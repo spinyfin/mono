@@ -1025,7 +1025,7 @@ fn release_pending_review_hold_unconditional(work_db: &crate::work::WorkDb, work
 /// [`super::pr_transition::WorkerCompletionHandler::finalize_pr_transition`].
 /// Shares the exact pure-rebase and no-op skip rules that gate uses
 /// ([`super::finalize_passes::pure_rebase_skip_gate`],
-/// [`super::finalize_passes::noop_skip_reason`]) so the two completion paths
+/// [`super::finalize_passes::noop_skip_outcome`]) so the two completion paths
 /// can never silently diverge on the same input.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn maybe_enqueue_declared_delivery_reviewer(
@@ -1068,15 +1068,18 @@ pub(super) async fn maybe_enqueue_declared_delivery_reviewer(
     // `finalize_pr_transition` runs it: `pure_rebase_skip_gate` first (it is
     // independent of `review_cycle` / `last_reviewed_sha`, so it also
     // catches a pure rebase landing before the PR's very first review),
-    // then `noop_skip_reason` for the sha_unchanged / empty_diff /
+    // then `noop_skip_outcome` for the sha_unchanged / empty_diff /
     // trivial_diff rules.
     let pure_rebase_gate =
         super::finalize_passes::pure_rebase_skip_gate(work_db, branch_verifier, pr_url, execution, &cycle_root_id)
             .await;
-    let noop_skip_reason = match pure_rebase_gate.skip_reason {
-        Some(reason) => Some(reason),
+    let noop_skip = match pure_rebase_gate.skip_reason {
+        Some(reason) => super::finalize_passes::NoopSkipOutcome {
+            reason: Some(reason),
+            head_sha: pure_rebase_gate.post_head.clone(),
+        },
         None => {
-            super::finalize_passes::noop_skip_reason(
+            super::finalize_passes::noop_skip_outcome(
                 branch_verifier,
                 pr_url,
                 execution,
@@ -1088,13 +1091,27 @@ pub(super) async fn maybe_enqueue_declared_delivery_reviewer(
             .await
         }
     };
+    let skip_head_sha = noop_skip.head_sha.as_deref().or(execution.pr_head_after.as_deref());
 
-    if let Some(skip_reason) = noop_skip_reason {
+    if let Some(skip_reason) = noop_skip.reason {
         tracing::info!(
             work_item_id,
             skip_reason,
             "run_done post-effects: pr_review noop skip; advancing to in_review without reviewer pass",
         );
+        if let Err(err) = work_db.record_skip_review_verdict(
+            &execution.id,
+            &cycle_root_id,
+            skip_head_sha,
+            crate::work::REVIEW_GATE_OUTCOME_SKIPPED_NOOP,
+        ) {
+            tracing::warn!(
+                execution_id = %execution.id,
+                cycle_root_id,
+                ?err,
+                "run_done post-effects: failed to record skipped_noop verdict on chain root",
+            );
+        }
         release_pending_review_hold_with_verdict(work_db, work_item_id, &cycle_root_id);
         return;
     }
@@ -1105,6 +1122,19 @@ pub(super) async fn maybe_enqueue_declared_delivery_reviewer(
             max_review_cycles,
             "run_done post-effects: pr_review cycle bound reached; skipping reviewer",
         );
+        if let Err(err) = work_db.record_skip_review_verdict(
+            &execution.id,
+            &cycle_root_id,
+            skip_head_sha,
+            crate::work::REVIEW_GATE_OUTCOME_SKIPPED_CYCLE_CAP,
+        ) {
+            tracing::warn!(
+                execution_id = %execution.id,
+                cycle_root_id,
+                ?err,
+                "run_done post-effects: failed to record skipped_cycle_cap verdict on chain root",
+            );
+        }
         let _ = work_db.create_attention_item(CreateAttentionItemInput {
             work_item_id: Some(work_item_id.to_owned()),
             kind: "pr_review_cycle_bound".to_owned(),

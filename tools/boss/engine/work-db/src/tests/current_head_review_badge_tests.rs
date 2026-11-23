@@ -116,7 +116,7 @@ fn current_head_review_badge_findings_revision_clean_then_new_unreviewed_head() 
     assert_eq!(old.ai_review_findings_revision_id.as_deref(), Some(revision.as_str()));
 
     observe(&db, &root, Some("fixed"), "success", "mergeable");
-    for status in ["active", "in_review"] {
+    for (status, expected) in [("active", "not_reviewed"), ("in_review", "review_not_required")] {
         db.connect()
             .unwrap()
             .execute(
@@ -124,10 +124,7 @@ fn current_head_review_badge_findings_revision_clean_then_new_unreviewed_head() 
                 rusqlite::params![root, status],
             )
             .unwrap();
-        assert_eq!(
-            card(&db, &product, &root).ai_review_state.as_deref(),
-            Some("not_reviewed")
-        );
+        assert_eq!(card(&db, &product, &root).ai_review_state.as_deref(), Some(expected));
     }
     verdict(&db, &root, "fixed", "completed_clean");
     let clean = card(&db, &product, &root);
@@ -176,7 +173,7 @@ fn current_head_review_badge_findings_revision_clean_then_new_unreviewed_head() 
 
     assert_eq!(
         card(&db, &product, &root).ai_review_state.as_deref(),
-        Some("not_reviewed")
+        Some("review_not_required")
     );
     verdict(&db, &root, "next", "completed_with_findings");
     assert_eq!(
@@ -376,13 +373,17 @@ fn current_head_review_badge_findings_revision_delivered_without_head_change_is_
         Some(boss_engine_storage_values::dispatch_wait::DISPATCH_WAIT_REASON_AWAITING_MERGE)
     );
     let delivered = card(&db, &product, &root);
-    assert_eq!(delivered.ai_review_state.as_deref(), Some("not_reviewed"));
+    assert_eq!(delivered.ai_review_state.as_deref(), Some("review_not_required"));
     assert!(delivered.ai_review_findings_revision_id.is_none());
     let badge = delivered.ai_review_badge.unwrap();
-    assert_eq!(badge.label, "Findings addressed");
-    assert_eq!(badge.system_image, "checkmark.circle");
+    assert_eq!(badge.label, "No AI review scheduled");
+    assert_eq!(badge.system_image, "minus.circle");
     assert!(badge.tooltip.contains("Last reviewed h1"));
-    assert!(badge.tooltip.contains("No subsequent AI review is recorded"));
+    assert!(
+        badge
+            .tooltip
+            .contains("No AI review of the current PR head is running or scheduled")
+    );
     assert!(badge.tooltip.contains("(Review)"));
     let tree = db.get_work_tree(&product).unwrap();
     let revision_card = tree.tasks.iter().find(|row| row.id == revision).unwrap();
@@ -421,7 +422,17 @@ fn current_head_review_badge_findings_revision_with_new_commit_keeps_head_rules(
         Some("reviewed_with_findings")
     );
 
-    // Once the new head is observed, it is simply not yet reviewed.
+    // Once the new head is observed with a review due, it is not yet reviewed.
+    db.create_attention_item(CreateAttentionItemInput {
+        work_item_id: Some(root.clone()),
+        kind: "pr_review_admission_deferred".to_owned(),
+        title: "Review deferred".to_owned(),
+        body_markdown: "Waiting for review pool slot.".to_owned(),
+        execution_id: None,
+        status: None,
+        resolved_at: None,
+    })
+    .unwrap();
     observe(&db, &root, Some("h2"), "success", "mergeable");
     let badge = card(&db, &product, &root).ai_review_badge.unwrap();
     assert_eq!(badge.label, "Not reviewed: latest commit");
@@ -473,6 +484,16 @@ fn review_badge_does_not_attribute_a_headless_verdict_to_a_legacy_reviewed_sha()
     let db = WorkDb::open(temp_db_path("review-badge-headless-verdict")).unwrap();
     let product = make_revision_product(&db, "review-badge-headless-verdict");
     let root = make_in_review_chore(&db, &product, "https://github.com/spinyfin/mono/pull/8011");
+    db.create_attention_item(CreateAttentionItemInput {
+        work_item_id: Some(root.clone()),
+        kind: "pr_review_admission_deferred".to_owned(),
+        title: "Review deferred".to_owned(),
+        body_markdown: "Waiting for review pool slot.".to_owned(),
+        execution_id: None,
+        status: None,
+        resolved_at: None,
+    })
+    .unwrap();
     observe(&db, &root, Some("current-head"), "success", "mergeable");
     let execution = verdict(&db, &root, "unknown", "completed_clean");
     db.connect()
@@ -511,4 +532,260 @@ fn single_item_primary_review_badge_matches_the_board_projection() {
     };
     assert!(board.ai_review_badge.is_some());
     assert_eq!(single.ai_review_badge, board.ai_review_badge);
+}
+
+fn skip_execution(db: &WorkDb, owner: &str) -> String {
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(owner)
+            .kind(ExecutionKind::RevisionImplementation)
+            .status(ExecutionStatus::Ready)
+            .build(),
+    )
+    .unwrap()
+    .id
+}
+
+/// A findings revision that delivered without moving the head leaves the
+/// findings verdict as the newest informative row; the skip the completion
+/// gate records for that unchanged head must still end the wait, while the
+/// findings history stays readable.
+#[test]
+fn current_head_review_badge_findings_revision_delivered_unmoved_with_skip_is_not_required() {
+    let db = WorkDb::open(temp_db_path("current-head-review-unmoved-skip")).unwrap();
+    let product = make_revision_product(&db, "current-head-unmoved-skip");
+    let root = make_in_review_chore(&db, &product, "https://github.com/spinyfin/mono/pull/8007");
+    observe(&db, &root, Some("h1"), "success", "mergeable");
+    let revision = findings_with_revision(&db, &product, &root, "h1");
+    set_status(&db, &revision, "in_review");
+    complete_revision_execution(&db, &revision, None);
+    assert_eq!(
+        card(&db, &product, &root).ai_review_state.as_deref(),
+        Some("review_not_required"),
+        "without a skip verdict or any scheduled review, the unmoved head does not wait"
+    );
+
+    let queued_review = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&root)
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    assert_eq!(
+        card(&db, &product, &root).ai_review_state.as_deref(),
+        Some("review_queued"),
+        "with a queued review, the unmoved head waits"
+    );
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'cancelled' WHERE id = ?1",
+            [&queued_review.id],
+        )
+        .unwrap();
+
+    let execution = skip_execution(&db, &revision);
+    db.record_skip_review_verdict(&execution, &root, Some("h1"), "skipped_noop")
+        .unwrap();
+    for tree in [
+        db.get_work_tree(&product).unwrap(),
+        db.get_work_tree_cached(
+            &product,
+            &mut boss_metrics::population_timing::PopulationTrace::new(
+                product.clone(),
+                "skip",
+                None,
+                std::time::Instant::now(),
+            ),
+            &crate::board_caches::BoardCaches::default(),
+        )
+        .unwrap(),
+    ] {
+        let card = tree.chores.into_iter().find(|t| t.id == root).unwrap();
+        assert_eq!(card.ai_review_state.as_deref(), Some("review_not_required"));
+        // The findings evidence stays on the badge and the baseline is unmoved.
+        assert!(card.ai_review_badge.unwrap().tooltip.contains("Last reviewed h1"));
+    }
+}
+
+/// A skip verdict at a head is bookkeeping, not a review result: it must not
+/// displace the informative verdict as the root's latest, or the duplicate
+/// admission guard would let a second review of the same SHA through.
+#[test]
+fn skip_verdict_does_not_defeat_the_already_reviewed_at_head_guard() {
+    let db = WorkDb::open(temp_db_path("skip-verdict-already-reviewed")).unwrap();
+    let product = make_revision_product(&db, "skip-verdict-already-reviewed");
+    let root = make_in_review_chore(&db, &product, "https://github.com/spinyfin/mono/pull/8008");
+    observe(&db, &root, Some("h1"), "success", "mergeable");
+    verdict(&db, &root, "h1", "completed_clean");
+    let reviewed = |db: &WorkDb| WorkDb::already_reviewed_at_head_in_tx(&db.connect().unwrap(), &root, "h1").unwrap();
+    assert!(reviewed(&db));
+
+    let execution = skip_execution(&db, &root);
+    db.record_skip_review_verdict(&execution, &root, Some("h1"), "skipped_noop")
+        .unwrap();
+    assert!(reviewed(&db));
+    assert_eq!(
+        db.latest_review_verdict(&root).unwrap().unwrap().gate_outcome,
+        "completed_clean"
+    );
+}
+
+/// Closed work shows no badge unless a verdict matches its last observed
+/// head: a merged card whose head has no verdict gains neither
+/// "not reviewed" nor "review not required".
+#[test]
+fn merged_card_without_a_verdict_for_its_head_shows_no_review_state() {
+    let db = WorkDb::open(temp_db_path("done-card-no-verdict")).unwrap();
+    let product = make_revision_product(&db, "done-card-no-verdict");
+    let root = make_in_review_chore(&db, &product, "https://github.com/spinyfin/mono/pull/8009");
+    observe(&db, &root, Some("h1"), "success", "mergeable");
+    verdict(&db, &root, "h0", "completed_clean");
+    set_status(&db, &root, "done");
+    let done = card(&db, &product, &root);
+    assert_eq!(done.ai_review_state, None);
+    assert!(done.ai_review_badge.is_none());
+}
+
+/// The board's "a review is coming" answer for a dead reviewer is built from
+/// the same predicates the recovery sweep uses: whenever the sweep would
+/// re-fire the review the card waits, and once a batch owns recovery (even a
+/// failed newest one) both stand down.
+#[test]
+fn dead_review_recovery_eligibility_matches_the_recovery_sweep() {
+    let db = WorkDb::open(temp_db_path("dead-review-equivalence")).unwrap();
+    let product = make_revision_product(&db, "dead-review-equivalence");
+    let root = make_in_review_chore(&db, &product, "https://github.com/spinyfin/mono/pull/8010");
+    observe(&db, &root, Some("h1"), "success", "mergeable");
+    let dead = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&root)
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute("UPDATE work_executions SET status = 'failed' WHERE id = ?1", [&dead.id])
+        .unwrap();
+    let sweep_would_refire = |db: &WorkDb| {
+        db.list_dead_pr_review_candidates()
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.work_item_id == root)
+            && !db.pre_merge_batch_owns_review_recovery(&root).unwrap()
+    };
+
+    assert!(sweep_would_refire(&db));
+    assert_eq!(
+        card(&db, &product, &root).ai_review_state.as_deref(),
+        Some("not_reviewed")
+    );
+
+    // A failed newest batch retains ownership: neither re-fires.
+    db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO pr_review_batches(id, cycle_root_id, base_sha, classification_json, created_at, phase, pr_number, pr_url, status, target_sha, updated_at, generation, explicit)
+             VALUES ('eq-batch', ?1, 'b', '{}', '1', 'pre_merge', 8010, 'https://github.com/spinyfin/mono/pull/8010', 'failed', 'other', '1', 9, 0)",
+            [&root],
+        )
+        .unwrap();
+    assert!(!sweep_would_refire(&db));
+    assert_eq!(
+        card(&db, &product, &root).ai_review_state.as_deref(),
+        Some("review_not_required")
+    );
+}
+
+/// Legacy revision-owned dead reviews carry their own `pr_url` and execution
+/// on the revision child while batch ownership still resolves to the cycle
+/// root. The board projection and recovery sweep must agree on them too.
+#[test]
+fn dead_review_recovery_eligibility_matches_the_recovery_sweep_for_legacy_revision_owned_attempt() {
+    let db = WorkDb::open(temp_db_path("dead-review-legacy-revision-equivalence")).unwrap();
+    let product = make_revision_product(&db, "dead-review-legacy-revision-equivalence");
+    let root = make_in_review_chore(&db, &product, "https://github.com/spinyfin/mono/pull/8011");
+    observe(&db, &root, Some("h1"), "success", "mergeable");
+
+    let revision = insert_revision_row(&db, &product, &root);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'in_review', pr_url = 'https://github.com/spinyfin/mono/pull/8011' WHERE id = ?1",
+            [&revision],
+        )
+        .unwrap();
+
+    let dead = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&revision)
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute("UPDATE work_executions SET status = 'failed' WHERE id = ?1", [&dead.id])
+        .unwrap();
+
+    let sweep_would_refire = |db: &WorkDb| {
+        db.list_dead_pr_review_candidates()
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.work_item_id == revision)
+            && !db.pre_merge_batch_owns_review_recovery(&root).unwrap()
+    };
+
+    assert!(sweep_would_refire(&db));
+    assert_eq!(
+        card(&db, &product, &root).ai_review_state.as_deref(),
+        Some("not_reviewed")
+    );
+
+    // A failed newest batch on the cycle root takes ownership: neither re-fires.
+    db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO pr_review_batches(id, cycle_root_id, base_sha, classification_json, created_at, phase, pr_number, pr_url, status, target_sha, updated_at, generation, explicit)
+             VALUES ('eq-rev-batch', ?1, 'b', '{}', '1', 'pre_merge', 8011, 'https://github.com/spinyfin/mono/pull/8011', 'failed', 'other', '1', 9, 0)",
+            [&root],
+        )
+        .unwrap();
+    assert!(!sweep_would_refire(&db));
+    assert_eq!(
+        card(&db, &product, &root).ai_review_state.as_deref(),
+        Some("review_not_required")
+    );
+
+    // Removing the batch restores recovery; parking the revision child stops it.
+    db.connect()
+        .unwrap()
+        .execute("DELETE FROM pr_review_batches WHERE id = 'eq-rev-batch'", [])
+        .unwrap();
+    assert!(sweep_would_refire(&db));
+    assert_eq!(
+        card(&db, &product, &root).ai_review_state.as_deref(),
+        Some("not_reviewed")
+    );
+
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET parked_at = '2026-01-01T00:00:00Z' WHERE id = ?1",
+            [&revision],
+        )
+        .unwrap();
+    assert!(!sweep_would_refire(&db));
+    assert_eq!(
+        card(&db, &product, &root).ai_review_state.as_deref(),
+        Some("review_not_required")
+    );
 }

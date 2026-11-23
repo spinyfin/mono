@@ -11,7 +11,7 @@
 //! write, and the engine logs which one carried the decision.
 //!
 //! Prior work this couples to (not replaces):
-//! - `check_noop_skip` / `sha_unchanged` in `finalize_passes.rs` — still
+//! - `check_noop_skip_outcome` / `sha_unchanged` in `finalize_passes.rs` — still
 //!   skips the reviewer; now also blocks false-success terminalization.
 //! - Metadata-only finalize (`metadata_gate.rs`, issue #1252) — positive
 //!   evidence via `metadata_fix_confirmed_at`.

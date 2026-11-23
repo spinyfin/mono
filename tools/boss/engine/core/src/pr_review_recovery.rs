@@ -484,36 +484,19 @@ fn recover_reviews(work_db: &WorkDb, pr_checker: &dyn PrStateChecker) -> (PrRevi
         // Any failed newest batch also
         // retains ownership, including exhausted or non-remintable failures:
         // legacy recovery must not circumvent the batch retry limits.
-        let batches = work_db
+        let batch_owned = work_db
             .resolve_review_cycle_root(&work_item_id)
-            .and_then(|root| work_db.review_batches_for_cycle_root(&root));
-        match batches {
-            Ok(batches) => {
-                let mut pre_merge = batches
-                    .iter()
-                    .filter(|batch| batch.phase == boss_protocol::ReviewBatchPhase::PreMerge);
-                let newest = pre_merge.next();
-                let owning_batch = newest
-                    .filter(|batch| batch.status != boss_protocol::ReviewBatchStatus::Completed)
-                    .or_else(|| {
-                        pre_merge.find(|batch| {
-                            !matches!(
-                                batch.status,
-                                boss_protocol::ReviewBatchStatus::Completed | boss_protocol::ReviewBatchStatus::Failed
-                            )
-                        })
-                    });
-                if let Some(batch) = owning_batch {
-                    tracing::info!(
-                        work_item_id,
-                        dead_execution_id,
-                        batch_id = %batch.id,
-                        batch_status = ?batch.status,
-                        "pr_review recovery: batch owns review; skipping memberless legacy recovery",
-                    );
-                    continue;
-                }
+            .and_then(|root| work_db.pre_merge_batch_owns_review_recovery(&root));
+        match batch_owned {
+            Ok(true) => {
+                tracing::info!(
+                    work_item_id,
+                    dead_execution_id,
+                    "pr_review recovery: batch owns review; skipping memberless legacy recovery",
+                );
+                continue;
             }
+            Ok(false) => {}
             Err(error) => {
                 tracing::warn!(
                     work_item_id,

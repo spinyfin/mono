@@ -302,15 +302,18 @@ impl WorkerCompletionHandler {
                     // conflict/CI-fix attempt row rather than
                     // `review_cycle`/`last_reviewed_sha`, so it also catches a
                     // pure rebase that lands before the PR's very first review
-                    // — a case `check_noop_skip`'s rule 1 always treats as
+                    // — a case `check_noop_skip_outcome`'s rule 1 always treats as
                     // "never skip" (right for genuinely new content, wrong for
                     // a rebase that contributes none). It is a no-op for any
                     // producer that isn't a conflict-resolution / CI-fix push.
                     let pure_rebase_gate = self.check_pure_rebase_skip(&pr_url, producing, &cycle_root_id).await;
-                    let noop_skip_reason = match pure_rebase_gate.skip_reason {
-                        Some(reason) => Some(reason),
+                    let noop_skip = match pure_rebase_gate.skip_reason {
+                        Some(reason) => super::finalize_passes::NoopSkipOutcome {
+                            reason: Some(reason),
+                            head_sha: pure_rebase_gate.post_head.clone(),
+                        },
                         None => {
-                            self.check_noop_skip(
+                            self.check_noop_skip_outcome(
                                 &pr_url,
                                 producing,
                                 review_cycle,
@@ -320,8 +323,9 @@ impl WorkerCompletionHandler {
                             .await
                         }
                     };
+                    let skip_head_sha = noop_skip.head_sha.as_deref().or(pr_head_after.as_deref());
 
-                    if let Some(skip_reason) = noop_skip_reason {
+                    if let Some(skip_reason) = noop_skip.reason {
                         tracing::info!(
                             execution_id,
                             work_item_id = %producing.work_item_id,
@@ -329,6 +333,19 @@ impl WorkerCompletionHandler {
                             trigger,
                             "pr_review noop skip: advancing to in_review without reviewer pass",
                         );
+                        if let Err(err) = self.work_db.record_skip_review_verdict(
+                            execution_id,
+                            &cycle_root_id,
+                            skip_head_sha,
+                            crate::work::REVIEW_GATE_OUTCOME_SKIPPED_NOOP,
+                        ) {
+                            tracing::warn!(
+                                execution_id,
+                                cycle_root_id,
+                                ?err,
+                                "failed to record skipped_noop verdict on chain root",
+                            );
+                        }
                         false
                     } else {
                         // Cycle bound check.
@@ -343,6 +360,19 @@ impl WorkerCompletionHandler {
                                 "pr_review cycle bound reached; skipping reviewer \
                                  and advancing to in_review",
                             );
+                            if let Err(err) = self.work_db.record_skip_review_verdict(
+                                execution_id,
+                                &cycle_root_id,
+                                skip_head_sha,
+                                crate::work::REVIEW_GATE_OUTCOME_SKIPPED_CYCLE_CAP,
+                            ) {
+                                tracing::warn!(
+                                    execution_id,
+                                    cycle_root_id,
+                                    ?err,
+                                    "failed to record skipped_cycle_cap verdict on chain root",
+                                );
+                            }
                             // Surface a sticky attention item so the human can see
                             // the cycle limit was hit when they open the PR card.
                             let _ = self.work_db.create_attention_item(CreateAttentionItemInput {

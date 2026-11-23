@@ -41,6 +41,46 @@ impl Board {
         chore.id
     }
 
+    fn in_review_project_task(&self, pr_number: u32) -> (String, String) {
+        let project = self
+            .db
+            .create_project(CreateProjectInput {
+                product_id: self.product_id.clone(),
+                name: format!("Project {pr_number}"),
+                description: None,
+                goal: None,
+                autostart: true,
+                no_design_task: false,
+                design_reasoning_effort_xhigh: false,
+            })
+            .unwrap();
+        let task = self
+            .db
+            .create_task(
+                CreateTaskInput::builder()
+                    .product_id(&self.product_id)
+                    .project_id(&project.id)
+                    .name(format!("Task {pr_number}"))
+                    .autostart(true)
+                    .build(),
+            )
+            .unwrap();
+        self.sql(
+            "UPDATE tasks SET status = 'in_review', pr_url = ?2 WHERE id = ?1",
+            &[&task.id, &format!("https://github.com/spinyfin/mono/pull/{pr_number}")],
+        );
+        (project.id, task.id)
+    }
+
+    fn dead_pr_review(&self, work_item_id: &str, created_at_epoch: i64) -> String {
+        let exec = self.execution(work_item_id, ExecutionKind::PrReview);
+        self.sql(
+            "UPDATE work_executions SET status = 'failed', created_at = ?2 WHERE id = ?1",
+            &[&exec, &created_at_epoch.to_string()],
+        );
+        exec
+    }
+
     fn revision(&self, root: &str) -> String {
         insert_revision_row(&self.db, &self.product_id, root)
     }
@@ -191,10 +231,14 @@ fn cached_board_matches_uncached_through_every_review_input() {
     assert_eq!(board.assert_equivalent(), Pass { misses: 1, queries: 4 });
     assert_eq!(board.assert_equivalent(), Pass { misses: 0, queries: 2 });
 
-    // The observed head moved: the clean verdict no longer matches.
+    // The observed head moved: the clean verdict no longer matches, and no
+    // review is scheduled for the unproduced head.
     board.observe(&root, "h2", "success", "mergeable");
     assert_eq!(board.assert_equivalent().misses, 1);
-    assert_eq!(board.card(&root).ai_review_state.as_deref(), Some("not_reviewed"));
+    assert_eq!(
+        board.card(&root).ai_review_state.as_deref(),
+        Some("review_not_required")
+    );
 
     // A findings verdict on the new head, then linked to its revision.
     let findings = board.verdict(&root, "h2", "completed_with_findings");
@@ -253,7 +297,7 @@ fn cached_board_matches_uncached_through_every_review_input() {
     board.sql("UPDATE tasks SET status = 'in_review' WHERE id = ?1", &[&revision]);
     assert_eq!(board.assert_equivalent().misses, 1);
     let badge = board.card(&root).ai_review_badge.unwrap();
-    assert_eq!(badge.label, "Findings addressed");
+    assert_eq!(badge.label, "No AI review scheduled");
 
     // Removing the revision from the board changes the family.
     board.sql("UPDATE tasks SET deleted_at = '9' WHERE id = ?1", &[&revision]);
@@ -523,7 +567,10 @@ fn reparented_findings_revision_writes_invalidate_the_original_owner() {
     );
     board.sql("UPDATE tasks SET status = 'done' WHERE id = ?1", &[&revision]);
     assert_eq!(board.assert_equivalent().misses, 2);
-    assert_eq!(board.card(&owner_a).ai_review_state.as_deref(), Some("not_reviewed"));
+    assert_eq!(
+        board.card(&owner_a).ai_review_state.as_deref(),
+        Some("review_not_required")
+    );
 }
 
 #[test]
@@ -710,4 +757,154 @@ fn review_attach_emits_cache_counts_and_subsegments() {
             .segment_counts(segment::DB_AI_REVIEW_STATE_BADGE_HISTORIES)
             .is_some()
     );
+}
+
+/// `review_due` reads inputs the cache epoch does not version (attention
+/// items, batches, parking). A warm cache must still see each change, so the
+/// cached board never disagrees with the uncached one about whether a review
+/// is coming.
+#[test]
+fn warm_cache_follows_volatile_review_due_inputs() {
+    let board = Board::new("review-cache-due");
+    let root = board.in_review_chore(7);
+    board.observe(&root, "h1", "success", "mergeable");
+    // No verdict at the head and nothing scheduled: nothing is coming.
+    assert_eq!(board.assert_equivalent().misses, 1);
+    assert_eq!(
+        board.card(&root).ai_review_state.as_deref(),
+        Some("review_not_required")
+    );
+    // Warm: the owner is served from the cache.
+    assert_eq!(board.assert_equivalent().misses, 0);
+
+    // An open admission-deferred attention item makes a review due, with no
+    // epoch moving.
+    board.sql(
+        "INSERT INTO work_attention_items(id, work_item_id, kind, status, title, body_markdown, created_at)
+         VALUES ('due-1', ?1, 'pr_review_admission_deferred', 'open', 't', 'b', '1')",
+        &[&root],
+    );
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(board.card(&root).ai_review_state.as_deref(), Some("not_reviewed"));
+
+    // Resolving it ends the wait, still without a recompute.
+    board.sql(
+        "UPDATE work_attention_items SET status = 'resolved' WHERE id = 'due-1'",
+        &[],
+    );
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(
+        board.card(&root).ai_review_state.as_deref(),
+        Some("review_not_required")
+    );
+
+    // A non-terminal review batch makes one due.
+    board.sql(
+        "INSERT INTO pr_review_batches(id, cycle_root_id, base_sha, classification_json, created_at, phase, pr_number, pr_url, status, target_sha, updated_at, generation, explicit)
+         VALUES ('due-batch', ?1, 'b', '{}', '1', 'pre_merge', 7, 'https://github.com/spinyfin/mono/pull/7', 'collecting', 'h1', '1', 1, 0)",
+        &[&root],
+    );
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(board.card(&root).ai_review_state.as_deref(), Some("not_reviewed"));
+    board.sql(
+        "UPDATE pr_review_batches SET status = 'completed' WHERE id = 'due-batch'",
+        &[],
+    );
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(
+        board.card(&root).ai_review_state.as_deref(),
+        Some("review_not_required")
+    );
+}
+
+/// A warm cache must also track parking (task and project), positioning holds,
+/// and churn-window expiry for a recoverable dead review without any
+/// epoch-invalidating write.
+#[test]
+fn warm_cache_follows_parking_hold_and_churn_window_transitions() {
+    let board = Board::new("review-cache-due-recovery");
+    let (project, root) = board.in_review_project_task(8);
+    board.observe(&root, "h1", "success", "mergeable");
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    let _dead = board.dead_pr_review(&root, now);
+
+    // Cold -> warm: recoverable dead review keeps the owner waiting.
+    assert_eq!(board.assert_equivalent().misses, 1);
+    assert_eq!(board.card(&root).ai_review_state.as_deref(), Some("not_reviewed"));
+    assert_eq!(board.assert_equivalent().misses, 0);
+
+    // Task park / unpark.
+    board.sql(
+        "UPDATE tasks SET parked_at = '2026-01-01T00:00:00Z' WHERE id = ?1",
+        &[&root],
+    );
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(
+        board.card(&root).ai_review_state.as_deref(),
+        Some("review_not_required")
+    );
+    board.sql("UPDATE tasks SET parked_at = NULL WHERE id = ?1", &[&root]);
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(board.card(&root).ai_review_state.as_deref(), Some("not_reviewed"));
+
+    // Project park / unpark.
+    board.sql(
+        "UPDATE projects SET parked_at = '2026-01-01T00:00:00Z' WHERE id = ?1",
+        &[&project],
+    );
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(
+        board.card(&root).ai_review_state.as_deref(),
+        Some("review_not_required")
+    );
+    board.sql("UPDATE projects SET parked_at = NULL WHERE id = ?1", &[&project]);
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(board.card(&root).ai_review_state.as_deref(), Some("not_reviewed"));
+
+    // Positioning hold create / resolve.
+    board.sql(
+        "INSERT INTO work_attention_items(id, work_item_id, kind, status, title, body_markdown, created_at)
+         VALUES ('hold-1', ?1, 'workspace_positioning_refused', 'open', 't', 'b', '1')",
+        &[&root],
+    );
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(
+        board.card(&root).ai_review_state.as_deref(),
+        Some("review_not_required")
+    );
+    board.sql(
+        "UPDATE work_attention_items SET status = 'resolved' WHERE id = 'hold-1'",
+        &[],
+    );
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(board.card(&root).ai_review_state.as_deref(), Some("not_reviewed"));
+
+    // Churn-window expiry: saturate the churn guard, warm the cache, then move
+    // the older attempts past the churn window without an epoch-invalidating write.
+    let mut churn_ids = Vec::new();
+    for _ in 1..ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD {
+        churn_ids.push(board.dead_pr_review(&root, now));
+    }
+    assert_eq!(board.assert_equivalent().misses, 1);
+    assert_eq!(
+        board.card(&root).ai_review_state.as_deref(),
+        Some("review_not_required")
+    );
+    assert_eq!(board.assert_equivalent().misses, 0);
+
+    let expired = (now - ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS - 60).to_string();
+    let epoch_before = board.epoch(&root);
+    for id in &churn_ids {
+        board.sql(
+            "UPDATE work_executions SET created_at = ?2 WHERE id = ?1",
+            &[id, &expired],
+        );
+    }
+    assert_eq!(
+        board.epoch(&root),
+        epoch_before,
+        "moving created_at past the churn window must not invalidate board_review_epoch"
+    );
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(board.card(&root).ai_review_state.as_deref(), Some("not_reviewed"));
 }

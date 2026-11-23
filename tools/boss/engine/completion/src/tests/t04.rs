@@ -1749,7 +1749,7 @@ async fn noop_revision_push_does_not_enqueue_a_review() {
 // against a fixed point would pull in every upstream commit the rebase
 // crossed and make the predicate false for any base movement at all.
 // Deliberately independent of `review_cycle` / `last_reviewed_sha`, unlike
-// `check_noop_skip`, so it also covers a conflict/CI-fix that lands before
+// `check_noop_skip_outcome`, so it also covers a conflict/CI-fix that lands before
 // the PR's very first review.
 // -----------------------------------------------------------
 
@@ -1757,7 +1757,7 @@ async fn noop_revision_push_does_not_enqueue_a_review() {
 /// base branch (`"main"`, per the fixture) is identical before and after
 /// the push (a clean rebase, no hand-authored content) must skip the
 /// reviewer entirely -- even though this is the PR's first-ever review
-/// pass (`review_cycle == 0`), which `check_noop_skip` alone would never
+/// pass (`review_cycle == 0`), which `check_noop_skip_outcome` alone would never
 /// skip. The skip must also leave a durable `[pr-review-skip]` audit line
 /// on the parent chore's description. Also asserts the gate requested
 /// exactly the `(base, head)` pairs `("main", pre_head)` /
@@ -1985,7 +1985,7 @@ async fn pure_rebase_skip_gate_fails_open_on_base_ref_error() {
 /// If nothing pushed this round (the PR's current head still equals
 /// `pre_head`), the gate itself must report "no skip" without fetching a
 /// base ref or diff signature it has no need for — leaving
-/// `check_noop_skip`'s own `sha_unchanged` rule (once it has a
+/// `check_noop_skip_outcome`'s own `sha_unchanged` rule (once it has a
 /// `last_reviewed_sha` to compare against) to own that case. Called
 /// directly rather than through `on_stop`: the Stop-boundary SHA-delta
 /// gate that runs ahead of the reviewer-enqueue path also treats an
@@ -2027,7 +2027,7 @@ async fn pure_rebase_skip_gate_falls_through_when_head_unchanged() {
     assert_eq!(
         gate.post_head,
         Some(head_before.to_owned()),
-        "the fetched head OID must still be threaded through for `check_noop_skip` to reuse",
+        "the fetched head OID must still be threaded through for `check_noop_skip_outcome` to reuse",
     );
     assert!(
         verifier.diff_signature_calls_snapshot().await.is_empty(),

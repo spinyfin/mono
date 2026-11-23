@@ -769,3 +769,221 @@ fn observe_badge_head(db: &WorkDb, root: &str, sha: &str) {
         rusqlite::params![root, sha],
     ).unwrap();
 }
+
+#[test]
+fn ai_review_state_is_review_not_required_for_human_push_without_boss_producer() {
+    let db = WorkDb::open(temp_db_path("ai-review-state-human-push")).unwrap();
+    let product_id = make_revision_product(&db, "human-push");
+    let chore_id = make_in_review_chore(&db, &product_id, "https://github.com/spinyfin/mono/pull/9301");
+    let first = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+            [&first.id],
+        )
+        .unwrap();
+        WorkDb::insert_review_verdict_in_tx(
+            &conn,
+            &first.id,
+            &chore_id,
+            &crate::ReviewVerdictInput {
+                head_sha: Some("sha-boss-1".to_owned()),
+                findings_count: 0,
+                revision_warranted: false,
+                gate_outcome: crate::REVIEW_GATE_OUTCOME_COMPLETED_CLEAN,
+            },
+        )
+        .unwrap();
+    }
+    observe_badge_head(&db, &chore_id, "sha-human-2");
+
+    let tree = db.get_work_tree(&product_id).unwrap();
+    let card = tree.chores.iter().find(|c| c.id == chore_id).expect("chore present");
+    assert_eq!(card.ai_review_state.as_deref(), Some("review_not_required"));
+}
+
+#[test]
+fn ai_review_state_treats_gave_up_as_due_only_while_recovery_will_refire_it() {
+    let db = WorkDb::open(temp_db_path("ai-review-state-fresh-vs-exhausted-gave-up")).unwrap();
+    let product_id = make_revision_product(&db, "fresh-vs-exhausted-gave-up");
+    let chore_id = make_in_review_chore(&db, &product_id, "https://github.com/spinyfin/mono/pull/9302");
+    observe_badge_head(&db, &chore_id, "sha-gave-up");
+
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    let insert_gave_up = |created_at: i64| {
+        let exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore_id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE work_executions SET status = 'completed', created_at = ?2 WHERE id = ?1",
+            rusqlite::params![exec.id, created_at.to_string()],
+        )
+        .unwrap();
+        WorkDb::insert_review_verdict_in_tx(
+            &conn,
+            &exec.id,
+            &chore_id,
+            &crate::ReviewVerdictInput {
+                head_sha: Some("sha-gave-up".to_owned()),
+                findings_count: 0,
+                revision_warranted: false,
+                gate_outcome: crate::REVIEW_GATE_OUTCOME_GAVE_UP,
+            },
+        )
+        .unwrap();
+    };
+
+    // Fresh gave-up: under ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD -> recovery will re-fire.
+    insert_gave_up(now);
+    let fresh_tree = db.get_work_tree(&product_id).unwrap();
+    let fresh_card = fresh_tree
+        .chores
+        .iter()
+        .find(|c| c.id == chore_id)
+        .expect("chore present");
+    assert_eq!(fresh_card.ai_review_state.as_deref(), Some("not_reviewed"));
+
+    // Exhausted gave-up: reaches ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD -> recovery will not re-fire.
+    for offset in 1..crate::ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD {
+        insert_gave_up(now + offset);
+    }
+    let exhausted_tree = db.get_work_tree(&product_id).unwrap();
+    let exhausted_card = exhausted_tree
+        .chores
+        .iter()
+        .find(|c| c.id == chore_id)
+        .expect("chore present");
+    assert_eq!(exhausted_card.ai_review_state.as_deref(), Some("review_not_required"));
+}
+
+#[test]
+fn mixed_board_with_empty_head_and_headless_owners_does_not_abort_fetch() {
+    let db = WorkDb::open(temp_db_path("mixed-board-headless-empty")).unwrap();
+    let product_id = make_revision_product(&db, "mixed-board");
+    let normal_owner = make_in_review_chore(&db, &product_id, "https://github.com/spinyfin/mono/pull/9303");
+    observe_badge_head(&db, &normal_owner, "sha-normal");
+    let clean_exec = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(normal_owner.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+            [&clean_exec.id],
+        )
+        .unwrap();
+        WorkDb::insert_review_verdict_in_tx(
+            &conn,
+            &clean_exec.id,
+            &normal_owner,
+            &crate::ReviewVerdictInput {
+                head_sha: Some("sha-normal".to_owned()),
+                findings_count: 0,
+                revision_warranted: false,
+                gate_outcome: crate::REVIEW_GATE_OUTCOME_COMPLETED_CLEAN,
+            },
+        )
+        .unwrap();
+    }
+
+    let empty_head_owner = create_test_chore_manual(&db, product_id.clone(), "Empty head owner").id;
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'in_review', pr_url = 'https://github.com/spinyfin/mono/pull/9304'
+             WHERE id = ?1",
+            [&empty_head_owner],
+        )
+        .unwrap();
+    let headless_revision = create_test_chore_manual(&db, product_id.clone(), "Headless revision");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET kind = 'revision', parent_task_id = NULL, status = 'in_review',
+                              pr_url = 'https://github.com/spinyfin/mono/pull/9305', pr_head_sha = ''
+             WHERE id = ?1",
+            [&headless_revision.id],
+        )
+        .unwrap();
+
+    let caches = crate::board_caches::BoardCaches::default();
+    let mut trace = boss_metrics::population_timing::PopulationTrace::new(
+        product_id.clone(),
+        "mixed-board",
+        None,
+        std::time::Instant::now(),
+    );
+    let cached = db.get_work_tree_cached(&product_id, &mut trace, &caches).unwrap();
+    let uncached = db.get_work_tree(&product_id).unwrap();
+
+    assert_eq!(
+        uncached
+            .chores
+            .iter()
+            .find(|c| c.id == normal_owner)
+            .unwrap()
+            .ai_review_state
+            .as_deref(),
+        Some("reviewed_all_clear")
+    );
+    assert_eq!(
+        uncached
+            .chores
+            .iter()
+            .find(|c| c.id == empty_head_owner)
+            .unwrap()
+            .ai_review_state
+            .as_deref(),
+        Some("not_reviewed")
+    );
+    assert_eq!(
+        cached
+            .chores
+            .iter()
+            .find(|c| c.id == normal_owner)
+            .unwrap()
+            .ai_review_state,
+        uncached
+            .chores
+            .iter()
+            .find(|c| c.id == normal_owner)
+            .unwrap()
+            .ai_review_state
+    );
+    assert_eq!(
+        cached
+            .chores
+            .iter()
+            .find(|c| c.id == empty_head_owner)
+            .unwrap()
+            .ai_review_state,
+        uncached
+            .chores
+            .iter()
+            .find(|c| c.id == empty_head_owner)
+            .unwrap()
+            .ai_review_state
+    );
+}

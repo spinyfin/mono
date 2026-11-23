@@ -395,8 +395,9 @@ fn measure_cached_reviews(db: &WorkDb, product: &str, samples: usize) {
         cards(&reference),
         "cold cached review projections diverged"
     );
-    // Cold: the epoch read, the two owner-keyed miss queries, the live probe.
-    assert_eq!(cold_queries, 4, "cold review statements");
+    // Cold: the epoch read, the two owner-keyed miss queries, the live
+    // review-due read and the live probe.
+    assert_eq!(cold_queries, 5, "cold review statements");
     let stats = caches.reviews.stats();
     println!(
         "scale review_cache entries={} hits={} misses={}",
@@ -414,8 +415,9 @@ fn measure_cached_reviews(db: &WorkDb, product: &str, samples: usize) {
             cards(&reference),
             "warm cached review projections diverged"
         );
-        // Warm with nothing written: the epoch read and the live probe only.
-        assert_eq!(queries, 2, "warm review statements");
+        // Warm with nothing written: the epoch read, the live review-due read
+        // (its inputs are not epoch-versioned) and the live probe only.
+        assert_eq!(queries, 3, "warm review statements");
         assert_eq!(
             caches.reviews.stats().misses,
             misses_before,
@@ -460,7 +462,7 @@ fn measure_cached_reviews(db: &WorkDb, product: &str, samples: usize) {
             count as u64,
             "{count} verdict writes"
         );
-        assert_eq!(queries, 4, "{count} verdict writes: statements");
+        assert_eq!(queries, 5, "{count} verdict writes: statements");
     }
 }
 

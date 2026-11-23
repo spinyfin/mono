@@ -32,6 +32,20 @@ pub const REVIEW_GATE_OUTCOME_REVISION_CREATION_FAILED: &str = "revision_creatio
 /// sweep's re-admission arm if nothing else did). Non-informative: it says
 /// nothing about the head the card shows, so the badge keeps "Not reviewed".
 pub const REVIEW_GATE_OUTCOME_STALE_HEAD: &str = "stale_head";
+/// The completion gate skipped automated review because the push was a no-op
+/// (`sha_unchanged`, `empty_diff`, `trivial_diff`, or `pure_rebase`). Recorded
+/// per-head on the chain root without moving `last_reviewed_sha`.
+pub const REVIEW_GATE_OUTCOME_SKIPPED_NOOP: &str = "skipped_noop";
+/// The completion gate skipped automated review because the PR's review-cycle
+/// counter reached `max_review_cycles`. Recorded per-head on the chain root
+/// without moving `last_reviewed_sha`.
+pub const REVIEW_GATE_OUTCOME_SKIPPED_CYCLE_CAP: &str = "skipped_cycle_cap";
+
+/// Gate outcomes that mean the completion gate explicitly declined to run an
+/// AI review for this head, so the current-head projection treats no review as
+/// due (`review_not_required`) without forging an informative clean/findings
+/// verdict or moving `last_reviewed_sha`.
+pub const SKIPPED_GATE_OUTCOMES: [&str; 2] = [REVIEW_GATE_OUTCOME_SKIPPED_NOOP, REVIEW_GATE_OUTCOME_SKIPPED_CYCLE_CAP];
 
 /// Gate outcomes that represent a real completed judgement about a pass —
 /// the only ones the AI-review badge (`attach_ai_review_state`) will ever
@@ -104,19 +118,24 @@ pub const PR_REVIEW_VERDICTS_SINCE_METADATA_KEY: &str = "pr_review_verdicts_sinc
 /// yank the card back to Doing, re-review the same SHA, drop as a
 /// duplicate again, and loop until the churn guard parks it.
 pub(crate) fn unproductive_completed_pr_review_sql() -> String {
+    unproductive_completed_pr_review_sql_for("we")
+}
+
+/// Parameterized alias form of [`unproductive_completed_pr_review_sql`].
+pub(crate) fn unproductive_completed_pr_review_sql_for(alias: &str) -> String {
     format!(
-        "(we.status = 'completed' AND (
+        "({alias}.status = 'completed' AND (
             EXISTS (
                 SELECT 1 FROM pr_review_verdicts rv
-                WHERE rv.execution_id = we.id
+                WHERE rv.execution_id = {alias}.id
                   AND rv.gate_outcome = '{gave_up}'
             )
             OR (
                 NOT EXISTS (
                     SELECT 1 FROM pr_review_verdicts rv
-                    WHERE rv.execution_id = we.id
+                    WHERE rv.execution_id = {alias}.id
                 )
-                AND CAST(we.created_at AS INTEGER) >= COALESCE(
+                AND CAST({alias}.created_at AS INTEGER) >= COALESCE(
                     (SELECT CAST(value AS INTEGER) FROM metadata WHERE key = '{since_key}'),
                     0
                 )
@@ -124,6 +143,72 @@ pub(crate) fn unproductive_completed_pr_review_sql() -> String {
         ))",
         gave_up = REVIEW_GATE_OUTCOME_GAVE_UP,
         since_key = PR_REVIEW_VERDICTS_SINCE_METADATA_KEY,
+    )
+}
+
+/// SQL boolean over a `work_executions` row aliased `alias`: a `pr_review`
+/// attempt that did not yield a durable judgement — a dead terminal status or a
+/// completed give-up ([`unproductive_completed_pr_review_sql_for`]). The one
+/// definition of "dead review attempt" shared by the recovery sweep's candidate
+/// list, its churn count and the board's review-readiness projection.
+pub(crate) fn dead_pr_review_attempt_sql(alias: &str) -> String {
+    format!(
+        "({alias}.status IN ('orphaned', 'abandoned', 'failed', 'cancelled') OR {})",
+        unproductive_completed_pr_review_sql_for(alias)
+    )
+}
+
+/// SQL boolean over `work_executions` row `alias`: no later `pr_review`
+/// attempt of the same work item exists, so `alias` is the item's newest
+/// review. `later` is a free alias for the inner row.
+pub(crate) fn latest_pr_review_attempt_sql(alias: &str, later: &str) -> String {
+    format!(
+        "NOT EXISTS (
+            SELECT 1 FROM work_executions {later}
+            WHERE {later}.work_item_id = {alias}.work_item_id
+              AND {later}.kind = 'pr_review'
+              AND ({later}.created_at > {alias}.created_at
+                   OR ({later}.created_at = {alias}.created_at AND {later}.id > {alias}.id))
+        )"
+    )
+}
+
+/// SQL boolean over a `tasks` row (`task`) and its `work_executions` row
+/// (`exec`, with `later` as a free alias for the inner latest-attempt check):
+/// the task and execution form a dead `pr_review` recovery candidate. Shared by
+/// [`WorkDb::list_dead_pr_review_candidates`] and the board's `review_due`
+/// projection so both agree on eligibility, PR URL requirement, dead status,
+/// and latest-attempt selection.
+pub(crate) fn dead_pr_review_candidate_where_sql(task: &str, exec: &str, later: &str) -> String {
+    let eligible = dead_review_recovery_eligible_sql(task);
+    let dead = dead_pr_review_attempt_sql(exec);
+    let latest = latest_pr_review_attempt_sql(exec, later);
+    format!(
+        "({eligible}
+          AND NULLIF({task}.pr_url, '') IS NOT NULL
+          AND {exec}.kind = 'pr_review'
+          AND {dead}
+          AND {latest})"
+    )
+}
+
+/// SQL boolean over a `tasks` row aliased `task`: the review recovery sweep may
+/// act on it — live, not done/archived, not parked, not held by a positioning
+/// refusal, and not routed through batch admission by a deferred marker.
+pub(crate) fn dead_review_recovery_eligible_sql(task: &str) -> String {
+    let upkeep = super::parking::upkeep_eligible_task_sql(task);
+    let not_held = super::dispatch_helpers::not_positioning_held_sql(task);
+    format!(
+        "({task}.deleted_at IS NULL
+          AND {task}.status NOT IN ('done', 'archived')
+          AND {upkeep}
+          AND {not_held}
+          AND NOT EXISTS (
+              SELECT 1 FROM work_attention_items ai
+              WHERE ai.work_item_id = {task}.id
+                AND ai.kind = 'pr_review_admission_deferred'
+                AND ai.status = 'open'
+          ))"
     )
 }
 
@@ -204,19 +289,29 @@ fn map_review_verdict(row: &rusqlite::Row) -> rusqlite::Result<ReviewVerdict> {
 /// [`WorkDb::latest_review_verdict`] and
 /// [`WorkDb::already_reviewed_at_head_in_tx`] so both read the same query
 /// against either a fresh connection or an already-open transaction.
+///
+/// Skip outcomes ([`SKIPPED_GATE_OUTCOMES`]) record why no review will run at a
+/// head; they are not review results. They are excluded so a skip never
+/// displaces the real verdict as "latest" (which would, for example, make an
+/// already-reviewed head look unreviewed).
 fn latest_review_verdict_in(conn: &rusqlite::Connection, work_item_id: &str) -> Result<Option<ReviewVerdict>> {
-    conn.query_row(
+    let placeholders = (0..SKIPPED_GATE_OUTCOMES.len())
+        .map(|i| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
         "SELECT id, execution_id, work_item_id, head_sha, findings_count,
                 revision_warranted, gate_outcome, revision_task_id, created_at
          FROM pr_review_verdicts
          WHERE work_item_id = ?1
+           AND gate_outcome NOT IN ({placeholders})
          ORDER BY created_at DESC, id DESC
-         LIMIT 1",
-        params![work_item_id],
-        map_review_verdict,
-    )
-    .optional()
-    .map_err(Into::into)
+         LIMIT 1"
+    );
+    let params = std::iter::once(work_item_id).chain(SKIPPED_GATE_OUTCOMES.iter().copied());
+    conn.query_row(&sql, rusqlite::params_from_iter(params), map_review_verdict)
+        .optional()
+        .map_err(Into::into)
 }
 
 #[work_db_boundary::instrument]
@@ -287,6 +382,59 @@ impl WorkDb {
             ],
         )?;
         Ok(id)
+    }
+
+    /// Record a per-head skip verdict (`skipped_noop` or `skipped_cycle_cap`)
+    /// on `cycle_root_id` without modifying `last_reviewed_sha` or
+    /// `review_cycle`. Falls back to `cycle_root_id`'s stored `pr_head_sha`
+    /// when the caller had no `head_sha`, and is idempotent per
+    /// `(execution_id, work_item_id, head_sha, gate_outcome)`.
+    pub fn record_skip_review_verdict(
+        &self,
+        execution_id: &str,
+        cycle_root_id: &str,
+        head_sha: Option<&str>,
+        gate_outcome: &'static str,
+    ) -> Result<()> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let resolved_head: Option<String> = match head_sha.filter(|sha| !sha.is_empty()) {
+            Some(sha) => Some(sha.to_owned()),
+            None => tx
+                .query_row(
+                    "SELECT NULLIF(pr_head_sha, '') FROM tasks WHERE id = ?1",
+                    params![cycle_root_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten(),
+        };
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pr_review_verdicts
+                WHERE execution_id = ?1
+                  AND work_item_id = ?2
+                  AND gate_outcome = ?3
+                  AND COALESCE(head_sha, '') = COALESCE(?4, '')
+            )",
+            params![execution_id, cycle_root_id, gate_outcome, resolved_head],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            Self::insert_review_verdict_in_tx(
+                &tx,
+                execution_id,
+                cycle_root_id,
+                &ReviewVerdictInput {
+                    head_sha: resolved_head,
+                    findings_count: 0,
+                    revision_warranted: false,
+                    gate_outcome,
+                },
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Record that the revision a verdict predicted (`gate_outcome =

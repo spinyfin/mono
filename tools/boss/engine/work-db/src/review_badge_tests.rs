@@ -79,7 +79,7 @@ fn review_badge_labels_and_icons_cover_every_state() {
         ),
         ("reviewed_all_clear", "AI review: clean", "checkmark.seal.fill"),
         ("reviewed_clean_pending", "AI review: clean", "checkmark.seal.fill"),
-        ("review_not_required", "AI review not required", "minus.circle"),
+        ("review_not_required", "No AI review scheduled", "minus.circle"),
     ] {
         let badge = badge_presentation(state, None, Some(&history), "card");
         assert_eq!(badge.label, label, "{state}");
@@ -499,25 +499,40 @@ fn badge_history_and_current_heads_use_the_work_item_index() {
     let sample = vec!["owner-0".to_owned(), "owner-1".to_owned()];
     let heads_sql = current_heads_sql("?1,?2", ReviewKey::Owner);
     let histories_sql = badge_histories_sql("?1,?2", ReviewKey::Owner);
+    let due_sql = review_due_heads_sql("?1,?2", ReviewKey::Owner);
 
     drop_planner_stats(&conn);
     let heads_unstat = explain_plan(&conn, &heads_sql, &sample);
     let histories_unstat = explain_plan(&conn, &histories_sql, &sample);
+    let due_unstat = explain_plan(&conn, &due_sql, &sample);
     println!("current_heads without sqlite_stat1:\n{heads_unstat}");
     println!("badge_histories without sqlite_stat1:\n{histories_unstat}");
+    println!("review_due without sqlite_stat1:\n{due_unstat}");
     // The covering (work_item_id, kind, status, finished_at) index is enough for
     // bundled SQLite 3.51 to pick a work_item-led plan even with no sqlite_stat1.
     // ANALYZE is still required at startup so other queries keep a good plan.
     assert_work_item_led_plan(&heads_unstat, "fetch_current_heads without sqlite_stat1");
     assert_work_item_led_plan(&histories_unstat, "fetch_badge_histories without sqlite_stat1");
+    assert_work_item_led_plan(&due_unstat, "fetch_review_due without sqlite_stat1");
+    assert!(
+        !due_unstat.contains("SCAN we") && !due_unstat.contains("SCAN work_executions"),
+        "fetch_review_due without sqlite_stat1 walked work_executions:\n{due_unstat}"
+    );
 
     conn.execute_batch("ANALYZE").unwrap();
     let heads_plan = explain_plan(&conn, &heads_sql, &sample);
     let histories_plan = explain_plan(&conn, &histories_sql, &sample);
+    let due_plan = explain_plan(&conn, &due_sql, &sample);
     println!("current_heads with sqlite_stat1:\n{heads_plan}");
     println!("badge_histories with sqlite_stat1:\n{histories_plan}");
+    println!("review_due with sqlite_stat1:\n{due_plan}");
     assert_work_item_led_plan(&heads_plan, "fetch_current_heads");
     assert_work_item_led_plan(&histories_plan, "fetch_badge_histories");
+    assert_work_item_led_plan(&due_plan, "fetch_review_due");
+    assert!(
+        !due_plan.contains("SCAN we") && !due_plan.contains("SCAN work_executions"),
+        "fetch_review_due walked work_executions:\n{due_plan}"
+    );
 
     let owners: Vec<String> = (0..PLAN_OWNERS).map(|i| format!("owner-{i}")).collect();
     let started = std::time::Instant::now();

@@ -162,6 +162,37 @@ pub(crate) fn has_live_pre_merge_review_batch_in(conn: &Connection, cycle_root_i
     Ok(found.is_some())
 }
 
+/// SQL boolean: a pre-merge review batch of `cycle_root_expr` owns review
+/// recovery, so a memberless legacy reviewer must not be re-fired. The newest
+/// batch owns it unless it completed; a failed newest batch keeps ownership
+/// too (legacy recovery must not circumvent the batch retry limits). When the
+/// newest completed, any older batch that is still non-terminal owns it.
+pub(crate) fn pre_merge_batch_owns_review_recovery_sql(cycle_root_expr: &str) -> String {
+    format!(
+        "(EXISTS (
+            SELECT 1 FROM pr_review_batches newest
+            WHERE newest.id = (
+                SELECT latest.id FROM pr_review_batches latest
+                WHERE latest.cycle_root_id = {cycle_root_expr} AND latest.phase = 'pre_merge'
+                ORDER BY latest.created_at DESC, latest.generation DESC, latest.id DESC
+                LIMIT 1
+            )
+            AND newest.status != 'completed'
+         )
+         OR EXISTS (
+            SELECT 1 FROM pr_review_batches older
+            WHERE older.cycle_root_id = {cycle_root_expr} AND older.phase = 'pre_merge'
+              AND older.status NOT IN ('completed', 'failed')
+              AND older.id != (
+                  SELECT latest.id FROM pr_review_batches latest
+                  WHERE latest.cycle_root_id = {cycle_root_expr} AND latest.phase = 'pre_merge'
+                  ORDER BY latest.created_at DESC, latest.generation DESC, latest.id DESC
+                  LIMIT 1
+              )
+         ))"
+    )
+}
+
 /// SQL boolean over a cycle-root id expression (`cycle_root_expr` is spliced
 /// verbatim — pass a column reference, never user input): true when that
 /// root's NEWEST pre-merge batch leaves the PR head needing a fresh review
@@ -2025,6 +2056,16 @@ impl WorkDb {
     pub fn resolve_review_cycle_root(&self, task_id: &str) -> Result<String> {
         let conn = self.connect()?;
         super::chain_helpers::chain_root(&conn, task_id)
+    }
+
+    /// Whether a pre-merge review batch of `cycle_root_id` owns review
+    /// recovery (see [`pre_merge_batch_owns_review_recovery_sql`]). The
+    /// recovery sweep and the board's review-readiness projection read the
+    /// same predicate.
+    pub fn pre_merge_batch_owns_review_recovery(&self, cycle_root_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let sql = format!("SELECT {}", pre_merge_batch_owns_review_recovery_sql("?1"));
+        Ok(conn.query_row(&sql, params![cycle_root_id], |row| row.get(0))?)
     }
 
     /// Return all persisted batches for a review cycle root, newest first.

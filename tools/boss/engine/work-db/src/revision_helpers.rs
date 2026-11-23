@@ -919,7 +919,9 @@ pub(crate) fn attach_ai_review_state_with(
     chores: &mut [Task],
     cache: Option<(&BoardReviewCache, &str)>,
 ) -> Result<(ReviewAttachStats, ReviewAttachTimings)> {
-    use super::review_badge::{OwnerReview, ReviewKey, fetch_badge_histories, fetch_current_heads};
+    use super::review_badge::{
+        OwnerReview, ReviewKey, fetch_badge_histories, fetch_current_heads, fetch_review_due, fetch_verdict_heads,
+    };
     use std::time::Instant;
 
     let mut stats = ReviewAttachStats::default();
@@ -1000,7 +1002,7 @@ pub(crate) fn attach_ai_review_state_with(
         let mut fresh = Vec::with_capacity(misses.len());
         if !misses.is_empty() {
             let started = Instant::now();
-            let mut heads = fetch_current_heads(conn, &misses, ReviewKey::Owner)?;
+            let mut heads = fetch_verdict_heads(conn, &misses, ReviewKey::Owner)?;
             add_timing(&mut timings.current_heads_ms, started);
             let started = Instant::now();
             let mut histories = fetch_badge_histories(conn, &misses, ReviewKey::Owner)?;
@@ -1013,7 +1015,8 @@ pub(crate) fn attach_ai_review_state_with(
                     .map(|history| history.trimmed_for(current_head.as_ref().map(|head| head.state)));
                 let review = std::sync::Arc::new(OwnerReview { current_head, history });
                 owner_reviews.insert(id.clone(), std::sync::Arc::clone(&review));
-                fresh.push((id.clone(), keys[&id].clone(), review));
+                let key = keys.get(&id).cloned().unwrap_or_else(|| vec![(id.clone(), 0)]);
+                fresh.push((id.clone(), key, review));
             }
         }
         cache.complete(product_id, lookup.pass, fresh);
@@ -1033,6 +1036,33 @@ pub(crate) fn attach_ai_review_state_with(
             }
         }
     }
+    // Whether a review is still due is volatile (attention items, batches,
+    // parking, a time window) and not versioned by the board review cache, so
+    // it is read live for every owner whose cached head depends on it. Done
+    // cards never show "not reviewed"/"not required", so owners with only
+    // Done cards are skipped.
+    let live_owners: std::collections::HashSet<&str> = tasks
+        .iter()
+        .chain(chores.iter())
+        .filter(|row| row.status != TaskStatus::Done)
+        .filter_map(|row| owner_of.get(&row.id).map(String::as_str))
+        .collect();
+    let due_ids: Vec<String> = owner_reviews
+        .iter()
+        .filter(|(id, review)| {
+            live_owners.contains(id.as_str()) && review.current_head.as_ref().is_some_and(|head| head.due_dependent)
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    let due_owners = if due_ids.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        let started = Instant::now();
+        let due = fetch_review_due(conn, &due_ids, ReviewKey::Owner)?;
+        add_timing(&mut timings.current_heads_ms, started);
+        stats.queries += 1;
+        due
+    };
     let fallback_heads = if fallback.is_empty() {
         HashMap::new()
     } else {
@@ -1087,15 +1117,18 @@ pub(crate) fn attach_ai_review_state_with(
     // The owner's current-head verdict as this card shows it: a revision
     // inherits the owner's verdict, but must not link to itself.
     let current_head = |row: &Task| -> Option<(&'static str, Option<String>)> {
-        let head = match owner_of.get(&row.id) {
-            Some(owner) => owner_reviews.get(owner)?.current_head.as_ref()?,
-            None => fallback_heads.get(&row.id)?,
+        let (head, review_due) = match owner_of.get(&row.id) {
+            Some(owner) => (
+                owner_reviews.get(owner)?.current_head.as_ref()?,
+                due_owners.contains(owner),
+            ),
+            None => (fallback_heads.get(&row.id)?, false),
         };
         let revision = head
             .findings_revision_id
             .clone()
             .filter(|revision_id| revision_id != &row.id);
-        Some((head.state, revision))
+        Some((head.state_when(review_due), revision))
     };
     let resolve = |row: &Task| -> (Option<&'static str>, Option<String>) {
         if task_kind_excluded_from_ai_review(&row.kind) {
@@ -1115,10 +1148,17 @@ pub(crate) fn attach_ai_review_state_with(
                 .map(|(state, revision)| (Some(state), revision))
                 .unwrap_or((None, None)),
             // Closed work shows no badge unless a verdict matches the last
-            // observed head; "not reviewed" is only meaningful while the PR
-            // is still open (`pr_head_sha` is NULL for legacy merged cards).
+            // observed head; "not reviewed" and "review not required" are
+            // only meaningful while the PR is still open (`pr_head_sha` is
+            // NULL for legacy merged cards, and a head with no verdict is not
+            // a head that needed none).
             TaskStatus::Done => current_head(row)
-                .filter(|(state, _)| *state != AI_REVIEW_STATE_NOT_REVIEWED)
+                .filter(|(state, _)| {
+                    !matches!(
+                        *state,
+                        AI_REVIEW_STATE_NOT_REVIEWED | AI_REVIEW_STATE_REVIEW_NOT_REQUIRED
+                    )
+                })
                 .map(|(state, revision)| (Some(state), revision))
                 .unwrap_or((None, None)),
             _ => (None, None),
