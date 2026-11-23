@@ -387,20 +387,27 @@ def text_outside_single_quotes(command):
     return "".join(out)
 
 
-def neutralize_expanding_heredoc_quotes(command):
-    # Quote characters inside an unquoted (expanding) heredoc are literal data.
-    # Replace them with spaces so quote tracking of later shell code cannot be
-    # inverted by an apostrophe in the body, while `$`, `[` and `(` stay visible
-    # for the arithmetic / substitution scan.
+def apply_heredoc_masks(command):
+    # Compute heredoc records once on the stripped original command. Quoted
+    # bodies are blanked (newlines kept so later lines stay on their own
+    # records); quotes inside expanding bodies are spaced out. Re-parsing a
+    # body whose newlines were already replaced with spaces would glue the
+    # terminator onto the previous line (`  A`) and hide later expanding
+    # heredocs from quote neutralization.
     command = strip_line_continuations(command)
     masked = list(command)
     for group in command_records(command, True):
-        if not group.body_span or not group.expanding_body:
+        if not group.body_span:
             continue
         start, end = group.body_span
-        for index in range(start, end):
-            if masked[index] in ("'", '"'):
-                masked[index] = " "
+        if group.expanding_body:
+            for index in range(start, end):
+                if masked[index] in ("'", '"'):
+                    masked[index] = " "
+        else:
+            for index in range(start, end):
+                if masked[index] != "\n":
+                    masked[index] = " "
     return "".join(masked)
 
 
@@ -409,8 +416,9 @@ def reject_dynamic_text(command):
     # heredoc is data, so it is masked first. Quotes inside an expanding
     # heredoc are literal, so they are spaced out before
     # `text_outside_single_quotes` blanks single-quoted data. Neither can be
-    # evaluated by the shell.
-    code = neutralize_expanding_heredoc_quotes(mask_literal_heredoc_bodies(command))
+    # evaluated by the shell. Both masks come from one parse of the original
+    # command so an earlier quoted heredoc cannot switch neutralization off.
+    code = apply_heredoc_masks(command)
     text = text_outside_single_quotes(code)
     if DYNAMIC_NAME_RE.search(text):
         fail_closed("variables that bash later executes or evaluates cannot be named")
@@ -721,9 +729,12 @@ def python_cwd_needs_traversal_scan(cwd, policy):
     workspace = policy.get("workspace_path")
     if isinstance(workspace, str) and workspace:
         try:
-            return resolved != os.path.realpath(workspace)
+            root = os.path.realpath(workspace)
         except Exception:
             return True
+        if resolved == root or resolved.startswith(root + os.sep):
+            return False
+        return True
     return True
 
 
@@ -741,6 +752,56 @@ def python_body_has_traversal(body, spellings):
         decoded = python_unescape_string(content)
         if decoded != content and (
                 python_literal_escapes_scratch(decoded, spellings) or PYTHON_DOTDOT_TOKEN_RE.search(decoded)):
+            return True
+    return False
+
+
+def python_expand_home_prefix(path, policy):
+    home = policy.get("process_home") or ""
+    if path.startswith("${HOME}"):
+        return home + path[len("${HOME}"):]
+    if path.startswith("$HOME"):
+        return home + path[len("$HOME"):]
+    if path == "~" or path.startswith("~/"):
+        return home + path[1:]
+    return path
+
+
+def python_literal_leaves_scratch(content, policy, cwd):
+    # Lexical scratch allowance is not enough: a link already in scratch
+    # realpaths to protected state. Resolve the same way shell operands do.
+    decoded = python_unescape_string(content)
+    texts = [content]
+    if decoded != content:
+        texts.append(decoded)
+    spellings = allowed_scratch_spellings(policy)
+    scratch_cwd = False
+    if isinstance(cwd, str) and cwd:
+        try:
+            scratch_cwd = within_conversation_scratch(os.path.realpath(cwd), policy)
+        except Exception:
+            return True
+    for text in texts:
+        inspect = False
+        expanded = python_expand_home_prefix(text, policy)
+        if scratch_cwd and text and not os.path.isabs(expanded):
+            inspect = True
+        for spelling in spellings:
+            if not spelling:
+                continue
+            prefix = spelling.rstrip("/\\")
+            if text == spelling or text == prefix or text.startswith(prefix + "/") or text.startswith(prefix + os.sep):
+                inspect = True
+                break
+        if not inspect:
+            continue
+        if not os.path.isabs(expanded):
+            expanded = os.path.join(cwd or policy.get("workspace_path") or "", expanded)
+        try:
+            resolved = os.path.realpath(expanded)
+        except Exception:
+            return True
+        if not within_conversation_scratch(resolved, policy):
             return True
     return False
 
@@ -777,19 +838,34 @@ def python_body_touches_protected(body, policy, cwd=None):
             blob = blob.replace(spelling, "ALLOWED_SCRATCH")
         return blob
 
-    decoded = [python_unescape_string(content) for content in python_string_contents(body)]
+    contents = python_string_contents(body)
+    if any(python_literal_leaves_scratch(content, policy, cwd) for content in contents):
+        return True
+    decoded = [python_unescape_string(content) for content in contents]
     haystacks = [text]
     haystacks.extend(mask_scratch(blob) for blob in decoded)
     if decoded:
         haystacks.append(mask_scratch("".join(decoded)))
     conv = policy.get("conversation_id")
+    brain_pat = re.compile(r"antigravity-cli/brain[/\\]([A-Za-z0-9][A-Za-z0-9_-]{0,127})")
+    root_pats = []
+    root = policy.get("conversation_scratch_root")
+    if isinstance(root, str) and root:
+        for spelling in protected_spellings(root):
+            prefix = spelling.rstrip("/\\")
+            if prefix:
+                root_pats.append(re.compile(re.escape(prefix) + r"[/\\]([A-Za-z0-9][A-Za-z0-9_-]{0,127})"))
     for haystack in haystacks:
         for needle in needles:
             if needle and needle in haystack:
                 return True
-        for match in re.finditer(r"(?:antigravity-cli/)?brain[/\\]([A-Za-z0-9][A-Za-z0-9_-]{0,127})", haystack):
+        for match in brain_pat.finditer(haystack):
             if not isinstance(conv, str) or match.group(1) != conv:
                 return True
+        for pat in root_pats:
+            for match in pat.finditer(haystack):
+                if not isinstance(conv, str) or match.group(1) != conv:
+                    return True
     return False
 
 
@@ -807,7 +883,9 @@ def mask_heredoc_bodies(command, expanding):
         start, end = group.body_span
         if group.expanding_body:
             expanded.append(command[start:end])
-        masked[start:end] = ' ' * (end - start)
+        for index in range(start, end):
+            if masked[index] != "\n":
+                masked[index] = " "
     return ''.join(masked), expanded
 
 
@@ -1134,11 +1212,26 @@ def glob_prefix_spellings(static):
     return prefixes
 
 
-def glob_wildcard_uses_unmodeled_brackets(wildcard):
-    # Python's glob/fnmatch does not implement POSIX classes, equivalence
-    # classes, collating symbols or bash's `[^` negation. A "no matches" result is
-    # not proof the pattern stays inside scratch.
-    return any(marker in wildcard for marker in ("[[", "[!", "[^"))
+def glob_bracket_entry_candidates(expanded):
+    # When a path component has a bracket expression, Python's glob is not a
+    # model of bash. Conservatively every name in that component's parent is a
+    # candidate; an empty listing is not proof the pattern stays in scratch.
+    parts = expanded.split(os.sep)
+    prefix = []
+    if expanded.startswith(os.sep):
+        prefix = [""]
+        parts = parts[1:]
+    for part in parts:
+        if "[" in part:
+            parent = os.sep.join(prefix) if prefix != [""] else os.sep
+            if not prefix:
+                parent = "."
+            try:
+                return [os.path.join(parent, name) for name in os.listdir(parent)]
+            except OSError:
+                return []
+        prefix.append(part)
+    return []
 
 
 def glob_touches_protected(expanded, policy, trust_missing_scratch=True):
@@ -1164,8 +1257,16 @@ def glob_touches_protected(expanded, policy, trust_missing_scratch=True):
         hubs = (base, os.path.join(base, ".system_generated"))
         if all(within_conversation_scratch(p, policy) and p not in hubs for p in inner):
             # A wildcard can match a link that leads out of the directory, so
-            # every actual match must resolve inside it too.
-            if all(within_conversation_scratch(os.path.realpath(match), policy) for match in glob.glob(expanded)):
+            # every actual match must resolve inside it too. A bracket
+            # expression with no Python matches is not proof: list the parent
+            # of the bracketed component and require each entry stay inside.
+            matches = list(glob.glob(expanded))
+            if "[" in wildcard:
+                matches.extend(glob_bracket_entry_candidates(expanded))
+                if not matches:
+                    matches = None
+            if matches is not None and all(
+                    within_conversation_scratch(os.path.realpath(match), policy) for match in matches):
                 return False
     for root in policy.get("protected_paths", []):
         for spelling in protected_spellings(root):
@@ -1473,69 +1574,7 @@ def cp_creates_links(rest):
     return False
 
 
-def cp_preserves_links(rest):
-    for arg in rest[1:]:
-        if arg == "--":
-            break
-        if arg in ("-a", "--archive", "-R", "-r", "--recursive", "-d", "--no-dereference") or arg.startswith("--preserve"):
-            return True
-        if arg.startswith("-") and not arg.startswith("--") and any(flag in arg[1:] for flag in "aRrd"):
-            return True
-    return False
-
-
-SCRATCH_SAFE_PROGRAMS = {
-    "cat", "head", "tail", "wc", "ls", "echo", "printf", "true", "false", ":",
-    "pwd", "test", "[", "dirname", "basename", "cd", "pushd", "popd",
-}
-
-
-def program_uses_pattern_file(rest):
-    program = os.path.basename(rest[0]) if rest else ""
-    flags = FILE_FLAGS.get(program, ())
-    if not flags:
-        return False
-    for arg in rest[1:]:
-        if arg == "--":
-            break
-        if arg in flags:
-            return True
-        if any(arg.startswith(flag + "=") for flag in flags if flag.startswith("--")):
-            return True
-        if arg.startswith("-") and not arg.startswith("--"):
-            for flag in flags:
-                if len(flag) == 2 and flag[1] in arg[1:]:
-                    return True
-    return False
-
-
-def sed_is_scratch_safe(args):
-    has_n = False
-    for arg in args:
-        if arg == "--":
-            break
-        if arg in ("-i", "--in-place") or arg.startswith("--in-place="):
-            return False
-        if arg.startswith("-") and not arg.startswith("--") and "i" in arg[1:]:
-            return False
-        if arg in ("-n", "--quiet", "--silent") or (
-                arg.startswith("-") and not arg.startswith("--") and "n" in arg[1:]):
-            has_n = True
-    return has_n
-
-
-def group_is_scratch_safe(group):
-    rest = strip_prefixes(group)
-    if not rest:
-        return True
-    program = os.path.basename(rest[0])
-    if program in SCRATCH_SAFE_PROGRAMS:
-        return True
-    if program in ("grep", "rg") and not program_uses_pattern_file(rest):
-        return True
-    if program == "sed" and sed_is_scratch_safe(rest[1:]):
-        return True
-    return False
+# SCRATCH_SAFE_PROGRAMS_FRAGMENT
 
 
 def nested_command_groups(group):
@@ -1606,7 +1645,7 @@ def operand_touches_protected(candidate, policy, current, program, is_redirect, 
     return path_is_protected(expanded, policy, current, pre_expanded=True, trust_missing_scratch=trust_missing_scratch)
 
 
-def command_touches_protected(command, policy, cwd):
+def command_touches_protected(command, policy, cwd, enclosing_trust=True):
     current = cwd
     groups = command_groups(command)
     reject_trusted_rebinding(command, groups)
@@ -1626,8 +1665,10 @@ def command_touches_protected(command, policy, cwd):
                 return True
         # Scratch operands are trusted only when every other group, including
         # nested shell bodies, is a read-only program. Existence at check
-        # time is not trust: an earlier group can replace the path.
-        trust_missing_scratch = other_groups_are_scratch_safe(groups, group_index)
+        # time is not trust: an earlier group can replace the path. Nested
+        # `-c` bodies inherit this group's distrust so a one-group inner
+        # command cannot reset the allowance.
+        trust_missing_scratch = enclosing_trust and other_groups_are_scratch_safe(groups, group_index)
         rest_ids = strip_prefix_indices(group)
         program_index = rest_ids[0] if rest_ids else None
         for index, role in sorted(path_operand_positions(group).items()):
@@ -1676,8 +1717,21 @@ def command_touches_protected(command, policy, cwd):
             # keeps a tracked cwd for the Python scan.
             if path_is_protected(current, policy, pre_expanded=True, trust_missing_scratch=True):
                 return True
+        elif not trust_missing_scratch:
+            # A distrusted group that names no path still reads its cwd. After
+            # `cd` into scratch, `rg .` walks a same-command planted link.
+            # `cd <scratch> && python3` stays allowed: that python group's
+            # own trust is still True because `cd` is read-only.
+            tracked = current or policy.get("workspace_path")
+            if isinstance(tracked, str) and tracked:
+                try:
+                    resolved_cwd = os.path.realpath(tracked)
+                except Exception:
+                    return True
+                if within_conversation_scratch(resolved_cwd, policy):
+                    return True
         for body in nested_shell_bodies(group):
-            if command_touches_protected(body, policy, current):
+            if command_touches_protected(body, policy, current, enclosing_trust=trust_missing_scratch):
                 return True
     return False
 

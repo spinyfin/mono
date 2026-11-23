@@ -430,131 +430,40 @@ def emit(decision, reason=None):
 
 "#,
         crate::render_conversation_scratch!(),
+        crate::render_command_tokenizer!("", ""),
+        crate::render_scratch_safe_programs!(),
         r#"
 def conversation_scratch_path(candidate, cwd, payload):
     # The root comes from engine-owned hook wiring, never the payload.
-    # Bracket constructs Python's glob does not model (`[[`, `[^`) can
-    # expand to a name the worker created as a link out of scratch, so those
-    # spellings keep the data-dir check.
-    if any(marker in candidate for marker in ("[[", "[!", "[^")):
+    # Bracket constructs Python's glob does not model (POSIX classes later
+    # in a set, `[!`, `[^`) can expand to a name the worker created as a
+    # link out of scratch, so those spellings keep the data-dir check.
+    if glob_wildcard_uses_unmodeled_brackets(candidate):
         return False
     base = conversation_scratch_base(os.environ.get("BOSS_AGY_SCRATCH_ROOT"), payload.get("session_id"))
     return conversation_scratch_contains(canonical(candidate, cwd), base)
 
 
-SCRATCH_SAFE_PROGRAMS = frozenset((
-    "cat", "head", "tail", "wc", "ls", "echo", "printf", "true", "false", ":",
-    "pwd", "test", "[", "dirname", "basename", "cd", "pushd", "popd",
-))
-SHELL_PROGRAMS = frozenset(("sh", "bash", "zsh", "dash", "ksh"))
-COMMAND_DELIMS = frozenset(("&&", "||", ";", "|", "&", "|&"))
-WRAPPER_PROGRAMS = frozenset((
-    "env", "command", "builtin", "exec", "nohup", "stdbuf", "setsid",
-    "caffeinate", "time", "nice",
-))
-
-
-def lex_shell(text):
-    lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|")
-    lexer.whitespace_split = True
-    lexer.commenters = ""
-    return list(lexer)
-
-
-def split_token_groups(tokens):
-    groups, current = [], []
-    for token in tokens:
-        if token in COMMAND_DELIMS:
-            if current:
-                groups.append(current)
-                current = []
-        else:
-            current.append(token)
-    if current:
-        groups.append(current)
-    return groups
-
-
-def c_bodies(tokens):
-    bodies = []
-    for index, token in enumerate(tokens):
-        prog = os.path.basename(token.lstrip("({"))
-        if prog not in SHELL_PROGRAMS:
-            continue
-        for j, arg in enumerate(tokens[index + 1:], index + 1):
-            if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", arg) and j + 1 < len(tokens):
-                bodies.append(tokens[j + 1])
-                break
-    return bodies
-
-
-def program_uses_pattern_file(tokens):
-    prog = os.path.basename(tokens[0].lstrip("({")) if tokens else ""
-    flags = {"grep": ("-f", "--file"), "rg": ("-f", "--file"), "sed": ("-f", "--file")}.get(prog, ())
-    for arg in tokens[1:]:
-        if arg == "--":
-            break
-        if arg in flags or any(arg.startswith(flag + "=") for flag in flags if flag.startswith("--")):
-            return True
-        if arg.startswith("-") and not arg.startswith("--"):
-            for flag in flags:
-                if len(flag) == 2 and flag[1] in arg[1:]:
-                    return True
-    return False
-
-
-def sed_is_scratch_safe(tokens):
-    has_n = False
-    for arg in tokens[1:]:
-        if arg == "--":
-            break
-        if arg in ("-i", "--in-place") or arg.startswith("--in-place="):
-            return False
-        if arg.startswith("-") and not arg.startswith("--") and "i" in arg[1:]:
-            return False
-        if arg in ("-n", "--quiet", "--silent") or (
-                arg.startswith("-") and not arg.startswith("--") and "n" in arg[1:]):
-            has_n = True
-    return has_n
-
-
-def group_program_tokens(tokens):
-    index = 0
-    while index < len(tokens) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[index]):
-        index += 1
-    while index < len(tokens) and os.path.basename(tokens[index].lstrip("({")) in WRAPPER_PROGRAMS:
-        index += 1
-        while index < len(tokens) and tokens[index].startswith("-"):
-            if tokens[index] == "--":
-                index += 1
-                break
-            index += 1
-    return tokens[index:]
-
-
-def group_is_scratch_safe(tokens):
-    rest = group_program_tokens(tokens)
+def nested_c_bodies(group):
+    rest = strip_prefixes(group)
     if not rest:
-        return True
-    prog = os.path.basename(rest[0].lstrip("({"))
-    if prog in SCRATCH_SAFE_PROGRAMS:
-        return True
-    if prog in ("grep", "rg") and not program_uses_pattern_file(rest):
-        return True
-    if prog == "sed" and sed_is_scratch_safe(rest):
-        return True
-    return False
+        return []
+    if os.path.basename(rest[0]) in ("sh", "bash", "zsh", "dash", "ksh"):
+        for index, arg in enumerate(rest[1:], 1):
+            if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", arg) and index + 1 < len(rest):
+                return [rest[index + 1]]
+    return []
 
 
-def flatten_token_groups(tokens):
+def flatten_command_groups(command):
     groups = []
-    for group in split_token_groups(tokens):
-        groups.append(group)
-        for body in c_bodies(group):
-            inner = lex_shell(body)
-            nested, _ = flatten_token_groups(inner)
-            groups.extend(nested)
-    return groups, True
+    def walk(text):
+        for group in command_groups(text):
+            groups.append(group)
+            for body in nested_c_bodies(group):
+                walk(body)
+    walk(command)
+    return groups
 
 
 def main():
@@ -601,14 +510,13 @@ def main():
             command = masked
         raw_command = command
         try:
-            tokens = lex_shell(command)
-        except Exception:
-            tokens = command.split()
-        try:
-            bash_groups, _ = flatten_token_groups(tokens)
+            bash_groups = flatten_command_groups(command)
         except Exception:
             emit("block", MALFORMED + " Detail: a nested -c body could not be parsed.")
+        tokens = []
         for group in bash_groups:
+            tokens.extend(group)
+            tokens.append(";")
             candidates.extend(group)
         # Creating a link inside the conversation allowance is how a later
         # (or same-command) read walks out of scratch. `ln` / `cp -s` / `cp -l`

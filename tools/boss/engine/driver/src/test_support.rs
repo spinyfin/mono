@@ -557,3 +557,29 @@ impl AgentDriver for StubDriver {
         self.worker_process_lifetime
     }
 }
+
+/// Relative path from `from_dir` to `to`, using `..` components as needed.
+/// Used by scratch-link guard tests in the adapter and the data-dir gate.
+#[cfg(test)]
+pub(crate) fn relative_from(from_dir: &Path, to: &Path) -> std::path::PathBuf {
+    let from = std::fs::canonicalize(from_dir).unwrap();
+    let to = if to.exists() {
+        std::fs::canonicalize(to).unwrap()
+    } else {
+        to.to_path_buf()
+    };
+    let mut cursor = from.as_path();
+    let mut up = std::path::PathBuf::new();
+    loop {
+        if to.starts_with(cursor) {
+            return up.join(to.strip_prefix(cursor).unwrap());
+        }
+        match cursor.parent() {
+            Some(parent) => {
+                up.push("..");
+                cursor = parent;
+            }
+            None => return up.join(&to),
+        }
+    }
+}

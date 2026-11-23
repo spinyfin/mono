@@ -141,26 +141,24 @@ fn conversation_allowance_is_scoped_in_both_path_and_substring_checks() {
 }
 
 fn relative_from(from_dir: &Path, to: &Path) -> std::path::PathBuf {
-    let from = std::fs::canonicalize(from_dir).unwrap();
-    let to = if to.exists() {
-        std::fs::canonicalize(to).unwrap()
-    } else {
-        to.to_path_buf()
-    };
-    let mut cursor = from.as_path();
-    let mut up = std::path::PathBuf::new();
-    loop {
-        if to.starts_with(cursor) {
-            return up.join(to.strip_prefix(cursor).unwrap());
-        }
-        match cursor.parent() {
-            Some(parent) => {
-                up.push("..");
-                cursor = parent;
-            }
-            None => return up.join(&to),
-        }
-    }
+    crate::test_support::relative_from(from_dir, to)
+}
+
+fn run_approved(data: &Path, brain: &Path, command: &str) {
+    assert_eq!(
+        verdict(
+            data,
+            brain,
+            json!({
+                "session_id": "c1", "tool_name": "Bash",
+                "tool_input": {"command": command}
+            })
+        ),
+        "approve",
+        "{command}"
+    );
+    let status = Command::new("bash").arg("-c").arg(command).status().unwrap();
+    assert!(status.success(), "{command}");
 }
 
 #[test]
@@ -251,6 +249,144 @@ fn link_creation_and_unmodeled_bracket_globs_do_not_skip_scratch() {
             scratch.display(),
             scratch.display()
         ),
+    ] {
+        assert_eq!(
+            verdict(
+                &data,
+                &brain,
+                json!({
+                    "session_id": "c1", "tool_name": "Bash",
+                    "tool_input": {"command": command}
+                })
+            ),
+            "block",
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn same_command_mv_cd_rg_and_nested_bodies_do_not_skip_scratch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("Boss state");
+    let sessions = data.join("executions/run/transcripts/agy/sessions");
+    std::fs::create_dir_all(sessions.join("c1/scratch")).unwrap();
+    std::fs::write(data.join("state.db"), "secret\n").unwrap();
+    let brain = tmp.path().join("brain");
+    std::os::unix::fs::symlink(&sessions, &brain).unwrap();
+    let scratch = brain.join("c1/scratch");
+    let hooks_dir = tmp.path().join("gemini-config");
+    std::fs::create_dir_all(&hooks_dir).unwrap();
+    std::fs::write(hooks_dir.join("hooks.json"), "{}\n").unwrap();
+    let to_data = relative_from(&scratch, &data);
+    let to_hooks = relative_from(&scratch, &hooks_dir);
+    let prepared_data = tmp.path().join("prepared-up");
+    let prepared_hooks = tmp.path().join("prepared-hooks");
+    run_approved(
+        &data,
+        &brain,
+        &format!("ln -s {} {}", to_data.display(), prepared_data.display()),
+    );
+    run_approved(
+        &data,
+        &brain,
+        &format!("ln -s {} {}", to_hooks.display(), prepared_hooks.display()),
+    );
+    for command in [
+        format!(
+            "mv {} {}/up\ncd {}/up\nrg -a --hidden --no-ignore .",
+            prepared_data.display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "mv {} {}/up && cd {}/up && rg -a --hidden --no-ignore .",
+            prepared_data.display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "bash -c 'mv {} {}/up'; bash -c 'cat {}/up/state.db'",
+            prepared_data.display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "true\nbash -c 'true\nmv {} {}/up'; bash -c 'cat {}/up/state.db'",
+            prepared_data.display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "mv {} {}/hooks\ncd {}/hooks\nrg -a --hidden --no-ignore .",
+            prepared_hooks.display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "bash -c 'mv {} {}/hooks'; bash -c 'cat {}/hooks/hooks.json'",
+            prepared_hooks.display(),
+            scratch.display(),
+            scratch.display()
+        ),
+    ] {
+        assert_eq!(
+            verdict(
+                &data,
+                &brain,
+                json!({
+                    "session_id": "c1", "tool_name": "Bash",
+                    "tool_input": {"command": command}
+                })
+            ),
+            "block",
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn posix_class_later_in_bracket_does_not_skip_scratch_after_mv() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("Boss state");
+    let sessions = data.join("executions/run/transcripts/agy/sessions");
+    std::fs::create_dir_all(sessions.join("c1/scratch")).unwrap();
+    std::fs::write(data.join("state.db"), "secret\n").unwrap();
+    let brain = tmp.path().join("brain");
+    std::os::unix::fs::symlink(&sessions, &brain).unwrap();
+    let scratch = brain.join("c1/scratch");
+    let hooks_dir = tmp.path().join("gemini-config");
+    std::fs::create_dir_all(&hooks_dir).unwrap();
+    std::fs::write(hooks_dir.join("hooks.json"), "{}\n").unwrap();
+    let to_data = relative_from(&scratch, &data);
+    let to_hooks = relative_from(&scratch, &hooks_dir);
+    let prepared_data = tmp.path().join("prepared-up");
+    let prepared_hooks = tmp.path().join("prepared-hooks");
+    run_approved(
+        &data,
+        &brain,
+        &format!("ln -s {} {}", to_data.display(), prepared_data.display()),
+    );
+    run_approved(
+        &data,
+        &brain,
+        &format!("mv {} {}/up", prepared_data.display(), scratch.display()),
+    );
+    run_approved(
+        &data,
+        &brain,
+        &format!("ln -s {} {}", to_hooks.display(), prepared_hooks.display()),
+    );
+    run_approved(
+        &data,
+        &brain,
+        &format!("mv {} {}/hooks.json", prepared_hooks.display(), scratch.display()),
+    );
+    for command in [
+        format!("cat {}/[a[:lower:]]p/state.db", scratch.display()),
+        format!("cat {}/[x[=u=]]p/state.db", scratch.display()),
+        format!("cat {}/[x[.u.]]p/state.db", scratch.display()),
+        format!("cat {}/[a[:lower:]]ooks.json", scratch.display()),
     ] {
         assert_eq!(
             verdict(
