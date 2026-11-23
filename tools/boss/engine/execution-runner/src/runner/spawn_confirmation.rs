@@ -502,6 +502,7 @@ mod tests {
         for screen in [
             "❯ \n  ⏵⏵ auto mode on (shift+tab to cycle)",
             "❯ \n  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+            "❯ \n  ⏸ manual mode on · ? for shortcuts",
             "❯ \n  /effort",
             "Claude Code v2.1.283",
         ] {

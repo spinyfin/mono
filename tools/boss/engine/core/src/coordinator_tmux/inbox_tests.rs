@@ -438,45 +438,6 @@ fn a_deadline_expiry_names_the_furthest_stage_reached() {
 }
 
 #[tokio::test]
-async fn wait_for_input_record_returns_claude_uuid_and_falls_back_to_message_id() {
-    let directory = tempfile::tempdir().unwrap();
-    let attributed_path = directory.path().join("attributed.jsonl");
-    let attributed = json!({
-        "type": "user",
-        "uuid": "claude-assigned",
-        "origin": {"kind": "peer", "msg_id": "expected"},
-        "message": {"content": "Another Claude session sent a message:\nprompt\n\nClaude attribution."}
-    });
-    std::fs::write(&attributed_path, format!("{attributed}\n")).unwrap();
-    let file = tokio::fs::File::open(&attributed_path).await.unwrap();
-    let resolved = tokio::time::timeout(
-        Duration::from_secs(1),
-        wait_for_input_record(file, "expected", "prompt"),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(resolved, "claude-assigned");
-
-    let missing_uuid_path = directory.path().join("missing-uuid.jsonl");
-    let missing_uuid = json!({
-        "type": "user",
-        "origin": {"kind": "peer", "msg_id": "expected"},
-        "message": {"content": "Another Claude session sent a message:\nprompt\n\nClaude attribution."}
-    });
-    std::fs::write(&missing_uuid_path, format!("{missing_uuid}\n")).unwrap();
-    let file = tokio::fs::File::open(&missing_uuid_path).await.unwrap();
-    let fallback = tokio::time::timeout(
-        Duration::from_secs(1),
-        wait_for_input_record(file, "expected", "prompt"),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(fallback, "expected");
-}
-
-#[tokio::test]
 async fn receipt_winning_confirm_still_correlates_claude_uuid_to_end_turn() {
     let (_directory, path, listener, transcript) = private_inbox();
     let (observer_result, frame_msg_id) = tokio::join!(

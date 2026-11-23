@@ -378,6 +378,7 @@ fn unresolved_conflict_revision_gets_discovery_gate() {
     for needle in [
         "run the tests for the targets affected by the files that had conflicts",
         "rdeps(//..., set(<conflicted source files>))",
+        "except attr(tags, \"manual\", //...)",
         "do NOT on their own select tests",
         "stop as blocked",
         "`bazel test` of the test targets affected by the conflicted source files",

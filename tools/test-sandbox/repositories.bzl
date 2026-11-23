@@ -308,7 +308,7 @@ test_runtime(
         ),
     )
 
-def host_tool_symlink(repository_ctx, name, path, visibility):
+def host_tool_symlink(repository_ctx, name, path, visibility, subdir = "", extra_exports = []):
     """Fills a repository with one target, `name`, that links to a host tool.
 
     `@<repository>//:<name>` is a declared symlink to `path`. On a remote
@@ -321,6 +321,8 @@ def host_tool_symlink(repository_ctx, name, path, visibility):
       name: Target name, and the file name of the link in runfiles.
       path: Absolute host path the link points at.
       visibility: Visibility of the target.
+      subdir: Optional subdirectory within the repository for generated files.
+      extra_exports: Optional additional files in `subdir` to export with `visibility`.
     """
     if repository_ctx.path(path).exists:
         fingerprint = _host_fingerprint(repository_ctx, {name: path})
@@ -329,10 +331,17 @@ def host_tool_symlink(repository_ctx, name, path, visibility):
         # on this host. Refetch if the tool appears.
         repository_ctx.watch(path)
         fingerprint = "{}={} absent\n".format(name, path)
-    repository_ctx.file("fingerprint", content = fingerprint, executable = False)
-    repository_ctx.file("host_tool.bzl", content = _HOST_TOOL_RULE_BZL, executable = False)
+    prefix = subdir.rstrip("/") + "/" if subdir else ""
+    repository_ctx.file(prefix + "fingerprint", content = fingerprint, executable = False)
+    repository_ctx.file(prefix + "host_tool.bzl", content = _HOST_TOOL_RULE_BZL, executable = False)
+    extra_block = ""
+    if extra_exports:
+        extra_block = "\nexports_files({extra_exports}, visibility = {visibility})\n".format(
+            extra_exports = repr(extra_exports),
+            visibility = repr(visibility),
+        )
     repository_ctx.file(
-        "BUILD.bazel",
+        prefix + "BUILD.bazel",
         content = """\
 load(":host_tool.bzl", "host_tool")
 
@@ -342,10 +351,11 @@ host_tool(
     target_path = {path},
     visibility = {visibility},
 )
-""".format(
+{extra_block}""".format(
             name = repr(name),
             path = repr(path),
             visibility = repr(visibility),
+            extra_block = extra_block,
         ),
     )
 
@@ -366,7 +376,6 @@ def _codex_probe_runtime(repository_ctx):
     shell = result.stdout.strip()
     if result.return_code != 0 or not shell:
         fail("cannot resolve Codex probe login shell: " + result.stderr)
-    repository_ctx.symlink(repository_ctx.path(shell).realpath, "codex/login-shell")
     ca_candidates = [
         "/etc/ssl/cert.pem",
         "/etc/ssl/certs/ca-certificates.crt",
@@ -380,9 +389,13 @@ def _codex_probe_runtime(repository_ctx):
             break
     if not found_ca:
         fail("cannot find a CA bundle for the Codex probe; tried: " + ", ".join(ca_candidates))
-    repository_ctx.file(
-        "codex/BUILD.bazel",
-        content = 'exports_files(["login-shell", "ca.pem"], visibility = ["@@//tools/boss/engine/core:__pkg__"])\n',
+    host_tool_symlink(
+        repository_ctx,
+        "login-shell",
+        str(repository_ctx.path(shell).realpath),
+        ["@@//tools/boss/engine/core:__pkg__"],
+        subdir = "codex",
+        extra_exports = ["ca.pem"],
     )
 
 codex_probe_runtime_repository = repository_rule(
@@ -425,75 +438,6 @@ host_tmux = rule(
 )
 """
 
-_BUNDLE_MACOS_TMUX_PY = """\
-import os
-import shutil
-import subprocess
-import sys
-
-src_bin, out_bin, out_lib_dir = sys.argv[1:4]
-shutil.copy2(src_bin, out_bin)
-os.chmod(out_bin, 0o755)
-
-def list_non_system_deps(macho_path, is_dylib):
-    out = subprocess.check_output(["otool", "-L", macho_path], text=True)
-    lines = out.splitlines()[1:]
-    if is_dylib and lines:
-        # First entry of a dylib is its own LC_ID_DYLIB.
-        lines = lines[1:]
-    deps = []
-    for line in lines:
-        dep = line.strip().split(" (compatibility version", 1)[0]
-        if not dep or dep.startswith("/usr/lib/") or dep.startswith("/System/"):
-            continue
-        deps.append(dep)
-    return deps
-
-def resolve_dep(dep, parent_real_path):
-    if dep.startswith("@loader_path/"):
-        rel = dep[len("@loader_path/"):]
-        raw = os.path.normpath(os.path.join(os.path.dirname(parent_real_path), rel))
-    else:
-        raw = dep
-    return raw, os.path.realpath(raw)
-
-os.makedirs(out_lib_dir, exist_ok=True)
-copied = {}  # resolved_src_path -> basename
-watched = {src_bin}
-queue = []
-
-for dep in list_non_system_deps(out_bin, False):
-    raw_dep, resolved = resolve_dep(dep, src_bin)
-    watched.add(raw_dep)
-    watched.add(resolved)
-    base = os.path.basename(resolved)
-    if resolved not in copied:
-        copied[resolved] = base
-        queue.append((resolved, base))
-    subprocess.check_call(["install_name_tool", "-change", dep, "@loader_path/lib/" + base, out_bin], stdout=subprocess.DEVNULL)
-
-while queue:
-    resolved_src, base = queue.pop(0)
-    dst_lib = os.path.join(out_lib_dir, base)
-    shutil.copy2(resolved_src, dst_lib)
-    os.chmod(dst_lib, 0o755)
-    subprocess.check_call(["install_name_tool", "-id", "@loader_path/" + base, dst_lib], stdout=subprocess.DEVNULL)
-    for dep in list_non_system_deps(dst_lib, True):
-        raw_dep, dep_resolved = resolve_dep(dep, resolved_src)
-        watched.add(raw_dep)
-        watched.add(dep_resolved)
-        dep_base = os.path.basename(dep_resolved)
-        if dep_resolved not in copied:
-            copied[dep_resolved] = dep_base
-            queue.append((dep_resolved, dep_base))
-        subprocess.check_call(["install_name_tool", "-change", dep, "@loader_path/" + dep_base, dst_lib], stdout=subprocess.DEVNULL)
-    subprocess.check_call(["codesign", "--force", "--sign", "-", dst_lib], stdout=subprocess.DEVNULL)
-
-subprocess.check_call(["codesign", "--force", "--sign", "-", out_bin], stdout=subprocess.DEVNULL)
-for watched_path in sorted(watched):
-    print(watched_path)
-"""
-
 def _host_tmux_repository_impl(repository_ctx):
     """Exposes the locally installed tmux binary as one declared test input.
 
@@ -508,7 +452,12 @@ def _host_tmux_repository_impl(repository_ctx):
     their load commands to `@loader_path/lib/...` so the runfiles are
     self-contained.
     """
-    visibility = ["@@//tools/boss/engine/core:__pkg__", "@@//tools/boss/engine/spoke:__pkg__", "@@//tools/boss/spoke-package:__pkg__"]
+    visibility = [
+        "@@//tools/boss/engine/core:__pkg__",
+        "@@//tools/boss/engine/spoke:__pkg__",
+        "@@//tools/boss/spoke-package:__pkg__",
+        "@@//tools/test-sandbox:__pkg__",
+    ]
     for candidate in [
         "/opt/homebrew/bin/tmux",
         "/usr/local/bin/tmux",
@@ -519,10 +468,10 @@ def _host_tmux_repository_impl(repository_ctx):
         if path.exists:
             if repository_ctx.os.name == "mac os x":
                 python = repository_ctx.which("python3") or repository_ctx.path("/usr/bin/python3")
+                bundle_script = repository_ctx.path(Label("//tools/test-sandbox:bundle_macos_tmux.py"))
                 result = repository_ctx.execute([
                     str(python),
-                    "-c",
-                    _BUNDLE_MACOS_TMUX_PY,
+                    str(bundle_script),
                     str(path.realpath),
                     str(repository_ctx.path("tmux.bin")),
                     str(repository_ctx.path("lib")),

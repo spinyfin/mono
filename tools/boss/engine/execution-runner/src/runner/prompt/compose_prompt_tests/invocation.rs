@@ -698,6 +698,7 @@ fn bazel_conflict_revision_requires_affected_tests_with_lockfile_carve_out() {
     for needle in [
         "run the tests for the targets affected by the files that had conflicts",
         "rdeps(//..., set(<conflicted source files>))",
+        "except attr(tags, \"manual\", //...)",
         "do NOT on their own select tests",
         "stop as blocked",
         "Do NOT run the full `bazel test //...` suite in this gate",
