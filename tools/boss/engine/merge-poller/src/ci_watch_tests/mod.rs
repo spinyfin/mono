@@ -4,6 +4,7 @@
 mod back_to_back;
 mod contract_capture;
 mod detection;
+mod head_advance;
 mod helpers;
 mod log_excerpt;
 mod noop_validation;

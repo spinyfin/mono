@@ -198,7 +198,7 @@ enum EngineEvent {
     /// attempt was already terminal (failed/abandoned). Distinct from
     /// `ciRemediationSucceeded`: the `ci failing` badge should be cleared
     /// but the `ci auto-fixed` badge must NOT be set.
-    case ciFailureCleared(productID: String, workItemID: String, prURL: String)
+    case ciFailureCleared(productID: String, workItemID: String, prURL: String, attempt: EngineAttemptListEntry? = nil)
     /// Activity-feed push: a CI-remediation attempt terminated in
     /// `failed`. Fired when the worker calls
     /// `boss engine ci mark-failed` or when the completion-path

@@ -1308,7 +1308,8 @@ final class EngineClient: @unchecked Sendable {
             emit(.ciFailureCleared(
                 productID: payload["product_id"] as? String ?? "",
                 workItemID: payload["work_item_id"] as? String ?? "",
-                prURL: payload["pr_url"] as? String ?? ""
+                prURL: payload["pr_url"] as? String ?? "",
+                attempt: (payload["attempt"] as? [String: Any]).flatMap(parseEngineAttemptListEntry)
             ))
         case "ci_remediation_failed":
             emit(.ciRemediationFailed(

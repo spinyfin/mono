@@ -286,16 +286,7 @@ pub(crate) async fn retire_superseded_merge_queue_attempt(
             "merge_queue_ci_attempt_superseded",
         )
         .await;
-    publisher
-        .publish_frontend_event_on_product(
-            &candidate.product_id,
-            FrontendEvent::CiFailureCleared {
-                product_id: candidate.product_id.clone(),
-                work_item_id: candidate.work_item_id.clone(),
-                pr_url: candidate.pr_url.clone(),
-            },
-        )
-        .await;
+    crate::remediation_push::publish_ci_failure_cleared(work_db, publisher, candidate).await;
     match current_head_sha {
         Some(current_head_sha) => tracing::info!(
             work_item_id = %candidate.work_item_id,
@@ -2043,7 +2034,10 @@ pub async fn on_ci_in_flight(
 ///     pushed a new commit while the prior fix was still pending),
 ///     that remediation is stale — the new CI run is independent of it.
 ///     Abandon the stale row and proceed with the supersede so the badge
-///     reflects the current run, not the prior one.
+///     reflects the current run, not the prior one. The abandoned row is
+///     published on every exit (on the clear, or on its own when there was
+///     no signal left to clear): the app keeps showing "ci failing" for as
+///     long as its copy of the attempt reads `pending`/`running`.
 ///   * The same `auto_pr_maintenance` opt-out as the detect / retire
 ///     paths is respected.
 ///   * Unlike `on_ci_resolved`, we do NOT reset the CI budget counter:
@@ -2086,6 +2080,10 @@ pub async fn on_ci_in_flight_supersedes_failure(
     //      new head independently of that attempt. Abandon the stale row
     //      and proceed with the supersede so the badge does not persist
     //      from a CI run that is no longer current.
+    // The attempt this call abandons as stale, if any. Its terminal row must
+    // reach the app on every exit below, or the app keeps treating it as
+    // running and shows "ci failing" for a head that is no longer current.
+    let mut abandoned_stale: Option<CiRemediation> = None;
     match work_db.active_ci_remediation_for_work_item(&candidate.work_item_id) {
         Ok(Some(active)) => {
             // A queue-side failure lives on a merged-result CI surface, not
@@ -2122,17 +2120,18 @@ pub async fn on_ci_in_flight_supersedes_failure(
                     "ci_watch: active remediation is for an old head SHA; \
                      abandoning stale row and superseding with current InFlight run",
                 );
-                if let Err(err) = work_db.mark_ci_remediation_abandoned_with_head(
+                match work_db.mark_ci_remediation_abandoned_with_head(
                     &active.id,
                     "new_head_sha_inflight",
                     current_head_sha,
                 ) {
-                    tracing::warn!(
+                    Ok(row) => abandoned_stale = row,
+                    Err(err) => tracing::warn!(
                         work_item_id = %candidate.work_item_id,
                         attempt_id = %active.id,
                         ?err,
                         "ci_watch: failed to abandon stale remediation on head-SHA change",
-                    );
+                    ),
                 }
                 // The abandoned attempt's revision (if it spawned one) is
                 // superseded the moment a fresh commit lands — nothing else
@@ -2181,6 +2180,9 @@ pub async fn on_ci_in_flight_supersedes_failure(
                 ?err,
                 "ci_watch: failed to clear stale blocked: ci_failure on InFlight",
             );
+            if let Some(attempt) = &abandoned_stale {
+                crate::remediation_push::publish_ci_attempt(work_db, publisher, attempt).await;
+            }
             return false;
         }
     };
@@ -2200,6 +2202,11 @@ pub async fn on_ci_in_flight_supersedes_failure(
                 false
             });
         if !signal_cleared {
+            // Nothing was blocking the card, but the abandoned attempt still
+            // has to be reported so the app stops counting it as running.
+            if let Some(attempt) = &abandoned_stale {
+                crate::remediation_push::publish_ci_attempt(work_db, publisher, attempt).await;
+            }
             return false;
         }
         // Signal was present — fall through to publish the supersede events.
@@ -2212,16 +2219,7 @@ pub async fn on_ci_in_flight_supersedes_failure(
             "ci_failure_superseded_in_progress",
         )
         .await;
-    publisher
-        .publish_frontend_event_on_product(
-            &candidate.product_id,
-            FrontendEvent::CiFailureCleared {
-                product_id: candidate.product_id.clone(),
-                work_item_id: candidate.work_item_id.clone(),
-                pr_url: candidate.pr_url.clone(),
-            },
-        )
-        .await;
+    crate::remediation_push::publish_ci_failure_cleared(work_db, publisher, candidate).await;
     tracing::info!(
         work_item_id = %candidate.work_item_id,
         pr_url = %candidate.pr_url,
@@ -2393,16 +2391,7 @@ pub async fn apply_retired_signal(
                 )
                 .await;
         } else {
-            publisher
-                .publish_frontend_event_on_product(
-                    &candidate.product_id,
-                    FrontendEvent::CiFailureCleared {
-                        product_id: candidate.product_id.clone(),
-                        work_item_id: candidate.work_item_id.clone(),
-                        pr_url: candidate.pr_url.clone(),
-                    },
-                )
-                .await;
+            crate::remediation_push::publish_ci_failure_cleared(work_db, publisher, candidate).await;
         }
         if result.task_transitioned || !had_ci_attempt {
             publisher
@@ -2633,16 +2622,7 @@ pub async fn on_pr_merged(work_db: &WorkDb, publisher: &dyn ExecutionPublisher, 
         };
     let count = abandoned.len();
     if count > 0 {
-        publisher
-            .publish_frontend_event_on_product(
-                &candidate.product_id,
-                FrontendEvent::CiFailureCleared {
-                    product_id: candidate.product_id.clone(),
-                    work_item_id: candidate.work_item_id.clone(),
-                    pr_url: candidate.pr_url.clone(),
-                },
-            )
-            .await;
+        crate::remediation_push::publish_ci_failure_cleared(work_db, publisher, candidate).await;
         tracing::debug!(
             work_item_id = %candidate.work_item_id,
             pr_url = %candidate.pr_url,

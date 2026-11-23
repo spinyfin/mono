@@ -381,7 +381,7 @@ pub async fn on_conflict_detected_with(
             // normal re-arm path below. The genuine PR#1861 orphan has
             // no `merge_conflict` signal at all — only ci_watch ever touched
             // this row — so the takeover applies cleanly there.
-            if !take_over_foreign_ci_block(work_db, candidate, &reason) {
+            if !take_over_foreign_ci_block(work_db, publisher, candidate, &reason).await {
                 return false;
             }
             // Row is now `blocked: merge_conflict`; fall through into the
@@ -846,7 +846,7 @@ pub async fn on_conflict_detected_with(
     // `pending` forever (no retire path ever marks it `succeeded` once
     // conflict_watch has taken the PR over), stranding a phantom "ci
     // failing" badge alongside the correct conflict block.
-    supersede_stale_ci_remediation(work_db, candidate);
+    supersede_stale_ci_remediation(work_db, publisher, candidate).await;
 
     // Insert the `conflict_resolutions` attempt row. The UNIQUE key is
     // `(work_item_id, base_sha_at_trigger, head_sha_before)`, so a second
@@ -1494,18 +1494,26 @@ pub(crate) fn retire_moot_conflict_revisions(
 /// next tick would abandon the re-opened attempt and close its revision
 /// before the run the owner asked for could start. The abandon itself is
 /// logged by the ledger write.
-fn supersede_stale_ci_remediation(work_db: &WorkDb, candidate: &PendingMergeCheck) {
+async fn supersede_stale_ci_remediation(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+) {
     let Ok(Some(stale)) = work_db.active_ci_remediation_for_work_item(&candidate.work_item_id) else {
         return;
     };
-    if let Err(err) = work_db.mark_ci_remediation_abandoned(&stale.id, "superseded_by_conflict") {
-        tracing::warn!(
-            work_item_id = %candidate.work_item_id,
-            attempt_id = %stale.id,
-            ?err,
-            "conflict_watch: failed to abandon stale ci_remediation superseded by conflict",
-        );
-    }
+    let abandoned = match work_db.mark_ci_remediation_abandoned(&stale.id, "superseded_by_conflict") {
+        Ok(row) => row,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                attempt_id = %stale.id,
+                ?err,
+                "conflict_watch: failed to abandon stale ci_remediation superseded by conflict",
+            );
+            None
+        }
+    };
     if let Err(err) = work_db.clear_ci_failure_signal_only(&candidate.work_item_id) {
         tracing::warn!(
             work_item_id = %candidate.work_item_id,
@@ -1519,6 +1527,11 @@ fn supersede_stale_ci_remediation(work_db: &WorkDb, candidate: &PendingMergeChec
         stale.revision_task_id.as_deref(),
         "superseded: merge-conflict resolution pre-empts CI-fix for the same PR",
     );
+    // Report the abandoned row, with the signal already cleared, so the app
+    // stops showing "ci failing" for an attempt it still holds as running.
+    if let Some(attempt) = &abandoned {
+        crate::remediation_push::publish_ci_attempt(work_db, publisher, attempt).await;
+    }
 }
 
 /// Foreign-bucket takeover (PR#1861 fix): re-bucket a row that is
@@ -1540,14 +1553,19 @@ fn supersede_stale_ci_remediation(work_db: &WorkDb, candidate: &PendingMergeChec
 /// guard miss (raced with a concurrent clear) or DB error, both logged. The
 /// caller should treat `false` the same as any other "not ours to touch
 /// this sweep" outcome.
-fn take_over_foreign_ci_block(work_db: &WorkDb, candidate: &PendingMergeCheck, from_reason: &str) -> bool {
+async fn take_over_foreign_ci_block(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+    from_reason: &str,
+) -> bool {
     // The caller (`on_conflict_detected`) also unconditionally supersedes
     // any active `ci_remediations` attempt right before it inserts a fresh
     // `conflict_resolutions` row, covering every path that reaches that
     // point (including this takeover, once it falls through). Called here
     // too so the row's ownership signals are consistent immediately after a
     // successful takeover even if a caller inspects them before that point.
-    supersede_stale_ci_remediation(work_db, candidate);
+    supersede_stale_ci_remediation(work_db, publisher, candidate).await;
     match work_db.retarget_blocked_ci_failure_to_merge_conflict(&candidate.work_item_id, &candidate.pr_url) {
         Ok(Some(_)) => {
             tracing::info!(

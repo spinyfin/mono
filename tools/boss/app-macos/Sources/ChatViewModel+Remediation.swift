@@ -23,7 +23,7 @@ extension ChatViewModel {
     }
 
     /// The compact row a lifecycle push carries, if any. Pushes without a
-    /// projection (exhausted, ci_failure_cleared) have no history row.
+    /// projection (exhausted) have no history row.
     func remediationRow(of event: EngineEvent) -> EngineAttemptListEntry? {
         switch event {
         case .conflictResolutionStarted(_, _, _, _, let attempt),
@@ -33,7 +33,8 @@ extension ChatViewModel {
              .ciRemediationStarted(_, _, _, _, _, let attempt),
              .ciRemediationSucceeded(_, _, _, _, let attempt),
              .ciRemediationFailed(_, _, _, _, _, let attempt),
-             .ciRemediationAbandoned(_, _, _, _, _, let attempt):
+             .ciRemediationAbandoned(_, _, _, _, _, let attempt),
+             .ciFailureCleared(_, _, _, let attempt):
             return attempt
         default:
             return nil
@@ -54,19 +55,23 @@ extension ChatViewModel {
     }
 
     func applyRemediationPush(_ row: EngineAttemptListEntry) {
+        storeRemediationRow(row)
+        let rows = row.kind == "conflict" ? conflictResolutions : row.kind == "ci" ? ciRemediations : []
+        if rows.first(where: { $0.prURL == row.prURL })?.id == row.id {
+            reconcileRemediationBadge(row)
+        }
+    }
+
+    /// Replace the held copy of an attempt row with the engine's, without
+    /// deciding any chip from it.
+    func storeRemediationRow(_ row: EngineAttemptListEntry) {
         // Keep any cached detail: it is refreshed by the Activity detail pane
         // when the selected row's status or finish time changes.
         engineAttempts = upserting(row, into: engineAttempts, limit: 200)
         if row.kind == "conflict" {
             conflictResolutions = upserting(row, into: conflictResolutions)
-            if conflictResolutions.first(where: { $0.prURL == row.prURL })?.id == row.id {
-                reconcileRemediationBadge(row)
-            }
         } else if row.kind == "ci" {
             ciRemediations = upserting(row, into: ciRemediations)
-            if ciRemediations.first(where: { $0.prURL == row.prURL })?.id == row.id {
-                reconcileRemediationBadge(row)
-            }
         }
     }
 

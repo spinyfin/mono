@@ -1319,7 +1319,7 @@ async fn stale_ci_failing_badge_cleared_by_poll_without_active_signal() {
     assert!(
         events.iter().any(|(_, e)| matches!(
             e,
-            boss_protocol::FrontendEvent::CiFailureCleared { product_id: p, work_item_id: w, pr_url: u }
+            boss_protocol::FrontendEvent::CiFailureCleared { product_id: p, work_item_id: w, pr_url: u, .. }
                 if p == &product && w == &chore && u == pr
         )),
         "CiFailureCleared must carry the chore's product/work-item/pr ids; got: {events:?}",
