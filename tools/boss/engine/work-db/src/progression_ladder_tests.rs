@@ -816,6 +816,54 @@ fn a_question_filed_for_enotfound_runs_is_withdrawn_and_the_item_runs_again() {
     assert!(fx.open_question(&id).is_none());
 }
 
+#[test]
+fn empty_or_whitespace_last_error_falls_back_to_work_runs_error_text_in_ladder() {
+    let fx = fx();
+    let id = fx.conflicted("Empty last_error with ENOTFOUND on work_runs");
+    let env_run = fx.past_run(&id, "orphaned", None, 30 * HOUR, "fp", S5);
+    let ws_env_run = fx.past_run(&id, "orphaned", None, 25 * HOUR, "fp", S5);
+    let real_1 = fx.past_run(&id, "failed", None, 20 * HOUR, "fp", S5);
+    let real_2 = fx.past_run(&id, "failed", None, 10 * HOUR, "fp", S5);
+    fx.set_error(&env_run, "");
+    fx.set_error(&ws_env_run, "   ");
+    fx.set_error(&real_1, "progression-run-timeout: elapsed 1800s (limit 1800s)");
+    fx.set_error(&real_2, "progression-run-timeout: elapsed 1800s (limit 1800s)");
+    {
+        let conn = fx.db.connect().unwrap();
+        for (run_id, exec_id) in [("run_empty_err", &env_run), ("run_ws_err", &ws_env_run)] {
+            conn.execute(
+                "INSERT INTO work_runs (id, execution_id, agent_id, status, error_text, created_at)
+                 VALUES (?1, ?2, 'progression-1', 'failed', ?3, ?4)",
+                params![run_id, exec_id, ENOTFOUND_ERROR, now().to_string()],
+            )
+            .unwrap();
+        }
+    }
+
+    let state = fx.db.progression_ladder_state(&id, S5).unwrap();
+    let by_id = |target: &str| {
+        state
+            .runs
+            .iter()
+            .find(|r| r.execution_id == target)
+            .expect("run present")
+    };
+    assert!(by_id(&env_run).environment_failed);
+    assert_eq!(by_id(&env_run).error.as_deref(), Some(ENOTFOUND_ERROR));
+    assert!(by_id(&ws_env_run).environment_failed);
+    assert_eq!(by_id(&ws_env_run).error.as_deref(), Some(ENOTFOUND_ERROR));
+    assert!(!by_id(&real_1).environment_failed);
+    assert!(!by_id(&real_2).environment_failed);
+
+    let pass = fx.pass();
+    assert_eq!(pass.asked.len(), 1);
+    let q = fx.open_question(&id).unwrap();
+    assert!(q.question.explanation.contains(&real_1));
+    assert!(q.question.explanation.contains(&real_2));
+    assert!(!q.question.explanation.contains(&env_run));
+    assert!(!q.question.explanation.contains(&ws_env_run));
+}
+
 /// An item already parked on a question that was filed for two failed
 /// launches, while those still counted. The next pass takes the question back
 /// and nominates the item again, with nothing asked of the owner.

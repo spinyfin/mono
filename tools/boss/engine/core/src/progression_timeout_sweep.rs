@@ -3,8 +3,10 @@
 //! spawning, missing registry entries and orphaned rows must not hide a claim.
 //!
 //! Elapsed time is host-awake time: a monotonic clock that does not advance
-//! during suspend, compared against wall-clock so a lid-close never consumes
-//! the budget. A run that genuinely exceeds the awake-time limit still fails.
+//! during suspend, persisted per execution in `metadata` so a lid-close never
+//! consumes the budget and an engine restart resumes from the accrued awake
+//! time instead of granting a fresh budget. A run that genuinely exceeds the
+//! awake-time limit still fails.
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -17,10 +19,33 @@ use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::pool_claim_sweep::{TeardownRetries, WorkerViewerDetach};
 use crate::work::WorkDb;
 
-/// Wall gap larger than this on first observation is treated as suspend (or
-/// an engine restart after sleep), not as run time. Larger than the five-minute
-/// fixture age used by timeout tests, smaller than a closed-lid sleep.
-const SUSPEND_GAP_SECS: i64 = 10 * 60;
+/// Cadence of the progression deadline sweep. Also bounds the unknown elapsed
+/// time charged on first observation or across an engine restart, because an
+/// awake host runs a sweep pass at least this often.
+const SWEEP_INTERVAL_SECS: i64 = 60;
+
+/// Metadata key prefix storing `<elapsed_secs>:<last_wall_epoch_secs>` per
+/// claimed progression execution so accrued awake time survives engine restarts.
+const METADATA_PREFIX_AWAKE_ELAPSED: &str = "progression.awake_elapsed.";
+
+fn awake_elapsed_key(execution_id: &str) -> String {
+    format!("{METADATA_PREFIX_AWAKE_ELAPSED}{execution_id}")
+}
+
+fn load_persisted_awake(work_db: &WorkDb, execution_id: &str) -> Option<(i64, i64)> {
+    let raw = work_db.get_metadata(&awake_elapsed_key(execution_id)).ok()??;
+    let (elapsed_str, wall_str) = raw.trim().split_once(':')?;
+    let elapsed = elapsed_str.parse::<i64>().ok()?.max(0);
+    let last_wall = wall_str.parse::<i64>().ok()?;
+    Some((elapsed, last_wall))
+}
+
+fn store_persisted_awake(work_db: &WorkDb, execution_id: &str, elapsed: i64, last_wall: i64) {
+    let value = format!("{}:{last_wall}", elapsed.max(0));
+    if let Err(err) = work_db.set_metadata(&awake_elapsed_key(execution_id), &value) {
+        tracing::warn!(execution_id, error = %err, "failed to persist progression awake elapsed");
+    }
+}
 
 /// Wall-clock and awake-time sample for one sweep pass.
 #[derive(Debug, Clone, Copy)]
@@ -53,7 +78,6 @@ fn process_awake_secs() -> i64 {
 }
 
 struct AwakeWatch {
-    last_wall: i64,
     last_awake: i64,
     elapsed: i64,
 }
@@ -78,7 +102,7 @@ pub struct ProgressionTimeoutSweep {
 
 pub fn spawn_loop(sweep: ProgressionTimeoutSweep) -> tokio::task::JoinHandle<()> {
     let sweep = Arc::new(sweep);
-    crate::sweep_loop::spawn_sweep_loop(Duration::from_secs(60), move || {
+    crate::sweep_loop::spawn_sweep_loop(Duration::from_secs(SWEEP_INTERVAL_SECS as u64), move || {
         let sweep = sweep.clone();
         async move { SweepOutcome(sweep.run_deadline_pass(DeadlineClock::live()).await) }
     })
@@ -135,6 +159,8 @@ impl ProgressionTimeoutSweep {
             match result {
                 Ok(true) => {
                     self.teardown_retries.lock().unwrap().succeeded(&claim.execution_id);
+                    self.awake_watches.lock().unwrap().remove(&claim.execution_id);
+                    let _ = self.work_db.delete_metadata(&awake_elapsed_key(&claim.execution_id));
                     // Teardown may already have handed this slot to a new run.
                     self.live_states.release_slot_for_run(&claim.execution_id);
                     self.coordinator
@@ -158,27 +184,41 @@ impl ProgressionTimeoutSweep {
     }
 
     fn awake_elapsed(&self, execution_id: &str, started: i64, clock: DeadlineClock) -> i64 {
-        let mut watches = self.awake_watches.lock().unwrap();
-        if let Some(watch) = watches.get_mut(execution_id) {
-            let wall_gap = clock.wall_epoch_secs.saturating_sub(watch.last_wall);
-            let awake_gap = clock.awake_secs.saturating_sub(watch.last_awake);
-            watch.elapsed = watch.elapsed.saturating_add(wall_gap.min(awake_gap));
-            watch.last_wall = clock.wall_epoch_secs;
-            watch.last_awake = clock.awake_secs;
-            watch.elapsed
-        } else {
-            let from_start = clock.wall_epoch_secs.saturating_sub(started);
-            let elapsed = if from_start > SUSPEND_GAP_SECS { 0 } else { from_start };
-            watches.insert(
-                execution_id.to_owned(),
-                AwakeWatch {
-                    last_wall: clock.wall_epoch_secs,
-                    last_awake: clock.awake_secs,
-                    elapsed,
-                },
-            );
-            elapsed
+        let existing = {
+            let mut watches = self.awake_watches.lock().unwrap();
+            watches.get_mut(execution_id).map(|watch| {
+                let awake_gap = clock.awake_secs.saturating_sub(watch.last_awake).max(0);
+                watch.elapsed = watch.elapsed.saturating_add(awake_gap);
+                watch.last_awake = clock.awake_secs;
+                watch.elapsed
+            })
+        };
+        if let Some(elapsed) = existing {
+            store_persisted_awake(&self.work_db, execution_id, elapsed, clock.wall_epoch_secs);
+            return elapsed;
         }
+
+        let elapsed = if let Some((persisted_elapsed, last_wall)) = load_persisted_awake(&self.work_db, execution_id) {
+            let restart_gap = clock
+                .wall_epoch_secs
+                .saturating_sub(last_wall)
+                .clamp(0, SWEEP_INTERVAL_SECS);
+            persisted_elapsed.saturating_add(restart_gap)
+        } else {
+            clock
+                .wall_epoch_secs
+                .saturating_sub(started)
+                .clamp(0, SWEEP_INTERVAL_SECS)
+        };
+        self.awake_watches.lock().unwrap().insert(
+            execution_id.to_owned(),
+            AwakeWatch {
+                last_awake: clock.awake_secs,
+                elapsed,
+            },
+        );
+        store_persisted_awake(&self.work_db, execution_id, elapsed, clock.wall_epoch_secs);
+        elapsed
     }
 
     async fn reconcile(&self, execution_id: &str, clock: DeadlineClock, timeout_secs: i64) -> anyhow::Result<bool> {

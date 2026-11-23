@@ -206,7 +206,7 @@ pub(crate) fn launch_failed_sql(x: &str) -> String {
 
 /// Recorded error text of execution `x`: `last_error`, else the latest run's
 /// `error_text`. The candidate view and the ladder read the same body.
-fn execution_error_sql(x: &str) -> String {
+pub(crate) fn execution_error_sql(x: &str) -> String {
     format!(
         "COALESCE(NULLIF(TRIM({x}.last_error), ''),
                  (SELECT r.error_text FROM work_runs r

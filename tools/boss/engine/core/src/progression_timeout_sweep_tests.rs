@@ -325,19 +325,207 @@ async fn a_suspend_gap_does_not_consume_the_run_timeout() {
 }
 
 #[tokio::test]
-async fn a_first_observation_after_a_long_wall_gap_is_treated_as_suspend() {
-    let (_dir, db, _item, execution, states, coordinator) = progression_fixture(Some(60)).await;
-    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+async fn a_sleep_before_first_sweep_does_not_exhaust_a_short_budget() {
+    for sleep_secs in [5 * 60, 8 * 3600] {
+        let (_dir, db, _item, execution, states, coordinator) = progression_fixture(Some(180)).await;
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET started_at = ?1 WHERE id = ?2",
+                [&now.saturating_sub(sleep_secs).to_string(), &execution],
+            )
+            .unwrap();
+        let sweep = ProgressionTimeoutSweep::builder()
+            .work_db(db.clone())
+            .live_states(states)
+            .coordinator(coordinator.clone())
+            .pane_releaser(Arc::new(RecordingReaper::new(coordinator, db.clone())))
+            .hold_registry(Arc::new(crate::hold_registry::HoldRegistry::new()))
+            .dispatch_events(Arc::new(crate::dispatch_events::NoopDispatchEventSink))
+            .viewers(Arc::new(NoViewers))
+            .build();
+        // First observation charges at most one sweep interval (60s), not the sleep gap.
+        assert_eq!(
+            sweep
+                .run_deadline_pass(DeadlineClock {
+                    wall_epoch_secs: now,
+                    awake_secs: 0,
+                })
+                .await,
+            0,
+            "sleep_secs={sleep_secs}"
+        );
+        assert_ne!(db.get_execution(&execution).unwrap().status, ExecutionStatus::Failed);
+        // 119s more awake (total 179s < 180s): still running.
+        assert_eq!(
+            sweep
+                .run_deadline_pass(DeadlineClock {
+                    wall_epoch_secs: now + 119,
+                    awake_secs: 119,
+                })
+                .await,
+            0,
+            "sleep_secs={sleep_secs}"
+        );
+        // 1s more awake (total 180s >= 180s): reaped.
+        assert_eq!(
+            sweep
+                .run_deadline_pass(DeadlineClock {
+                    wall_epoch_secs: now + 120,
+                    awake_secs: 120,
+                })
+                .await,
+            1,
+            "sleep_secs={sleep_secs}"
+        );
+        assert_eq!(db.get_execution(&execution).unwrap().status, ExecutionStatus::Failed);
+    }
+}
+
+#[tokio::test]
+async fn restarting_after_near_budget_awake_time_does_not_grant_a_new_full_budget() {
+    let (_dir, db, _item, execution, states, coordinator) = progression_fixture(Some(1800)).await;
+    let t0 = 100_000_i64;
     db.connect()
         .unwrap()
         .execute(
             "UPDATE work_executions SET started_at = ?1 WHERE id = ?2",
-            [&now.saturating_sub(8 * 3600).to_string(), &execution],
+            [&t0.to_string(), &execution],
         )
         .unwrap();
-    let reaper = RecordingReaper::new(coordinator.clone(), db.clone());
-    assert_eq!(sweep(&db, &states, &coordinator, &reaper).await, 0);
+    let make_sweep = || {
+        ProgressionTimeoutSweep::builder()
+            .work_db(db.clone())
+            .live_states(states.clone())
+            .coordinator(coordinator.clone())
+            .pane_releaser(Arc::new(RecordingReaper::new(coordinator.clone(), db.clone())))
+            .hold_registry(Arc::new(crate::hold_registry::HoldRegistry::new()))
+            .dispatch_events(Arc::new(crate::dispatch_events::NoopDispatchEventSink))
+            .viewers(Arc::new(NoViewers))
+            .build()
+    };
+
+    // Process 1: accrue 28 minutes (1680s) of awake time.
+    let before_restart = make_sweep();
+    assert_eq!(
+        before_restart
+            .run_deadline_pass(DeadlineClock {
+                wall_epoch_secs: t0,
+                awake_secs: 0,
+            })
+            .await,
+        0
+    );
+    assert_eq!(
+        before_restart
+            .run_deadline_pass(DeadlineClock {
+                wall_epoch_secs: t0 + 1680,
+                awake_secs: 1680,
+            })
+            .await,
+        0
+    );
+    drop(before_restart);
+
+    // Process 2 (engine restart after an 8-hour sleep): resumes at 1680s + capped 60s = 1740s.
+    // Does not fail immediately from the sleep, and does not grant a fresh 30-minute budget.
+    let after_restart = make_sweep();
+    let after_sleep_wall = t0 + 1680 + 8 * 3600;
+    assert_eq!(
+        after_restart
+            .run_deadline_pass(DeadlineClock {
+                wall_epoch_secs: after_sleep_wall,
+                awake_secs: 0,
+            })
+            .await,
+        0
+    );
     assert_ne!(db.get_execution(&execution).unwrap().status, ExecutionStatus::Failed);
+
+    // 59s more awake (1799s < 1800s): still running.
+    assert_eq!(
+        after_restart
+            .run_deadline_pass(DeadlineClock {
+                wall_epoch_secs: after_sleep_wall + 59,
+                awake_secs: 59,
+            })
+            .await,
+        0
+    );
+    // 1s more awake (1800s >= 1800s): fails right on schedule.
+    assert_eq!(
+        after_restart
+            .run_deadline_pass(DeadlineClock {
+                wall_epoch_secs: after_sleep_wall + 60,
+                awake_secs: 60,
+            })
+            .await,
+        1
+    );
+    assert_eq!(db.get_execution(&execution).unwrap().status, ExecutionStatus::Failed);
+    assert!(
+        db.get_metadata(&awake_elapsed_key(&execution)).unwrap().is_none(),
+        "persisted awake-time key is cleaned up once the claim is released"
+    );
+}
+
+#[tokio::test]
+async fn a_backwards_wall_clock_correction_does_not_subtract_from_awake_elapsed() {
+    let (_dir, db, _item, execution, states, coordinator) = progression_fixture(Some(120)).await;
+    let t0 = 100_000_i64;
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET started_at = ?1 WHERE id = ?2",
+            [&t0.to_string(), &execution],
+        )
+        .unwrap();
+    let sweep = ProgressionTimeoutSweep::builder()
+        .work_db(db.clone())
+        .live_states(states)
+        .coordinator(coordinator.clone())
+        .pane_releaser(Arc::new(RecordingReaper::new(coordinator, db.clone())))
+        .hold_registry(Arc::new(crate::hold_registry::HoldRegistry::new()))
+        .dispatch_events(Arc::new(crate::dispatch_events::NoopDispatchEventSink))
+        .viewers(Arc::new(NoViewers))
+        .build();
+    assert_eq!(
+        sweep
+            .run_deadline_pass(DeadlineClock {
+                wall_epoch_secs: t0,
+                awake_secs: 0,
+            })
+            .await,
+        0
+    );
+    assert_eq!(
+        sweep
+            .run_deadline_pass(DeadlineClock {
+                wall_epoch_secs: t0 + 60,
+                awake_secs: 60,
+            })
+            .await,
+        0
+    );
+    // Wall clock steps back one hour while the awake clock advances 60s to the deadline.
+    assert_eq!(
+        sweep
+            .run_deadline_pass(DeadlineClock {
+                wall_epoch_secs: t0 + 60 - 3600,
+                awake_secs: 120,
+            })
+            .await,
+        1
+    );
+    assert_eq!(db.get_execution(&execution).unwrap().status, ExecutionStatus::Failed);
+    assert!(
+        db.list_runs(&execution).unwrap()[0]
+            .error_text
+            .as_ref()
+            .unwrap()
+            .contains("elapsed 120s (limit 120s)")
+    );
 }
 
 #[tokio::test]

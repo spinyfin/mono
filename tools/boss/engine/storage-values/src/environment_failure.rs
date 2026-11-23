@@ -27,11 +27,11 @@ const MARKERS: &[&str] = &[
     "network is unreachable",
     "ehostunreach",
     "no route to host",
-    "name resolution",
+    "temporary failure in name resolution",
     "can't reach the api",
     "cannot reach the api",
     "cant reach the api",
-    "unable to connect",
+    "unable to connect to api",
 ];
 
 /// True when `text` is a host-unreachable / DNS failure rather than a
@@ -44,15 +44,22 @@ pub fn is_environment_unreachable(text: &str) -> bool {
 /// SQL boolean over a text expression (already a column or `COALESCE(...)`)
 /// that is true when that expression matches [`is_environment_unreachable`].
 /// Generated from the same marker list the Rust classifier uses.
+///
+/// Materializes `LOWER({expr})` once in a single-row CTE so a correlated
+/// subquery inside `{expr}` is not re-evaluated once per marker.
 pub fn environment_unreachable_sql(expr: &str) -> String {
-    MARKERS
+    let conditions = MARKERS
         .iter()
         .map(|marker| {
             let escaped = marker.replace('\'', "''");
-            format!("LOWER({expr}) LIKE '%{escaped}%'")
+            format!("_env_err LIKE '%{escaped}%'")
         })
         .collect::<Vec<_>>()
-        .join(" OR ")
+        .join(" OR ");
+    format!(
+        "EXISTS (WITH _env(_env_err) AS MATERIALIZED (SELECT LOWER({expr})) \
+         SELECT 1 FROM _env WHERE {conditions})"
+    )
 }
 
 #[cfg(test)]
@@ -95,6 +102,10 @@ mod tests {
             "no disposition",
             "driver error",
             "refusing to complete codex spawn: no driver hook or session event arrived within 120s",
+            "Unable to connect to MCP server",
+            "Unable to connect to local postgres on port 5432",
+            "name resolution failed for symbol Foo",
+            "module name resolution error in tsconfig.json",
         ] {
             assert!(
                 !is_environment_unreachable(text),
@@ -104,11 +115,19 @@ mod tests {
     }
 
     #[test]
-    fn sql_fragment_uses_the_same_markers() {
-        let sql = environment_unreachable_sql("err");
+    fn sql_fragment_uses_the_same_markers_and_evaluates_expr_once() {
+        let expr = "COALESCE(last_error, (SELECT error_text FROM work_runs LIMIT 1))";
+        let sql = environment_unreachable_sql(expr);
         assert!(sql.contains("enotfound"));
         assert!(sql.contains("can''t reach the api"), "{sql}");
+        assert!(sql.contains("unable to connect to api"), "{sql}");
+        assert!(sql.contains("temporary failure in name resolution"), "{sql}");
         assert!(!sql.contains("overloaded"));
         assert!(!sql.contains("timeout"));
+        assert_eq!(
+            sql.matches(expr).count(),
+            1,
+            "expression should be embedded once, not once per marker: {sql}"
+        );
     }
 }

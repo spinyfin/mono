@@ -402,6 +402,7 @@ fn episode_floor(conn: &Connection, item_id: &str) -> Result<Floor> {
 /// started, are not attempts (the candidate view skips them the same way).
 fn runs_since(conn: &Connection, item_id: &str, since: Floor) -> Result<Vec<LadderRun>> {
     let launch_failed = crate::progression_candidates::launch_failed_sql("x");
+    let error_sql = crate::progression_candidates::execution_error_sql("x");
     let mut stmt = conn.prepare(&format!(
         "SELECT x.id, x.status, x.progression_disposition,
                 (SELECT value FROM metadata WHERE key = 'progression.fingerprint.' || x.id),
@@ -409,8 +410,7 @@ fn runs_since(conn: &Connection, item_id: &str, since: Floor) -> Result<Vec<Ladd
                 (SELECT json_extract(p.payload_json, '$.summary') FROM worker_proposals p
                  WHERE p.execution_id = x.id AND p.kind = 'run_done' AND p.state = 'applied'
                  ORDER BY p.created_at DESC, p.id DESC LIMIT 1),
-                COALESCE(x.last_error, (SELECT r.error_text FROM work_runs r
-                                        WHERE r.execution_id = x.id ORDER BY r.created_at DESC, r.id DESC LIMIT 1)),
+                NULLIF({error_sql}, ''),
                 CAST(x.created_at AS INTEGER),
                 {launch_failed}
          FROM work_executions x
@@ -422,11 +422,13 @@ fn runs_since(conn: &Connection, item_id: &str, since: Floor) -> Result<Vec<Ladd
          ORDER BY x.created_at ASC, x.id ASC"
     ))?;
     let rows = stmt.query_map(params![item_id, since.secs, since.rowid], |row| {
+        let status: String = row.get(1)?;
         let error: Option<String> = row.get(6)?;
-        let environment_failed = crate::progression_candidates::error_is_environment_failure(error.as_deref());
+        let environment_failed = matches!(status.as_str(), "failed" | "orphaned" | "abandoned")
+            && crate::progression_candidates::error_is_environment_failure(error.as_deref());
         Ok(LadderRun::builder()
             .execution_id(row.get::<_, String>(0)?)
-            .status(row.get::<_, String>(1)?)
+            .status(status)
             .maybe_disposition(
                 row.get::<_, Option<String>>(2)?
                     .and_then(|raw| raw.parse::<ProgressionDisposition>().ok()),

@@ -1766,3 +1766,25 @@ fn overloaded_api_errors_still_count_as_infrastructure_failures() {
     assert!(f.clauses(&id).infrastructure_failing);
     f.assert_candidate(&id, false);
 }
+
+#[test]
+fn environment_failure_sql_evaluates_work_runs_once_per_check() {
+    let f = fixture();
+    let predicate = crate::progression_candidates::environment_failed_sql("x");
+    let conn = f.db.connect().unwrap();
+    let mut stmt = conn
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN SELECT 1 FROM work_executions x WHERE {predicate}"
+        ))
+        .unwrap();
+    let plan: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(3))
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect();
+    let work_runs_scans = plan.iter().filter(|detail| detail.contains("work_runs")).count();
+    assert_eq!(
+        work_runs_scans, 1,
+        "expected work_runs to be queried once via materialized CTE, not once per marker: {plan:#?}"
+    );
+}
