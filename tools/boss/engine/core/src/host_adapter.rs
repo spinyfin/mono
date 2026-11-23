@@ -1958,6 +1958,7 @@ mod tests {
     /// are pinned against real processes rather than canned probe results.
     #[test]
     fn remote_occupancy_script_reports_empty_occupied_and_prefix_siblings() {
+        crate::test_support::install_peak_memory_report();
         struct Reaped(std::process::Child);
         impl Drop for Reaped {
             fn drop(&mut self) {
@@ -1995,22 +1996,27 @@ mod tests {
 
         let nested = workspace.join("nested");
         std::fs::create_dir_all(&nested).unwrap();
-        let _inside = Reaped(
-            std::process::Command::new("sleep")
-                .arg("60")
+        // The child's chdir happens in the forked process, before it execs.
+        // The line it writes therefore proves its cwd is the nested
+        // directory, and `exec` keeps that process (and cwd) for the sleep.
+        // One scan then gives the verdict, including the early return where
+        // the scan can only say UNKNOWN (every run under the macOS test sandbox).
+        let mut inside = Reaped(
+            std::process::Command::new("sh")
+                .args(["-c", "echo ready; exec sleep 60"])
                 .current_dir(&nested)
+                .stdout(std::process::Stdio::piped())
                 .spawn()
                 .unwrap(),
         );
-        // The child's chdir happens in the forked process; poll until visible.
-        let mut seen = String::new();
-        for _ in 0..100 {
-            seen = run_occupancy_script(&workspace);
-            if seen == "OCCUPIED" {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        let mut ready = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(inside.0.stdout.take().unwrap()),
+            &mut ready,
+        )
+        .unwrap();
+        assert_eq!(ready.trim(), "ready");
+        let seen = run_occupancy_script(&workspace);
         if seen == "UNKNOWN" {
             // macOS hermetic sandbox denies `lsof`; a Linux host whose every
             // same-uid cwd is unreadable also cannot observe occupancy.
@@ -2021,10 +2027,8 @@ mod tests {
 
     /// What the script concludes about a process whose cwd does not resolve,
     /// pinned against a directory laid out like `/proc`. A real process is in
-    /// most of these states for microseconds, and the script used to answer
-    /// `UNKNOWN` when it met one: the first test in this group failed about
-    /// once in six runs of this binary wherever a complete scan was possible,
-    /// because the other tests' children were exiting during its scans.
+    /// most of these states for microseconds; the cases below pin the `/proc`
+    /// branch so a sibling's exiting child cannot change this test's verdict.
     ///
     /// Linux only: this is the `/proc` branch of the script, and the stat
     /// lines are in the Linux format.

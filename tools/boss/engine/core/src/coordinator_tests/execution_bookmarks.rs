@@ -297,6 +297,16 @@ async fn bound_pr_snapshot_dispatch(revision: bool, fail_first: bool) {
         assert!(cube.bookmark_calls.lock().await.is_empty());
         assert!(runner.calls.lock().await.is_empty());
         verifier.set_head_oid(Ok(head.clone())).await;
+        let retry_at = db
+            .get_execution(&id)
+            .unwrap()
+            .dispatch_not_before
+            .as_deref()
+            .expect("pre-start retry stamps dispatch_not_before")
+            .parse::<i64>()
+            .unwrap();
+        let _clock = boss_engine_utils::epoch_time::NowGuard::set(retry_at + 1);
+        coordinator.drain_ready_queue_for_test().await;
     }
     wait_for_execution_status(&db, &id, ExecutionStatus::Running).await;
     assert_eq!(

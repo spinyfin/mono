@@ -648,16 +648,146 @@ mod work_item_write_tests;
 mod board_review_cache_tests;
 mod board_runtime_cache_tests;
 mod sweep_read_budget_tests;
+
+// Seeded-board scale tests and production-cardinality measurements. They are
+// compiled only into `:work_db_scale_test` (`--cfg=boss_scale_tests`), which
+// runs every test whose path contains `scale`. A cfg-gated module whose path
+// lacks that word is a silent miss; `scale_selection_guard` fails the target
+// if that happens. See the target's comment in BUILD.bazel.
+#[cfg(boss_scale_tests)]
+mod board_projection_scale;
 mod wait_scale_fixture;
+#[cfg(boss_scale_tests)]
 mod wait_scale_tests;
+#[cfg(boss_scale_tests)]
 mod work_tree_scale_tests;
 
 mod board_lane_read_tests;
+#[cfg(boss_scale_tests)]
+mod scale_selection_guard {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    /// `TESTBRIDGE_TEST_ONLY=scale` must run every cfg-gated test module and
+    /// must not also select an ungated test. A new gated module whose path
+    /// lacks `scale` compiles here but would never run; an ungated test with
+    /// `scale` in its path would run in both targets.
+    #[test]
+    fn cfg_gated_modules_match_the_name_filter() {
+        let manifest_dir =
+            std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_owned());
+        let gated = cfg_gated_mod_names(&PathBuf::from(manifest_dir).join("src"));
+        assert!(
+            !gated.is_empty(),
+            "expected at least one #[cfg(boss_scale_tests)] module under src/"
+        );
+
+        let listed = list_tests();
+        const FILTER: &str = "scale";
+        for module in &gated {
+            let in_mod: Vec<_> = listed.iter().filter(|name| path_has_segment(name, module)).collect();
+            // Fixture-only modules (e.g. `wait_scale_fixture`) have no tests.
+            if in_mod.is_empty() {
+                continue;
+            }
+            for name in &in_mod {
+                assert!(
+                    name.contains(FILTER),
+                    "{name} is compiled under cfg(boss_scale_tests) in `{module}` \
+                     but does not contain {FILTER:?}, so TESTBRIDGE_TEST_ONLY would skip it"
+                );
+            }
+        }
+        for name in &listed {
+            if !name.contains(FILTER) {
+                continue;
+            }
+            let in_gated = gated.iter().any(|module| path_has_segment(name, module));
+            assert!(
+                in_gated,
+                "{name} matches the scale filter but is not under a cfg(boss_scale_tests) \
+                 module, so it would also run in work_db_test"
+            );
+        }
+    }
+
+    fn path_has_segment(test: &str, segment: &str) -> bool {
+        test.split("::").any(|part| part == segment)
+    }
+
+    fn cfg_gated_mod_names(src: &Path) -> Vec<String> {
+        let mut files = Vec::new();
+        collect_rs_files(src, &mut files);
+        let mut names = Vec::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            let mut pending = false;
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("#[cfg") && trimmed.contains("boss_scale_tests") {
+                    pending = true;
+                    continue;
+                }
+                if !pending {
+                    continue;
+                }
+                if trimmed.starts_with("#[") {
+                    continue;
+                }
+                pending = false;
+                let Some(rest) = trimmed.strip_prefix("mod ") else {
+                    continue;
+                };
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() {
+                    names.push(name);
+                }
+            }
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    fn list_tests() -> Vec<String> {
+        let exe = std::env::current_exe().expect("current test binary");
+        let output = Command::new(exe)
+            .arg("--list")
+            .env_remove("TESTBRIDGE_TEST_ONLY")
+            .output()
+            .expect("list tests in this binary");
+        assert!(
+            output.status.success(),
+            "test binary --list failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.strip_suffix(": test").map(str::trim).map(str::to_owned))
+            .collect()
+    }
+}
 mod board_patch_tests;
 
 mod design_doc_contention_tests;
 
-mod board_projection_scale;
 mod board_projection_tests;
 mod navigator_projection_tests;
 

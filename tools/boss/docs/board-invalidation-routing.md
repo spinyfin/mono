@@ -77,8 +77,8 @@ This is a model of a schedule, not a trace. It uses the investigation's per-exec
 `work_tree_production_scale_measurement` (the fixture in `work-tree-scale-measurement.md`: 8,030 tasks, 21,127 executions) now also times `get_work_runtime_patch` for 1, 10 and 100 live cards, and asserts at that cardinality that every patched card is exactly the card the tree produces.
 
 ```sh
-bazel test //tools/boss/engine/core:engine_lib_test --test_sharding_strategy=disabled \
-  --test_filter=work_tree_production_scale_measurement --test_output=all --test_arg=--nocapture \
+bazel test //tools/boss/engine/work-db:work_db_scale_test \
+  --test_filter=work_tree_production_scale_measurement --test_output=all \
   --test_timeout=2400 --test_env=BOSS_BENCH_SAMPLES=20
 ```
 

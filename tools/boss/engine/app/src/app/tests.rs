@@ -61,6 +61,7 @@ pub(super) fn test_server_state_with_overrides(
     // matrix alone). Each fixture still owns its own on-disk WAL database.
     // An injected `work_db` is kept so a restart can rebuild ServerState over
     // the same file.
+    boss_engine_runtime::test_support::install_peak_memory_report();
     let temp = if overrides.work_db.is_none() {
         let (temp, db) = boss_work_db::test_support::open_db();
         overrides.work_db = Some(db);

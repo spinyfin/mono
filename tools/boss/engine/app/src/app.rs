@@ -2027,8 +2027,15 @@ impl ServerState {
         // conflict-detection path can wake the scheduler after inserting
         // a ready execution. The coordinator must exist before this is
         // called — hence the late bind.
-        let coord_for_kick = server_state.execution_coordinator.clone();
-        publisher_impl.set_kick(move || coord_for_kick.kick());
+        //
+        // Weak, because the coordinator owns this publisher: a strong handle
+        // here is a reference cycle.
+        let coord_for_kick = Arc::downgrade(&server_state.execution_coordinator);
+        publisher_impl.set_kick(move || {
+            if let Some(coordinator) = coord_for_kick.upgrade() {
+                coordinator.kick();
+            }
+        });
         let weak_for_queue = Arc::downgrade(&server_state);
         let queue_changed: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             let weak = weak_for_queue.clone();
@@ -2895,13 +2902,8 @@ async fn handle_frontend_connection(
 
 /// Whether a socket read error means the peer went away, as opposed to the
 /// engine failing. Linux reports `ECONNRESET` on a Unix stream whose peer
-/// closed while frames were still unread in its receive buffer: the normal
-/// end of a `boss` CLI invocation that exits on its reply without draining
-/// later pushes, or of the app quitting mid-burst. macOS reports the same
-/// close as plain EOF. Either way the session simply ends.
+/// closed with unread frames; macOS reports plain EOF. Either way the session ends.
 fn read_error_is_peer_disconnect(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
-    )
+    use std::io::ErrorKind;
+    matches!(error.kind(), ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted)
 }

@@ -34,10 +34,11 @@ New projection inputs must be added to the journal coverage or the full-snapshot
 The scale test reuses the existing 8,030-task / 21,127-execution fixture and changes 8 worker cards by default (8, 32 and 64 when BOSS_BENCH_SAMPLES is set) and their live execution states per batch. It checks parity against both cached and uncached complete assembly. CPU is process user plus system time; wall time includes scheduling contention. Transaction writes, including journal maintenance, are measured separately. The retained encoded-size bound is a memory proxy, while process peak RSS includes the test, both comparison paths and wire serialization. Wire bytes come from the real `WorkTreeCache` delta encoder. Materializing the response and comparing complete projections still depend on board size; wire encoding cost is reported separately from incremental maintenance.
 
 ```sh
-bazel test //tools/boss/engine/core:engine_lib_test --test_filter=board_projection_scale_measurement \
-  --test_sharding_strategy=disabled --test_output=all --test_arg=--nocapture \
-  --test_timeout=2400 --test_env=BOSS_BENCH_SAMPLES=5
+bazel test //tools/boss/engine/work-db:work_db_scale_test --test_filter=board_projection_scale_measurement \
+  --test_output=all --test_timeout=2400 --test_env=BOSS_BENCH_SAMPLES=5
 ```
+
+`work_db_scale_test` holds the seeded-board scale tests and measurements; `work_db_test` does not build them. It runs them all, once each and side by side, on every `bazel test //...`, and never captures their output, so the figures are in the test log of every run; only a filtered `BOSS_BENCH_SAMPLES` run like the one above is free of the other tests' load.
 
 Live counters distinguish `board.projection.incremental`, `board.projection.cards` and `board.projection.snapshot.<reason>`. The existing `board.assembly.full` counter counts actual complete assemblies, including recovery. The measurements establish per-batch costs on a synthetic board, not a concurrent-worker capacity limit or a production invalidation mix.
 
