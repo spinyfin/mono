@@ -6,12 +6,17 @@ load(":macos_direct_test_runner.bzl", "macos_direct_test_runner")
 
 exports_files(["macos_direct_test_runner.template.sh"])
 
+# Inspects the bundle that host_tmux_repository builds from the tmux installed
+# on the host running Bazel. `:macos_bundle` is `:tmux` there. On a host with
+# no tmux the repository holds only an exit-127 stub and `:macos_bundle` is
+# incompatible, so this test is reported as skipped: there is no bundle to
+# inspect, and neither a failure nor a pass would say anything about one.
 sh_test(
     name = "host_tmux_bundle_guard_test",
     size = "small",
     srcs = ["host_tmux_bundle_guard_test.sh"],
-    args = ["$(rootpath @host_tmux//:tmux)"],
-    data = ["@host_tmux//:tmux"],
+    args = ["$(rootpath @host_tmux//:macos_bundle)"],
+    data = ["@host_tmux//:macos_bundle"],
     env = {"MONO_TEST_XCODE_TOOLCHAIN": "1"},
     target_compatible_with = ["@platforms//os:macos"],
 )
