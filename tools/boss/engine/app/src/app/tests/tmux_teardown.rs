@@ -1458,3 +1458,190 @@ async fn grok_teardown_stalled_db_does_not_hold_back_kill() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+
+struct GrokIngestStall {
+    unlock: std::sync::mpsc::SyncSender<()>,
+    unlocked: std::sync::mpsc::Receiver<()>,
+}
+
+/// Handshake so ingest starts after driver lookup, then hold an exclusive
+/// SQLite lock across the transcript-path / snapshot writes. Kill can then
+/// proceed while ingest is still blocked.
+fn arm_grok_ingest_db_stall(state: &crate::app::ServerState) -> GrokIngestStall {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let (started_tx, started_rx) = mpsc::sync_channel::<()>(1);
+    let (proceed_tx, proceed_rx) = mpsc::sync_channel::<()>(1);
+    let (unlock_tx, unlock_rx) = mpsc::sync_channel::<()>(1);
+    let (unlocked_tx, unlocked_rx) = mpsc::sync_channel::<()>(1);
+    state.set_grok_ingest_gate_for_test(started_tx, proceed_rx);
+    let work_db = Arc::clone(&state.work_db);
+    std::thread::spawn(move || {
+        if started_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+            return;
+        }
+        let conn = work_db.connect_new().unwrap();
+        conn.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        let _ = proceed_tx.send(());
+        // Hold long enough for settle/ingest to observe SQLITE_BUSY and for
+        // kill to proceed, then release so identity-clear and the detached
+        // persist can finish. An explicit unlock from the test also unblocks.
+        let _ = unlock_rx.recv_timeout(Duration::from_millis(400));
+        let _ = conn.execute_batch("ROLLBACK;");
+        let _ = unlocked_tx.send(());
+    });
+    GrokIngestStall {
+        unlock: unlock_tx,
+        unlocked: unlocked_rx,
+    }
+}
+
+async fn wait_for_completed_grok_usage(db: &WorkDb, execution_id: &str) -> RunUsageFields {
+    let expected = expected_completed_grok_usage();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let fields = read_run_usage_fields(db, execution_id);
+        assert_ne!(
+            fields.usage_unavailable.as_deref(),
+            Some(crate::app::tmux_teardown::GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON),
+            "completed ingest must never write the before-turn_completed reason"
+        );
+        if fields == expected {
+            return fields;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "completed Grok usage did not persist for {execution_id}: {fields:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+async fn assert_completed_ingest_outlives_settle(
+    kind: &str,
+    session_name: &str,
+    token: &str,
+    runner: Arc<ScriptedGrokTmuxRunner>,
+) {
+    use std::time::{Duration, Instant};
+
+    let (state, dir) = test_server_state();
+    state.set_grok_teardown_settle_window_for_test(Duration::from_millis(200));
+    let execution_id = seed_completed_grok_run(&state, &dir, session_name, token);
+    let stall = arm_grok_ingest_db_stall(&state);
+    let tmux =
+        boss_tmux::Tmux::with_runner_and_socket("/opt/homebrew/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH)
+            .unwrap();
+    state.set_tmux_override_for_test(tmux);
+
+    let started = Instant::now();
+    assert_eq!(
+        state.release_worker_pane(&execution_id).await,
+        PaneReleaseOutcome::Reaped,
+        "{kind}: teardown must finish"
+    );
+    if kind == "missing session" {
+        assert!(
+            runner.recorded_kill_at().is_none(),
+            "{kind} must not issue kill-session: {:?}",
+            runner.calls()
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "{kind}: stalled completed ingest must not delay teardown (elapsed={elapsed:?})"
+        );
+    } else {
+        let kill_at = runner
+            .recorded_kill_at()
+            .unwrap_or_else(|| panic!("{kind}: kill-session must still run: {:?}", runner.calls()));
+        let kill_elapsed = kill_at.saturating_duration_since(started);
+        assert!(
+            kill_elapsed < Duration::from_millis(1500),
+            "{kind}: stalled completed ingest must not delay kill-session (kill_elapsed={kill_elapsed:?})"
+        );
+    }
+
+    let _ = stall.unlock.send(());
+    let _ = stall.unlocked.recv();
+    wait_for_completed_grok_usage(state.work_db.as_ref(), &execution_id).await;
+}
+
+/// Completed `turn_completed` usage already on disk must not delay kill when
+/// ingest outlives the settle deadline. After the lock lifts, tokens persist
+/// and the before-turn_completed reason is never written. Shared ingest covers
+/// live, dead-pane, and missing-session teardowns.
+#[tokio::test]
+async fn grok_completed_ingest_outliving_settle_still_persists_usage() {
+    assert_completed_ingest_outlives_settle(
+        "live",
+        "boss-1-grok-late-live",
+        "tok-late-live",
+        ScriptedGrokTmuxRunner::new("tok-late-live", None),
+    )
+    .await;
+    assert_completed_ingest_outlives_settle(
+        "dead pane",
+        "boss-1-grok-late-dead",
+        "tok-late-dead",
+        ScriptedGrokTmuxRunner::dead_pane("tok-late-dead"),
+    )
+    .await;
+    assert_completed_ingest_outlives_settle(
+        "missing session",
+        "boss-1-grok-late-gone",
+        "tok-late-gone",
+        ScriptedGrokTmuxRunner::missing_session("tok-late-gone"),
+    )
+    .await;
+}
+
+/// When `turn_completed` is present but capture fails, the
+/// `usage_unavailable` write runs off the runtime thread. An exclusive DB
+/// lock on that write must not delay kill.
+#[tokio::test]
+async fn grok_failed_ingest_usage_unavailable_write_does_not_hold_back_kill() {
+    use std::time::{Duration, Instant};
+
+    let (state, dir) = test_server_state();
+    state.set_grok_teardown_settle_window_for_test(Duration::from_millis(200));
+    state.run_cost_capture.set_persist_blocked_for_test(true);
+    let execution_id = seed_completed_grok_run(&state, &dir, "boss-1-grok-fail-ingest", "tok-fail-ingest");
+    let stall = arm_grok_ingest_db_stall(&state);
+    let runner = ScriptedGrokTmuxRunner::new("tok-fail-ingest", None);
+    let tmux =
+        boss_tmux::Tmux::with_runner_and_socket("/opt/homebrew/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH)
+            .unwrap();
+    state.set_tmux_override_for_test(tmux);
+
+    let started = Instant::now();
+    assert_eq!(
+        state.release_worker_pane(&execution_id).await,
+        PaneReleaseOutcome::Reaped
+    );
+    let kill_at = runner.recorded_kill_at().expect("kill-session must still run");
+    let kill_elapsed = kill_at.saturating_duration_since(started);
+    assert!(
+        kill_elapsed < Duration::from_millis(1500),
+        "failed-ingest usage_unavailable write must not delay kill-session (kill_elapsed={kill_elapsed:?})"
+    );
+
+    let _ = stall.unlock.send(());
+    let _ = stall.unlocked.recv();
+    let fields = wait_for_run_usage_unavailable(
+        state.work_db.as_ref(),
+        &execution_id,
+        crate::app::tmux_teardown::GROK_TEARDOWN_INGEST_FAILED_REASON,
+    )
+    .await;
+    assert_ne!(
+        fields.usage_unavailable.as_deref(),
+        Some(crate::app::tmux_teardown::GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON),
+        "failed ingest after turn_completed must not use the before-turn_completed reason"
+    );
+    assert!(
+        fields.input_tokens.is_none(),
+        "persist-blocked capture must not write tokens: {fields:?}"
+    );
+}

@@ -73,6 +73,22 @@ impl ServerState {
         GROK_TEARDOWN_SETTLE_WINDOW
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_grok_ingest_gate_for_test(
+        &self,
+        started: std::sync::mpsc::SyncSender<()>,
+        proceed: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.grok_ingest_gate.lock().unwrap() = Some((started, proceed));
+    }
+
+    #[cfg(test)]
+    fn take_grok_ingest_gate_for_test(
+        &self,
+    ) -> Option<(std::sync::mpsc::SyncSender<()>, std::sync::mpsc::Receiver<()>)> {
+        self.grok_ingest_gate.lock().unwrap().take()
+    }
+
     /// Best-effort one-shot cost capture for a Grok session whose process is
     /// already dead or missing when teardown runs, so any `turn_completed`
     /// flushed just before exit is still ingested. Bounded by the settle
@@ -339,19 +355,7 @@ impl ServerState {
         let work_db = self.work_db.clone();
         let execution_id = execution_id.to_owned();
         let reason = reason.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let snapshot = RunCostSnapshot {
-                usage_unavailable: Some(reason),
-                ..Default::default()
-            };
-            if let Err(err) = work_db.set_run_cost_snapshot(&execution_id, snapshot) {
-                tracing::warn!(
-                    execution_id,
-                    error = %format!("{err:#}"),
-                    "reap_tmux_worker: failed recording Grok teardown usage_unavailable reason",
-                );
-            }
-        })
+        tokio::task::spawn_blocking(move || persist_grok_usage_unavailable(&work_db, &execution_id, reason))
     }
 
     fn spawn_ingest_grok_updates(
@@ -363,25 +367,45 @@ impl ServerState {
         let capture = Arc::clone(&self.run_cost_capture);
         let work_db = self.work_db.clone();
         let execution_id = execution_id.to_owned();
+        #[cfg(test)]
+        let ingest_gate = self.take_grok_ingest_gate_for_test();
         tokio::task::spawn(async move {
+            #[cfg(test)]
+            if let Some((started, proceed)) = ingest_gate {
+                let _ = started.send(());
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = proceed.recv();
+                })
+                .await;
+            }
             let outcome = ingest_grok_updates(&capture, work_db.clone(), &execution_id, &paths).await;
             if !matches!(outcome, GrokIngestOutcome::Persisted)
                 && let Some(reason) = failure_reason
             {
-                let snapshot = RunCostSnapshot {
-                    usage_unavailable: Some(reason.to_owned()),
-                    ..Default::default()
-                };
-                if let Err(err) = work_db.set_run_cost_snapshot(&execution_id, snapshot) {
-                    tracing::warn!(
-                        execution_id,
-                        error = %format!("{err:#}"),
-                        "reap_tmux_worker: failed recording Grok teardown usage_unavailable reason",
-                    );
-                }
+                let persist_db = work_db.clone();
+                let persist_id = execution_id.clone();
+                let persist_reason = reason.to_owned();
+                let _ = tokio::task::spawn_blocking(move || {
+                    persist_grok_usage_unavailable(&persist_db, &persist_id, persist_reason);
+                })
+                .await;
             }
             outcome
         })
+    }
+}
+
+fn persist_grok_usage_unavailable(work_db: &boss_work_db::WorkDb, execution_id: &str, reason: String) {
+    let snapshot = RunCostSnapshot {
+        usage_unavailable: Some(reason),
+        ..Default::default()
+    };
+    if let Err(err) = work_db.set_run_cost_snapshot(execution_id, snapshot) {
+        tracing::warn!(
+            execution_id,
+            error = %format!("{err:#}"),
+            "reap_tmux_worker: failed recording Grok teardown usage_unavailable reason",
+        );
     }
 }
 

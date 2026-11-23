@@ -969,6 +969,38 @@ async fn send_interrupt_gesture_repeats_the_plan_presses() {
     assert_eq!(keys, ["C-c", "C-c"]);
 }
 
+struct FailingInterruptSink {
+    calls: usize,
+}
+
+#[async_trait]
+impl InterruptKeySink for FailingInterruptSink {
+    type Error = &'static str;
+
+    async fn send_interrupt_key(&mut self, _key: &'static str) -> Result<(), Self::Error> {
+        self.calls += 1;
+        Err("transport refused")
+    }
+}
+
+#[tokio::test]
+async fn send_interrupt_gesture_aborts_after_a_failed_press() {
+    let plan = InterruptPlan {
+        gesture: InterruptGesture {
+            key: "Escape",
+            presses: 3,
+            press_interval: Duration::ZERO,
+        },
+        confirm_window: Duration::from_millis(1),
+        max_attempts: 1,
+        turn_end_evidence: TurnEndEvidence::TurnBoundarySignal,
+    };
+    let mut sink = FailingInterruptSink { calls: 0 };
+    let err = send_interrupt_gesture(Some(&plan), &mut sink).await.unwrap_err();
+    assert_eq!(err, "transport refused");
+    assert_eq!(sink.calls, 1, "a refused press must not continue the remaining presses");
+}
+
 #[test]
 fn tmux_session_config_is_codex_only_and_session_scoped() {
     let codex_config = tmux_session_config_for("codex").expect("codex must carry a tmux session config");

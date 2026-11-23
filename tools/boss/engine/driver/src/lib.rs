@@ -1035,10 +1035,14 @@ pub trait InterruptKeySink {
 
 /// Execute one interrupt attempt's key sequence.
 ///
-/// Falls back to a single `Escape` when `plan` is `None`, matching the
-/// operator `agents interrupt` behaviour for a run whose driver could not be
-/// resolved. Callers for which a missing plan is meaningful check first and
-/// never reach here with `None`.
+/// Falls back to a single `Escape` when `plan` is `None`, matching
+/// `bossctl agents interrupt` for a run whose driver could not be resolved.
+/// Callers for which a missing plan is meaningful check first and never
+/// reach here with `None`.
+///
+/// A failed press aborts the rest of the attempt: repeating a gesture the
+/// transport just refused cannot succeed, and the caller needs that
+/// transport error rather than a later press's.
 pub async fn send_interrupt_gesture<S: InterruptKeySink + ?Sized>(
     plan: Option<&InterruptPlan>,
     sink: &mut S,

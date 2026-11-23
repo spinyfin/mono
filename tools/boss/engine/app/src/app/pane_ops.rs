@@ -230,6 +230,25 @@ impl SendInputError {
     }
 }
 
+/// Pane `send-keys` adapter for [`boss_engine_driver::send_interrupt_gesture`].
+struct PaneInterruptSink<'a> {
+    state: &'a ServerState,
+    run_id: &'a str,
+    slot_id: u8,
+}
+
+#[async_trait::async_trait]
+impl boss_engine_driver::InterruptKeySink for PaneInterruptSink<'_> {
+    type Error = InterruptPaneError;
+
+    async fn send_interrupt_key(&mut self, key: &'static str) -> Result<(), Self::Error> {
+        self.state
+            .send_interrupt_key(self.run_id, self.slot_id, key)
+            .await
+            .map(|_| ())
+    }
+}
+
 impl ServerState {
     /// Resolve `run_id → slot_id` and ask the app to bring that
     /// worker pane to the front. Returns the resolved slot on success
@@ -528,27 +547,6 @@ impl ServerState {
                 interrupt_recovery_prep::prepare(&self.work_db, driver.as_ref(), run_id)
                     .map(|snapshot| (driver, snapshot))
             });
-        // A failed press aborts the rest of the attempt: repeating a gesture
-        // the transport just refused cannot succeed, and the caller needs the
-        // transport error, not the last press's.
-        struct PaneInterruptSink<'a> {
-            state: &'a ServerState,
-            run_id: &'a str,
-            slot_id: u8,
-        }
-
-        #[async_trait::async_trait]
-        impl boss_engine_driver::InterruptKeySink for PaneInterruptSink<'_> {
-            type Error = InterruptPaneError;
-
-            async fn send_interrupt_key(&mut self, key: &'static str) -> Result<(), Self::Error> {
-                self.state
-                    .send_interrupt_key(self.run_id, self.slot_id, key)
-                    .await
-                    .map(|_| ())
-            }
-        }
-
         boss_engine_driver::send_interrupt_gesture(
             plan,
             &mut PaneInterruptSink {
