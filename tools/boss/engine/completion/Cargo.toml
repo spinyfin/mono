@@ -56,6 +56,7 @@ boss-transcript-tail = { path = "../transcript-tail" }
 boss-work-db = { path = "../work-db" }
 chrono = { workspace = true }
 git-utils = { path = "../../../../lib/rust/git_utils" }
+workspace-procs = { path = "../../../../lib/rust/workspace_procs" }
 libc = "0.2"
 regex = { workspace = true }
 rusqlite = { workspace = true, optional = true }

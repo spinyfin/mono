@@ -134,6 +134,7 @@ impl WorkerCompletionHandler {
             crate::driver_teardown::TeardownReason::ForceRelease,
         )
         .await;
+        // Cube sweeps only after verifying that this lease is still held.
         self.release_held_lease(&execution, crate::workspace_lease_release::TerminalCause::ProvenStopped)
             .await
     }

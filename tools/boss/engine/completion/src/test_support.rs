@@ -94,7 +94,21 @@ pub fn seed_published_guide_comment(db: &WorkDb, pr_number: u32, body: &str) -> 
     (root, series, comment)
 }
 
-pub use boss_engine_test_process::{ProcessGroupChild, spawn_group_leader_sleeper, spawn_setsid_sleeper};
+pub use boss_engine_test_process::{ProcessGroupChild, spawn_setsid_sleeper};
+
+/// Give each completion fixture its own cwd so a sibling run-process reap
+/// of its recorded workspace cannot claim it. The shared session fixture
+/// retains the owning guard and stdin lifeline for a killed test process.
+pub fn spawn_group_leader_sleeper() -> ProcessGroupChild {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let cwd = std::env::temp_dir().join(format!(
+        "boss-sleeper-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&cwd).expect("create sleeper cwd");
+    spawn_setsid_sleeper(&cwd, |_| {})
+}
 
 /// Give a local completion fixture the same durable recovery record as a
 /// dispatched worker. Uses the fixture's existing directory and real jj.

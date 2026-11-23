@@ -9,6 +9,7 @@ exports_files(["Cargo.toml"])
 # caller injects.
 COMPLETION_DEPS = [
     "//lib/rust/git_utils",
+    "//lib/rust/workspace_procs",
     "//tools/boss/backoff",
     "//tools/boss/engine/dispatch-events",
     "//tools/boss/engine/driver",
@@ -145,7 +146,9 @@ rust_test(
         proc_macro_dev = True,
     ),
     shard_count = 4,
-    deps = [d for d in COMPLETION_DEPS if d not in TEST_SUPPORT_SWAPS] + TEST_SUPPORT_DEPS + all_crate_deps(
+    deps = [d for d in COMPLETION_DEPS if d not in TEST_SUPPORT_SWAPS] + TEST_SUPPORT_DEPS + [
+        "//lib/rust/workspace_procs:workspace_procs_testing",
+    ] + all_crate_deps(
         normal = True,
         normal_dev = True,
     ),
