@@ -330,12 +330,17 @@ fn missing_local_path_without_override_is_not_treated_as_non_bazel() {
         assert!(prompt.contains("[blocked] reason="));
         for requirement in [
             "rdeps(//..., <changed-target>)",
+            "except attr(tags, \"requires-credentials\", //...)",
             ".github/workflows/*.yml",
             "until it returns `exit_code`",
             "evidence-backed as pre-existing or environmental",
         ] {
             assert!(prompt.contains(requirement), "missing {requirement}");
         }
+        assert!(
+            !prompt.contains("except attr(tags, \"manual\", //...)"),
+            "unresolved non-conflict prompt must not blanket-exclude credential-free manual targets:\n{prompt}"
+        );
         assert!(!prompt.contains("`BUILD.bazel`"));
     }
 }
@@ -378,6 +383,7 @@ fn unresolved_conflict_revision_gets_discovery_gate() {
     for needle in [
         "run the tests for the targets affected by the files that had conflicts",
         "rdeps(//..., set(<conflicted source files>))",
+        "except attr(tags, \"requires-credentials\", //...)",
         "do NOT on their own select tests",
         "stop as blocked",
         "`bazel test` of the test targets affected by the conflicted source files",
@@ -387,6 +393,10 @@ fn unresolved_conflict_revision_gets_discovery_gate() {
             "unresolved conflict prompt missing `{needle}`:\n{prompt}"
         );
     }
+    assert!(
+        !prompt.contains("except attr(tags, \"manual\", //...)"),
+        "unresolved conflict prompt must not blanket-exclude credential-free manual targets:\n{prompt}"
+    );
     assert!(!prompt.contains("compile-only gate applies"), "{prompt}");
     assert!(!prompt.contains("Bazel compile if markers are present"), "{prompt}");
 }

@@ -6,11 +6,22 @@ load(":macos_direct_test_runner.bzl", "macos_direct_test_runner")
 
 exports_files(["macos_direct_test_runner.template.sh"])
 
+sh_test(
+    name = "host_tmux_bundle_guard_test",
+    size = "small",
+    srcs = ["host_tmux_bundle_guard_test.sh"],
+    args = ["$(rootpath @host_tmux//:tmux)"],
+    data = ["@host_tmux//:tmux"],
+    env = {"MONO_TEST_XCODE_TOOLCHAIN": "1"},
+    target_compatible_with = ["@platforms//os:macos"],
+)
+
 # Run by the packages that may use a single-tool host repository, against
 # their own label; see the script.
 exports_files(
     ["host_tool_symlink_guard_test.sh"],
     visibility = [
+        "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/worker-bin:__pkg__",
         "//tools/cube:__pkg__",
     ],

@@ -8,23 +8,19 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 pub struct TurnObserver {
     pub(super) file: tokio::fs::File,
     pub(super) message_id: String,
-    pub(super) seed_uuids: Vec<String>,
 }
 
 impl TurnObserver {
     pub async fn wait(self) {
-        let mut descendants = std::iter::once(self.message_id.clone())
-            .chain(self.seed_uuids)
-            .collect::<HashSet<_>>();
+        let mut descendants = std::iter::once(self.message_id.clone()).collect::<HashSet<_>>();
         let mut reader = BufReader::new(self.file);
         let mut line = Vec::new();
         loop {
             match reader.read_until(b'\n', &mut line).await {
                 Ok(_) if line.last() == Some(&b'\n') => {
                     if let Ok(value) = serde_json::from_slice::<Value>(&line) {
-                        // When the receipt arm wins confirm(), TurnObserver only knows the
-                        // frame's message_id; recognize the peer user record via origin.msg_id
-                        // so its Claude-assigned uuid enters the descendant set.
+                        // TurnObserver only knows the frame's message_id; recognize the peer user
+                        // record via origin.msg_id so its Claude-assigned uuid enters the descendant set.
                         let is_peer_origin = value["type"] == "user"
                             && value["origin"]["kind"] == "peer"
                             && value["origin"]["msg_id"] == self.message_id.as_str();
@@ -67,7 +63,6 @@ mod tests {
         let observer = TurnObserver {
             file: tokio::fs::File::open(&path).await.unwrap(),
             message_id: "request".into(),
-            seed_uuids: vec![],
         };
         let mut wait = Box::pin(observer.wait());
         let mut writer = tokio::fs::OpenOptions::new().append(true).open(&path).await.unwrap();
@@ -97,7 +92,6 @@ mod tests {
         let observer = TurnObserver {
             file: tokio::fs::File::open(&path).await.unwrap(),
             message_id: "request".into(),
-            seed_uuids: vec![],
         };
         let answer =
             json!({"type":"assistant", "uuid":"answer", "parentUuid":"request", "message":{"stop_reason":"end_turn"}});
@@ -105,23 +99,6 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), observer.wait())
             .await
             .unwrap();
-    }
-
-    #[tokio::test]
-    async fn seeded_claude_uuid_chains_assistant_reply() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("transcript");
-        std::fs::write(&path, "").unwrap();
-        let observer = TurnObserver {
-            file: tokio::fs::File::open(&path).await.unwrap(),
-            message_id: "request".into(),
-            seed_uuids: vec!["claude-assigned".into()],
-        };
-        let wait = Box::pin(observer.wait());
-        let mut writer = tokio::fs::OpenOptions::new().append(true).open(&path).await.unwrap();
-        let answer = json!({"type":"assistant", "uuid":"answer", "parentUuid":"claude-assigned", "message":{"stop_reason":"end_turn"}});
-        writer.write_all(format!("{answer}\n").as_bytes()).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(1), wait).await.unwrap();
     }
 
     #[tokio::test]
@@ -133,7 +110,6 @@ mod tests {
         let observer = TurnObserver {
             file: tokio::fs::File::open(&path).await.unwrap(),
             message_id: "request".into(),
-            seed_uuids: vec![],
         };
         let mut wait = Box::pin(observer.wait());
         let mut writer = tokio::fs::OpenOptions::new().append(true).open(&path).await.unwrap();
@@ -163,7 +139,6 @@ mod tests {
         let pre_observer = TurnObserver {
             file: tokio::fs::File::open(&pre_path).await.unwrap(),
             message_id: "request".into(),
-            seed_uuids: vec![],
         };
         std::fs::write(&pre_path, format!("{user}\n{answer}\n")).unwrap();
         tokio::time::timeout(Duration::from_secs(1), pre_observer.wait())
