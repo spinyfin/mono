@@ -77,18 +77,23 @@ Several statements were rewritten or pinned so the plan does not depend on plann
 
 The migration analyzes only the indexes it creates. Building them reads each of the four tables once, on the first start after the upgrade.
 
+Two follow-up migrations cover the periodic and retention sweeps:
+
+- `20261122_0515_review_guide_retention_indexes` (`tools/boss/engine/work-db/src/review_guide_source_retention.rs`) adds `pr_review_guide_versions_attempt_idx`, `pr_review_guide_versions_comparison_idx`, and `pr_review_guide_updates_previous_version_idx` so the `NOT EXISTS` checks in `prune_pr_review_guide_sources` seek by index (`139` pages in `sweep_read_budget_tests` over 500 seeded guide series/versions).
+- `20261122_0630_work_db_periodic_sweep_indexes` (`tools/boss/engine/work-db/src/recurring_read_indexes.rs`) adds nine partial indexes (`tasks_positioning_refused_idx`, `tasks_open_pr_idx`, `tasks_pr_url_live_non_revision_idx`, `tasks_origin_pr_url_idx`, `work_executions_preserved_commit_idx`, `work_executions_never_started_prunable_idx`, `execution_bookmarks_recovered_from_idx`, `execution_bookmarks_archive_cleanup_idx`, and `work_runs_ephemeral_transcript_idx`). On the fixture, preserved-work cleanup reads `1` page per pass, positioning-hold recheck reads `43` pages, PR binding repair reads `509` pages, steady-state execution retention reads `63` pages, and durable transcript-path backfill reads `1` page.
+
 ### Result on the fixture
 
 Same fixture, same isolated engine, idle, no app, no workers. Pages are 4 KiB.
 
-| Measure                                                     |        Before |         After |
-| ----------------------------------------------------------- | ------------: | ------------: |
-| One pass of the recurring reads (budget test)               | 233,146 pages |   6,506 pages |
-| Engine, steady state, pages per minute (`db read summary`)  | about 495,000 |  about 16,000 |
-| Engine, steady state, holds of 200 pages or more per minute |            45 |            25 |
-| Engine, first 10 s after start                              | 582,201 pages | 127,901 pages |
+| Measure                                                        |        Before |         After |
+| -------------------------------------------------------------- | ------------: | ------------: |
+| One pass of the 25 reads measured before the fix (budget test) | 233,146 pages |   6,506 pages |
+| Engine, steady state, pages per minute (`db read summary`)     | about 495,000 |  about 16,000 |
+| Engine, steady state, holds of 200 pages or more per minute    |            45 |            25 |
+| Engine, first 10 s after start                                 | 582,201 pages | 127,901 pages |
 
-The budget-test "before" is the 25 reads measured before the fix; "after" is those 25 plus five added since. The first ten seconds after the upgrade include the one-time index build, 82,809 pages; without it the figure is 45,092. The engine rows are single runs of about six minutes each on 2026-11-21. Re-measure with the recipe below before quoting them for a later build.
+The budget-test rows cover only the 25 reads measured before the fix, before and after. The budget test now covers more reads than that (the periodic-sweep reads added later, one of them 7,836 pages), so its total is higher than 6,506 and is not re-measured here. The first ten seconds after the upgrade include the one-time index build, 82,809 pages; without it the figure is 45,092. The engine rows are single runs of about six minutes each on 2026-11-21. Re-measure with the recipe below before quoting them for a later build.
 
 ## Rules for a recurring read
 
@@ -101,7 +106,7 @@ The budget-test "before" is the 25 reads measured before the fix; "after" is tho
 
 ## The budget test
 
-`tools/boss/engine/work-db/src/tests/sweep_read_budget_tests.rs` runs every recurring read against the fixture and fails any that fetches more than 2,500 pages, naming the read and its heaviest statement. It runs under four sets of planner statistics: none, fresh, average-only (as the system `sqlite3` writes them) and "analyzed before the upgrade".
+`tools/boss/engine/work-db/src/tests/sweep_read_budget_tests.rs` runs every recurring read against the fixture and fails any that fetches more than its own budget, naming the read and its heaviest statement. Each read carries its budget: 2,500 pages by default, 10,000 for the hourly full-stock `list_executions_with_driver_runtime_state` read. It runs under four sets of planner statistics: none, fresh, average-only (as the system `sqlite3` writes them) and "analyzed before the upgrade".
 
 ```sh
 bazel test //tools/boss/engine/work-db:work_db_test --test_filter=sweep_read_budget --test_output=all --test_arg=--nocapture
@@ -122,21 +127,18 @@ env -u BOSS_EVENTS_SOCKET BOSS_WORKER_POOL_SIZE=0 BOSS_WORK_DB_HEAVY_READ_PAGES=
 
 Place a copy of the database to measure at `/tmp/boss-test-<id>.db` first. The engine derives that path from the socket path and never touches production state. Read `work DB heavy read` and `db read summary` from `/tmp/boss-test-<id>.engine-trace.jsonl`. Never point this at the live database.
 
+Figures in this doc come from a synthetic fixture. To measure a real database, copy it, including its `-wal` file, outside the engine state directory and run the recipe above against the copy. A `VACUUM INTO` backup is compacted and cannot show the original free-page count.
+
 ## Reads that still walk
 
-Measured on the same fixture after the fix. None of these runs more often than every five minutes.
+Measured on the same fixture after migration `20261122_0630_work_db_periodic_sweep_indexes`. Both run hourly (`3600 s`):
 
-| Read                                                                      | Timer  | Pages per pass |
-| ------------------------------------------------------------------------- | ------ | -------------: |
-| Preserved-work cleanup (`preserved_cleanup.rs`, two reads)                | 300 s  |     8,700 each |
-| Positioning-hold recheck (`pre_start_failure.rs`)                         | 300 s  |          7,640 |
-| PR binding repair (`pr_binding.rs`)                                       | 600 s  |          9,960 |
-| Execution retention (`execution_retention.rs`)                            | 3600 s |         57,600 |
-| Review-guide source retention (`review_guide_source_retention.rs`)        | 3600 s |         49,700 |
-| Driver home retention, three sweeps (`executions_runs.rs`, `run_rows.rs`) | 3600 s |    15,300 each |
-| Backup snapshot (`VACUUM INTO`)                                           | 3600 s | the whole file |
+| Read                                                                                      | Timer  | Pages per pass |
+| ----------------------------------------------------------------------------------------- | ------ | -------------: |
+| Driver home retention: `list_executions_with_driver_runtime_state` (`executions_runs.rs`) | 3600 s |          7,836 |
+| Backup snapshot (`VACUUM INTO`)                                                           | 3600 s | the whole file |
 
-The backup reads the whole file by design. The review-guide retention pass is the one to look at next: its delete stepped 5.7 million rows in a nested loop over 2,800 guide versions, so it grows with the square of the guide history.
+Both read the full stock by design: `list_executions_with_driver_runtime_state` is called by each of the Codex, Agy and Grok home retention sweeps (`codex_home_retention_sweep.rs`, `agy_home_retention_sweep.rs`, `grok_home_retention_sweep.rs`), so it is paid three times an hour (3 x 7,836 pages on the fixture). Each sweep needs every execution's driver runtime state to decide whether a home directory is still live or terminal, so the whole stock is classified rather than a live subset. It live vs terminal `driver_runtime_state` blobs across executions (budgeted at `10,000` pages in `sweep_read_budget_tests`), and the backup copies the whole file through `WorkDb::connect_new_for_snapshot()` (`Scope::WholeFile`).
 
 ## Size of the file
 
@@ -154,5 +156,3 @@ Decided worker proposals are kept for 90 days after both the decision and the ow
 Review verdicts, review batch members, final batch verdicts, attention records, operator questions and progression actions retain their referenced proposals indefinitely. This keeps review badges, findings, accepted-report recovery and pending decisions readable. The reference set is built once per delete statement; eligibility and deletion are atomic. The sweep deletes rows, not executions or artifacts, and does not vacuum the live database. Its hourly scan is outside the frequent-read budget; unlike the recurring readers above, retention must inspect historical eligibility.
 
 `proposal_retention_keeps_pending_recent_live_and_referenced_payloads` checks deletion of all four decided states, the strict 90-day boundary, running and recently finished workers, unknown states, missing timestamps, all six reference paths, payload preservation and an idempotent second pass. Other unbounded tables have no retention yet; each needs its own preservation policy before rows can be deleted.
-
-The incident database measurements also require an authorized offline copy outside the engine state directory, which workers must not read. A copy must include committed WAL contents; a compacted backup alone cannot reveal the incident file's original freelist count. The table/index breakdown and original free-page count, and before/after recurring-read measurements on isolated copies of that real-sized database, remain unavailable until that input is supplied. The synthetic measurements above do not satisfy those deliverables.

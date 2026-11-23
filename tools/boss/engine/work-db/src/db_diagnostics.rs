@@ -211,24 +211,35 @@ pub(super) fn start(
     (id, observation)
 }
 
-/// Independent WorkDb connections (notably backups) need the same observations.
+/// Independent WorkDb connections need the same observations.
 pub struct OwnedConnection {
     connection: Option<rusqlite::Connection>,
     id: usize,
     observation: Rc<Observation>,
     acquired: Instant,
+    scope: read_volume::Scope,
 }
 
 impl OwnedConnection {
-    #[track_caller]
-    pub(super) fn new(connection: rusqlite::Connection, metrics: std::sync::Arc<boss_metrics::Registry>) -> Self {
-        let (id, observation) = start(&connection, Location::caller(), metrics);
+    pub(super) fn new_with_scope(
+        connection: rusqlite::Connection,
+        metrics: std::sync::Arc<boss_metrics::Registry>,
+        caller: &'static Location<'static>,
+        scope: read_volume::Scope,
+    ) -> Self {
+        let (id, observation) = start(&connection, caller, metrics);
         Self {
             connection: Some(connection),
             id,
             observation,
             acquired: Instant::now(),
+            scope,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn caller(&self) -> &'static Location<'static> {
+        self.observation.caller
     }
 }
 
@@ -252,13 +263,12 @@ impl Drop for OwnedConnection {
         finish(self.id);
         let held = self.acquired.elapsed();
         if let Some(reads) = &reads {
-            // An independent connection is the backup's: it copies the file.
             read_volume::record(
                 self.observation.caller,
                 &self.observation.attribution,
                 held,
                 reads,
-                read_volume::Scope::WholeFile,
+                self.scope,
             );
         }
         if held >= Duration::from_millis(100) {

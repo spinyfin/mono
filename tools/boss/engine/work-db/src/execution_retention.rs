@@ -189,44 +189,48 @@ fn prune_terminal_executions_on(
     let rows = stmt.query_map(params![cutoff, policy.keep_per_work_item], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
     })?;
-    let mut protected = Vec::new();
+    let mut eligible_ids = Vec::new();
+    let mut codex_homes_set = HashSet::new();
     for row in rows {
         let (id, raw) = row?;
         if raw.as_deref().is_some_and(agy_container_still_exists) {
-            protected.push(format!("'{}'", id.replace('\'', "''")));
+            continue;
         }
+        if let Some(raw) = raw.as_deref().filter(|s| !s.is_empty())
+            && let Some(path) = owned_home_from_runtime_state_json(raw)
+        {
+            codex_homes_set.insert(path);
+        }
+        eligible_ids.push(id);
     }
-    let candidates_sql = if protected.is_empty() {
-        candidates_sql
-    } else {
-        format!("{candidates_sql} AND id NOT IN ({})", protected.join(","))
-    };
 
     if dry_run {
-        let count: i64 = conn.query_row(
-            &format!("SELECT COUNT(*) FROM ({candidates_sql})"),
-            params![cutoff, policy.keep_per_work_item],
-            |row| row.get(0),
-        )?;
         return Ok(ExecutionPruneOutcome {
-            deleted: count as u64,
+            deleted: eligible_ids.len() as u64,
             driver_homes_reclaimed: 0,
         });
+    }
+
+    if eligible_ids.is_empty() {
+        return Ok(ExecutionPruneOutcome::default());
     }
 
     // Capture recorded Codex homes *before* the DELETE so a prune cannot
     // permanently orphan reclaimable trees. Paths still referenced by any
     // surviving execution (including a live owner of the same home) are
     // filtered out after the delete.
-    let codex_homes_on_candidates =
-        codex_homes_for_prune_candidates(conn, &candidates_sql, cutoff, policy.keep_per_work_item)?;
+    let codex_homes_on_candidates: Vec<PathBuf> = codex_homes_set.into_iter().collect();
 
     let deleted = conn.execute(
-        &format!("DELETE FROM work_executions WHERE id IN ({candidates_sql})"),
-        params![cutoff, policy.keep_per_work_item],
+        "DELETE FROM work_executions WHERE id IN (SELECT value FROM json_each(?1))",
+        params![serde_json::to_string(&eligible_ids)?],
     )?;
 
-    let still_referenced = remaining_codex_home_paths(conn)?;
+    let still_referenced = if codex_homes_on_candidates.is_empty() {
+        HashSet::new()
+    } else {
+        remaining_codex_home_paths(conn)?
+    };
     let mut reclaimed = 0u64;
     for path in codex_homes_on_candidates {
         if still_referenced.contains(&path) {
@@ -257,34 +261,6 @@ fn prune_terminal_executions_on(
         deleted: deleted as u64,
         driver_homes_reclaimed: reclaimed,
     })
-}
-
-/// Unique owned-home paths (Codex `codex_home` or Claude `initial_prompt_home`) recorded on prune-candidate execution rows.
-fn codex_homes_for_prune_candidates(
-    conn: &Connection,
-    candidates_sql: &str,
-    cutoff: i64,
-    keep_per_work_item: u32,
-) -> Result<Vec<PathBuf>> {
-    let sql = format!(
-        "SELECT driver_runtime_state FROM work_executions
-          WHERE id IN ({candidates_sql})
-            AND driver_runtime_state IS NOT NULL
-            AND driver_runtime_state != ''"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![cutoff, keep_per_work_item], |row| {
-        let raw: String = row.get(0)?;
-        Ok(raw)
-    })?;
-    let mut paths = HashSet::new();
-    for raw in rows {
-        let raw = raw?;
-        if let Some(path) = owned_home_from_runtime_state_json(&raw) {
-            paths.insert(path);
-        }
-    }
-    Ok(paths.into_iter().collect())
 }
 
 /// Every `codex_home` still recorded on a remaining execution row.

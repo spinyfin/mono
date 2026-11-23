@@ -526,6 +526,11 @@ pub(super) fn all() -> Vec<Migration> {
             },
         },
         Migration {
+            id: review_guide_sources::RETENTION_INDEXES_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: review_guide_sources::migrate_retention_indexes,
+        },
+        Migration {
             id: "20261120_1630_run_usage_unavailable".into(),
             legacy_version: None,
             apply: |conn| {
@@ -610,6 +615,11 @@ pub(super) fn all() -> Vec<Migration> {
             id: "20261110_0730_wait_input_invalidation".into(),
             legacy_version: None,
             apply: board_projection_schema::refine_triggers,
+        },
+        Migration {
+            id: recurring_read_indexes::PERIODIC_SWEEP_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: recurring_read_indexes::migrate_periodic_sweep,
         },
         Migration {
             id: "20261029_0735_work_executions_item_kind_status_finished_idx".into(),

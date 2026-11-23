@@ -146,6 +146,52 @@ fn only_a_query_over_the_threshold_is_warned_about() {
 }
 
 #[test]
+fn connect_new_warns_on_heavy_read_and_snapshot_connection_does_not() {
+    let (_dir, db) = seeded(4000);
+    let loops = (heavy_hold_pages() / 1500) + 2;
+    let scan_many = |conn: &rusqlite::Connection| {
+        for _ in 0..loops {
+            let n: i64 = conn
+                .prepare("SELECT count(*) FROM read_probe WHERE length(filler) > 0")
+                .unwrap()
+                .query_row([], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 4000);
+        }
+    };
+    let (query_caller, query_measured) = measure(|| {
+        let conn = db.connect_new().unwrap();
+        let caller = conn.caller();
+        scan_many(&conn);
+        caller
+    });
+    assert!(
+        query_measured.pages >= heavy_hold_pages(),
+        "expected heavy read on connect_new: {query_measured:?}"
+    );
+    assert!(
+        was_warned(query_caller),
+        "connect_new must be flagged heavy when reading >= {} pages",
+        heavy_hold_pages()
+    );
+
+    let (snapshot_caller, snapshot_measured) = measure(|| {
+        let conn = db.connect_new_for_snapshot().unwrap();
+        let caller = conn.caller();
+        scan_many(&conn);
+        caller
+    });
+    assert!(
+        snapshot_measured.pages >= heavy_hold_pages(),
+        "expected heavy read on connect_new_for_snapshot: {snapshot_measured:?}"
+    );
+    assert!(
+        !was_warned(snapshot_caller),
+        "connect_new_for_snapshot must be exempt from heavy-read warnings"
+    );
+}
+
+#[test]
 fn previews_collapse_whitespace_and_truncate() {
     assert_eq!(preview("SELECT 1\n   FROM   t"), "SELECT 1 FROM t");
     let long = preview(&"word ".repeat(200));

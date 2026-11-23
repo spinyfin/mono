@@ -174,12 +174,7 @@ impl WorkDb {
     /// missing timestamps fail closed. Freed pages remain available for reuse.
     pub fn prune_decided_worker_proposals(&self, now_epoch: i64) -> Result<usize> {
         let cutoff = now_epoch.saturating_sub(90 * 24 * 60 * 60);
-        let terminal = boss_protocol::ExecutionStatus::ALL
-            .iter()
-            .filter(|status| status.is_terminal())
-            .map(|status| format!("'{}'", status.as_str()))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let terminal = super::recurring_read_indexes::terminal_execution_statuses_sql();
         let conn = self.connect()?;
         // Materialize references once instead of scanning report and attention
         // history for each candidate. One statement makes checking and deleting

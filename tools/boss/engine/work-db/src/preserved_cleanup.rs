@@ -135,10 +135,17 @@ impl WorkDb {
     ) -> Result<Vec<PreservedCleanup>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
-            "SELECT we.id FROM work_executions we
-             JOIN execution_bookmarks eb ON eb.execution_id = we.id
-             WHERE (we.preserved_commit_id IS NOT NULL OR eb.archive_cleanup_pending = 1)
-               AND we.id NOT IN (SELECT value FROM json_each(?1))
+            "WITH candidates(id) AS (
+                 SELECT we.id FROM work_executions we INDEXED BY work_executions_preserved_commit_idx
+                 WHERE we.preserved_commit_id IS NOT NULL
+                 UNION
+                 SELECT eb.execution_id FROM execution_bookmarks eb INDEXED BY execution_bookmarks_archive_cleanup_idx
+                 WHERE eb.archive_cleanup_pending = 1
+             )
+             SELECT we.id FROM candidates c
+             CROSS JOIN work_executions we ON we.id = c.id
+             CROSS JOIN execution_bookmarks eb ON eb.execution_id = we.id
+             WHERE we.id NOT IN (SELECT value FROM json_each(?1))
                AND we.id > ?2
                AND NOT EXISTS (SELECT 1 FROM work_attention_items a
                    WHERE a.execution_id = we.id AND a.status = 'open'
