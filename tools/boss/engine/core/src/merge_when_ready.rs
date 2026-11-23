@@ -65,13 +65,34 @@ pub struct DirectMergeSuccess {
 /// the `gh` error message when the merge was rejected (conflicts, auth
 /// failure, PR not open, etc.).
 pub async fn gh_merge_when_ready(pr_url: &str) -> Result<DirectMergeSuccess> {
-    let started = std::time::Instant::now();
-    let head_sha = probe_head_sha(pr_url).await?;
-    tracing::info!(
-        pr_url,
-        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-        "merge request head probe completed"
-    );
+    gh_merge_when_ready_matching_head(pr_url, None).await
+}
+
+/// Perform "Merge When Ready" for `pr_url`, optionally pinning
+/// `--match-head-commit` to an already-verified `expected_head_sha` without
+/// re-probing GitHub.
+///
+/// When `expected_head_sha` is `Some` (non-empty), `gh pr merge` fails before
+/// GitHub accepts anything if GitHub's view of the PR head does not match
+/// that SHA (preventing a lagged probe from re-introducing a pre-rebase SHA).
+/// When `None`, the current head is probed first as in [`gh_merge_when_ready`].
+pub async fn gh_merge_when_ready_matching_head(
+    pr_url: &str,
+    expected_head_sha: Option<&str>,
+) -> Result<DirectMergeSuccess> {
+    let head_sha = match expected_head_sha.filter(|s| !s.is_empty()) {
+        Some(sha) => sha.to_owned(),
+        None => {
+            let started = std::time::Instant::now();
+            let head_sha = probe_head_sha(pr_url).await?;
+            tracing::info!(
+                pr_url,
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "merge request head probe completed"
+            );
+            head_sha
+        }
+    };
     let command_started = std::time::Instant::now();
     let output = gh_scope(
         callers::MERGE_WHEN_READY,
@@ -133,6 +154,13 @@ pub async fn gh_disarm_auto_merge(pr_url: &str) -> Result<()> {
 #[async_trait]
 pub trait DirectMergeExecutor: Send + Sync {
     async fn execute(&self, pr_url: &str) -> Result<DirectMergeSuccess>;
+
+    /// Like [`Self::execute`], but when `expected_head_sha` is `Some`, pins
+    /// `--match-head-commit` directly to that SHA without re-probing GitHub.
+    async fn execute_matching_head(&self, pr_url: &str, expected_head_sha: Option<&str>) -> Result<DirectMergeSuccess> {
+        let _ = expected_head_sha;
+        self.execute(pr_url).await
+    }
 
     /// Turn off the auto-merge a successful [`Self::execute`] armed, so a PR
     /// the engine has stopped merging cannot be merged by GitHub anyway.
@@ -358,6 +386,10 @@ pub async fn resume_after_conflict(
 impl DirectMergeExecutor for CommandDirectMergeExecutor {
     async fn execute(&self, pr_url: &str) -> Result<DirectMergeSuccess> {
         gh_merge_when_ready(pr_url).await
+    }
+
+    async fn execute_matching_head(&self, pr_url: &str, expected_head_sha: Option<&str>) -> Result<DirectMergeSuccess> {
+        gh_merge_when_ready_matching_head(pr_url, expected_head_sha).await
     }
 
     async fn disarm(&self, pr_url: &str) -> Result<()> {

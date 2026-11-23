@@ -24,21 +24,36 @@ use super::super::*;
 
 struct FakeDirectMergeExecutor {
     calls: Mutex<Vec<String>>,
+    pinned_heads: Mutex<Vec<Option<String>>>,
     disarms: Mutex<Vec<String>>,
     head_sha: String,
+    ignore_expected_head: bool,
 }
 
 impl FakeDirectMergeExecutor {
     fn returning(head_sha: impl Into<String>) -> Self {
         Self {
             calls: Mutex::new(Vec::new()),
+            pinned_heads: Mutex::new(Vec::new()),
             disarms: Mutex::new(Vec::new()),
             head_sha: head_sha.into(),
+            ignore_expected_head: false,
+        }
+    }
+
+    fn ignoring_expected_head(head_sha: impl Into<String>) -> Self {
+        Self {
+            ignore_expected_head: true,
+            ..Self::returning(head_sha)
         }
     }
 
     fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
+    }
+
+    fn pinned_heads(&self) -> Vec<Option<String>> {
+        self.pinned_heads.lock().unwrap().clone()
     }
 
     fn disarms(&self) -> Vec<String> {
@@ -49,10 +64,27 @@ impl FakeDirectMergeExecutor {
 #[async_trait]
 impl DirectMergeExecutor for FakeDirectMergeExecutor {
     async fn execute(&self, pr_url: &str) -> anyhow::Result<DirectMergeSuccess> {
+        self.execute_matching_head(pr_url, None).await
+    }
+
+    async fn execute_matching_head(
+        &self,
+        pr_url: &str,
+        expected_head_sha: Option<&str>,
+    ) -> anyhow::Result<DirectMergeSuccess> {
         self.calls.lock().unwrap().push(pr_url.to_owned());
-        Ok(DirectMergeSuccess {
-            head_sha: self.head_sha.clone(),
-        })
+        self.pinned_heads
+            .lock()
+            .unwrap()
+            .push(expected_head_sha.map(str::to_owned));
+        let head_sha = if self.ignore_expected_head {
+            self.head_sha.clone()
+        } else {
+            expected_head_sha
+                .map(str::to_owned)
+                .unwrap_or_else(|| self.head_sha.clone())
+        };
+        Ok(DirectMergeSuccess { head_sha })
     }
 
     async fn disarm(&self, pr_url: &str) -> anyhow::Result<()> {
@@ -1092,16 +1124,26 @@ async fn lagged_github_head_after_rebase_refuses_without_arming() {
     }
     assert_eq!(cube.rebase_calls(), 1);
     assert!(direct_executor.calls().is_empty(), "must not arm merge on a stale head");
-    assert!(state.work_db.get_ci_merge_rebase(&chore_id, pr_url).unwrap().is_none());
+    // The push succeeded, so the rebase record is persisted with
+    // `rebased_head_sha = None` so a retry can arm once GitHub catches up.
+    let rebase = state
+        .work_db
+        .get_ci_merge_rebase(&chore_id, pr_url)
+        .unwrap()
+        .expect("post-push rebase record must persist for retry");
+    assert_eq!(rebase.head_sha_before.as_deref(), Some("head-old"));
+    assert_eq!(rebase.rebased_head_sha, None);
 }
 
-/// Even after GitHub shows a new head, a Direct merge executor that still
-/// reports the pre-rebase SHA must refuse rather than record the old head.
+/// Even after GitHub shows a new head, a Direct merge executor that ignores
+/// the pinned head and still returns the pre-rebase SHA must refuse AND record
+/// a durable `disarm_pending` obligation so GitHub auto-merge is not left
+/// armed and untracked.
 #[tokio::test]
 async fn direct_merge_executor_returning_pre_rebase_head_is_refused() {
     let server = MockServer::start().await;
     let pr_url = "https://github.com/spinyfin/mono/pull/413";
-    let direct_executor = Arc::new(FakeDirectMergeExecutor::returning("head-old"));
+    let direct_executor = Arc::new(FakeDirectMergeExecutor::ignoring_expected_head("head-old"));
     let cube = RebaseCube::clean_pushed();
     let probe = ScriptedMergeProbe::new(failing_probe(pr_url, "head-old", "BEHIND"), true)
         .with_after_rebase_head("head-rebased");
@@ -1137,5 +1179,334 @@ async fn direct_merge_executor_returning_pre_rebase_head_is_refused() {
         other => panic!("expected WorkError refusal, got {other:?}"),
     }
     assert_eq!(direct_executor.calls(), vec![pr_url.to_owned()]);
-    assert!(state.work_db.get_ci_merge_rebase(&chore_id, pr_url).unwrap().is_none());
+    assert_eq!(direct_executor.pinned_heads(), vec![Some("head-rebased".to_owned())]);
+    assert!(
+        state.work_db.merge_disarm_pending(&chore_id, pr_url).unwrap(),
+        "rejecting an already-accepted external merge must record a durable disarm obligation"
+    );
+    assert!(
+        state
+            .work_db
+            .get_active_github_merge_intent(&chore_id, pr_url)
+            .unwrap()
+            .is_none()
+    );
+    let rebase = state
+        .work_db
+        .get_ci_merge_rebase(&chore_id, pr_url)
+        .unwrap()
+        .expect("post-push rebase record must stay intact for retry");
+    assert_eq!(rebase.rebased_head_sha, None);
+}
+
+/// C1: Trunk conflict handoff when a prior eviction left the active intent in
+/// `'failed'` must stamp it `boss:superseded_by_conflict` so conflict
+/// retirement advances it to `boss:awaiting_resubmit` and the poller
+/// resubmits it to Trunk.
+#[tokio::test]
+async fn rebase_conflict_on_trunk_with_failed_intent_stamps_superseded_and_resubmits() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/getQueue"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "state": "running",
+            "branch": "main",
+            "enqueuedPullRequests": [],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/submitPullRequest"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let pr_url = "https://github.com/spinyfin/mono/pull/414";
+    let direct_executor = Arc::new(FakeDirectMergeExecutor::returning("head-resolved"));
+    let cube = RebaseCube::conflicting(vec!["src/lib.rs"]);
+    let probe = ScriptedMergeProbe::new(failing_probe(pr_url, "head-old", "BEHIND"), true);
+    let (state, _temp) = test_server(
+        trunk_client_for(server.uri()),
+        direct_executor.clone(),
+        cube.clone(),
+        probe.clone(),
+    );
+    let (_product_id, chore_id) = seed_ci_blocked_chore(&state.work_db, "ci-conflict-trunk-failed", pr_url, true, true);
+    let existing = state
+        .work_db
+        .insert_trunk_merge_intent(
+            boss_work_db::TrunkMergeIntentInsertInput::builder()
+                .work_item_id(&chore_id)
+                .pr_url(pr_url)
+                .pr_number(414)
+                .repo("spinyfin/mono")
+                .target_branch("main")
+                .build(),
+        )
+        .unwrap()
+        .expect("seeded intent");
+    state
+        .work_db
+        .record_trunk_merge_intent_state(&existing.id, "failed")
+        .unwrap();
+    let sink = make_session_sink();
+
+    handle_merge_when_ready(
+        dispatch_ctx(&state, &sink),
+        FrontendRequest::MergeWhenReady {
+            work_item_id: chore_id.clone(),
+            confirmed_revisions: vec![],
+        },
+    )
+    .await;
+
+    let envelope = tokio::time::timeout(Duration::from_secs(5), sink.next())
+        .await
+        .unwrap()
+        .expect("expected reply");
+    assert!(matches!(envelope.payload, FrontendEvent::MergeWhenReadyAccepted { .. }));
+
+    let intent = state
+        .work_db
+        .get_active_trunk_merge_intent(&chore_id)
+        .unwrap()
+        .expect("active Trunk intent must survive");
+    assert_eq!(
+        intent.last_trunk_state.as_deref(),
+        Some(boss_engine_merge_poller::trunk_merge::TRUNK_INTENT_SUPERSEDED_BY_CONFLICT),
+        "failed active intent must be stamped superseded_by_conflict on conflict handoff"
+    );
+
+    // Simulate conflict resolution retiring the merge_conflict signal (what
+    // `conflict_watch::on_resolved` runs once GitHub reports the PR mergeable):
+    // the intent advances to `boss:awaiting_resubmit` and the poller resubmits.
+    let retired = state
+        .work_db
+        .clear_resolved_pr_signal(&chore_id, pr_url, false)
+        .unwrap();
+    assert!(
+        matches!(retired, boss_work_db::ClearResolvedSignal::Applied(_)),
+        "expected conflict signal retirement to apply, got {retired:?}"
+    );
+    let after_retire = state
+        .work_db
+        .get_active_trunk_merge_intent(&chore_id)
+        .unwrap()
+        .expect("intent still active");
+    assert_eq!(
+        after_retire.last_trunk_state.as_deref(),
+        Some(boss_engine_merge_poller::trunk_merge::TRUNK_INTENT_AWAITING_RESUBMIT),
+        "conflict retirement must advance superseded_by_conflict to awaiting_resubmit"
+    );
+
+    let mut trunk_probe = boss_engine_merge_poller::trunk_queue_poller::TrunkQueueProbe::new();
+    let outcome = trunk_probe
+        .run_pass(
+            &boss_engine_merge_poller::trunk_queue_poller::TrunkSweepContext {
+                contract_fetcher: &NoopContractFetcher,
+                work_db: &state.work_db,
+                publisher: state.publisher.as_ref(),
+                api: &state.trunk_client,
+            },
+            Instant::now(),
+        )
+        .await;
+    assert_eq!(outcome.resubmits, 1);
+    server.verify().await;
+}
+
+/// C2: When the head wait sees the verified rebased SHA, the Direct merge
+/// executor is pinned to that SHA rather than re-probing (even if an unpinned
+/// read would still return the pre-rebase SHA).
+#[tokio::test]
+async fn direct_merge_pins_verified_rebased_head_without_reprobing_stale_sha() {
+    let server = MockServer::start().await;
+    let pr_url = "https://github.com/spinyfin/mono/pull/415";
+    // Fallback unpinned head is still the stale pre-rebase SHA; pinning must
+    // supply the verified `"head-rebased"` SHA instead.
+    let direct_executor = Arc::new(FakeDirectMergeExecutor::returning("head-old"));
+    let cube = RebaseCube::clean_pushed();
+    let probe = ScriptedMergeProbe::new(failing_probe(pr_url, "head-old", "BEHIND"), true)
+        .with_after_rebase_head("head-rebased");
+    let (state, _temp) = test_server(
+        trunk_client_for(server.uri()),
+        direct_executor.clone(),
+        cube.clone(),
+        probe.clone(),
+    );
+    let (_product_id, chore_id) = seed_ci_blocked_chore(&state.work_db, "ci-pinned-head", pr_url, false, false);
+    let sink = make_session_sink();
+
+    handle_merge_when_ready(
+        dispatch_ctx(&state, &sink),
+        FrontendRequest::MergeWhenReady {
+            work_item_id: chore_id.clone(),
+            confirmed_revisions: vec![],
+        },
+    )
+    .await;
+
+    let envelope = tokio::time::timeout(Duration::from_secs(5), sink.next())
+        .await
+        .unwrap()
+        .expect("expected accepted reply");
+    assert!(matches!(envelope.payload, FrontendEvent::MergeWhenReadyAccepted { .. }));
+    assert_eq!(direct_executor.pinned_heads(), vec![Some("head-rebased".to_owned())]);
+    let intent = state
+        .work_db
+        .get_active_github_merge_intent(&chore_id, pr_url)
+        .unwrap()
+        .expect("merge intent recorded");
+    assert_eq!(intent.head_sha, "head-rebased");
+}
+
+/// C3: When the first click times out waiting for GitHub to surface the
+/// rebased head, a second click once GitHub shows the new head and not-behind
+/// skips the rebase and arms the merge directly.
+#[tokio::test]
+async fn retry_after_head_wait_timeout_arms_rebased_pr_without_rebasing_again() {
+    let server = MockServer::start().await;
+    let pr_url = "https://github.com/spinyfin/mono/pull/416";
+    let direct_executor = Arc::new(FakeDirectMergeExecutor::returning("head-old"));
+    let cube = RebaseCube::clean_pushed();
+    let probe = ScriptedMergeProbe::new(failing_probe(pr_url, "head-old", "BEHIND"), true);
+    let (state, _temp) = test_server(
+        trunk_client_for(server.uri()),
+        direct_executor.clone(),
+        cube.clone(),
+        probe.clone(),
+    );
+    let (_product_id, chore_id) = seed_ci_blocked_chore(&state.work_db, "ci-retry-after-lag", pr_url, false, false);
+    let sink = make_session_sink();
+
+    // First click: rebase pushes, head wait times out while GitHub lags.
+    handle_merge_when_ready(
+        dispatch_ctx(&state, &sink),
+        FrontendRequest::MergeWhenReady {
+            work_item_id: chore_id.clone(),
+            confirmed_revisions: vec![],
+        },
+    )
+    .await;
+    let first = tokio::time::timeout(Duration::from_secs(5), sink.next())
+        .await
+        .unwrap()
+        .expect("expected refusal");
+    assert!(matches!(first.payload, FrontendEvent::WorkError { .. }));
+    assert_eq!(cube.rebase_calls(), 1);
+    assert!(direct_executor.calls().is_empty());
+
+    // GitHub catches up: branch is no longer behind and reports the rebased head.
+    probe.set(failing_probe(pr_url, "head-rebased", "CLEAN"), false);
+
+    // Second click: must skip rebase and arm Direct merge pinned to the new head.
+    handle_merge_when_ready(
+        dispatch_ctx(&state, &sink),
+        FrontendRequest::MergeWhenReady {
+            work_item_id: chore_id.clone(),
+            confirmed_revisions: vec![],
+        },
+    )
+    .await;
+    let second = tokio::time::timeout(Duration::from_secs(5), sink.next())
+        .await
+        .unwrap()
+        .expect("expected accepted reply");
+    assert!(
+        matches!(second.payload, FrontendEvent::MergeWhenReadyAccepted { .. }),
+        "retry after head-wait timeout must arm the merge, got {:?}",
+        second.payload
+    );
+    assert_eq!(cube.rebase_calls(), 1, "retry must not rebase a second time");
+    assert_eq!(direct_executor.pinned_heads(), vec![Some("head-rebased".to_owned())]);
+    let intent = state
+        .work_db
+        .get_active_github_merge_intent(&chore_id, pr_url)
+        .unwrap()
+        .expect("merge intent recorded on retry");
+    assert_eq!(intent.head_sha, "head-rebased");
+    let rebase = state
+        .work_db
+        .get_ci_merge_rebase(&chore_id, pr_url)
+        .unwrap()
+        .expect("rebase marker updated");
+    assert_eq!(rebase.rebased_head_sha.as_deref(), Some("head-rebased"));
+}
+
+/// C4: Post-rebase Trunk retry must not retire an active `boss:withdraw`
+/// intent while its `cancelPullRequest` is still owed by the poller.
+#[tokio::test]
+async fn post_rebase_trunk_retry_refuses_while_withdraw_cancel_is_pending() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/submitPullRequest"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let pr_url = "https://github.com/spinyfin/mono/pull/417";
+    let direct_executor = Arc::new(FakeDirectMergeExecutor::returning("head-rebased"));
+    let cube = RebaseCube::clean_pushed();
+    let probe = ScriptedMergeProbe::new(failing_probe(pr_url, "head-old", "BEHIND"), true)
+        .with_after_rebase_head("head-rebased");
+    let (state, _temp) = test_server(
+        trunk_client_for(server.uri()),
+        direct_executor.clone(),
+        cube.clone(),
+        probe.clone(),
+    );
+    let (_product_id, chore_id) =
+        seed_ci_blocked_chore(&state.work_db, "ci-trunk-withdraw-pending", pr_url, false, true);
+    let withdraw_intent = state
+        .work_db
+        .insert_trunk_merge_intent(
+            boss_work_db::TrunkMergeIntentInsertInput::builder()
+                .work_item_id(&chore_id)
+                .pr_url(pr_url)
+                .pr_number(417)
+                .repo("spinyfin/mono")
+                .target_branch("main")
+                .initial_trunk_state(boss_engine_merge_poller::trunk_merge::TRUNK_INTENT_WITHDRAW)
+                .build(),
+        )
+        .unwrap()
+        .expect("seeded withdraw intent");
+    let sink = make_session_sink();
+
+    handle_merge_when_ready(
+        dispatch_ctx(&state, &sink),
+        FrontendRequest::MergeWhenReady {
+            work_item_id: chore_id.clone(),
+            confirmed_revisions: vec![],
+        },
+    )
+    .await;
+
+    let envelope = tokio::time::timeout(Duration::from_secs(5), sink.next())
+        .await
+        .unwrap()
+        .expect("expected refusal");
+    match envelope.payload {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains("a previous queue withdrawal is still pending"),
+                "unexpected refusal message: {message}"
+            );
+        }
+        other => panic!("expected WorkError refusal, got {other:?}"),
+    }
+    let still_active = state
+        .work_db
+        .get_active_trunk_merge_intent(&chore_id)
+        .unwrap()
+        .expect("boss:withdraw intent must remain active until poller cancels it");
+    assert_eq!(still_active.id, withdraw_intent.id);
+    assert_eq!(
+        still_active.last_trunk_state.as_deref(),
+        Some(boss_engine_merge_poller::trunk_merge::TRUNK_INTENT_WITHDRAW)
+    );
+    server.verify().await;
 }

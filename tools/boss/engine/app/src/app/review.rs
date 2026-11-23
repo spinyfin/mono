@@ -181,6 +181,7 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                     .kick_reconciler_on_error(false)
                     .recv_instant(recv_instant)
                     .build();
+                // Spawn the GitHub interaction so the main loop isn't blocked.
                 boss_task_scope::spawn(async move {
                     arm_direct_github_merge(arm).await;
                 });
@@ -281,6 +282,8 @@ pub(super) async fn arm_direct_github_merge(req: DirectMergeArmRequest) {
         pr_url = %pr_url,
         "merge_when_ready: requesting GitHub-native merge",
     );
+    // Persist what the person confirmed, bound to this request, before GitHub
+    // is called so the continuation can compare.
     let confirmation = match work_db.remember_confirmed_merge_revisions(&work_item_id, &pr_url, &confirmed_revisions) {
         Ok(confirmation) => confirmation,
         Err(err) => {
@@ -288,12 +291,40 @@ pub(super) async fn arm_direct_github_merge(req: DirectMergeArmRequest) {
             return;
         }
     };
+    let prior_intent = work_db
+        .get_active_github_merge_intent(&work_item_id, &pr_url)
+        .ok()
+        .flatten()
+        .map(|intent| intent.id);
+    let expected_head_sha = after_rebase
+        .as_ref()
+        .and_then(|after| after.rebased_head_sha.as_deref());
     let external_started = std::time::Instant::now();
-    match direct_merge_executor.execute(&pr_url).await {
+    match direct_merge_executor
+        .execute_matching_head(&pr_url, expected_head_sha)
+        .await
+    {
         Ok(success) => {
             if after_rebase.as_ref().and_then(|after| after.head_sha_before.as_deref())
                 == Some(success.head_sha.as_str())
             {
+                // GitHub already accepted `gh pr merge --auto` on the stale
+                // head; record a durable disarm obligation so the poller turns
+                // auto-merge off instead of leaving it armed and untracked.
+                if let Err(disarm_err) = work_db.record_unrecorded_merge_disarm(
+                    &work_item_id,
+                    &pr_url,
+                    &success.head_sha,
+                    prior_intent.as_deref(),
+                ) {
+                    tracing::warn!(
+                        work_item_id = %work_item_id,
+                        pr_url = %pr_url,
+                        ?disarm_err,
+                        "merge_when_ready: could not record a disarm obligation after rejecting a stale-head merge",
+                    );
+                }
+                event_bus.publish(Event::PrReconcileRequested { pr_url: pr_url.clone() });
                 let _ = work_db.forget_confirmed_merge_revisions(&confirmation);
                 refuse_merge_when_ready(
                     &sink,
@@ -306,6 +337,13 @@ pub(super) async fn arm_direct_github_merge(req: DirectMergeArmRequest) {
             }
             tracing::info!(request_id = %request_id, elapsed_ms = external_started.elapsed().as_secs_f64() * 1000.0, "merge request external operation completed");
             let record_started = std::time::Instant::now();
+            // `gh pr merge --auto --squash` has accepted a merge request for
+            // this exact head. GitHub's queue/auto-merge projection lags that
+            // command, so persist the request and move the card before asking
+            // the poller for its first observation. A future empty probe is
+            // absence, not a dequeue; the per-row intent keeps it from
+            // clobbering this state until the timeline or terminal probe says
+            // otherwise.
             let detail = boss_engine_storage_values::merge_queue_section::queued_no_position_detail();
             let record = work_db.record_github_merge_intent(
                 boss_work_db::GithubMergeIntentInsertInput::builder()
@@ -358,6 +396,8 @@ pub(super) async fn arm_direct_github_merge(req: DirectMergeArmRequest) {
             record_after_rebase(&work_db, &work_item_id, &pr_url, after_rebase.as_ref());
             let remembered = remember_merge_request(&work_db, &work_item_id, &pr_url, Some(&success.head_sha));
             tracing::info!(request_id = %request_id, elapsed_ms = record_started.elapsed().as_secs_f64() * 1000.0, "merge request durable write completed");
+            // Acknowledge durable acceptance before publication takes the
+            // shared decision-feed lock or wakes board readers.
             send_response(
                 &sink,
                 &request_id,
@@ -387,6 +427,10 @@ pub(super) async fn arm_direct_github_merge(req: DirectMergeArmRequest) {
                 error = %message,
                 "merge_when_ready: GitHub refused the merge request",
             );
+            // When enabled (the InReview path), a merge request is what a
+            // deferred conflict waits for, and GitHub can refuse the request
+            // *because* of that conflict. The request still stands as a human
+            // asking: release the conflict so it is resolved now, and say so.
             let conflict_released = if release_deferred_conflict_on_refusal {
                 release_deferred_conflict_for_merge(
                     &work_db,
@@ -398,12 +442,19 @@ pub(super) async fn arm_direct_github_merge(req: DirectMergeArmRequest) {
             } else {
                 false
             };
+            // A released conflict becomes the standing request, which keeps
+            // what this request confirmed.
             let confirmation_kept = conflict_released
                 && work_db
                     .attach_confirmed_merge_revisions(&work_item_id, &pr_url, &confirmation)
                     .unwrap_or(false);
-            if !confirmation_kept && let Err(err) = work_db.forget_confirmed_merge_revisions(&confirmation) {
-                tracing::warn!(work_item_id = %work_item_id, ?err, "merge_when_ready: could not drop the refused request's confirmation");
+            if !confirmation_kept {
+                // The refused request never stood, so what it confirmed must
+                // not carry into a later one. Only this request's snapshot
+                // goes.
+                if let Err(err) = work_db.forget_confirmed_merge_revisions(&confirmation) {
+                    tracing::warn!(work_item_id = %work_item_id, ?err, "merge_when_ready: could not drop the refused request's confirmation");
+                }
             }
             if boss_engine_runtime::merge_mechanism::is_push_restriction_error(&message) {
                 let _ = work_db.create_attention_item(boss_work_db::CreateAttentionItemInput {
@@ -616,8 +667,48 @@ pub(super) async fn handle_trunk_queue_merge(
                     }
                     return;
                 }
+                Some(active)
+                    if retire_stale_and_retry
+                        && matches!(
+                            active.last_trunk_state.as_deref(),
+                            Some(boss_engine_merge_poller::trunk_merge::TRUNK_INTENT_WITHDRAW)
+                                | Some(boss_engine_merge_poller::trunk_merge::TRUNK_INTENT_SUPERSEDED_BY_CONFLICT)
+                        ) =>
+                {
+                    // Do not retire an intent whose `cancelPullRequest` is
+                    // still owed by the poller: if the replacement submit
+                    // failed and rolled back, Boss would stop tracking a PR
+                    // Trunk still holds.
+                    tracing::warn!(
+                        %work_item_id,
+                        %pr_url,
+                        intent_id = %active.id,
+                        last_trunk_state = ?active.last_trunk_state,
+                        outcome = "refused",
+                        "merge_when_ready: refusing to retire trunk intent while queue cancel is still pending",
+                    );
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: rebase_arm_error(
+                                after_rebase.as_ref(),
+                                "a previous queue withdrawal is still pending; try again shortly",
+                            ),
+                        },
+                    );
+                    return;
+                }
                 Some(active) if retire_stale_and_retry => {
-                    let _ = work_db.retire_trunk_merge_intent(&active.id, "cancelled");
+                    if let Err(err) = work_db.retire_trunk_merge_intent(&active.id, "cancelled") {
+                        tracing::warn!(
+                            %work_item_id,
+                            %pr_url,
+                            intent_id = %active.id,
+                            ?err,
+                            "merge_when_ready: failed to retire stale trunk merge intent before retry",
+                        );
+                    }
                     match work_db.insert_trunk_merge_intent(insert_input) {
                         Ok(Some(intent)) => intent,
                         _ => {
@@ -636,12 +727,24 @@ pub(super) async fn handle_trunk_queue_merge(
                     }
                 }
                 Some(active) => {
-                    // Duplicate click: never re-submit. "already in the queue"
-                    // only when the intent is still live there.
+                    // Duplicate click: an intent is already active for this
+                    // work item. Never re-submit — repeatedly POSTing the same
+                    // PR to Trunk is the hazard the guard exists to prevent.
+                    // The reply must still be honest: "already in the queue"
+                    // only when the intent is still live there; a
+                    // terminal/non-advancing state (e.g. `failed`) is a
+                    // refusal, not a success toast. Design: "a second merge
+                    // click on an already-active intent is a no-op that
+                    // re-reports current queue state".
                     reply_duplicate_trunk_merge_click(&sink, &request_id, work_item_id, pr_url, active);
                     return;
                 }
                 None => {
+                    // The insert reported a duplicate but no active row is
+                    // visible now (raced with the poller retiring it, or
+                    // `INSERT OR IGNORE` swallowed a genuine constraint
+                    // violation unrelated to the dedup index) — do not claim
+                    // success for a submission that never happened.
                     tracing::warn!(
                         %work_item_id,
                         %pr_url,

@@ -90,6 +90,10 @@ pub struct TrunkMergeIntentInsertInput {
     /// Set only by `boss_engine::trunk_queue_adopt`, to that check run's
     /// `completedAt` — see [`TrunkMergeIntent::adopted_at_check_completed_at`].
     pub adopted_at_check_completed_at: Option<String>,
+    /// Optional initial `last_trunk_state` written atomically in the same
+    /// `INSERT OR IGNORE` transaction (e.g. `TRUNK_INTENT_SUPERSEDED_BY_CONFLICT`
+    /// so the poller never observes a fresh intent with `NULL` state).
+    pub initial_trunk_state: Option<String>,
 }
 
 /// One `active` intent joined with the two facts about its task the
@@ -140,11 +144,13 @@ impl WorkDb {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let id = next_id("tmi");
         let now = now_string();
+        let initial_state_at = input.initial_trunk_state.as_ref().map(|_| now.as_str());
         let rows = tx.execute(
             "INSERT OR IGNORE INTO trunk_merge_intents
-                (id, work_item_id, pr_url, pr_number, repo, target_branch, status, submit_count, created_at,
+                (id, work_item_id, pr_url, pr_number, repo, target_branch, status,
+                 last_trunk_state, last_trunk_state_at, submit_count, created_at,
                  adopted_at_head_sha, adopted_at_check_completed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 1, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 1, ?9, ?10, ?11)",
             params![
                 id,
                 input.work_item_id,
@@ -152,6 +158,8 @@ impl WorkDb {
                 input.pr_number,
                 input.repo,
                 input.target_branch,
+                input.initial_trunk_state,
+                initial_state_at,
                 now,
                 input.adopted_at_head_sha,
                 input.adopted_at_check_completed_at,
@@ -753,5 +761,29 @@ mod tests {
         assert_eq!(row, ("cancelled".to_owned(), Some("cancelled".to_owned())));
         // The dedup slot is free: a fresh merge click can enqueue again.
         assert!(db.insert_trunk_merge_intent(input_for(&task_id)).unwrap().is_some());
+    }
+
+    #[test]
+    fn insert_can_atomically_set_initial_trunk_state() {
+        let db = test_db();
+        let (_, task_id) = seed_task(&db, "initial-state");
+        let intent = db
+            .insert_trunk_merge_intent(
+                TrunkMergeIntentInsertInput::builder()
+                    .work_item_id(task_id)
+                    .pr_url("https://github.com/brianduff/flunge/pull/978")
+                    .pr_number(978)
+                    .repo("brianduff/flunge")
+                    .target_branch("main")
+                    .initial_trunk_state(TRUNK_INTENT_SUPERSEDED_BY_CONFLICT)
+                    .build(),
+            )
+            .unwrap()
+            .expect("inserted");
+        assert_eq!(
+            intent.last_trunk_state.as_deref(),
+            Some(TRUNK_INTENT_SUPERSEDED_BY_CONFLICT)
+        );
+        assert!(intent.last_trunk_state_at.is_some());
     }
 }
