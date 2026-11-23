@@ -127,3 +127,52 @@ pub struct UsageWindowRecords {
     pub runs: Vec<UsageRunRecord>,
     pub tasks: Vec<UsageTaskRecord>,
 }
+
+/// One `work_executions` row that finished in the requested window.
+///
+/// Carried separately from [`UsageRunRecord`] because an execution can finish
+/// inside `[since, until)` while its run was created before `since` (or with
+/// no `work_runs` row at all). Drives `executions_completed` and
+/// `distinct_prs` in [`crate::series`].
+#[derive(Debug, Clone, PartialEq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct UsageExecutionRecord {
+    pub execution_id: String,
+    pub work_item_id: String,
+    pub execution_kind: String,
+    pub execution_status: String,
+    pub execution_created_at_epoch_s: i64,
+    pub execution_finished_at_epoch_s: i64,
+    pub execution_started_at_epoch_s: Option<i64>,
+    pub execution_pr_url: Option<String>,
+    pub execution_host_id: Option<String>,
+    /// Effective driver: the launch tuple when present, otherwise the slug
+    /// resolved for a NULL launch tuple, otherwise `None`.
+    pub driver: Option<String>,
+    #[builder(default = DriverSource::Unknown)]
+    pub driver_source: DriverSource,
+    /// `work_executions.model`: the model alias the execution launched with.
+    pub execution_model: Option<String>,
+    /// `work_executions.effort_level`: the effort the execution launched with.
+    pub execution_effort: Option<String>,
+}
+
+/// Everything the series builder needs for one window.
+///
+/// * `runs` holds every `work_runs` row created in `[since, until)` **plus**
+///   every all-time `work_runs` row belonging to the revision chain of any
+///   root task completed in `[since, until)` (so `tasks_completed_cost`
+///   includes out-of-window runs). The builder filters to `[since, until)` for
+///   bucket `measurement` and uses all chain runs for `tasks_completed_cost`.
+/// * `finished_executions` holds every `work_executions` row with
+///   `finished_at` in `[since, until)`.
+/// * `tasks` holds every task referenced by `runs` or `finished_executions`,
+///   every chain-root task completed in `[since, until)`, and every revision
+///   in those completed tasks' chains, each carrying its resolved
+///   `chain_root_id`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UsageSeriesRecords {
+    pub runs: Vec<UsageRunRecord>,
+    pub finished_executions: Vec<UsageExecutionRecord>,
+    pub tasks: Vec<UsageTaskRecord>,
+}

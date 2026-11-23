@@ -18,16 +18,8 @@ use type_imports::*;
 mod topics;
 pub use topics::*;
 
-/// Optional task-list predicates evaluated before transferring rows to clients.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct TaskListQuery {
-    /// Canonical task id or decimal short id, scoped by the request's product.
-    pub selector: Option<String>,
-    pub match_term: Option<String>,
-    #[serde(default)]
-    pub kinds: Vec<crate::TaskKind>,
-    pub created_since: Option<i64>,
-}
+mod envelope;
+pub use envelope::{FrontendEventEnvelope, FrontendRequestEnvelope, TaskListQuery, UnpopulatePreservedTask};
 
 fn default_pool_size() -> i64 {
     1
@@ -41,64 +33,6 @@ fn default_pool_size() -> i64 {
 /// lost probes, so an unspecified request must not opt into it by accident.
 fn default_probe_interrupt() -> bool {
     true
-}
-
-/// One task preserved (not deleted) by [`FrontendRequest::UnpopulateProject`]
-/// because it already had an execution — i.e. it was released and
-/// dispatched, so undoing the populate would destroy in-flight work.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UnpopulatePreservedTask {
-    pub id: String,
-    pub name: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FrontendRequestEnvelope {
-    pub request_id: String,
-    pub payload: FrontendRequest,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FrontendEventEnvelope {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub request_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub revision: Option<u64>,
-    pub payload: FrontendEvent,
-}
-
-impl FrontendEventEnvelope {
-    pub fn response(request_id: impl Into<String>, payload: FrontendEvent) -> Self {
-        Self {
-            request_id: Some(request_id.into()),
-            revision: None,
-            payload,
-        }
-    }
-
-    pub fn push(payload: FrontendEvent) -> Self {
-        Self {
-            request_id: None,
-            revision: None,
-            payload,
-        }
-    }
-
-    pub fn response_with_revision(request_id: impl Into<String>, revision: u64, payload: FrontendEvent) -> Self {
-        Self {
-            request_id: Some(request_id.into()),
-            revision: Some(revision),
-            payload,
-        }
-    }
-
-    pub fn push_with_revision(revision: u64, payload: FrontendEvent) -> Self {
-        Self {
-            request_id: None,
-            revision: Some(revision),
-            payload,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1037,6 +971,22 @@ pub enum FrontendRequest {
     /// rows` and the Token Usage window. The fields sit flat beside `type`; see
     /// [`crate::TokenUsageRowsRequest`]. Replies with [`FrontendEvent::TokenUsageRows`].
     GetTokenUsageRows(crate::TokenUsageRowsRequest),
+
+    /// Bucketed token usage over time with engine-computed normalizer ratios
+    /// (tokens per run, per completed execution, per active hour, per
+    /// completed task, per distinct PR) and honest range coverage. Read-only;
+    /// backs `boss cost series` and the Token Usage window's Over-time tab.
+    ///
+    /// Fold-in note (see `tools/boss/docs/designs/token-usage-window.md` §4):
+    /// when `GetMetricSeries` from the performance-metrics catalog lands,
+    /// `boss-usage-report`'s series builder maps onto `MetricSeriesReport`
+    /// (`measurement` → `Tokens`/`Usd`; counts and ratios → catalog series
+    /// over the same projection) without changing the builder or its tests.
+    /// Delete this variant only once the Over-time view consumes the catalog.
+    ///
+    /// The fields sit flat beside `type`; see [`crate::TokenUsageSeriesRequest`].
+    /// Replies with [`FrontendEvent::TokenUsageSeries`].
+    GetTokenUsageSeries(crate::TokenUsageSeriesRequest),
 
     /// The highest-token-cost runs recorded in `[since_epoch_s,
     /// until_epoch_s)`, ranked descending by total tokens. Read-only;

@@ -14,7 +14,10 @@
 use super::*;
 
 use boss_engine_storage_values::CostRunRecord;
-use boss_usage_report::{RecordedDriver, UsageRunRecord, UsageTaskRecord, UsageWindowRecords};
+use boss_protocol::DriverSource;
+use boss_usage_report::{
+    RecordedDriver, UsageExecutionRecord, UsageRunRecord, UsageSeriesRecords, UsageTaskRecord, UsageWindowRecords,
+};
 
 const COST_RECORD_COLUMNS: &str = "
     wr.id,
@@ -162,6 +165,14 @@ fn map_usage_run_record(row: &Row) -> rusqlite::Result<UsageRunRecord> {
 /// one bad row never makes the whole window unreadable.
 fn fill_resolved_drivers(db: &WorkDb, runs: &mut [UsageRunRecord]) {
     let mut resolved: HashMap<String, Option<String>> = HashMap::new();
+    fill_resolved_drivers_with_cache(db, runs, &mut resolved);
+}
+
+fn fill_resolved_drivers_with_cache(
+    db: &WorkDb,
+    runs: &mut [UsageRunRecord],
+    resolved: &mut HashMap<String, Option<String>>,
+) {
     for run in runs {
         if run.driver.slug().is_some() {
             continue;
@@ -185,6 +196,103 @@ fn fill_resolved_drivers(db: &WorkDb, runs: &mut [UsageRunRecord]) {
         };
     }
 }
+
+fn fill_resolved_execution_drivers_with_cache(
+    db: &WorkDb,
+    executions: &mut [UsageExecutionRecord],
+    resolved: &mut HashMap<String, Option<String>>,
+) {
+    for exec in executions {
+        if exec.driver.as_deref().is_some_and(|slug| !slug.is_empty()) {
+            continue;
+        }
+        if !resolved.contains_key(&exec.execution_id) {
+            let slug = match db.get_execution_driver_slug(&exec.execution_id) {
+                Ok(slug) => slug.filter(|s| !s.is_empty()),
+                Err(err) => {
+                    tracing::warn!(
+                        execution_id = %exec.execution_id,
+                        error = %format!("{err:#}"),
+                        "failed to resolve driver for usage report execution; leaving unknown"
+                    );
+                    None
+                }
+            };
+            resolved.insert(exec.execution_id.clone(), slug);
+        }
+        match resolved.get(&exec.execution_id).and_then(|slug| slug.as_deref()) {
+            Some(slug) => {
+                exec.driver = Some(slug.to_owned());
+                exec.driver_source = DriverSource::Resolved;
+            }
+            None => {
+                exec.driver = None;
+                exec.driver_source = DriverSource::Unknown;
+            }
+        }
+    }
+}
+
+/// Execution columns of [`UsageExecutionRecord`] in field order of
+/// [`map_usage_execution_record`].
+const USAGE_EXECUTION_COLUMNS: &str = "
+    we.id,
+    we.work_item_id,
+    we.kind,
+    we.status,
+    CAST(we.created_at AS INTEGER),
+    CAST(we.finished_at AS INTEGER),
+    CAST(we.started_at AS INTEGER),
+    we.pr_url,
+    we.host_id,
+    we.driver,
+    we.model,
+    we.effort_level
+";
+
+fn map_usage_execution_record(row: &Row) -> rusqlite::Result<UsageExecutionRecord> {
+    let driver: Option<String> = row.get(9)?;
+    let driver = driver.filter(|slug| !slug.is_empty());
+    let driver_source = if driver.is_some() {
+        DriverSource::LaunchTuple
+    } else {
+        DriverSource::Unknown
+    };
+    Ok(UsageExecutionRecord {
+        execution_id: row.get(0)?,
+        work_item_id: row.get(1)?,
+        execution_kind: row.get(2)?,
+        execution_status: row.get(3)?,
+        execution_created_at_epoch_s: row.get(4)?,
+        execution_finished_at_epoch_s: row.get(5)?,
+        execution_started_at_epoch_s: row.get(6)?,
+        execution_pr_url: row.get(7)?,
+        execution_host_id: row.get(8)?,
+        driver,
+        driver_source,
+        execution_model: row.get(10)?,
+        execution_effort: row.get(11)?,
+    })
+}
+
+/// Lean task projection for the series builder: omits the per-task all-time
+/// run-count subquery that only `boss cost rows` needs (`runs_outside_window`).
+const USAGE_SERIES_TASK_COLUMNS: &str = "
+    t.id,
+    t.name,
+    t.kind,
+    t.status,
+    t.product_id,
+    t.short_id,
+    p.name,
+    t.project_id,
+    pr.name,
+    t.pr_url,
+    CAST(t.completed_at AS INTEGER),
+    t.reasoning,
+    t.effort_level,
+    0
+";
 
 /// Task columns of [`UsageTaskRecord`] in field order of [`map_usage_task_record`],
 /// ending with the task's all-time run count.
@@ -370,6 +478,151 @@ impl WorkDb {
         }
         fill_resolved_drivers(self, &mut runs);
         Ok(UsageWindowRecords { runs, tasks })
+    }
+
+    /// Everything the series builder needs for `[since_epoch_s, until_epoch_s)`,
+    /// read in one snapshot:
+    ///
+    /// * every `work_runs` row created in `[since, until)` (seeking
+    ///   `work_runs_created_at_epoch_idx`),
+    /// * every `work_executions` row with `finished_at` in `[since, until)`
+    ///   (for `executions_completed` and `distinct_prs`),
+    /// * every chain-root task with `completed_at` in `[since, until)`, all of
+    ///   its descendant revisions (including legacy nested chains), and any
+    ///   out-of-window runs belonging to those chains so `tasks_completed_cost`
+    ///   carries the full inclusive cost whenever spent, and
+    /// * the task context (with resolved `chain_root_id`) for every referenced
+    ///   task.
+    ///
+    /// After the snapshot is released, NULL launch-tuple drivers are resolved
+    /// once per distinct execution across both runs and finished executions.
+    pub fn usage_series_records_for_window(
+        &self,
+        since_epoch_s: i64,
+        until_epoch_s: i64,
+    ) -> Result<UsageSeriesRecords> {
+        let mut runs;
+        let mut finished_executions;
+        let tasks;
+        {
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+
+            let run_sql = format!(
+                "SELECT {USAGE_RUN_COLUMNS}
+                 FROM work_runs wr
+                 JOIN work_executions we ON we.id = wr.execution_id
+                 WHERE CAST(wr.created_at AS INTEGER) >= ?1 AND CAST(wr.created_at AS INTEGER) < ?2
+                 ORDER BY CAST(wr.created_at AS INTEGER) ASC, wr.id ASC"
+            );
+            runs = tx
+                .prepare(&run_sql)?
+                .query_map(params![since_epoch_s, until_epoch_s], map_usage_run_record)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+
+            let exec_sql = format!(
+                "SELECT {USAGE_EXECUTION_COLUMNS}
+                 FROM work_executions we
+                 WHERE we.finished_at IS NOT NULL
+                   AND CAST(we.finished_at AS INTEGER) >= ?1
+                   AND CAST(we.finished_at AS INTEGER) < ?2
+                 ORDER BY CAST(we.finished_at AS INTEGER) ASC, we.id ASC"
+            );
+            finished_executions = tx
+                .prepare(&exec_sql)?
+                .query_map(params![since_epoch_s, until_epoch_s], map_usage_execution_record)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+
+            // All chain-root tasks completed in [since, until) plus every
+            // descendant revision in their chains. `UNION` deduplicates and
+            // guards against cycles.
+            let chain_members: Vec<(String, String)> = tx
+                .prepare(
+                    "WITH RECURSIVE chain(task_id, root_id) AS (
+                         SELECT t.id, t.id
+                         FROM tasks t
+                         WHERE t.completed_at IS NOT NULL
+                           AND CAST(t.completed_at AS INTEGER) >= ?1
+                           AND CAST(t.completed_at AS INTEGER) < ?2
+                           AND t.kind != 'revision'
+                         UNION
+                         SELECT r.id, c.root_id
+                         FROM tasks r
+                         JOIN chain c ON r.parent_task_id = c.task_id
+                         WHERE r.kind = 'revision'
+                     )
+                     SELECT task_id, root_id FROM chain",
+                )?
+                .query_map(params![since_epoch_s, until_epoch_s], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+
+            if !chain_members.is_empty() {
+                let mut chain_task_ids: Vec<&str> = chain_members.iter().map(|(id, _)| id.as_str()).collect();
+                chain_task_ids.sort_unstable();
+                chain_task_ids.dedup();
+                let extra_run_sql = format!(
+                    "SELECT {USAGE_RUN_COLUMNS}
+                     FROM work_runs wr
+                     JOIN work_executions we ON we.id = wr.execution_id
+                     WHERE we.work_item_id IN (SELECT value FROM json_each(?1))
+                       AND (CAST(wr.created_at AS INTEGER) < ?2 OR CAST(wr.created_at AS INTEGER) >= ?3)
+                     ORDER BY CAST(wr.created_at AS INTEGER) ASC, wr.id ASC"
+                );
+                let extra_runs = tx
+                    .prepare(&extra_run_sql)?
+                    .query_map(
+                        params![query_ensure::id_array(&chain_task_ids), since_epoch_s, until_epoch_s],
+                        map_usage_run_record,
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                runs.extend(extra_runs);
+            }
+
+            let mut work_item_ids: Vec<&str> = runs
+                .iter()
+                .map(|run| run.work_item_id.as_str())
+                .chain(finished_executions.iter().map(|exec| exec.work_item_id.as_str()))
+                .chain(chain_members.iter().map(|(id, _)| id.as_str()))
+                .chain(chain_members.iter().map(|(_, root)| root.as_str()))
+                .collect();
+            work_item_ids.sort_unstable();
+            work_item_ids.dedup();
+
+            let mut roots = chain_helpers::chain_roots(&tx, &work_item_ids)?;
+            for (task_id, root_id) in &chain_members {
+                roots.entry(task_id.clone()).or_insert_with(|| root_id.clone());
+            }
+            let mut task_ids: Vec<&str> = work_item_ids;
+            task_ids.extend(roots.values().map(String::as_str));
+            task_ids.sort_unstable();
+            task_ids.dedup();
+
+            let task_sql = format!(
+                "SELECT {USAGE_SERIES_TASK_COLUMNS}
+                 FROM tasks t
+                 LEFT JOIN products p ON p.id = t.product_id
+                 LEFT JOIN projects pr ON pr.id = t.project_id
+                 WHERE t.id IN (SELECT value FROM json_each(?1))
+                 ORDER BY t.id"
+            );
+            tasks = tx
+                .prepare(&task_sql)?
+                .query_map([query_ensure::id_array(&task_ids)], |row| {
+                    map_usage_task_record(row, &roots)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            tx.commit()?;
+        }
+        let mut resolved: HashMap<String, Option<String>> = HashMap::new();
+        fill_resolved_drivers_with_cache(self, &mut runs, &mut resolved);
+        fill_resolved_execution_drivers_with_cache(self, &mut finished_executions, &mut resolved);
+        Ok(UsageSeriesRecords {
+            runs,
+            finished_executions,
+            tasks,
+        })
     }
 
     /// Every `work_runs` row created in `[since_epoch_s, until_epoch_s)`,
@@ -1046,5 +1299,78 @@ mod tests {
         assert_eq!(ghost.runs_outside_window, 1);
         assert_eq!(ghost.revisions.len(), 1);
         assert!(ghost.inclusive.as_ref().unwrap().total_tokens > 0);
+    }
+
+    #[test]
+    fn usage_series_records_pull_out_of_window_chain_runs_for_tasks_completed_in_window() {
+        use boss_protocol::UsageBucketWidth;
+        use boss_usage_report::{UsageSeriesQuery, build_usage_series_report, note};
+
+        let (_dir, db) = open_db();
+        db.connect()
+            .unwrap()
+            .execute_batch(include_str!(env!("BOSS_USAGE_SEED_SQL")))
+            .expect("the seed fixture applies to a freshly migrated database");
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+
+        // 7-day window: task_seed_c_ghost_root completed 10h ago, while its own
+        // run (`run_seed_c0_1`) was 40 days ago (outside the 7d window!).
+        let since = now - 7 * 86_400;
+        let until = now + 86_400;
+        let records = db.usage_series_records_for_window(since, until).unwrap();
+        assert!(
+            records.runs.iter().any(|r| r.run_id == "run_seed_c0_1"),
+            "out-of-window root run must be pulled for attributed task cost"
+        );
+        let q = UsageSeriesQuery::builder()
+            .since_epoch_s(since)
+            .until_epoch_s(until)
+            .generated_at_epoch_s(now)
+            .capture_start_epoch_s(1_785_144_180)
+            .completed_at_start_epoch_s(1_782_805_232)
+            .retention_max_age_secs(14 * 86_400)
+            .bucket(UsageBucketWidth::Week)
+            .build();
+        let report = build_usage_series_report(&q, &records, None);
+        assert!(!report.buckets.is_empty());
+        // Grok + Antigravity both lack agent_active_ms in the seed fixture -> 2 excluded.
+        assert_eq!(report.coverage.runs_excluded_from_active_hour, 2);
+        assert!(
+            report
+                .coverage
+                .notes
+                .iter()
+                .any(|n| n.code == note::ACTIVE_TIME_MISSING)
+        );
+        let total_completed_task_runs: u32 = report
+            .buckets
+            .iter()
+            .flat_map(|b| b.cells.iter())
+            .map(|c| c.tasks_completed_cost.runs_total)
+            .sum();
+        let total_window_runs: u32 = report
+            .buckets
+            .iter()
+            .flat_map(|b| b.cells.iter())
+            .map(|c| c.measurement.runs_total)
+            .sum();
+        // Window has 18 runs (all 20 minus pre-capture h1 and 40d-old c0).
+        // Completed tasks in 7d include ghost_root (which pulls in c0!).
+        assert_eq!(total_window_runs, 18);
+        assert!(
+            total_completed_task_runs > 0,
+            "completed tasks in 7d must carry attributed chain runs"
+        );
+        // Specifically verify ghost_root's out-of-window run (750,800 tokens) is
+        // included in tasks_completed_cost across the 7d window.
+        let completed_tasks_total: u32 = report
+            .buckets
+            .iter()
+            .flat_map(|b| b.cells.iter())
+            .map(|c| c.tasks_completed)
+            .sum();
+        // 13 seed tasks total: 3 are revisions (b_rev1, b_rev2, c_ghost_rev),
+        // 1 completed pre-capture (h_precapture) => 9 completed chain-root tasks in 7d.
+        assert_eq!(completed_tasks_total, 9);
     }
 }

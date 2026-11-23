@@ -37,14 +37,23 @@ pub const DEFAULT_RUN_CAP: u32 = 5_000;
 /// Grouping depth the reply shape supports: the outer level and one subgroup level.
 pub const MAX_GROUP_LEVELS: usize = 2;
 
-/// Note codes on [`UsageCoverage::notes`].
+/// Note codes on [`UsageCoverage::notes`] and [`boss_protocol::UsageSeriesCoverage::notes`].
 pub mod note {
     /// The window starts before per-run token capture began.
     pub const CAPTURE_STARTED: &str = "capture_started";
+    /// A grouped dimension or derived metric (`tasks.completed_at`) only has
+    /// meaningful history starting at `epoch_s`.
+    pub const DIMENSION_STARTED: &str = "dimension_started";
     /// The window starts before the failed-execution retention bound.
     pub const RETENTION_BOUNDED: &str = "retention_bounded";
     /// A USD estimate left some models out.
     pub const PRICING_GAPS: &str = "pricing_gaps";
+    /// The engine coarsened the requested or default bucket width to stay
+    /// within the reply cell cap.
+    pub const BUCKET_COARSENED: &str = "bucket_coarsened";
+    /// One or more measured runs lacked `agent_active_ms` (e.g. Grok) and were
+    /// excluded from both numerator and denominator of `tokens_per_active_hour`.
+    pub const ACTIVE_TIME_MISSING: &str = "active_time_missing";
 }
 
 /// What a rows request asks for, plus the engine constants the report
@@ -217,7 +226,7 @@ fn spend_class_buckets(runs: &[&RunFacts<'_>]) -> Vec<CostBucket> {
 /// filters on the same dimension union their values (OR within one
 /// dimension), matching the wire contract and a client that sends one chip
 /// row per value. Distinct dimensions still AND.
-fn compile_filters(filters: &[UsageFilter]) -> Vec<(UsageDimension, HashSet<&str>)> {
+pub(crate) fn compile_filters(filters: &[UsageFilter]) -> Vec<(UsageDimension, HashSet<&str>)> {
     let mut by_dimension: BTreeMap<UsageDimension, HashSet<&str>> = BTreeMap::new();
     for filter in filters {
         if filter.values.is_empty() {
@@ -231,7 +240,7 @@ fn compile_filters(filters: &[UsageFilter]) -> Vec<(UsageDimension, HashSet<&str
     by_dimension.into_iter().collect()
 }
 
-fn passes_filters(
+pub(crate) fn passes_filters(
     facts: &RunFacts<'_>,
     filters: &[(UsageDimension, HashSet<&str>)],
     skip: Option<UsageDimension>,
@@ -277,7 +286,7 @@ fn dimension_values(
 /// Distinct models a requested USD estimate left out, among measured runs.
 /// Subscription-billed drivers (`subscription_unpriced`) are excluded by driver
 /// rather than a pricing gap, so they are omitted.
-fn pricing_gaps(runs: &[&RunFacts<'_>]) -> BTreeSet<String> {
+pub(crate) fn pricing_gaps(runs: &[&RunFacts<'_>]) -> BTreeSet<String> {
     runs.iter()
         .filter(|facts| {
             facts.coverage != RunCoverage::Unmeasured

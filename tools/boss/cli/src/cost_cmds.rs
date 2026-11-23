@@ -4,6 +4,229 @@
 
 use crate::*;
 
+#[derive(Debug, Subcommand)]
+pub(crate) enum CostCommand {
+    /// Compare Sol-eligible PRs by Sol/Astra arm, including revisions and retries.
+    Sol,
+    /// Token cost for one work item, aggregated across every execution
+    /// and run it has ever had. The natural companion to `boss task
+    /// show` / `boss chore show`.
+    Task(CostTaskArgs),
+    /// Token cost recorded in a time window, broken down by execution
+    /// kind, model, reasoning mode, and effort level — the groupings
+    /// that answer "where did the budget go."
+    Window(CostWindowArgs),
+    /// The highest-token-cost runs recorded in a time window, ranked
+    /// descending.
+    Top(CostTopArgs),
+    /// Run-grain token usage in a time window as a task → execution → run
+    /// tree with the driver and model each execution and run used. Every
+    /// figure is computed by the engine; runs with no recorded tokens are
+    /// shown as unknown, never as zero. A task's revisions roll up under its
+    /// chain root: the root shows its own tokens and the chain's inclusive
+    /// total, and list totals count each run once.
+    Rows(CostRowsArgs),
+    /// Bucketed token usage over time with engine-computed normalizer ratios
+    /// (tokens per run, per completed execution, per active hour, per
+    /// completed task, per distinct PR) and range coverage notes.
+    Series(CostSeriesArgs),
+}
+
+/// How deep `boss cost rows` prints the tree in text mode (`--json` is always
+/// the whole reply).
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub(crate) enum UsageDepth {
+    Task,
+    Execution,
+    Run,
+}
+
+/// Parse `DIMENSION=VALUE[,VALUE…]` for `--filter`.
+pub(crate) fn parse_usage_filter(input: &str) -> Result<boss_protocol::UsageFilter, String> {
+    let (dimension, values) = input
+        .split_once('=')
+        .ok_or_else(|| format!("expected DIMENSION=VALUE[,VALUE…], got {input:?}"))?;
+    let values: Vec<String> = values
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if values.is_empty() {
+        return Err(format!("--filter {dimension} needs at least one value"));
+    }
+    Ok(boss_protocol::UsageFilter {
+        dimension: dimension.trim().parse()?,
+        values,
+    })
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct CostTaskArgs {
+    /// Task/chore id. Accepts: primary id (`task_…`), friendly short id
+    /// (case-insensitive `t`-prefixed form, `42`, or `#42`), or
+    /// cross-product form (`boss/42` or `boss/#42`). Globally unique
+    /// short ids resolve without `--product`.
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
+    pub(crate) id: String,
+
+    /// Resolve a friendly short id (`42` or `#42`) against this product
+    /// (slug or id). Optional when the short id is globally unique.
+    /// Ignored when the selector already embeds a product slug or is a
+    /// primary id.
+    #[arg(long)]
+    pub(crate) product: Option<String>,
+
+    /// Include an estimated USD figure alongside the token totals,
+    /// priced from `boss-engine`'s human-maintained pricing table
+    /// (`tools/boss/engine/core/src/cost_pricing.rs`). Always labelled
+    /// as an estimate in the output — never billing truth.
+    #[arg(long)]
+    pub(crate) usd: bool,
+
+    /// Print report timestamps in UTC instead of this host's local time.
+    #[arg(long)]
+    pub(crate) utc: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct CostWindowArgs {
+    /// Start of the window: an RFC3339 timestamp (e.g.
+    /// `2026-07-01T00:00:00Z`) or a relative duration ago (`24h`, `7d`,
+    /// `2w`).
+    #[arg(long)]
+    pub(crate) since: String,
+
+    /// End of the window, same accepted formats as `--since`. Defaults
+    /// to now.
+    #[arg(long)]
+    pub(crate) until: Option<String>,
+
+    /// Include an estimated USD figure alongside the token totals. See
+    /// `boss cost task --usd`'s help for the pricing-table caveat.
+    #[arg(long)]
+    pub(crate) usd: bool,
+
+    /// Print report timestamps in UTC instead of this host's local time.
+    #[arg(long)]
+    pub(crate) utc: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct CostTopArgs {
+    /// Start of the window: an RFC3339 timestamp (e.g.
+    /// `2026-07-01T00:00:00Z`) or a relative duration ago (`24h`, `7d`,
+    /// `2w`).
+    #[arg(long)]
+    pub(crate) since: String,
+
+    /// End of the window, same accepted formats as `--since`. Defaults
+    /// to now.
+    #[arg(long)]
+    pub(crate) until: Option<String>,
+
+    /// How many of the highest-token-cost runs to return.
+    #[arg(long, default_value_t = 20)]
+    pub(crate) limit: u32,
+
+    /// Include an estimated USD figure alongside the token totals. See
+    /// `boss cost task --usd`'s help for the pricing-table caveat.
+    #[arg(long)]
+    pub(crate) usd: bool,
+
+    /// Print report timestamps in UTC instead of this host's local time.
+    #[arg(long)]
+    pub(crate) utc: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct CostRowsArgs {
+    /// Start of the window: an RFC3339 timestamp (e.g.
+    /// `2026-07-01T00:00:00Z`) or a relative duration ago (`24h`, `7d`,
+    /// `2w`).
+    #[arg(long)]
+    pub(crate) since: String,
+
+    /// End of the window, same accepted formats as `--since`. Defaults
+    /// to now.
+    #[arg(long)]
+    pub(crate) until: Option<String>,
+
+    /// Group runs by up to two dimensions, outermost first (e.g.
+    /// `driver,model`). Dimensions: product, project, task_kind,
+    /// execution_kind, spend_class, driver, model, effort, reasoning,
+    /// task_status, execution_status, coverage, host. Reasoning is the task's
+    /// current setting; the launch tuple does not record it.
+    #[arg(long, value_delimiter = ',', value_name = "DIMENSION")]
+    pub(crate) group_by: Vec<boss_protocol::UsageDimension>,
+
+    /// Keep runs whose value for DIMENSION is one of the listed values, e.g.
+    /// `--filter driver=claude,codex`. Repeat to filter on several
+    /// dimensions: filters AND across dimensions and OR within one.
+    /// Repeating the same dimension unions its values, so
+    /// `--filter driver=claude --filter driver=codex` equals
+    /// `--filter driver=claude,codex`.
+    #[arg(long = "filter", value_name = "DIMENSION=VALUE[,VALUE…]", value_parser = parse_usage_filter)]
+    pub(crate) filters: Vec<boss_protocol::UsageFilter>,
+
+    /// List revisions as top-level rows instead of nesting them under
+    /// their chain root.
+    #[arg(long)]
+    pub(crate) no_roll_up: bool,
+
+    /// How deep the text output goes. `--json` always carries every level.
+    #[arg(long, value_enum, default_value_t = UsageDepth::Execution)]
+    pub(crate) depth: UsageDepth,
+
+    /// Include an estimated USD figure alongside the token totals. See
+    /// `boss cost task --usd`'s help for the pricing-table caveat; Grok and
+    /// Antigravity are subscription-billed and never priced.
+    #[arg(long)]
+    pub(crate) usd: bool,
+
+    /// Print report timestamps in UTC instead of this host's local time.
+    #[arg(long)]
+    pub(crate) utc: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct CostSeriesArgs {
+    /// Start of the window: an RFC3339 timestamp (e.g.
+    /// `2026-07-01T00:00:00Z`) or a relative duration ago (`24h`, `7d`,
+    /// `90d`).
+    #[arg(long)]
+    pub(crate) since: String,
+
+    /// End of the window, same accepted formats as `--since`. Defaults
+    /// to now.
+    #[arg(long)]
+    pub(crate) until: Option<String>,
+
+    /// Bucket width: `hour`, `day`, `week`, or `month`. Omitted lets the
+    /// engine choose from the window span and coarsen at the 5,000-cell cap.
+    #[arg(long, value_name = "WIDTH")]
+    pub(crate) bucket: Option<boss_protocol::UsageBucketWidth>,
+
+    /// Group series cells by one dimension (e.g. `driver`, `model`, `effort`).
+    #[arg(long, value_name = "DIMENSION")]
+    pub(crate) group_by: Option<boss_protocol::UsageDimension>,
+
+    /// Keep facts whose value for DIMENSION is one of the listed values, e.g.
+    /// `--filter driver=claude,codex`. Repeat to filter on several dimensions
+    /// (AND across dimensions, OR within one).
+    #[arg(long = "filter", value_name = "DIMENSION=VALUE[,VALUE…]", value_parser = parse_usage_filter)]
+    pub(crate) filters: Vec<boss_protocol::UsageFilter>,
+
+    /// Include an estimated USD figure alongside the token totals. Always
+    /// labelled as an estimate; Grok and Antigravity are never priced.
+    #[arg(long)]
+    pub(crate) usd: bool,
+
+    /// Print report timestamps in UTC instead of this host's local time.
+    #[arg(long)]
+    pub(crate) utc: bool,
+}
+
 pub(crate) async fn run_cost_command(command: CostCommand, ctx: &RunContext) -> Result<(), CliError> {
     let mut client = connect_for_work(ctx).await?;
     match command {
@@ -116,6 +339,33 @@ pub(crate) async fn run_cost_command(command: CostCommand, ctx: &RunContext) -> 
             let tz = resolve_display_tz(args.utc);
             print_entity(ctx, &serde_json::json!({ "report": report }), || {
                 print_usage_rows_report(&report, args.depth, args.usd, &tz)
+            })
+        }
+        CostCommand::Series(args) => {
+            let (since_epoch_s, until_epoch_s) = resolve_window(&args.since, args.until.as_deref())?;
+            let response = client
+                .send_request(&FrontendRequest::GetTokenUsageSeries(
+                    boss_protocol::TokenUsageSeriesRequest {
+                        since_epoch_s,
+                        until_epoch_s,
+                        bucket: args.bucket,
+                        group_by: args.group_by,
+                        filters: args.filters.clone(),
+                        estimate_usd: args.usd,
+                    },
+                ))
+                .await
+                .map_err(CliError::internal)?;
+            let report = match response {
+                FrontendEvent::TokenUsageSeries { report } => report,
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    return Err(CliError::application(message));
+                }
+                other => return Err(unexpected_event("cost series", &other)),
+            };
+            let tz = resolve_display_tz(args.utc);
+            print_entity(ctx, &serde_json::json!({ "report": report }), || {
+                print_usage_series_report(&report, args.usd, &tz)
             })
         }
         CostCommand::Top(args) => {
@@ -716,6 +966,165 @@ fn format_optional_average(value: Option<f64>) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
+// ── `boss cost series` ────────────────────────────────────────────────
+
+fn format_bucket_width_secs(bucket_secs: i64) -> String {
+    match bucket_secs {
+        3_600 => "hour (3,600s)".to_owned(),
+        86_400 => "day (86,400s)".to_owned(),
+        604_800 => "week (604,800s)".to_owned(),
+        2_592_000 => "month (2,592,000s)".to_owned(),
+        other => format!("{other}s"),
+    }
+}
+
+fn format_optional_ratio(value: Option<f64>) -> String {
+    match value {
+        Some(v) => format_tokens(v.round() as i64),
+        None => "—".to_owned(),
+    }
+}
+
+fn format_optional_share(value: Option<f64>) -> String {
+    match value {
+        Some(v) => format!("{:.1}%", v * 100.0),
+        None => "—".to_owned(),
+    }
+}
+
+fn series_table_rows(report: &boss_protocol::TokenUsageSeriesReport, usd: bool, tz: &DisplayTz) -> Vec<Vec<String>> {
+    let grouped = report.group_by.is_some();
+    let mut rows = Vec::new();
+    for bucket in &report.buckets {
+        let stamp = format_epoch(bucket.start_epoch_s, tz);
+        for cell in &bucket.cells {
+            let tokens = if cell.measurement.runs_total == 0 {
+                "—".to_owned()
+            } else {
+                format_measurement_tokens(&cell.measurement)
+            };
+            let mut row = vec![stamp.clone()];
+            if grouped {
+                let label = report
+                    .group_labels
+                    .get(&cell.group)
+                    .cloned()
+                    .unwrap_or_else(|| cell.group.clone());
+                row.push(label);
+            }
+            row.extend([
+                tokens,
+                format!("{}/{}", cell.measurement.runs_measured, cell.measurement.runs_total),
+                cell.executions_completed.to_string(),
+                cell.tasks_completed.to_string(),
+                cell.distinct_prs.to_string(),
+                format_optional_ratio(cell.ratios.tokens_per_run),
+                format_optional_ratio(cell.ratios.tokens_per_completed_execution),
+                format_optional_ratio(cell.ratios.tokens_per_active_hour),
+                format_optional_ratio(cell.ratios.tokens_per_completed_task),
+                format_optional_ratio(cell.ratios.tokens_per_pr),
+            ]);
+            if grouped {
+                row.push(format_optional_share(cell.share_of_bucket_total_tokens));
+            }
+            if usd {
+                let cell_usd = match cell.measurement.estimated_usd {
+                    Some(v) if cell.measurement.estimated_usd_partial => {
+                        format!("{} (partial)", format_usd_estimate(v))
+                    }
+                    Some(v) => format_usd_estimate(v),
+                    None => "—".to_owned(),
+                };
+                row.push(cell_usd);
+            }
+            rows.push(row);
+        }
+    }
+    rows
+}
+
+fn print_usage_series_report(report: &boss_protocol::TokenUsageSeriesReport, usd: bool, tz: &DisplayTz) {
+    println!(
+        "Token usage series from {} to {} ({}), bucket {}",
+        format_epoch(report.since_epoch_s, tz),
+        format_epoch(report.until_epoch_s, tz),
+        tz.label,
+        format_bucket_width_secs(report.bucket_secs),
+    );
+    if let Some(dim) = report.group_by {
+        println!("  Grouped by {dim}.");
+    }
+    if report.spans_capture_boundary {
+        println!();
+        println!(
+            "  WARNING: this window starts before per-run token capture began ({}). Runs before that \
+             instant have no recorded tokens — buckets before that point are a FLOOR, not a complete total.",
+            format_epoch(report.capture_start_epoch_s, tz),
+        );
+    }
+    println!();
+    if let Some(data_from) = report.coverage.data_from_epoch_s {
+        println!("  Data from: {}", format_epoch(data_from, tz));
+    } else {
+        println!("  Data from: none (no facts in window)");
+    }
+    if let Some(dim_from) = report.coverage.dimension_from_epoch_s {
+        println!("  Dimension from: {}", format_epoch(dim_from, tz));
+    }
+    if !report.coverage.by_caveat.is_empty() {
+        let counted: Vec<String> = report
+            .coverage
+            .by_caveat
+            .iter()
+            .map(|caveat| format!("{} ×{}", caveat.code, caveat.runs))
+            .collect();
+        println!("  Caveats: {}", counted.join(", "));
+    }
+    for note in &report.coverage.notes {
+        if let Some(epoch_s) = note.epoch_s {
+            println!(
+                "  NOTE ({} @ {}): {}",
+                note.code,
+                format_epoch(epoch_s, tz),
+                note.detail
+            );
+        } else {
+            println!("  NOTE ({}): {}", note.code, note.detail);
+        }
+    }
+    print_pricing_gaps(&report.pricing_gaps);
+
+    let rows = series_table_rows(report, usd, tz);
+    println!();
+    if rows.is_empty() {
+        println!("  (no buckets with facts in this window)");
+        return;
+    }
+    let grouped = report.group_by.is_some();
+    let mut headers = vec!["BUCKET"];
+    if grouped {
+        headers.push("GROUP");
+    }
+    headers.extend([
+        "TOKENS", "RUNS", "EXECS", "TASKS", "PRS", "TOK/RUN", "TOK/EXEC", "TOK/HR", "TOK/TASK", "TOK/PR",
+    ]);
+    if grouped {
+        headers.push("SHARE");
+    }
+    if usd {
+        headers.push("USD (EST)");
+    }
+    let mut table = new_dynamic_table(headers);
+    for row in rows {
+        table.add_row(row);
+    }
+    print_table(table);
+    if usd {
+        println!();
+        println!("  USD figures: (ESTIMATE, not billing truth)");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -946,5 +1355,66 @@ mod tests {
         assert_eq!(format_optional_tokens(None), "unknown");
         assert_eq!(format_optional_tokens(Some(0)), "0");
         assert_eq!(format_token_total(12, true), "12 (partial)");
+    }
+
+    #[test]
+    fn series_table_renders_unknown_and_missing_ratios_as_dashes_never_zero() {
+        let mut partial_m = measurement(2, 2, 3_000);
+        partial_m.tokens_partial = true;
+        let unmeasured_m = measurement(1, 0, 0);
+        let report = boss_protocol::TokenUsageSeriesReport::builder()
+            .bucket_secs(86_400)
+            .capture_start_epoch_s(1_785_144_180)
+            .coverage(boss_protocol::UsageSeriesCoverage::builder().build())
+            .generated_at_epoch_s(1_790_121_600)
+            .since_epoch_s(1_790_035_200)
+            .spans_capture_boundary(false)
+            .until_epoch_s(1_790_121_600)
+            .group_by(boss_protocol::UsageDimension::Driver)
+            .groups(vec!["claude".into(), "grok".into()])
+            .buckets(vec![boss_protocol::UsageBucket {
+                start_epoch_s: 1_790_035_200,
+                cells: vec![
+                    boss_protocol::UsageCell::builder()
+                        .distinct_prs(1)
+                        .executions_completed(2)
+                        .group("claude")
+                        .measurement(partial_m)
+                        .ratios(
+                            boss_protocol::UsageRatios::builder()
+                                .tokens_per_run(1_500.0)
+                                .tokens_per_completed_execution(1_500.0)
+                                .tokens_per_pr(3_000.0)
+                                .build(),
+                        )
+                        .tasks_completed(0)
+                        .tasks_completed_cost(measurement(0, 0, 0))
+                        .share_of_bucket_total_tokens(1.0)
+                        .build(),
+                    boss_protocol::UsageCell::builder()
+                        .distinct_prs(0)
+                        .executions_completed(0)
+                        .group("grok")
+                        .measurement(unmeasured_m)
+                        .ratios(boss_protocol::UsageRatios::default())
+                        .tasks_completed(0)
+                        .tasks_completed_cost(measurement(0, 0, 0))
+                        .build(),
+                ],
+            }])
+            .build();
+        let tz = resolve_display_tz(true);
+        let rows = series_table_rows(&report, false, &tz);
+        assert_eq!(rows.len(), 2);
+        let claude = rows[0].join(" | ");
+        assert!(claude.contains("3,000 (partial)"), "{claude}");
+        assert!(claude.contains("100.0%"), "{claude}");
+        assert!(claude.contains("—"), "missing ratios print as dash: {claude}");
+        let grok = rows[1].join(" | ");
+        assert!(grok.contains("unknown"), "unmeasured bucket prints unknown: {grok}");
+        assert!(
+            !grok.contains("| 0.0%"),
+            "unmeasured group never gets 0.0% share: {grok}"
+        );
     }
 }
