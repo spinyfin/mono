@@ -901,7 +901,13 @@ async fn grok_missing_turn_completed_reaps_after_bound_with_specific_reason() {
     let log_start = buffer.lock().len();
 
     let (state, dir) = test_server_state();
-    state.set_grok_teardown_settle_window_for_test(Duration::from_millis(120));
+    // The settle deadline covers driver lookup (spawn_blocking), the first
+    // transcript poll, the interrupt send, and the wait for turn_completed.
+    // 120ms is enough on an idle host and failed in CI when lookup queued
+    // behind other blocking work, so Escape never left. Keep this well under
+    // the 5s production bound while leaving room for that lookup.
+    let settle_window = Duration::from_millis(500);
+    state.set_grok_teardown_settle_window_for_test(settle_window);
     let db = state.work_db.as_ref();
     let product_id = create_product(db);
     let work_item_id = create_active_chore(db, &product_id, "grok silent timeout");
@@ -959,14 +965,21 @@ async fn grok_missing_turn_completed_reaps_after_bound_with_specific_reason() {
         PaneReleaseOutcome::Reaped
     );
     let elapsed = started.elapsed();
+    let escape_at = runner
+        .recorded_escape_at()
+        .expect("Escape must be sent before the settle bound expires");
+    let kill_at = runner.recorded_kill_at().expect("kill-session timestamp recorded");
+    let waited_after_escape = kill_at.saturating_duration_since(escape_at);
 
     assert!(
-        elapsed >= Duration::from_millis(100),
-        "teardown should wait out the bounded settle window when turn_completed never arrives (elapsed={elapsed:?})"
+        waited_after_escape >= Duration::from_millis(80),
+        "teardown should wait out the bounded settle window after cancelling when turn_completed never arrives \
+         (waited_after_escape={waited_after_escape:?}, elapsed={elapsed:?})"
     );
     assert!(
-        elapsed < Duration::from_millis(800),
-        "teardown must stay inside the advertised settle bound even when Grok never responds (elapsed={elapsed:?})"
+        elapsed < Duration::from_secs(2),
+        "teardown must stay far inside the 5s production settle bound even when Grok never responds \
+         (elapsed={elapsed:?})"
     );
     assert!(db.tmux_identity_for_execution(&execution_id).unwrap().is_none());
     assert_eq!(pool.idle_count().await, 1, "slot must be released after bound");
