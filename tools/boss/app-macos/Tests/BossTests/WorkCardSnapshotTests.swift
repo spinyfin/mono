@@ -1324,10 +1324,10 @@ final class WorkCardSnapshotTests: XCTestCase {
     /// `WorkTask.isMergeWhenReadyEligible` is the single shared predicate
     /// both the card's snapshot builder (`showsMergeWhenReady`) and
     /// `ReviewGuideViewerHeader` gate the Merge When Ready control on. A
-    /// task only routed into the Review column because it is `blocked` on a
-    /// review-phase reason (`isReviewPhaseBlocked`) must never be eligible,
-    /// even though its `boardColumn` is `.review` — the card deliberately
-    /// hides the control for exactly this case.
+    /// task only routed into the Review column because it is `blocked` on
+    /// `ci_failure` / `ci_failure_exhausted` is eligible (Merge rebases a
+    /// behind-base branch). Other review-phase blocks must not be eligible,
+    /// even though their `boardColumn` is `.review`.
     func testIsMergeWhenReadyEligibleMatchesCardGate() {
         let eligible = Self.makeTask(status: "in_review", prURL: "https://github.com/x/y/pull/3")
         XCTAssertEqual(eligible.boardColumn, .review)
@@ -1336,14 +1336,22 @@ final class WorkCardSnapshotTests: XCTestCase {
         var blockedOnCIFailure = Self.makeTask(status: "blocked", prURL: "https://github.com/x/y/pull/3")
         blockedOnCIFailure.blockedReason = "ci_failure"
         XCTAssertEqual(blockedOnCIFailure.boardColumn, .review, "blocked-for-review-reason routes into Review")
-        XCTAssertFalse(
+        XCTAssertTrue(
             blockedOnCIFailure.isMergeWhenReadyEligible,
-            "a task the card refuses to offer merge for must not be eligible in the viewer either"
+            "CI-blocked Review cards must offer Merge so the engine can rebase a behind-base branch"
         )
+
+        var blockedOnCIFailureExhausted = Self.makeTask(status: "blocked", prURL: "https://github.com/x/y/pull/3")
+        blockedOnCIFailureExhausted.blockedReason = "ci_failure_exhausted"
+        XCTAssertTrue(blockedOnCIFailureExhausted.isMergeWhenReadyEligible)
 
         var blockedOnMergeConflict = Self.makeTask(status: "blocked", prURL: "https://github.com/x/y/pull/3")
         blockedOnMergeConflict.blockedReason = "merge_conflict"
         XCTAssertFalse(blockedOnMergeConflict.isMergeWhenReadyEligible)
+
+        var blockedOnReviewFeedback = Self.makeTask(status: "blocked", prURL: "https://github.com/x/y/pull/3")
+        blockedOnReviewFeedback.blockedReason = "review_feedback"
+        XCTAssertFalse(blockedOnReviewFeedback.isMergeWhenReadyEligible)
 
         let noPRURL = Self.makeTask(status: "in_review", prURL: nil)
         XCTAssertFalse(noPRURL.isMergeWhenReadyEligible)
@@ -1351,6 +1359,11 @@ final class WorkCardSnapshotTests: XCTestCase {
         var alreadyQueued = Self.makeTask(status: "in_review", prURL: "https://github.com/x/y/pull/3")
         alreadyQueued.mergeQueueState = "queued"
         XCTAssertFalse(alreadyQueued.isMergeWhenReadyEligible)
+
+        var ciBlockedAlreadyQueued = Self.makeTask(status: "blocked", prURL: "https://github.com/x/y/pull/3")
+        ciBlockedAlreadyQueued.blockedReason = "ci_failure"
+        ciBlockedAlreadyQueued.mergeQueueState = "queued"
+        XCTAssertFalse(ciBlockedAlreadyQueued.isMergeWhenReadyEligible)
     }
 
     /// `workCardSnapshot` gates Merge When Ready on the *effective* column

@@ -760,16 +760,16 @@ final class MarkdownDocumentChromeTests: XCTestCase {
     }
 
     /// A task routed into Review only because it is `blocked` on a
-    /// review-phase reason (`ci_failure`) must not render the Merge When
-    /// Ready control — `WorkTask.isMergeWhenReadyEligible` is `false` here
-    /// even though `boardColumn == .review`, and the header must be
-    /// narrower than the same task made eligible, since the control is the
-    /// only thing in the header's trailing `HStack` slot.
+    /// non-CI review-phase reason (`merge_conflict`) must not render the
+    /// Merge When Ready control — `WorkTask.isMergeWhenReadyEligible` is
+    /// `false` here even though `boardColumn == .review`, and the header
+    /// must be narrower than the same task made eligible, since the
+    /// control is the only thing in the header's trailing `HStack` slot.
     func testReviewGuideViewerHeaderHidesMergeControlWhenReviewPhaseBlocked() {
         let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
         var blocked = Self.makeReviewGuideTestTask(id: "task_1")
         blocked.status = "blocked"
-        blocked.blockedReason = "ci_failure"
+        blocked.blockedReason = "merge_conflict"
         XCTAssertEqual(blocked.boardColumn, .review)
         XCTAssertFalse(blocked.isMergeWhenReadyEligible)
         model.taskIndexByID = [blocked.id: blocked]

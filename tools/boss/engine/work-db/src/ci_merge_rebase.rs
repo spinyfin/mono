@@ -1,9 +1,9 @@
 //! Durable tracking for a Merge click on a `blocked: ci_failure` /
 //! `blocked: ci_failure_exhausted` card whose branch was behind its base.
 //!
-//! When the repo owner clicks Merge on such a card, the engine rebases the PR
-//! branch onto its base via the existing mechanical rebase rung and arms the
-//! merge (`gh pr merge --auto --squash` or Trunk merge queue). This table
+//! A Merge click on such a card rebases the PR branch onto its base via the
+//! existing mechanical rebase rung and arms the merge (`gh pr merge --auto
+//! --squash` or Trunk merge queue). This table
 //! records that one-shot rebase so the merge poller can:
 //!
 //! - ignore stale failing probes that still describe the pre-rebase head;
@@ -130,8 +130,9 @@ impl WorkDb {
     /// 1. Deletes the `ci_merge_rebases` row (one-shot; prevents rebase loops).
     /// 2. Transitions any active GitHub merge intent for `(work_item_id, pr_url)`
     ///    to `disarm_pending` so the merge poller turns off auto-merge.
-    /// 3. Cancels any active Trunk merge intent for `work_item_id` so the card
-    ///    does not remain queued on a failing head.
+    /// 3. Marks any active Trunk merge intent `boss:withdraw` so the queue
+    ///    poller calls `cancelPullRequest` and retires the intent only after
+    ///    Trunk confirms — the card must not stay in Trunk's queue untracked.
     /// 4. Clears `merge_queue_state` and records a visible paused-merge detail
     ///    carrying `reason`.
     /// 5. If `clear_pre_rebase_block` is true and the task is still in a stale
@@ -164,11 +165,7 @@ impl WorkDb {
               WHERE work_item_id = ?1 AND pr_url = ?2 AND status = 'active'",
             params![work_item_id, pr_url, crate::merge_conflict_merging::DISARM_PENDING],
         )?;
-        tx.execute(
-            "UPDATE trunk_merge_intents SET status = 'cancelled'
-              WHERE work_item_id = ?1 AND status = 'active'",
-            params![work_item_id],
-        )?;
+        crate::trunk_merge_intents::mark_active_trunk_intent_withdraw_in_tx(&tx, work_item_id)?;
         let paused = format!("Merge paused: {reason}");
         let detail = serde_json::json!({
             "source": CI_MERGE_REBASE_DETAIL_SOURCE,
@@ -279,6 +276,53 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("rebased onto main; CI still failing")
+        );
+    }
+
+    #[test]
+    fn stop_ci_merge_rebase_marks_active_trunk_intent_withdraw_instead_of_cancelling() {
+        let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+        let product = create_test_product(&db);
+        let chore = create_test_chore_manual(&db, product.id, "Rebase CI trunk");
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some(PR.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.mark_chore_blocked_ci_failure(&chore.id, PR, None).unwrap();
+        let intent = db
+            .insert_trunk_merge_intent(
+                TrunkMergeIntentInsertInput::builder()
+                    .work_item_id(&chore.id)
+                    .pr_url(PR)
+                    .pr_number(77)
+                    .repo("example/repo")
+                    .target_branch("main")
+                    .build(),
+            )
+            .unwrap()
+            .expect("intent inserted");
+        db.record_ci_merge_rebase(&chore.id, PR, "main", Some("head-before"), Some("head-after"))
+            .unwrap();
+
+        assert!(
+            db.stop_ci_merge_rebase_for_failure(&chore.id, PR, "rebased onto main; CI still failing", true)
+                .unwrap()
+        );
+
+        let still_active = db
+            .get_active_trunk_merge_intent(&chore.id)
+            .unwrap()
+            .expect("intent must stay active until Trunk confirms cancel");
+        assert_eq!(still_active.id, intent.id);
+        assert_eq!(still_active.status, "active");
+        assert_eq!(
+            still_active.last_trunk_state.as_deref(),
+            Some(crate::TRUNK_INTENT_WITHDRAW)
         );
     }
 }

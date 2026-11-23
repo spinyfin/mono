@@ -169,7 +169,8 @@ pub enum CiMergeRebaseOutcome {
         spawned: bool,
     },
     /// Mechanical rebase pushed, but the both-parent deletion tripwire halted
-    /// the card in `blocked: deletion_signoff` pending operator sign-off.
+    /// the card in `blocked: deletion_signoff` pending sign-off of the
+    /// flagged deletions.
     HaltedForSignoff,
     /// The rebase hit a lockfile-only conflict whose regeneration failed
     /// operationally; the block was moved to `blocked: merge_conflict`.

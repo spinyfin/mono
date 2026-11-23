@@ -10,8 +10,10 @@ import Textual
 /// That projection is `WorkTask.isMergeWhenReadyEligible` (Models.swift),
 /// the same one `ChatViewModel+BoardHelpers.swift` uses to gate the card's
 /// control — a task merely routed into the Review column while `blocked`
-/// (conflict/CI-failure resolution in progress, `isReviewPhaseBlocked`)
-/// must not show the button here either.
+/// on a non-CI review-phase reason (`merge_conflict`, `review_feedback`)
+/// must not show the button here either. CI-blocked Review cards
+/// (`ci_failure` / `ci_failure_exhausted`) are eligible: Merge rebases a
+/// behind-base branch.
 ///
 /// Deliberately quiet: a guide is "a generated explanation", never an
 /// approval. No checkmark, no green success wording, no merge gate tied to

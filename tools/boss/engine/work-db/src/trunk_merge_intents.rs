@@ -22,6 +22,10 @@ use super::*;
 pub const TRUNK_INTENT_AWAITING_RESUBMIT: &str = "boss:awaiting_resubmit";
 pub const TRUNK_INTENT_SUPERSEDED_BY_CONFLICT: &str = "boss:superseded_by_conflict";
 pub const TRUNK_INTENT_SUBMIT_FAILED: &str = "boss:submit_failed";
+/// Merge-click CI rebase whose rebased head is still red: the poller must
+/// `cancelPullRequest` and only then retire the intent, so Trunk does not
+/// keep a PR Boss has already stopped tracking.
+pub const TRUNK_INTENT_WITHDRAW: &str = "boss:withdraw";
 
 /// One `trunk_merge_intents` row.
 ///
@@ -364,7 +368,7 @@ fn query_active_trunk_merge_intent(conn: &Connection, work_item_id: &str) -> Res
     Ok(row)
 }
 
-fn record_trunk_merge_intent_state_in_tx(conn: &Connection, id: &str, state: &str) -> Result<bool> {
+pub(crate) fn record_trunk_merge_intent_state_in_tx(conn: &Connection, id: &str, state: &str) -> Result<bool> {
     let changed = conn.execute(
         "UPDATE trunk_merge_intents
          SET last_trunk_state = ?2, last_trunk_state_at = ?3
@@ -374,6 +378,16 @@ fn record_trunk_merge_intent_state_in_tx(conn: &Connection, id: &str, state: &st
         params![id, state, now_string()],
     )?;
     Ok(changed > 0)
+}
+
+/// Stamp the active Trunk intent [`TRUNK_INTENT_WITHDRAW`] so the queue
+/// poller calls `cancelPullRequest` and retires the row only after Trunk
+/// confirms. A no-op when there is no active intent.
+pub(crate) fn mark_active_trunk_intent_withdraw_in_tx(conn: &Connection, work_item_id: &str) -> Result<bool> {
+    let Some(intent) = query_active_trunk_merge_intent(conn, work_item_id)? else {
+        return Ok(false);
+    };
+    record_trunk_merge_intent_state_in_tx(conn, &intent.id, TRUNK_INTENT_WITHDRAW)
 }
 
 pub(crate) fn mark_active_trunk_intent_awaiting_resubmit_in_tx(

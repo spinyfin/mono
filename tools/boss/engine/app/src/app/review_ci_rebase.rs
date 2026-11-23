@@ -8,8 +8,16 @@
 //! Trunk queue) so GitHub / Trunk merges only if CI on the rebased head goes
 //! green.
 
-use super::review::{refuse_merge_when_ready, remember_merge_request};
+use std::time::Duration;
+
+use super::review::{
+    AfterRebaseRecord, DirectMergeArmRequest, TrunkQueueMergeRequest, arm_direct_github_merge,
+    handle_trunk_queue_merge, refuse_merge_when_ready, remember_merge_request,
+};
 use super::*;
+
+const REBASED_HEAD_ATTEMPTS: usize = 10;
+const REBASED_HEAD_DELAY: Duration = Duration::from_millis(150);
 
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
@@ -45,10 +53,10 @@ pub(super) async fn handle_ci_failure_merge_rebase(ctx: CiFailureMergeRebaseCont
     } = ctx;
     let merge_probe = server_state.merge_probe.clone();
     let cube_client = server_state.cube_client.clone();
-    let direct_merge_executor = server_state.direct_merge_executor.clone();
-    let trunk_client = server_state.trunk_client.clone();
     let publisher = server_state.publisher.clone();
-    let event_bus = server_state.event_bus.clone();
+    let mechanical_rebase_enabled = server_state
+        .feature_flags
+        .is_enabled("conflict_ladder_mechanical_rebase");
 
     boss_task_scope::spawn(async move {
         let probe = match merge_probe.probe(&pr_url).await {
@@ -92,6 +100,15 @@ pub(super) async fn handle_ci_failure_merge_rebase(ctx: CiFailureMergeRebaseCont
                 format!(
                     "merge_when_ready: CI is failing on an up-to-date branch (status: blocked, reason: {blocked_reason}); nothing to rebase"
                 ),
+            );
+            return;
+        }
+        if !mechanical_rebase_enabled {
+            refuse_merge_when_ready(
+                &sink,
+                &request_id,
+                &work_item_id,
+                "merge_when_ready: mechanical rebase is disabled; rebase manually".to_owned(),
             );
             return;
         }
@@ -154,44 +171,60 @@ pub(super) async fn handle_ci_failure_merge_rebase(ctx: CiFailureMergeRebaseCont
                         "merge_when_ready: failed to abandon pre-rebase CI remediation attempts; continuing",
                     );
                 }
+                let rebased_head =
+                    match wait_for_rebased_head(merge_probe.as_ref(), &pr_url, probe.head_ref_oid.as_deref()).await {
+                        Ok(sha) => sha,
+                        Err(message) => {
+                            refuse_merge_when_ready(&sink, &request_id, &work_item_id, message);
+                            return;
+                        }
+                    };
+                let after_rebase = AfterRebaseRecord {
+                    base_branch: base_branch.clone(),
+                    head_sha_before: probe.head_ref_oid.clone(),
+                    rebased_head_sha: Some(rebased_head),
+                };
                 match mechanism {
                     boss_engine_runtime::merge_mechanism::MergeMechanism::Direct => {
-                        arm_direct_merge_after_ci_rebase(
-                            DirectArmContext {
-                                work_db,
-                                sink,
-                                request_id,
-                                product_id,
-                                product_name,
-                                product_slug,
-                                work_item_id,
-                                pr_url,
-                                base_branch,
-                                head_sha_before: probe.head_ref_oid,
-                                confirmed_revisions,
-                            },
-                            direct_merge_executor,
-                            publisher,
-                            event_bus,
+                        arm_direct_github_merge(
+                            DirectMergeArmRequest::builder()
+                                .work_db(work_db)
+                                .sink(sink)
+                                .request_id(request_id)
+                                .product_id(product_id)
+                                .product_name(product_name)
+                                .product_slug(product_slug)
+                                .work_item_id(work_item_id)
+                                .pr_url(pr_url)
+                                .confirmed_revisions(confirmed_revisions)
+                                .publisher(publisher)
+                                .event_bus(server_state.event_bus.clone())
+                                .direct_merge_executor(server_state.direct_merge_executor.clone())
+                                .publish_reason("ci_merge_rebase_armed")
+                                .always_publish(true)
+                                .release_deferred_conflict_on_refusal(false)
+                                .kick_reconciler_on_error(true)
+                                .after_rebase(after_rebase)
+                                .build(),
                         )
                         .await;
                     }
                     boss_engine_runtime::merge_mechanism::MergeMechanism::TrunkQueue { target_branch } => {
-                        arm_trunk_merge_after_ci_rebase(
-                            TrunkArmContext {
-                                work_db,
-                                sink,
-                                request_id,
-                                product_id,
-                                work_item_id,
-                                pr_url,
-                                base_branch,
-                                target_branch,
-                                head_sha_before: probe.head_ref_oid,
-                            },
-                            trunk_client,
-                            publisher,
-                            event_bus,
+                        handle_trunk_queue_merge(
+                            server_state.clone(),
+                            work_db,
+                            sink,
+                            request_id,
+                            TrunkQueueMergeRequest::builder()
+                                .product_id(product_id)
+                                .work_item_id(work_item_id)
+                                .pr_url(pr_url)
+                                .target_branch(target_branch)
+                                .retire_stale_and_retry(true)
+                                .kick_pr_reconciler(true)
+                                .publish_reason("ci_merge_rebase_trunk_submitted")
+                                .after_rebase(after_rebase)
+                                .build(),
                         )
                         .await;
                     }
@@ -204,18 +237,35 @@ pub(super) async fn handle_ci_failure_merge_rebase(ctx: CiFailureMergeRebaseCont
                     spawned,
                     "merge_when_ready: CI-blocked rebase hit conflicts; handed off to conflict ladder",
                 );
-                if matches!(mechanism, boss_engine_runtime::merge_mechanism::MergeMechanism::Direct) {
-                    let started = work_db
-                        .start_merge_conflict_resolution(&work_item_id, &pr_url, &base_branch)
-                        .unwrap_or(false);
-                    if started
-                        && let Ok(confirmation) =
-                            work_db.remember_confirmed_merge_revisions(&work_item_id, &pr_url, &confirmed_revisions)
-                        && !work_db
-                            .attach_confirmed_merge_revisions(&work_item_id, &pr_url, &confirmation)
-                            .unwrap_or(false)
-                    {
-                        let _ = work_db.forget_confirmed_merge_revisions(&confirmation);
+                match &mechanism {
+                    boss_engine_runtime::merge_mechanism::MergeMechanism::Direct => {
+                        let started = work_db
+                            .start_merge_conflict_resolution(&work_item_id, &pr_url, &base_branch)
+                            .unwrap_or(false);
+                        if started
+                            && let Ok(confirmation) =
+                                work_db.remember_confirmed_merge_revisions(&work_item_id, &pr_url, &confirmed_revisions)
+                            && !work_db
+                                .attach_confirmed_merge_revisions(&work_item_id, &pr_url, &confirmation)
+                                .unwrap_or(false)
+                        {
+                            let _ = work_db.forget_confirmed_merge_revisions(&confirmation);
+                        }
+                    }
+                    boss_engine_runtime::merge_mechanism::MergeMechanism::TrunkQueue { target_branch } => {
+                        if let Err(message) =
+                            ensure_trunk_intent_superseded_by_conflict(&work_db, &work_item_id, &pr_url, target_branch)
+                        {
+                            refuse_merge_when_ready(
+                                &sink,
+                                &request_id,
+                                &work_item_id,
+                                format!(
+                                    "{message}; click Merge again after the conflict is resolved to submit to the Trunk queue"
+                                ),
+                            );
+                            return;
+                        }
                     }
                 }
                 remember_merge_request(&work_db, &work_item_id, &pr_url, None);
@@ -231,7 +281,7 @@ pub(super) async fn handle_ci_failure_merge_rebase(ctx: CiFailureMergeRebaseCont
                 publisher
                     .publish_work_item_changed(&product_id, &work_item_id, "merge_conflict_resolution_requested")
                     .await;
-                event_bus.publish(Event::PrReconcileRequested { pr_url });
+                server_state.event_bus.publish(Event::PrReconcileRequested { pr_url });
             }
             boss_engine_runtime::conflict_watch::CiMergeRebaseOutcome::HaltedForSignoff => {
                 refuse_merge_when_ready(
@@ -288,307 +338,91 @@ pub(super) async fn handle_ci_failure_merge_rebase(ctx: CiFailureMergeRebaseCont
     });
 }
 
-#[derive(bon::Builder)]
-#[builder(on(String, into))]
-struct DirectArmContext {
-    work_db: Arc<WorkDb>,
-    sink: Arc<SessionSink>,
-    request_id: String,
-    product_id: String,
-    product_name: String,
-    product_slug: String,
-    work_item_id: String,
-    pr_url: String,
-    base_branch: String,
-    head_sha_before: Option<String>,
-    confirmed_revisions: Vec<boss_protocol::OpenMergeRevision>,
-}
-
-async fn arm_direct_merge_after_ci_rebase(
-    ctx: DirectArmContext,
-    direct_merge_executor: Arc<dyn merge_when_ready::DirectMergeExecutor>,
-    publisher: Arc<dyn boss_execution_contracts::ExecutionPublisher>,
-    event_bus: Arc<EventBus>,
-) {
-    let DirectArmContext {
-        work_db,
-        sink,
-        request_id,
-        product_id,
-        product_name,
-        product_slug,
-        work_item_id,
-        pr_url,
-        base_branch,
-        head_sha_before,
-        confirmed_revisions,
-    } = ctx;
-    let confirmation = match work_db.remember_confirmed_merge_revisions(&work_item_id, &pr_url, &confirmed_revisions) {
-        Ok(confirmation) => confirmation,
-        Err(err) => {
-            refuse_merge_when_ready(&sink, &request_id, &work_item_id, err.to_string());
-            return;
-        }
+/// Wait until GitHub's PR head differs from the pre-rebase SHA. `gh pr view`
+/// can lag a cube push; recording the stale SHA would consume the one-shot
+/// rebase marker against the old head's red CI.
+async fn wait_for_rebased_head(
+    merge_probe: &dyn MergeProbe,
+    pr_url: &str,
+    head_sha_before: Option<&str>,
+) -> Result<String, String> {
+    let Some(before) = head_sha_before.filter(|s| !s.is_empty()) else {
+        let probe = merge_probe
+            .probe(pr_url)
+            .await
+            .map_err(|err| format!("merge_when_ready: rebased, but failed to read the new PR head: {err:#}"))?;
+        return probe
+            .head_ref_oid
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "merge_when_ready: rebased, but GitHub returned an empty head SHA".to_owned());
     };
-    match direct_merge_executor.execute(&pr_url).await {
-        Ok(success) => {
-            let detail = boss_engine_storage_values::merge_queue_section::queued_no_position_detail();
-            let record = work_db.record_github_merge_intent(
-                boss_work_db::GithubMergeIntentInsertInput::builder()
-                    .work_item_id(work_item_id.clone())
-                    .pr_url(pr_url.clone())
-                    .head_sha(success.head_sha.clone())
-                    .confirmation_request_id(confirmation.clone())
-                    .build(),
-                &detail,
-            );
-            if let Err(err) = record {
-                let _ = work_db.forget_confirmed_merge_revisions(&confirmation);
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: format!(
-                            "merge_when_ready accepted the GitHub request after rebase but could not record its merge intent: {err}"
-                        ),
-                    },
+    for attempt in 0..REBASED_HEAD_ATTEMPTS {
+        match merge_probe.probe(pr_url).await {
+            Ok(probe) => {
+                if let Some(head) = probe.head_ref_oid.filter(|s| !s.is_empty() && s != before) {
+                    return Ok(head);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    %pr_url,
+                    attempt,
+                    ?err,
+                    "merge_when_ready: failed to read PR head while waiting for the rebased SHA"
                 );
-                return;
             }
-            if let Err(err) = work_db.record_ci_merge_rebase(
-                &work_item_id,
-                &pr_url,
-                &base_branch,
-                head_sha_before.as_deref(),
-                Some(&success.head_sha),
-            ) {
-                tracing::warn!(%work_item_id, ?err, "merge_when_ready: failed to record post-rebase tracking");
-            }
-            remember_merge_request(&work_db, &work_item_id, &pr_url, Some(&success.head_sha));
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::MergeWhenReadyAccepted {
-                    work_item_id: work_item_id.clone(),
-                    pr_url: pr_url.clone(),
-                    action: merge_when_ready::MergeAction::Requested.as_str().to_owned(),
-                },
-            );
-            event_bus.publish(Event::PrReconcileRequested { pr_url: pr_url.clone() });
-            publisher
-                .publish_work_item_changed(&product_id, &work_item_id, "ci_merge_rebase_armed")
-                .await;
         }
-        Err(err) => {
-            let message = format!("{err:#}");
-            let _ = work_db.forget_confirmed_merge_revisions(&confirmation);
-            if boss_engine_runtime::merge_mechanism::is_push_restriction_error(&message) {
-                let _ = work_db.create_attention_item(boss_work_db::CreateAttentionItemInput {
-                    work_item_id: Some(work_item_id.clone()),
-                    kind: boss_engine_runtime::merge_mechanism::PUSH_RESTRICTION_ATTENTION_KIND.to_owned(),
-                    title: boss_engine_runtime::merge_mechanism::PUSH_RESTRICTION_ATTENTION_TITLE.to_owned(),
-                    body_markdown: boss_engine_runtime::merge_mechanism::render_push_restriction_attention_body(
-                        &product_name,
-                        &product_slug,
-                        &message,
-                    ),
-                    execution_id: None,
-                    status: None,
-                    resolved_at: None,
-                });
-            }
-            event_bus.publish(Event::PrReconcileRequested { pr_url });
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: format!(
-                        "merge_when_ready: rebased onto {base_branch}, but arming merge failed: {message}"
-                    ),
-                },
-            );
+        if attempt + 1 < REBASED_HEAD_ATTEMPTS {
+            tokio::time::sleep(REBASED_HEAD_DELAY).await;
         }
     }
+    Err("merge_when_ready: rebased onto base, but GitHub still reports the pre-rebase head; try again".to_owned())
 }
 
-#[derive(bon::Builder)]
-#[builder(on(String, into))]
-struct TrunkArmContext {
-    work_db: Arc<WorkDb>,
-    sink: Arc<SessionSink>,
-    request_id: String,
-    product_id: String,
-    work_item_id: String,
-    pr_url: String,
-    base_branch: String,
-    target_branch: String,
-    head_sha_before: Option<String>,
-}
-
-async fn arm_trunk_merge_after_ci_rebase(
-    ctx: TrunkArmContext,
-    trunk_client: boss_trunk_client::TrunkClient,
-    publisher: Arc<dyn boss_execution_contracts::ExecutionPublisher>,
-    event_bus: Arc<EventBus>,
-) {
-    let TrunkArmContext {
-        work_db,
-        sink,
-        request_id,
-        product_id,
-        work_item_id,
-        pr_url,
-        base_branch,
-        target_branch,
-        head_sha_before,
-    } = ctx;
-    let coords = match boss_engine_merge_poller::trunk_merge::parse_trunk_pr_coordinates(&pr_url) {
-        Ok(coords) => coords,
-        Err(err) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: format!("merge_when_ready: {err}"),
-                },
-            );
-            return;
-        }
-    };
+/// Create (or stamp) an active Trunk intent in `boss:superseded_by_conflict`
+/// so the existing cancel/resubmit path submits after the conflict fix lands.
+fn ensure_trunk_intent_superseded_by_conflict(
+    work_db: &WorkDb,
+    work_item_id: &str,
+    pr_url: &str,
+    target_branch: &str,
+) -> Result<(), String> {
+    let coords = boss_engine_merge_poller::trunk_merge::parse_trunk_pr_coordinates(pr_url)
+        .map_err(|err| format!("merge_when_ready: {err}"))?;
     let insert_input = boss_work_db::TrunkMergeIntentInsertInput::builder()
-        .work_item_id(work_item_id.clone())
-        .pr_url(pr_url.clone())
+        .work_item_id(work_item_id)
+        .pr_url(pr_url)
         .pr_number(coords.number as i64)
         .repo(format!("{}/{}", coords.owner, coords.repo))
-        .target_branch(target_branch.clone())
-        .build();
-    let intent = match work_db.insert_trunk_merge_intent(insert_input) {
-        Ok(Some(intent)) => intent,
-        Ok(None) => {
-            // An earlier failed/evicted active intent may still be sitting on
-            // the work item; retire it so this fresh post-rebase submission
-            // owns the slot.
-            if let Ok(Some(existing)) = work_db.get_active_trunk_merge_intent(&work_item_id) {
-                if boss_engine_merge_poller::trunk_merge::intent_is_live_in_queue(existing.last_trunk_state.as_deref())
-                {
-                    if let Err(err) = work_db.record_ci_merge_rebase(
-                        &work_item_id,
-                        &pr_url,
-                        &base_branch,
-                        head_sha_before.as_deref(),
-                        None,
-                    ) {
-                        tracing::warn!(%work_item_id, ?err, "merge_when_ready: failed to record post-rebase tracking");
-                    }
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::MergeWhenReadyAccepted {
-                            work_item_id,
-                            pr_url: pr_url.clone(),
-                            action: merge_when_ready::MergeAction::TrunkAlreadyEnqueued.as_str().to_owned(),
-                        },
-                    );
-                    event_bus.publish(Event::PrReconcileRequested { pr_url });
-                    return;
-                }
-                let _ = work_db.retire_trunk_merge_intent(&existing.id, "cancelled");
-                match work_db.insert_trunk_merge_intent(
-                    boss_work_db::TrunkMergeIntentInsertInput::builder()
-                        .work_item_id(work_item_id.clone())
-                        .pr_url(pr_url.clone())
-                        .pr_number(coords.number as i64)
-                        .repo(format!("{}/{}", coords.owner, coords.repo))
-                        .target_branch(target_branch.clone())
-                        .build(),
-                ) {
-                    Ok(Some(intent)) => intent,
-                    _ => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: format!(
-                                    "merge_when_ready: rebased onto {base_branch}, but could not record trunk merge intent"
-                                ),
-                            },
-                        );
-                        return;
-                    }
-                }
-            } else {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: format!(
-                            "merge_when_ready: rebased onto {base_branch}, but trunk merge intent insert was ignored"
-                        ),
-                    },
-                );
-                return;
-            }
-        }
-        Err(err) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: format!("merge_when_ready: failed to record trunk merge intent: {err}"),
-                },
-            );
-            return;
-        }
-    };
-
-    let request = boss_trunk_client::SubmitPullRequestRequest::builder()
-        .repo(boss_trunk_client::TrunkRepoRef::new(
-            boss_engine_merge_poller::trunk_merge::TRUNK_REPO_HOST,
-            coords.owner,
-            coords.repo,
-        ))
-        .pr(boss_trunk_client::TrunkPrRef::new(coords.number))
         .target_branch(target_branch)
         .build();
-    match trunk_client.submit_pull_request(&request).await {
-        Ok(()) => {
-            let detail = boss_engine_merge_poller::trunk_merge::optimistic_pending_detail_json();
-            let _ = work_db.set_task_merge_queue_state(&work_item_id, Some("queued"), Some(&detail));
-            if let Err(err) =
-                work_db.record_ci_merge_rebase(&work_item_id, &pr_url, &base_branch, head_sha_before.as_deref(), None)
+    match work_db.insert_trunk_merge_intent(insert_input) {
+        Ok(Some(intent)) => {
+            if let Err(err) = work_db.record_trunk_merge_intent_state(
+                &intent.id,
+                boss_engine_merge_poller::trunk_merge::TRUNK_INTENT_SUPERSEDED_BY_CONFLICT,
+            ) {
+                return Err(format!(
+                    "merge_when_ready: recorded a trunk merge intent but could not mark it superseded-by-conflict: {err}"
+                ));
+            }
+            Ok(())
+        }
+        Ok(None) => {
+            boss_engine_merge_poller::trunk_merge::mark_trunk_intent_superseded_by_conflict(work_db, work_item_id);
+            if work_db
+                .get_active_trunk_merge_intent(work_item_id)
+                .ok()
+                .flatten()
+                .is_none()
             {
-                tracing::warn!(%work_item_id, ?err, "merge_when_ready: failed to record post-rebase tracking");
+                return Err(
+                    "merge_when_ready: could not record a trunk merge intent for conflict continuation".to_owned(),
+                );
             }
-            remember_merge_request(&work_db, &work_item_id, &pr_url, None);
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::MergeWhenReadyAccepted {
-                    work_item_id: work_item_id.clone(),
-                    pr_url: pr_url.clone(),
-                    action: merge_when_ready::MergeAction::TrunkEnqueued.as_str().to_owned(),
-                },
-            );
-            event_bus.publish(Event::PrReconcileRequested { pr_url });
-            publisher
-                .publish_work_item_changed(&product_id, &work_item_id, "ci_merge_rebase_trunk_submitted")
-                .await;
+            Ok(())
         }
-        Err(err) => {
-            if work_db.delete_trunk_merge_intent(&intent.id).is_err() {
-                let _ = work_db.retire_trunk_merge_intent(&intent.id, "cancelled");
-            }
-            event_bus.publish(Event::PrReconcileRequested { pr_url: pr_url.clone() });
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: format!(
-                        "merge_when_ready: rebased onto {base_branch}, but trunk queue submission failed for {pr_url}: {err}"
-                    ),
-                },
-            );
-        }
+        Err(err) => Err(format!("merge_when_ready: failed to record trunk merge intent: {err}")),
     }
 }
 

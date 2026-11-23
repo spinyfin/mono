@@ -846,6 +846,7 @@ mod signal_retirement;
 pub use signal_retirement::{ClearResolvedSignal, SignalRetirement};
 pub use trunk_merge_intents::{
     TRUNK_INTENT_AWAITING_RESUBMIT, TRUNK_INTENT_SUBMIT_FAILED, TRUNK_INTENT_SUPERSEDED_BY_CONFLICT,
+    TRUNK_INTENT_WITHDRAW,
 };
 pub mod board_caches;
 mod board_notifications;

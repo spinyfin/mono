@@ -1,7 +1,8 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use boss_engine_merge_poller::{
@@ -134,6 +135,9 @@ struct ScriptedMergeProbe {
     probe: Mutex<PrLifecycleProbe>,
     behind: Mutex<bool>,
     probe_calls: AtomicUsize,
+    /// Head SHA returned after the first `probe()` (the behind-base check).
+    /// Subsequent probes used to wait for GitHub to show the rebased head.
+    after_rebase_head: Mutex<Option<String>>,
 }
 
 impl ScriptedMergeProbe {
@@ -142,12 +146,19 @@ impl ScriptedMergeProbe {
             probe: Mutex::new(probe),
             behind: Mutex::new(behind),
             probe_calls: AtomicUsize::new(0),
+            after_rebase_head: Mutex::new(None),
         })
+    }
+
+    fn with_after_rebase_head(self: &Arc<Self>, head: impl Into<String>) -> Arc<Self> {
+        *self.after_rebase_head.lock().unwrap() = Some(head.into());
+        self.clone()
     }
 
     fn set(&self, probe: PrLifecycleProbe, behind: bool) {
         *self.probe.lock().unwrap() = probe;
         *self.behind.lock().unwrap() = behind;
+        *self.after_rebase_head.lock().unwrap() = None;
     }
 
     fn probe_calls(&self) -> usize {
@@ -158,8 +169,14 @@ impl ScriptedMergeProbe {
 #[async_trait]
 impl MergeProbe for ScriptedMergeProbe {
     async fn probe(&self, _pr_url: &str) -> anyhow::Result<PrLifecycleProbe> {
-        self.probe_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(self.probe.lock().unwrap().clone())
+        let n = self.probe_calls.fetch_add(1, Ordering::SeqCst);
+        let mut probe = self.probe.lock().unwrap().clone();
+        if n > 0
+            && let Some(head) = self.after_rebase_head.lock().unwrap().clone()
+        {
+            probe.head_ref_oid = Some(head);
+        }
+        Ok(probe)
     }
 
     async fn is_pr_behind_base(&self, _pr_url: &str, _probe: &PrLifecycleProbe) -> anyhow::Result<bool> {
@@ -350,7 +367,8 @@ async fn ci_failure_behind_base_rebases_and_merges_when_green_in_both_arms() {
         let pr_url = format!("https://github.com/spinyfin/mono/pull/{pr_number}");
         let direct_executor = Arc::new(FakeDirectMergeExecutor::returning("head-rebased"));
         let cube = RebaseCube::clean_pushed();
-        let probe = ScriptedMergeProbe::new(failing_probe(&pr_url, "head-old", "BEHIND"), true);
+        let probe = ScriptedMergeProbe::new(failing_probe(&pr_url, "head-old", "BEHIND"), true)
+            .with_after_rebase_head("head-rebased");
         let (state, _temp) = test_server(
             trunk_client_for(server.uri()),
             direct_executor.clone(),
@@ -436,7 +454,8 @@ async fn ci_failure_exhausted_behind_base_rebases_and_merges_when_green() {
         let cube = RebaseCube::clean_pushed();
         // GitHub reports BLOCKED while CI is red even though the branch is
         // behind base — `is_pr_behind_base` returns true.
-        let probe = ScriptedMergeProbe::new(failing_probe(pr_url, "head-old", "BLOCKED"), true);
+        let probe = ScriptedMergeProbe::new(failing_probe(pr_url, "head-old", "BLOCKED"), true)
+            .with_after_rebase_head("head-rebased-exh");
         let (state, _temp) = test_server(
             trunk_client_for(server.uri()),
             direct_executor.clone(),
@@ -579,7 +598,8 @@ async fn rebased_head_still_red_returns_to_ci_failure_handling_with_reason_and_n
     let pr_url = "https://github.com/spinyfin/mono/pull/404";
     let direct_executor = Arc::new(FakeDirectMergeExecutor::returning("head-rebased"));
     let cube = RebaseCube::clean_pushed();
-    let probe = ScriptedMergeProbe::new(failing_probe(pr_url, "head-old", "BEHIND"), true);
+    let probe = ScriptedMergeProbe::new(failing_probe(pr_url, "head-old", "BEHIND"), true)
+        .with_after_rebase_head("head-rebased");
     let (state, _temp) = test_server(
         trunk_client_for(server.uri()),
         direct_executor.clone(),
@@ -606,6 +626,7 @@ async fn rebased_head_still_red_returns_to_ci_failure_handling_with_reason_and_n
 
     // A stale sweep still reporting the pre-rebase head must NOT prematurely
     // consume the post-rebase marker or disarm the newly armed merge.
+    probe.set(failing_probe(pr_url, "head-old", "BEHIND"), true);
     boss_engine_merge_poller::run_one_pass(
         &state.work_db,
         probe.as_ref(),
@@ -795,4 +816,326 @@ async fn in_review_merge_path_is_unchanged() {
     );
     assert_eq!(cube.rebase_calls(), 0, "InReview merge must not run mechanical rebase");
     assert_eq!(direct_executor.calls(), vec![pr_url.to_owned()]);
+}
+
+struct NoopContractFetcher;
+
+#[async_trait]
+impl boss_engine_merge_poller::queue_ci_contract::ContractFetcher for NoopContractFetcher {
+    async fn config(&self, _pr_url: &str) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
+    async fn step_keys(&self, _url: &str) -> anyhow::Result<BTreeMap<String, String>> {
+        Ok(BTreeMap::new())
+    }
+}
+
+/// (d) Trunk: a still-red rebased head stamps `boss:withdraw` and the queue
+/// poller calls `cancelPullRequest`, then retires the intent.
+#[tokio::test]
+async fn rebased_head_still_red_on_trunk_cancels_the_queue_entry() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/submitPullRequest"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/getQueue"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "state": "running",
+            "branch": "main",
+            "enqueuedPullRequests": [{
+                "id": "entry-409",
+                "state": "pending",
+                "prNumber": 409
+            }],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/cancelPullRequest"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let pr_url = "https://github.com/spinyfin/mono/pull/409";
+    let direct_executor = Arc::new(FakeDirectMergeExecutor::returning("head-rebased"));
+    let cube = RebaseCube::clean_pushed();
+    let probe = ScriptedMergeProbe::new(failing_probe(pr_url, "head-old", "BEHIND"), true)
+        .with_after_rebase_head("head-rebased");
+    let (state, _temp) = test_server(
+        trunk_client_for(server.uri()),
+        direct_executor.clone(),
+        cube.clone(),
+        probe.clone(),
+    );
+    let (_product_id, chore_id) = seed_ci_blocked_chore(&state.work_db, "ci-still-red-trunk", pr_url, true, true);
+    let sink = make_session_sink();
+
+    handle_merge_when_ready(
+        dispatch_ctx(&state, &sink),
+        FrontendRequest::MergeWhenReady {
+            work_item_id: chore_id.clone(),
+            confirmed_revisions: vec![],
+        },
+    )
+    .await;
+    let envelope = tokio::time::timeout(Duration::from_secs(5), sink.next())
+        .await
+        .unwrap()
+        .expect("expected reply");
+    match envelope.payload {
+        FrontendEvent::MergeWhenReadyAccepted { action, .. } => assert_eq!(action, "trunk_enqueued"),
+        other => panic!("expected MergeWhenReadyAccepted, got {other:?}"),
+    }
+    assert_eq!(cube.rebase_calls(), 1);
+    assert!(direct_executor.calls().is_empty(), "Trunk must never call gh pr merge");
+
+    probe.set(failing_probe(pr_url, "head-rebased", "BLOCKED"), false);
+    boss_engine_merge_poller::run_one_pass(
+        &state.work_db,
+        probe.as_ref(),
+        state.publisher.as_ref(),
+        None,
+        None,
+        Some(state.sweep_host.as_ref() as &dyn boss_engine_merge_poller::SweepHost),
+    )
+    .await;
+
+    let intent = state
+        .work_db
+        .get_active_trunk_merge_intent(&chore_id)
+        .unwrap()
+        .expect("intent stays active until Trunk confirms cancel");
+    assert_eq!(
+        intent.last_trunk_state.as_deref(),
+        Some(boss_engine_merge_poller::trunk_merge::TRUNK_INTENT_WITHDRAW)
+    );
+    let task = chore_of(&state.work_db, &chore_id);
+    assert_eq!(task.status, TaskStatus::Blocked);
+    assert_eq!(
+        task.blocked_detail.as_deref(),
+        Some("rebased onto main; CI still failing")
+    );
+
+    let mut trunk_probe = boss_engine_merge_poller::trunk_queue_poller::TrunkQueueProbe::new();
+    let outcome = trunk_probe
+        .run_pass(
+            &boss_engine_merge_poller::trunk_queue_poller::TrunkSweepContext {
+                contract_fetcher: &NoopContractFetcher,
+                work_db: &state.work_db,
+                publisher: state.publisher.as_ref(),
+                api: &state.trunk_client,
+            },
+            Instant::now(),
+        )
+        .await;
+    assert_eq!(outcome.queue_cancellations, 1);
+    assert_eq!(outcome.intents_retired, 1);
+    assert!(
+        state
+            .work_db
+            .get_active_trunk_merge_intent(&chore_id)
+            .unwrap()
+            .is_none(),
+        "intent must retire only after Trunk confirms cancel"
+    );
+    assert_eq!(cube.rebase_calls(), 1, "must never loop rebases automatically");
+    server.verify().await;
+}
+
+/// (e) Trunk: a conflicting rebase records a superseded-by-conflict intent so
+/// the existing cancel/resubmit path submits after the conflict fix lands.
+#[tokio::test]
+async fn rebase_conflict_on_trunk_records_superseded_intent_for_resubmit() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/submitPullRequest"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let pr_url = "https://github.com/spinyfin/mono/pull/410";
+    let direct_executor = Arc::new(FakeDirectMergeExecutor::returning("head-resolved"));
+    let cube = RebaseCube::conflicting(vec!["src/lib.rs"]);
+    let probe = ScriptedMergeProbe::new(failing_probe(pr_url, "head-old", "BEHIND"), true);
+    let (state, _temp) = test_server(
+        trunk_client_for(server.uri()),
+        direct_executor.clone(),
+        cube.clone(),
+        probe.clone(),
+    );
+    let (_product_id, chore_id) = seed_ci_blocked_chore(&state.work_db, "ci-conflict-trunk", pr_url, true, true);
+    let sink = make_session_sink();
+
+    handle_merge_when_ready(
+        dispatch_ctx(&state, &sink),
+        FrontendRequest::MergeWhenReady {
+            work_item_id: chore_id.clone(),
+            confirmed_revisions: vec![],
+        },
+    )
+    .await;
+
+    let envelope = tokio::time::timeout(Duration::from_secs(5), sink.next())
+        .await
+        .unwrap()
+        .expect("expected reply");
+    assert!(matches!(envelope.payload, FrontendEvent::MergeWhenReadyAccepted { .. }));
+    assert_eq!(cube.rebase_calls(), 1);
+    assert!(direct_executor.calls().is_empty());
+
+    let intent = state
+        .work_db
+        .get_active_trunk_merge_intent(&chore_id)
+        .unwrap()
+        .expect("Trunk conflict handoff must record an active intent");
+    assert_eq!(
+        intent.last_trunk_state.as_deref(),
+        Some(boss_engine_merge_poller::trunk_merge::TRUNK_INTENT_SUPERSEDED_BY_CONFLICT)
+    );
+    server.verify().await;
+}
+
+/// Merge on a behind CI-failed card refuses when mechanical rebase is off.
+#[tokio::test]
+async fn mechanical_rebase_flag_off_refuses_behind_ci_failed_merge() {
+    let server = MockServer::start().await;
+    let pr_url = "https://github.com/spinyfin/mono/pull/411";
+    let direct_executor = Arc::new(FakeDirectMergeExecutor::returning("head-rebased"));
+    let cube = RebaseCube::clean_pushed();
+    let probe = ScriptedMergeProbe::new(failing_probe(pr_url, "head-old", "BEHIND"), true);
+    let (state, _temp) = test_server(
+        trunk_client_for(server.uri()),
+        direct_executor.clone(),
+        cube.clone(),
+        probe.clone(),
+    );
+    state
+        .feature_flags
+        .set("conflict_ladder_mechanical_rebase", false)
+        .unwrap();
+    let (_product_id, chore_id) = seed_ci_blocked_chore(&state.work_db, "ci-flag-off", pr_url, false, false);
+    let sink = make_session_sink();
+
+    handle_merge_when_ready(
+        dispatch_ctx(&state, &sink),
+        FrontendRequest::MergeWhenReady {
+            work_item_id: chore_id.clone(),
+            confirmed_revisions: vec![],
+        },
+    )
+    .await;
+
+    let envelope = tokio::time::timeout(Duration::from_secs(5), sink.next())
+        .await
+        .unwrap()
+        .expect("expected refusal");
+    match envelope.payload {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains("mechanical rebase is disabled; rebase manually"),
+                "unexpected refusal message: {message}"
+            );
+        }
+        other => panic!("expected WorkError refusal, got {other:?}"),
+    }
+    assert_eq!(cube.rebase_calls(), 0);
+    assert!(direct_executor.calls().is_empty());
+}
+
+/// GitHub still reporting the pre-rebase head after a successful rebase is
+/// an error: the one-shot marker must not be recorded against the old SHA.
+#[tokio::test]
+async fn lagged_github_head_after_rebase_refuses_without_arming() {
+    let server = MockServer::start().await;
+    let pr_url = "https://github.com/spinyfin/mono/pull/412";
+    let direct_executor = Arc::new(FakeDirectMergeExecutor::returning("head-old"));
+    let cube = RebaseCube::clean_pushed();
+    let probe = ScriptedMergeProbe::new(failing_probe(pr_url, "head-old", "BEHIND"), true);
+    let (state, _temp) = test_server(
+        trunk_client_for(server.uri()),
+        direct_executor.clone(),
+        cube.clone(),
+        probe.clone(),
+    );
+    let (_product_id, chore_id) = seed_ci_blocked_chore(&state.work_db, "ci-lagged-head", pr_url, false, false);
+    let sink = make_session_sink();
+
+    handle_merge_when_ready(
+        dispatch_ctx(&state, &sink),
+        FrontendRequest::MergeWhenReady {
+            work_item_id: chore_id.clone(),
+            confirmed_revisions: vec![],
+        },
+    )
+    .await;
+
+    let envelope = tokio::time::timeout(Duration::from_secs(5), sink.next())
+        .await
+        .unwrap()
+        .expect("expected refusal");
+    match envelope.payload {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains("GitHub still reports the pre-rebase head"),
+                "unexpected refusal message: {message}"
+            );
+        }
+        other => panic!("expected WorkError refusal, got {other:?}"),
+    }
+    assert_eq!(cube.rebase_calls(), 1);
+    assert!(direct_executor.calls().is_empty(), "must not arm merge on a stale head");
+    assert!(state.work_db.get_ci_merge_rebase(&chore_id, pr_url).unwrap().is_none());
+}
+
+/// Even after GitHub shows a new head, a Direct merge executor that still
+/// reports the pre-rebase SHA must refuse rather than record the old head.
+#[tokio::test]
+async fn direct_merge_executor_returning_pre_rebase_head_is_refused() {
+    let server = MockServer::start().await;
+    let pr_url = "https://github.com/spinyfin/mono/pull/413";
+    let direct_executor = Arc::new(FakeDirectMergeExecutor::returning("head-old"));
+    let cube = RebaseCube::clean_pushed();
+    let probe = ScriptedMergeProbe::new(failing_probe(pr_url, "head-old", "BEHIND"), true)
+        .with_after_rebase_head("head-rebased");
+    let (state, _temp) = test_server(
+        trunk_client_for(server.uri()),
+        direct_executor.clone(),
+        cube.clone(),
+        probe.clone(),
+    );
+    let (_product_id, chore_id) = seed_ci_blocked_chore(&state.work_db, "ci-stale-executor", pr_url, false, false);
+    let sink = make_session_sink();
+
+    handle_merge_when_ready(
+        dispatch_ctx(&state, &sink),
+        FrontendRequest::MergeWhenReady {
+            work_item_id: chore_id.clone(),
+            confirmed_revisions: vec![],
+        },
+    )
+    .await;
+
+    let envelope = tokio::time::timeout(Duration::from_secs(5), sink.next())
+        .await
+        .unwrap()
+        .expect("expected refusal");
+    match envelope.payload {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains("GitHub still reports the pre-rebase head"),
+                "unexpected refusal message: {message}"
+            );
+        }
+        other => panic!("expected WorkError refusal, got {other:?}"),
+    }
+    assert_eq!(direct_executor.calls(), vec![pr_url.to_owned()]);
+    assert!(state.work_db.get_ci_merge_rebase(&chore_id, pr_url).unwrap().is_none());
 }

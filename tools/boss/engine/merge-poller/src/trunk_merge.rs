@@ -32,6 +32,7 @@ pub const TRUNK_REPO_HOST: &str = "github.com";
 //    conflict_watch owns the fix, poller cancels the entry)          ─┘
 pub use crate::work::{
     TRUNK_INTENT_AWAITING_RESUBMIT, TRUNK_INTENT_SUBMIT_FAILED, TRUNK_INTENT_SUPERSEDED_BY_CONFLICT,
+    TRUNK_INTENT_WITHDRAW,
 };
 
 /// Whether an active intent's `last_trunk_state` marks it as needing a
@@ -41,7 +42,10 @@ pub use crate::work::{
 fn needs_remediation(last_trunk_state: Option<&str>) -> bool {
     matches!(
         last_trunk_state,
-        Some("failed") | Some("pending_failure") | Some(TRUNK_INTENT_SUPERSEDED_BY_CONFLICT)
+        Some("failed")
+            | Some("pending_failure")
+            | Some(TRUNK_INTENT_SUPERSEDED_BY_CONFLICT)
+            | Some(TRUNK_INTENT_WITHDRAW)
     )
 }
 
@@ -293,6 +297,7 @@ mod tests {
             Some(TRUNK_INTENT_AWAITING_RESUBMIT),
             Some(TRUNK_INTENT_SUPERSEDED_BY_CONFLICT),
             Some(TRUNK_INTENT_SUBMIT_FAILED),
+            Some(TRUNK_INTENT_WITHDRAW),
         ] {
             assert!(
                 !intent_is_live_in_queue(state),
