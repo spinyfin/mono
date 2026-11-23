@@ -5,7 +5,9 @@
 //! validation, so database reconciliation never grows a second GitHub client.
 
 use sha2::{Digest, Sha256};
+use std::fmt;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use super::query_ensure::RequireRow;
@@ -211,75 +213,75 @@ impl WorkDb {
         // Protect published-but-not-yet-referenced blobs across processes.
         // This store lock never serializes database-only operations.
         let _publication = packet_store_lock(&artifact_root, false)?;
-        let mut published = None;
+        let mut published: Option<String> = None;
         loop {
-            let mut conn = self.connect()?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let existing_series: Option<(String, String, i64)> = tx
-                .query_row(
-                    "SELECT id, root_task_id, latest_observation_sequence
-                 FROM pr_review_guide_source_series WHERE canonical_pr_url = ?1",
-                    [&packet.canonical_pr_url],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .optional()?;
-            let (series_id, latest_sequence) = match existing_series {
-                Some((series_id, existing_root, latest_sequence)) => {
-                    if existing_root != root_task_id {
-                        bail!(
-                            "canonical PR `{}` is already associated with root task `{existing_root}`, not `{root_task_id}`",
-                            packet.canonical_pr_url,
-                        );
+            let (series_id, existing_meta) = {
+                let mut conn = self.connect()?;
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let (series_id, latest_sequence) =
+                    source_series_for_write(&tx, &packet.canonical_pr_url, root_task_id, &now)?;
+                if observation_sequence < latest_sequence {
+                    tx.commit()?;
+                    drop(conn);
+                    drop(_publication);
+                    if let Some(path) = published.as_ref() {
+                        gc_packet_blob(self, &artifact_root, path);
                     }
-                    (series_id, latest_sequence)
+                    return Ok(PrSourceCapturePersistOutcome::IgnoredStaleObservation);
                 }
-                None => {
-                    let series_id = next_id("prgs");
-                    tx.execute(
-                        "INSERT OR IGNORE INTO pr_review_guide_source_series
-                     (id, root_task_id, canonical_pr_url, latest_observation_sequence, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, 0, ?4, ?4)",
-                        params![series_id, root_task_id, packet.canonical_pr_url, now],
-                    )?;
-                    let (series_id, existing_root, latest_sequence): (String, String, i64) = tx.query_row(
-                        "SELECT id, root_task_id, latest_observation_sequence
-                     FROM pr_review_guide_source_series WHERE canonical_pr_url = ?1",
-                        [&packet.canonical_pr_url],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                    )?;
-                    if existing_root != root_task_id {
-                        bail!(
-                            "canonical PR `{}` is already associated with root task `{existing_root}`, not `{root_task_id}`",
-                            packet.canonical_pr_url,
-                        );
-                    }
-                    (series_id, latest_sequence)
-                }
-            };
-            if observation_sequence < latest_sequence {
+                let existing_meta =
+                    capture_metadata_by_endpoints(&tx, &series_id, &packet.observed_base_sha, &packet.head_sha)?;
                 tx.commit()?;
-                return Ok(PrSourceCapturePersistOutcome::IgnoredStaleObservation);
-            }
+                (series_id, existing_meta)
+            };
 
-            let existing = read_capture_by_endpoints(
-                &tx,
-                &artifact_root,
-                &series_id,
-                &packet.observed_base_sha,
-                &packet.head_sha,
-            )?;
+            let existing = match existing_meta {
+                None => None,
+                Some(meta) => match load_packet(&artifact_root, meta.packet_path.as_deref(), &meta.packet_hash) {
+                    Ok(loaded) => Some(meta.with_packet(loaded)),
+                    Err(LoadPacketError::Io { path, source }) => {
+                        return Err(LoadPacketError::Io { path, source }.into());
+                    }
+                    Err(error) => {
+                        discard_unreadable_capture(self, &artifact_root, &series_id, &meta, &error)?;
+                        None
+                    }
+                },
+            };
             let needs_blob = existing
                 .as_ref()
                 .is_none_or(|existing| !existing.complete && (complete || omission_count < existing.omission_count));
             if needs_blob && published.is_none() {
-                tx.commit()?;
-                drop(conn);
                 published = Some(publish.take().expect("publish once")(
                     &artifact_root,
                     &packet_hash,
                     &packet_bytes,
                 )?);
                 // Recheck both sequence and endpoint guards after publication.
+                continue;
+            }
+
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let latest_sequence: i64 = tx.query_row(
+                "SELECT latest_observation_sequence FROM pr_review_guide_source_series WHERE id = ?1",
+                [&series_id],
+                |row| row.get(0),
+            )?;
+            if observation_sequence < latest_sequence {
+                tx.commit()?;
+                drop(conn);
+                drop(_publication);
+                if let Some(path) = published.as_ref() {
+                    gc_packet_blob(self, &artifact_root, path);
+                }
+                return Ok(PrSourceCapturePersistOutcome::IgnoredStaleObservation);
+            }
+            let current_meta =
+                capture_metadata_by_endpoints(&tx, &series_id, &packet.observed_base_sha, &packet.head_sha)?;
+            if capture_version_changed(existing.as_ref(), current_meta.as_ref()) {
+                tx.commit()?;
+                drop(conn);
                 continue;
             }
             if let Some(mut existing) = existing {
@@ -312,16 +314,7 @@ impl WorkDb {
                     if let Some(old_path) = superseded_path
                         && old_path != packet_path
                     {
-                        let cleanup = (|| -> Result<()> {
-                            if let Some(_gc) = packet_store_lock(&artifact_root, true)? {
-                                let conn = self.connect()?;
-                                delete_unreferenced_packet_artifact(&conn, &artifact_root, &old_path)?;
-                            }
-                            Ok(())
-                        })();
-                        if let Err(err) = cleanup {
-                            tracing::warn!(path = %old_path, ?err, "stored capture; superseded blob cleanup failed");
-                        }
+                        gc_packet_blob(self, &artifact_root, &old_path);
                     }
                     let mut upgraded = existing;
                     upgraded.packet_hash = packet_hash;
@@ -334,6 +327,11 @@ impl WorkDb {
                 }
                 select_comparison(&tx, &series_id, &existing.comparison_id, observation_sequence, &now)?;
                 tx.commit()?;
+                drop(conn);
+                drop(_publication);
+                if let Some(path) = published.as_ref() {
+                    gc_packet_blob(self, &artifact_root, path);
+                }
                 return Ok(PrSourceCapturePersistOutcome::Existing(existing));
             }
 
@@ -533,7 +531,14 @@ impl WorkDb {
         head_sha: &str,
         sequence: i64,
     ) -> Result<bool> {
-        self.select_pr_review_guide_source_capture(root_task_id, pr_url, base_sha, head_sha, sequence, false)
+        self.select_pr_review_guide_source_capture(
+            root_task_id,
+            pr_url,
+            base_sha,
+            head_sha,
+            sequence,
+            SourceCaptureSelectMode::Complete,
+        )
     }
 
     /// Probe lookup avoids a metadata subprocess for unchanged observations.
@@ -545,7 +550,36 @@ impl WorkDb {
         head_sha: &str,
         sequence: i64,
     ) -> Result<bool> {
-        self.select_pr_review_guide_source_capture(root_task_id, pr_url, base_sha, head_sha, sequence, true)
+        self.select_pr_review_guide_source_capture(
+            root_task_id,
+            pr_url,
+            base_sha,
+            head_sha,
+            sequence,
+            SourceCaptureSelectMode::Probe,
+        )
+    }
+
+    /// Like [`Self::select_probe_pr_review_guide_source_capture`] without
+    /// reading the packet blob. A poller sweep uses this to skip GitHub work
+    /// for an already-recorded comparison without hashing artifacts on the
+    /// async worker. The capture task still validates the blob.
+    pub fn select_probe_pr_review_guide_source_row(
+        &self,
+        root_task_id: &str,
+        pr_url: &str,
+        base_sha: &str,
+        head_sha: &str,
+        sequence: i64,
+    ) -> Result<bool> {
+        self.select_pr_review_guide_source_capture(
+            root_task_id,
+            pr_url,
+            base_sha,
+            head_sha,
+            sequence,
+            SourceCaptureSelectMode::ProbeRow,
+        )
     }
 
     fn select_pr_review_guide_source_capture(
@@ -555,8 +589,10 @@ impl WorkDb {
         base_sha: &str,
         head_sha: &str,
         sequence: i64,
-        probe: bool,
+        mode: SourceCaptureSelectMode,
     ) -> Result<bool> {
+        let probe = mode.probe();
+        let validate_artifact = mode.validate_artifact();
         let conn = self.connect()?;
         let existing: Option<(String, String, String, i64, String, Option<String>)> = conn
             .query_row(
@@ -588,7 +624,12 @@ impl WorkDb {
             "canonical PR is already associated with another root task"
         );
         drop(conn);
-        let validation = load_packet(&self.artifact_root()?, path.as_deref(), &hash);
+        let artifact_root = self.artifact_root()?;
+        let validation = if validate_artifact {
+            Some(load_packet(&artifact_root, path.as_deref(), &hash))
+        } else {
+            None
+        };
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let latest: Option<i64> = tx
@@ -603,30 +644,46 @@ impl WorkDb {
         let Some(latest) = latest else {
             return Ok(false);
         };
-        if let Err(error) = validation {
-            if let Some(path) = &path {
-                match fs::remove_file(self.artifact_root()?.join(path)) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
+        if let Some(Err(error)) = validation {
+            match &error {
+                LoadPacketError::Io { .. } => {
+                    tx.execute(
+                        "UPDATE pr_review_guide_source_series
+                         SET last_capture_error = CASE WHEN selected_comparison_id = ?2 OR latest_observation_sequence <= ?4
+                             THEN ?3 ELSE last_capture_error END
+                         WHERE id = ?1",
+                        params![series, comparison, error.to_string(), sequence],
+                    )?;
+                    tx.commit()?;
+                    tracing::warn!(%error, pr_url, "transient source artifact read failure; retrying comparison");
+                    return Ok(false);
+                }
+                LoadPacketError::Missing { .. } | LoadPacketError::Corrupt { .. } => {
+                    if let Some(path) = &path {
+                        match fs::remove_file(artifact_root.join(path)) {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                    // Forget the unusable comparison so the next collection can replace it.
+                    tx.execute(
+                        "DELETE FROM pr_review_guide_source_comparisons WHERE id = ?1",
+                        [&comparison],
+                    )?;
+                    tx.execute(
+                        "UPDATE pr_review_guide_source_series
+                         SET selected_comparison_id = CASE WHEN selected_comparison_id = ?2 THEN NULL ELSE selected_comparison_id END,
+                             last_capture_error = CASE WHEN selected_comparison_id = ?2 OR latest_observation_sequence <= ?4
+                                 THEN ?3 ELSE last_capture_error END
+                         WHERE id = ?1",
+                        params![series, comparison, error.to_string(), sequence],
+                    )?;
+                    tx.commit()?;
+                    tracing::warn!(%error, pr_url, "invalid source artifact; recollecting comparison");
+                    return Ok(false);
                 }
             }
-            // Forget the unusable comparison so the next collection can replace it.
-            tx.execute(
-                "DELETE FROM pr_review_guide_source_comparisons WHERE id = ?1",
-                [&comparison],
-            )?;
-            tx.execute(
-                "UPDATE pr_review_guide_source_series
-                 SET selected_comparison_id = CASE WHEN selected_comparison_id = ?2 THEN NULL ELSE selected_comparison_id END,
-                     last_capture_error = CASE WHEN selected_comparison_id = ?2 OR latest_observation_sequence <= ?4
-                         THEN ?3 ELSE last_capture_error END
-                 WHERE id = ?1",
-                params![series, comparison, error.to_string(), sequence],
-            )?;
-            tx.commit()?;
-            tracing::warn!(%error, pr_url, "invalid source artifact; recollecting comparison");
-            return Ok(false);
         }
         if sequence >= latest {
             select_comparison(&tx, &series, &comparison, sequence, &now_string())?;
@@ -724,6 +781,23 @@ impl WorkDb {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SourceCaptureSelectMode {
+    Complete,
+    Probe,
+    ProbeRow,
+}
+
+impl SourceCaptureSelectMode {
+    fn probe(self) -> bool {
+        matches!(self, Self::Probe | Self::ProbeRow)
+    }
+
+    fn validate_artifact(self) -> bool {
+        matches!(self, Self::Complete | Self::Probe)
+    }
+}
+
 fn select_comparison(
     tx: &rusqlite::Transaction<'_>,
     series_id: &str,
@@ -750,45 +824,130 @@ fn select_comparison(
     Ok(())
 }
 
-fn read_capture_by_endpoints(
+fn source_series_for_write(
+    tx: &rusqlite::Transaction<'_>,
+    canonical_pr_url: &str,
+    root_task_id: &str,
+    now: &str,
+) -> Result<(String, i64)> {
+    let existing_series: Option<(String, String, i64)> = tx
+        .query_row(
+            "SELECT id, root_task_id, latest_observation_sequence
+                 FROM pr_review_guide_source_series WHERE canonical_pr_url = ?1",
+            [canonical_pr_url],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    match existing_series {
+        Some((series_id, existing_root, latest_sequence)) => {
+            if existing_root != root_task_id {
+                bail!(
+                    "canonical PR `{canonical_pr_url}` is already associated with root task `{existing_root}`, not `{root_task_id}`"
+                );
+            }
+            Ok((series_id, latest_sequence))
+        }
+        None => {
+            let series_id = next_id("prgs");
+            tx.execute(
+                "INSERT OR IGNORE INTO pr_review_guide_source_series
+                     (id, root_task_id, canonical_pr_url, latest_observation_sequence, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, 0, ?4, ?4)",
+                params![series_id, root_task_id, canonical_pr_url, now],
+            )?;
+            let (series_id, existing_root, latest_sequence): (String, String, i64) = tx.query_row(
+                "SELECT id, root_task_id, latest_observation_sequence
+                     FROM pr_review_guide_source_series WHERE canonical_pr_url = ?1",
+                [canonical_pr_url],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            if existing_root != root_task_id {
+                bail!(
+                    "canonical PR `{canonical_pr_url}` is already associated with root task `{existing_root}`, not `{root_task_id}`"
+                );
+            }
+            Ok((series_id, latest_sequence))
+        }
+    }
+}
+
+fn capture_metadata_by_endpoints(
     conn: &Connection,
-    artifact_root: &Path,
     series_id: &str,
     base_sha: &str,
     head_sha: &str,
-) -> Result<Option<PrReviewGuideSourceCapture>> {
-    let metadata = conn
-        .query_row(
-            "SELECT s.id, s.root_task_id, c.observation_sequence, c.trigger, c.packet_hash,
+) -> Result<Option<CaptureMetadata>> {
+    conn.query_row(
+        "SELECT s.id, s.root_task_id, c.observation_sequence, c.trigger, c.packet_hash,
                 c.complete, c.captured_at, c.id, c.packet_path, c.omission_count, c.omission_summary_json, c.attempt_count
          FROM pr_review_guide_source_series s
          JOIN pr_review_guide_source_comparisons c ON c.series_id = s.id
          WHERE c.series_id = ?1 AND c.observed_base_sha = ?2 AND c.head_sha = ?3",
-            params![series_id, base_sha, head_sha],
-            CaptureMetadata::from_row,
-        )
-        .optional()?;
-    let Some(metadata) = metadata else {
-        return Ok(None);
-    };
-    match load_packet(artifact_root, metadata.packet_path.as_deref(), &metadata.packet_hash) {
-        Ok(packet) => Ok(Some(metadata.with_packet(packet))),
-        Err(error) => {
-            if let Some(path) = &metadata.packet_path {
-                match fs::remove_file(artifact_root.join(path)) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            conn.execute("UPDATE pr_review_guide_source_series SET selected_comparison_id = NULL WHERE id = ?1 AND selected_comparison_id = ?2", params![series_id, metadata.comparison_id])?;
-            conn.execute(
-                "DELETE FROM pr_review_guide_source_comparisons WHERE id = ?1",
-                [&metadata.comparison_id],
-            )?;
-            tracing::warn!(%error, comparison_id = metadata.comparison_id, "invalid source artifact; replacing comparison");
-            Ok(None)
+        params![series_id, base_sha, head_sha],
+        CaptureMetadata::from_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn discard_unreadable_capture(
+    db: &WorkDb,
+    artifact_root: &Path,
+    series_id: &str,
+    meta: &CaptureMetadata,
+    error: &LoadPacketError,
+) -> Result<()> {
+    let mut conn = db.connect()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute(
+        "UPDATE pr_review_guide_source_series SET selected_comparison_id = NULL
+         WHERE id = ?1 AND selected_comparison_id = ?2
+           AND EXISTS (
+               SELECT 1 FROM pr_review_guide_source_comparisons c
+               WHERE c.id = ?2 AND c.packet_hash = ?3 AND c.packet_path IS ?4
+           )",
+        params![series_id, meta.comparison_id, meta.packet_hash, meta.packet_path],
+    )?;
+    let deleted = tx.execute(
+        "DELETE FROM pr_review_guide_source_comparisons
+         WHERE id = ?1 AND packet_hash = ?2 AND packet_path IS ?3",
+        params![meta.comparison_id, meta.packet_hash, meta.packet_path],
+    )?;
+    tx.commit()?;
+    drop(conn);
+    if deleted > 0 {
+        if let Some(path) = &meta.packet_path {
+            gc_packet_blob(db, artifact_root, path);
         }
+        tracing::warn!(%error, comparison_id = meta.comparison_id, "invalid source artifact; replacing comparison");
+    }
+    Ok(())
+}
+
+fn capture_version_changed(existing: Option<&PrReviewGuideSourceCapture>, current: Option<&CaptureMetadata>) -> bool {
+    match (existing, current) {
+        (None, None) => false,
+        (Some(existing), Some(current)) => {
+            existing.comparison_id != current.comparison_id
+                || existing.packet_hash != current.packet_hash
+                || existing.packet_path != current.packet_path
+                || existing.complete != current.complete
+                || existing.omission_count != current.omission_count
+        }
+        _ => true,
+    }
+}
+
+fn gc_packet_blob(db: &WorkDb, artifact_root: &Path, relative: &str) {
+    let cleanup = (|| -> Result<()> {
+        if let Some(_gc) = packet_store_lock(artifact_root, true)? {
+            let conn = db.connect()?;
+            delete_unreferenced_packet_artifact(&conn, artifact_root, relative)?;
+        }
+        Ok(())
+    })();
+    if let Err(err) = cleanup {
+        tracing::warn!(path = %relative, ?err, "source packet blob cleanup failed");
     }
 }
 
@@ -872,29 +1031,75 @@ pub(super) fn set_before_packet_read_hook(hook: Box<dyn FnOnce()>) {
     BEFORE_PACKET_READ.with(|slot| *slot.borrow_mut() = Some(hook));
 }
 
+#[derive(Debug)]
+pub(super) enum LoadPacketError {
+    Missing { path: Option<String> },
+    Corrupt { path: String, detail: String },
+    Io { path: PathBuf, source: io::Error },
+}
+
+impl fmt::Display for LoadPacketError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing { path: None } => {
+                write!(f, "missing referenced source packet blob: no artifact path")
+            }
+            Self::Missing { path: Some(path) } => {
+                write!(f, "missing referenced source packet blob at {path}")
+            }
+            Self::Corrupt { path, detail } => {
+                write!(f, "source packet integrity failure at {path}: {detail}")
+            }
+            Self::Io { path, source } => {
+                write!(f, "could not read source packet blob at {}: {source}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for LoadPacketError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::Missing { .. } | Self::Corrupt { .. } => None,
+        }
+    }
+}
+
 pub(super) fn load_packet(
     artifact_root: &Path,
     packet_path: Option<&str>,
     expected_hash: &str,
-) -> Result<SourcePacket> {
+) -> std::result::Result<SourcePacket, LoadPacketError> {
     #[cfg(any(test, feature = "test-support"))]
-    BEFORE_PACKET_READ.with(|hook| {
-        if let Some(hook) = hook.borrow_mut().take() {
-            hook();
-        }
-    });
-    let packet_path = packet_path
-        .filter(|path| !path.is_empty())
-        .context("missing referenced source packet blob: no artifact path")?;
+    if let Some(hook) = BEFORE_PACKET_READ.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+    let Some(packet_path) = packet_path.filter(|path| !path.is_empty()) else {
+        return Err(LoadPacketError::Missing { path: None });
+    };
     let path = artifact_root.join(packet_path);
-    let bytes =
-        fs::read(&path).with_context(|| format!("missing referenced source packet blob at {}", path.display()))?;
-    anyhow::ensure!(
-        format!("{:x}", Sha256::digest(&bytes)) == expected_hash,
-        "source packet integrity failure at {}: digest mismatch",
-        path.display()
-    );
-    serde_json::from_slice(&bytes).with_context(|| format!("failed to parse source packet blob at {}", path.display()))
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(LoadPacketError::Missing {
+                path: Some(path.display().to_string()),
+            });
+        }
+        Err(error) => {
+            return Err(LoadPacketError::Io { path, source: error });
+        }
+    };
+    if format!("{:x}", Sha256::digest(&bytes)) != expected_hash {
+        return Err(LoadPacketError::Corrupt {
+            path: path.display().to_string(),
+            detail: "digest mismatch".to_owned(),
+        });
+    }
+    serde_json::from_slice(&bytes).map_err(|error| LoadPacketError::Corrupt {
+        path: path.display().to_string(),
+        detail: error.to_string(),
+    })
 }
 
 fn publish_packet_artifact(state_root: &Path, packet_hash: &str, bytes: &[u8]) -> Result<String> {

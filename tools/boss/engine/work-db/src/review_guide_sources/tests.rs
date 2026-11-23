@@ -3,6 +3,8 @@ use crate::test_support::{create_active_chore, create_product, open_db};
 use crate::{FakePrStateChecker, PrOpenState};
 use boss_pr_review_sources::{ChangeKind, PinnedSource, SourceFile, SourceOmission, SourceSide};
 use boss_protocol::{CreateExecutionInput, CreateRevisionInput, ExecutionKind, ExecutionStatus, WorkItemPatch};
+use rusqlite::TransactionBehavior;
+use std::fs;
 
 pub(super) fn packet(base: &str, head: &str) -> SourcePacket {
     SourcePacket {
@@ -396,6 +398,134 @@ fn stale_invalid_comparison_does_not_replace_current_diagnostics() {
             .packet,
         new
     );
+}
+
+#[test]
+fn transient_io_error_does_not_delete_the_comparison_or_its_blob() {
+    let (dir, db) = open_db();
+    let product = create_product(&db);
+    let root = create_active_chore(&db, &product, "transient packet io");
+    let stored = db
+        .persist_pr_review_guide_source_capture(&root, 1, PrSourceCaptureTrigger::Creation, &packet("base", "head"))
+        .unwrap();
+    let PrSourceCapturePersistOutcome::Stored(stored) = stored else {
+        panic!("capture must persist")
+    };
+    let relative = stored.packet_path.expect("artifact path must be recorded");
+    let path = dir.path().join(&relative);
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    assert!(
+        !db.select_complete_pr_review_guide_source_capture(
+            &root,
+            stored.packet.canonical_pr_url.as_str(),
+            "base",
+            "head",
+            2
+        )
+        .unwrap()
+    );
+    let count: i64 = db
+        .connect()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM pr_review_guide_source_comparisons", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 1, "a transient read failure must leave the comparison row");
+    assert!(
+        path.is_dir(),
+        "a transient read failure must leave the referenced artifact"
+    );
+    let error = crate::test_support::source_capture_error(&db, &stored.packet.canonical_pr_url);
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|error| error.contains("could not read source packet blob")),
+        "transient IO must be recorded for retry, got {error:?}"
+    );
+    let persist_error = db
+        .persist_pr_review_guide_source_capture(&root, 3, PrSourceCaptureTrigger::Poller, &packet("base", "head"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        persist_error.contains("could not read source packet blob"),
+        "{persist_error}"
+    );
+    assert!(
+        !persist_error.contains("missing referenced source packet blob"),
+        "{persist_error}"
+    );
+    let count: i64 = db
+        .connect()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM pr_review_guide_source_comparisons", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn persist_releases_the_database_lock_while_reading_an_existing_blob() {
+    let (_dir, db) = open_db();
+    let db = std::sync::Arc::new(db);
+    db.persist_pr_review_guide_source_capture("root", 1, PrSourceCaptureTrigger::Creation, &packet("base", "head"))
+        .unwrap();
+    crate::test_support::set_before_packet_read_hook(Box::new({
+        let db = db.clone();
+        move || {
+            drop(
+                db.conn
+                    .try_lock()
+                    .expect("existing blob validation must release the pooled connection"),
+            );
+            let mut independent = db.connect_new().expect("independent connection during blob read");
+            independent
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .expect("existing blob validation must not hold SQLite write lock");
+        }
+    }));
+    let reused = db
+        .persist_pr_review_guide_source_capture("root", 2, PrSourceCaptureTrigger::Completion, &packet("base", "head"))
+        .unwrap();
+    assert!(matches!(reused, PrSourceCapturePersistOutcome::Existing(_)));
+}
+
+#[test]
+fn persist_does_not_overwrite_a_concurrent_complete_upgrade_from_a_stale_snapshot() {
+    let (_dir, db) = open_db();
+    let db = std::sync::Arc::new(db);
+    let mut original = incomplete_packet("base", "head", "first hole");
+    original.omissions.push(SourceOmission {
+        path: Some("src/lib.rs".to_owned()),
+        side: Some(SourceSide::Before),
+        reason: "second hole".to_owned(),
+        terminal: true,
+    });
+    db.persist_pr_review_guide_source_capture("root", 1, PrSourceCaptureTrigger::Creation, &original)
+        .unwrap();
+    let stale_upgrade = incomplete_packet("base", "head", "first hole");
+    crate::test_support::set_before_packet_read_hook(Box::new({
+        let db = db.clone();
+        move || {
+            db.persist_pr_review_guide_source_capture(
+                "root",
+                2,
+                PrSourceCaptureTrigger::Poller,
+                &packet("base", "head"),
+            )
+            .unwrap();
+        }
+    }));
+    db.persist_pr_review_guide_source_capture("root", 3, PrSourceCaptureTrigger::Poller, &stale_upgrade)
+        .unwrap();
+    let stored = db.get_latest_pr_review_guide_source_capture("root").unwrap().unwrap();
+    assert!(
+        stored.complete,
+        "a concurrent complete upgrade must survive a stale incomplete persist"
+    );
+    assert_eq!(stored.omission_count, 0);
 }
 
 #[test]

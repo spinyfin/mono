@@ -30,9 +30,11 @@ fn publication_releases_database_locks_and_rechecks_observation_order() {
         .unwrap();
     assert_eq!(result, PrSourceCapturePersistOutcome::IgnoredStaleObservation);
     assert!(db.get_latest_pr_review_guide_source_capture("root").unwrap().is_none());
-    assert_eq!(artifact_count(dir.path()), 1);
-    db.gc_unreferenced_pr_review_guide_source_artifacts().unwrap();
-    assert_eq!(artifact_count(dir.path()), 0);
+    assert_eq!(
+        artifact_count(dir.path()),
+        0,
+        "a stale observation must GC the blob it published and then abandoned"
+    );
 }
 
 #[test]

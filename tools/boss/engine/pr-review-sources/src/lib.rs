@@ -250,13 +250,14 @@ fn legacy_retryable_omission(reason: &str) -> bool {
 
 /// GitHub's Trees API 404 (`NotFound`) and 401/403 (`NotAuthorized`) are
 /// ambiguous for private repos — GitHub returns 404 rather than 403 when
-/// the token cannot see a private repo. `NotFound` is treated as terminal:
-/// a deleted head fork or a SHA that no longer resolves will not become
-/// capturable at this comparison. `NotAuthorized` stays retryable so
-/// restoring a token can recover the same immutable SHA, matching
-/// rate-limited and unreachable tree failures.
-fn tree_error_is_terminal(kind: boss_github::trees::TreeApiErrorKind) -> bool {
-    matches!(kind, boss_github::trees::TreeApiErrorKind::NotFound)
+/// the token cannot see a private repo. A lone `NotFound` is therefore
+/// retryable, matching `NotAuthorized`, rate-limited, and unreachable
+/// tree failures: restoring a token can recover the same immutable SHA.
+/// `NotFound` is terminal only when another tree read at the same commit
+/// SHA already succeeded, proving the SHA is visible and the missing
+/// path is a property of the revision.
+fn tree_error_is_terminal(kind: boss_github::trees::TreeApiErrorKind, sha_visible: bool) -> bool {
+    matches!(kind, boss_github::trees::TreeApiErrorKind::NotFound if sha_visible)
 }
 
 /// GitHub's changed-file classification, preserving the API value instead of
@@ -763,23 +764,31 @@ async fn collect_pinned_source_packet_with_transport<T: SourceTransport + Sync +
     let after_errors = omission_reasons(after_omissions);
 
     let mut source_work = Vec::new();
-    for file in &inventory {
+    for (index, file) in inventory.iter().enumerate() {
         let change_kind = ChangeKind::from_api(&file.status);
         if change_kind.has_before() {
-            let before_path = file.previous_filename.clone().unwrap_or_else(|| file.filename.clone());
+            let path = file.previous_filename.clone().unwrap_or_else(|| file.filename.clone());
             source_work.push(SourceFetch {
-                key: (before_path.clone(), SourceSide::Before),
-                repository: metadata.base_repository.clone(),
-                sha: merge_base_sha.clone(),
-                entry: before_entries.get(&before_path).cloned(),
-                tree_error: before_errors.get(&before_path).cloned(),
+                index,
+                side: SourceSide::Before,
+                target: SourceTarget {
+                    repository: metadata.base_repository.clone(),
+                    sha: merge_base_sha.clone(),
+                    path: path.clone(),
+                },
+                entry: before_entries.get(&path).cloned(),
+                tree_error: before_errors.get(&path).cloned(),
             });
         }
         if change_kind.has_after() {
             source_work.push(SourceFetch {
-                key: (file.filename.clone(), SourceSide::After),
-                repository: metadata.head_repository.clone(),
-                sha: metadata.head_sha.clone(),
+                index,
+                side: SourceSide::After,
+                target: SourceTarget {
+                    repository: metadata.head_repository.clone(),
+                    sha: metadata.head_sha.clone(),
+                    path: file.filename.clone(),
+                },
                 entry: after_entries.get(&file.filename).cloned(),
                 tree_error: after_errors.get(&file.filename).cloned(),
             });
@@ -791,21 +800,21 @@ async fn collect_pinned_source_packet_with_transport<T: SourceTransport + Sync +
         async move {
             let source = fetch_source(
                 &transport,
-                &work.repository,
-                &work.sha,
-                &work.key.0,
+                &work.target.repository,
+                &work.target.sha,
+                &work.target.path,
                 work.entry.as_ref(),
                 work.tree_error.as_ref(),
             )
             .await;
-            (work.key, source)
+            ((work.index, work.side), source)
         }
     });
     let mut fetched: HashMap<_, _> = resolve_bounded(requests).await?.into_iter().collect();
 
     let mut omissions = Vec::new();
     let mut files = Vec::with_capacity(inventory.len());
-    for file in inventory {
+    for (index, file) in inventory.into_iter().enumerate() {
         let change_kind = ChangeKind::from_api(&file.status);
         if let ChangeKind::Unknown(status) = &change_kind {
             omissions.push(SourceOmission {
@@ -818,13 +827,26 @@ async fn collect_pinned_source_packet_with_transport<T: SourceTransport + Sync +
             });
         }
         let before = if change_kind.has_before() {
-            let before_path = file.previous_filename.clone().unwrap_or_else(|| file.filename.clone());
-            fetched.remove(&(before_path, SourceSide::Before))
+            match fetched.remove(&(index, SourceSide::Before)) {
+                Some(source) => Some(source),
+                None => Some(unresolved_pinned_source(
+                    &metadata.base_repository,
+                    &merge_base_sha,
+                    &file.previous_filename.clone().unwrap_or_else(|| file.filename.clone()),
+                )),
+            }
         } else {
             None
         };
         let after = if change_kind.has_after() {
-            fetched.remove(&(file.filename.clone(), SourceSide::After))
+            match fetched.remove(&(index, SourceSide::After)) {
+                Some(source) => Some(source),
+                None => Some(unresolved_pinned_source(
+                    &metadata.head_repository,
+                    &metadata.head_sha,
+                    &file.filename,
+                )),
+            }
         } else {
             None
         };
@@ -871,12 +893,29 @@ async fn collect_pinned_source_packet_with_transport<T: SourceTransport + Sync +
     })
 }
 
-struct SourceFetch {
-    key: (String, SourceSide),
+struct SourceTarget {
     repository: String,
     sha: String,
+    path: String,
+}
+
+struct SourceFetch {
+    index: usize,
+    side: SourceSide,
+    target: SourceTarget,
     entry: Option<boss_github::trees::PinnedTreeEntry>,
     tree_error: Option<TreeSideError>,
+}
+
+fn unresolved_pinned_source(repository: &str, sha: &str, path: &str) -> PinnedSource {
+    PinnedSource::omitted(
+        repository,
+        sha,
+        path,
+        "internal: pinned source result was not resolved for this side".to_owned(),
+        None,
+        false,
+    )
 }
 
 #[derive(Clone)]
@@ -994,6 +1033,7 @@ where
         async move { (directory, names, result.await) }
     });
     let resolved = resolve_bounded(pending).await?;
+    let sha_visible = resolved.iter().any(|(_, _, result)| result.is_ok());
     let mut entries = HashMap::new();
     let mut omissions = Vec::new();
     for (directory, names, result) in resolved {
@@ -1007,7 +1047,7 @@ where
             result => {
                 let (cause, terminal) = match result {
                     Ok(_) => ("directory response was truncated".to_owned(), true),
-                    Err(error) => (error.to_string(), tree_error_is_terminal(error.kind)),
+                    Err(error) => (error.to_string(), tree_error_is_terminal(error.kind, sha_visible)),
                 };
                 for name in names {
                     omissions.push(SourceOmission {

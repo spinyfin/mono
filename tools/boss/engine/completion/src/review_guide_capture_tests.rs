@@ -45,10 +45,13 @@ async fn divergent_probe(existing: bool) {
             })
             .build()
     };
-    reconcile_review_guide_source_with_collector(db.clone(), flags.clone(), request(), collector.clone())
-        .expect("new probe must resolve REST identity")
-        .await
-        .unwrap();
+    crate::work::test_support::set_before_packet_read_hook(Box::new(|| {
+        panic!("poller pre-spawn path must not read the packet blob");
+    }));
+    let handle = reconcile_review_guide_source_with_collector(db.clone(), flags.clone(), request(), collector.clone())
+        .expect("new probe must resolve REST identity");
+    crate::work::test_support::set_before_packet_read_hook(Box::new(|| {}));
+    handle.await.unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), usize::from(!existing));
     assert_eq!(metadata_calls.load(Ordering::SeqCst), 1);
     let stored = db.get_latest_pr_review_guide_source_capture(&root).unwrap().unwrap();
@@ -64,11 +67,22 @@ async fn divergent_probe(existing: bool) {
             .unwrap(),
         1
     );
-    assert!(reconcile_review_guide_source_with_collector(db, flags, request(), collector).is_none());
+    crate::work::test_support::set_before_packet_read_hook(Box::new(|| {
+        panic!("poller pre-spawn path must not read the packet blob");
+    }));
+    let repeat = reconcile_review_guide_source_with_collector(db, flags, request(), collector)
+        .expect("repeat probe still spawns to validate the stored blob");
+    crate::work::test_support::set_before_packet_read_hook(Box::new(|| {}));
+    repeat.await.unwrap();
     assert_eq!(
         metadata_calls.load(Ordering::SeqCst),
         1,
-        "repeat probe must not spawn metadata fetch"
+        "repeat probe with a valid blob must not fetch metadata"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        usize::from(!existing),
+        "repeat probe with a valid blob must not re-collect"
     );
 }
 
@@ -80,6 +94,259 @@ async fn divergent_probe_reuses_complete_rest_comparison() {
 #[tokio::test]
 async fn divergent_probe_collects_and_persists_rest_identity() {
     divergent_probe(false).await;
+}
+
+#[tokio::test]
+async fn coalesced_newer_sequence_is_handed_off_so_an_older_comparison_cannot_win() {
+    use std::sync::Condvar;
+
+    let (_dir, db) = open_db();
+    let db = Arc::new(db);
+    let product = create_product(&db);
+    let root = create_active_chore(&db, &product, "handoff coalesced sequence");
+    let url = "https://github.com/acme/widget/pull/90";
+    let packet_a = source_capture_packet(url, "base", "head-a");
+    let packet_b = source_capture_packet(url, "base", "head-b");
+    let (a_started_tx, mut a_started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (b_started_tx, mut b_started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let a_release = Arc::new((Mutex::new(false), Condvar::new()));
+    let b_release = Arc::new((Mutex::new(false), Condvar::new()));
+    let collect_a = packet_a.clone();
+    let collect_b = packet_b.clone();
+    let a_wait = a_release.clone();
+    let b_wait = b_release.clone();
+    let collect: PacketCollectFn = Arc::new(move |_, observed, _, _| {
+        let observed = observed.expect("observed endpoints");
+        let (packet, started, release) = if observed.head_sha == "head-a" {
+            (collect_a.clone(), a_started_tx.clone(), a_wait.clone())
+        } else {
+            (collect_b.clone(), b_started_tx.clone(), b_wait.clone())
+        };
+        Box::pin(async move {
+            started.send(()).expect("started");
+            tokio::task::spawn_blocking(move || {
+                let (lock, cv) = &*release;
+                let mut go = lock.lock().unwrap();
+                while !*go {
+                    go = cv.wait(go).unwrap();
+                }
+            })
+            .await
+            .unwrap();
+            Ok(packet)
+        })
+    });
+    let metadata_head = Arc::new(Mutex::new("head-a".to_owned()));
+    let mut collector = SourcePacketCollector::fixture(collect, packet_a.clone());
+    let head = metadata_head.clone();
+    collector.metadata = Arc::new(move |_, _| {
+        let head_sha = head.lock().unwrap().clone();
+        Box::pin(async move {
+            Ok(PrComparisonMetadata {
+                number: 90,
+                title: "Captured".to_owned(),
+                body: None,
+                base_repository: "acme/widget".to_owned(),
+                head_repository: "acme/widget".to_owned(),
+                head_ref_name: "fixture".to_owned(),
+                base_sha: "base".to_owned(),
+                head_sha,
+                changed_files: 0,
+            })
+        })
+    });
+    let flag_directory = tempfile::tempdir().unwrap();
+    let flags = Arc::new(FeatureFlagsStore::new(flag_directory.path().join("feature-flags.toml")));
+    flags.set(REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, true).unwrap();
+    let key_a = (format!("{root}:{url}"), "base".to_owned(), "head-a".to_owned());
+    let persist_passes = Arc::new(AtomicUsize::new(0));
+    struct ClearPersistHook;
+    impl Drop for ClearPersistHook {
+        fn drop(&mut self) {
+            clear_after_capture_persist_hook();
+        }
+    }
+    let _clear_persist_hook = ClearPersistHook;
+    set_after_capture_persist_hook(Box::new({
+        let passes = persist_passes.clone();
+        let key = key_a.clone();
+        move |fired| {
+            if fired != &key {
+                return;
+            }
+            let n = passes.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                let sequence = if n == 0 { 3 } else { 5 };
+                drop(InFlightGuard::acquire(key.clone(), sequence));
+            }
+        }
+    }));
+    let request_a = SourceCaptureRequest::builder()
+        .root_task_id(root.clone())
+        .pr_url(url)
+        .trigger(PrSourceCaptureTrigger::Poller)
+        .observed(PinnedComparison {
+            base_sha: "base".to_owned(),
+            head_sha: "head-a".to_owned(),
+        })
+        .observation_sequence(1)
+        .build();
+    let handle_a =
+        reconcile_review_guide_source_with_collector(db.clone(), flags.clone(), request_a, collector.clone())
+            .expect("comparison A must start");
+    tokio::time::timeout(std::time::Duration::from_secs(10), a_started_rx.recv())
+        .await
+        .expect("comparison A started collecting")
+        .expect("comparison A started");
+    *metadata_head.lock().unwrap() = "head-b".to_owned();
+    let request_b = SourceCaptureRequest::builder()
+        .root_task_id(root.clone())
+        .pr_url(url)
+        .trigger(PrSourceCaptureTrigger::Poller)
+        .observed(PinnedComparison {
+            base_sha: "base".to_owned(),
+            head_sha: "head-b".to_owned(),
+        })
+        .observation_sequence(4)
+        .build();
+    let handle_b = reconcile_review_guide_source_with_collector(db.clone(), flags.clone(), request_b, collector)
+        .expect("comparison B must start");
+    tokio::time::timeout(std::time::Duration::from_secs(10), b_started_rx.recv())
+        .await
+        .expect("comparison B started collecting")
+        .expect("comparison B started");
+    {
+        let (lock, cv) = &*a_release;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+    }
+    handle_a.await.unwrap();
+    {
+        let (lock, cv) = &*b_release;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+    }
+    handle_b.await.unwrap();
+    clear_after_capture_persist_hook();
+    let latest = db.get_latest_pr_review_guide_source_capture(&root).unwrap().unwrap();
+    assert_eq!(latest.packet.head_sha, "head-a");
+    let watermark: i64 = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT latest_observation_sequence FROM pr_review_guide_source_series WHERE canonical_pr_url = ?1",
+            [url],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        watermark, 5,
+        "the coalesced sequence must be persisted as the series watermark"
+    );
+}
+
+#[tokio::test]
+async fn poller_recollects_when_a_complete_blob_is_missing() {
+    let (dir, db) = open_db();
+    let db = Arc::new(db);
+    let product = create_product(&db);
+    let root = create_active_chore(&db, &product, "missing complete blob");
+    let url = "https://github.com/acme/widget/pull/91";
+    let packet = source_capture_packet(url, "base", "head");
+    let stored = db
+        .persist_pr_review_guide_source_capture(&root, 1, PrSourceCaptureTrigger::Creation, &packet)
+        .unwrap();
+    let PrSourceCapturePersistOutcome::Stored(stored) = stored else {
+        panic!("complete comparison must persist");
+    };
+    std::fs::remove_file(dir.path().join(stored.packet_path.expect("artifact path"))).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let collector = crate::test_support::counting_source_collector(calls.clone(), packet.clone());
+    let flags = Arc::new(FeatureFlagsStore::new(dir.path().join("flags.toml")));
+    flags.set(REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, true).unwrap();
+    crate::work::test_support::set_before_packet_read_hook(Box::new(|| {
+        panic!("poller pre-spawn path must not read the packet blob");
+    }));
+    let handle = reconcile_review_guide_source_with_collector(
+        db.clone(),
+        flags,
+        SourceCaptureRequest::builder()
+            .root_task_id(root.clone())
+            .pr_url(url)
+            .trigger(PrSourceCaptureTrigger::Poller)
+            .observed(PinnedComparison {
+                base_sha: "base".to_owned(),
+                head_sha: "head".to_owned(),
+            })
+            .build(),
+        collector,
+    )
+    .expect("missing blob must still spawn a capture task");
+    crate::work::test_support::set_before_packet_read_hook(Box::new(|| {}));
+    handle.await.unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "collector must run after the blob is discarded"
+    );
+    let restored = db.get_latest_pr_review_guide_source_capture(&root).unwrap().unwrap();
+    assert_eq!(restored.packet, packet);
+    assert!(restored.complete);
+}
+
+#[tokio::test]
+async fn coalesced_arrival_after_equal_sequence_read_is_still_persisted() {
+    let (_dir, db) = open_db();
+    let db = Arc::new(db);
+    let product = create_product(&db);
+    let root = create_active_chore(&db, &product, "equal-sequence coalesced arrival");
+    let url = "https://github.com/acme/widget/pull/92";
+    let packet = source_capture_packet(url, "base", "head");
+    let collector = crate::test_support::counting_source_collector(Arc::new(AtomicUsize::new(0)), packet.clone());
+    let flags = Arc::new(FeatureFlagsStore::new(_dir.path().join("flags.toml")));
+    flags.set(REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, true).unwrap();
+    struct ClearReleaseHook;
+    impl Drop for ClearReleaseHook {
+        fn drop(&mut self) {
+            clear_before_in_flight_claim_release_hook();
+        }
+    }
+    let _clear_release_hook = ClearReleaseHook;
+    set_before_in_flight_claim_release_hook(Box::new(|sequence| {
+        let mut latest = sequence.lock().unwrap();
+        *latest = (*latest).max(7);
+    }));
+    let handle = reconcile_review_guide_source_with_collector(
+        db.clone(),
+        flags,
+        SourceCaptureRequest::builder()
+            .root_task_id(root.clone())
+            .pr_url(url)
+            .trigger(PrSourceCaptureTrigger::Poller)
+            .observed(PinnedComparison {
+                base_sha: "base".to_owned(),
+                head_sha: "head".to_owned(),
+            })
+            .observation_sequence(2)
+            .build(),
+        collector,
+    )
+    .expect("capture must start");
+    handle.await.unwrap();
+    clear_before_in_flight_claim_release_hook();
+    let watermark: i64 = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT latest_observation_sequence FROM pr_review_guide_source_series WHERE canonical_pr_url = ?1",
+            [url],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        watermark, 7,
+        "a coalesced arrival between the equal-sequence read and claim removal must still raise the watermark"
+    );
 }
 use crate::feature_flags::FeatureFlagsStore;
 use crate::test_support::{create_active_chore, create_product, open_db, source_capture_packet};

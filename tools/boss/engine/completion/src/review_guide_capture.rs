@@ -6,6 +6,8 @@
 //! The packet crate owns pinned source collection and reference validation;
 //! this module owns engine lifetime and reconciliation semantics.
 
+#[cfg(test)]
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -93,6 +95,56 @@ type CaptureMap = HashMap<CaptureKey, Arc<Mutex<i64>>>;
 fn in_flight_captures() -> &'static Mutex<CaptureMap> {
     static SET: OnceLock<Mutex<CaptureMap>> = OnceLock::new();
     SET.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+type AfterCapturePersistHook = Box<dyn FnMut(&CaptureKey)>;
+#[cfg(test)]
+type BeforeInFlightClaimReleaseHook = Box<dyn FnMut(&Arc<Mutex<i64>>)>;
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_CAPTURE_PERSIST: RefCell<Option<AfterCapturePersistHook>> = const { RefCell::new(None) };
+    static BEFORE_IN_FLIGHT_CLAIM_RELEASE: RefCell<Option<BeforeInFlightClaimReleaseHook>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_after_capture_persist_hook(hook: AfterCapturePersistHook) {
+    AFTER_CAPTURE_PERSIST.with(|slot| *slot.borrow_mut() = Some(hook));
+}
+
+#[cfg(test)]
+fn clear_after_capture_persist_hook() {
+    AFTER_CAPTURE_PERSIST.with(|slot| *slot.borrow_mut() = None);
+}
+
+#[cfg(test)]
+fn run_after_capture_persist(key: &CaptureKey) {
+    AFTER_CAPTURE_PERSIST.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(key);
+        }
+    });
+}
+
+#[cfg(test)]
+fn set_before_in_flight_claim_release_hook(hook: BeforeInFlightClaimReleaseHook) {
+    BEFORE_IN_FLIGHT_CLAIM_RELEASE.with(|slot| *slot.borrow_mut() = Some(hook));
+}
+
+#[cfg(test)]
+fn clear_before_in_flight_claim_release_hook() {
+    BEFORE_IN_FLIGHT_CLAIM_RELEASE.with(|slot| *slot.borrow_mut() = None);
+}
+
+#[cfg(test)]
+fn run_before_in_flight_claim_release(sequence: &Arc<Mutex<i64>>) {
+    BEFORE_IN_FLIGHT_CLAIM_RELEASE.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(sequence);
+        }
+    });
 }
 
 pub fn github_source_packet_collector() -> SourcePacketCollector {
@@ -329,29 +381,77 @@ pub fn reconcile_review_guide_source_with_collector(
             }
         },
     };
-    let guard = if let Some(endpoints) = &observed {
-        match prepare_capture(&work_db, &root_task_id, &pr_url, endpoints, observation_sequence, true) {
-            Ok(Some(guard)) => Some(guard),
-            Ok(None) => return None,
+    let (guard, validate_existing) = if let Some(endpoints) = &observed {
+        let existing_row = match work_db.select_probe_pr_review_guide_source_row(
+            &root_task_id,
+            &pr_url,
+            &endpoints.base_sha,
+            &endpoints.head_sha,
+            observation_sequence,
+        ) {
+            Ok(existing_row) => existing_row,
             Err(error) => {
                 record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error);
                 return None;
             }
-        }
+        };
+        (
+            Some(acquire_in_flight_claim(
+                &root_task_id,
+                &pr_url,
+                endpoints,
+                observation_sequence,
+            )?),
+            existing_row,
+        )
     } else {
-        None
+        (None, false)
     };
     Some(boss_task_scope::spawn(async move {
         // Own the guard before the future is polled, including cancellation.
         let guard = guard;
         boss_gh_telemetry::scope(boss_gh_telemetry::callers::REVIEW_GUIDE_SOURCE_CAPTURE, async move {
+            if validate_existing && let Some(endpoints) = observed.clone() {
+                let probe_db = Arc::clone(&work_db);
+                let probe_root = root_task_id.clone();
+                let probe_url = pr_url.clone();
+                let probe_sequence = observation_sequence;
+                match tokio::task::spawn_blocking(move || {
+                    probe_db.select_probe_pr_review_guide_source_capture(
+                        &probe_root,
+                        &probe_url,
+                        &endpoints.base_sha,
+                        &endpoints.head_sha,
+                        probe_sequence,
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(true)) => return,
+                    Ok(Ok(false)) => {}
+                    Ok(Err(error)) => {
+                        record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error);
+                        return;
+                    }
+                    Err(error) => {
+                        record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error);
+                        return;
+                    }
+                }
+            }
             // Completion may already have pinned the delivered head. Preserve
             // its attribution even when fetching fresh metadata fails.
             if let Some(revision) = &revision
                 && let Some(head) = &revision.head_after
                 && revision.head_before.as_ref() != Some(head)
                 && let Err(error) = work_db
-                    .record_review_guide_revision_head(&root_task_id, &pr_url, head, &revision.task_id, observation_sequence)
+                    .record_review_guide_revision_head(
+                        &root_task_id,
+                        &pr_url,
+                        head,
+                        &revision.task_id,
+                        observation_sequence,
+                    )
                     .and_then(|()| match &revision.head_before {
                         Some(before) => work_db.record_review_guide_head_ancestry(&root_task_id, &pr_url, before, head),
                         None => Ok(()),
@@ -386,7 +486,10 @@ pub fn reconcile_review_guide_source_with_collector(
                     // surfaces a durable failure. Any other completion without a
                     // confirmed REST identity defers to the poller.
                     if trigger == PrSourceCaptureTrigger::Completion
-                        && revision.as_ref().and_then(|revision| revision.head_after.as_ref()).is_none()
+                        && revision
+                            .as_ref()
+                            .and_then(|revision| revision.head_after.as_ref())
+                            .is_none()
                     {
                         defer_unconfirmed_completion(
                             &root_task_id,
@@ -436,7 +539,10 @@ pub fn reconcile_review_guide_source_with_collector(
             }
             if let Some(revision) = &revision
                 && revision.head_before.as_deref() != Some(metadata.head_sha.as_str())
-                && revision.head_after.as_deref().is_none_or(|head| head == metadata.head_sha)
+                && revision
+                    .head_after
+                    .as_deref()
+                    .is_none_or(|head| head == metadata.head_sha)
                 && let Err(error) = work_db
                     .record_review_guide_revision_head(
                         &root_task_id,
@@ -446,9 +552,12 @@ pub fn reconcile_review_guide_source_with_collector(
                         observation_sequence,
                     )
                     .and_then(|()| match &revision.head_before {
-                        Some(before) => {
-                            work_db.record_review_guide_head_ancestry(&root_task_id, &pr_url, before, &metadata.head_sha)
-                        }
+                        Some(before) => work_db.record_review_guide_head_ancestry(
+                            &root_task_id,
+                            &pr_url,
+                            before,
+                            &metadata.head_sha,
+                        ),
                         None => Ok(()),
                     })
             {
@@ -477,13 +586,21 @@ pub fn reconcile_review_guide_source_with_collector(
                             // A poll can capture this head before completion. Recover a
                             // missing enqueue without retrying a failed or completed job.
                             match work_db.get_latest_pr_review_guide_source_capture(&root_task_id) {
-                                Ok(Some(capture)) if capture.packet.canonical_pr_url == pr_url
-                                    && capture.packet.head_sha == rest_identity.head_sha => {
-                                        enqueue_review_guide_generation(&work_db, &feature_flags, &capture);
-                                    }
+                                Ok(Some(capture))
+                                    if capture.packet.canonical_pr_url == pr_url
+                                        && capture.packet.head_sha == rest_identity.head_sha =>
+                                {
+                                    enqueue_review_guide_generation(&work_db, &feature_flags, &capture);
+                                }
                                 Ok(_) => {}
                                 Err(error) => {
-                                    record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error);
+                                    record_capture_failure(
+                                        &work_db,
+                                        &root_task_id,
+                                        &pr_url,
+                                        observation_sequence,
+                                        error,
+                                    );
                                     return;
                                 }
                             }
@@ -510,55 +627,35 @@ pub fn reconcile_review_guide_source_with_collector(
             let result = (collector.collect)(pr_url.clone(), observed, expected_head_branch, metadata).await;
             for pass in 0..2 {
                 let observation_sequence = *guard.sequence.lock().unwrap_or_else(|error| error.into_inner());
-                match &result {
-                    Ok(packet) => match work_db.persist_pr_review_guide_source_capture(
-                        &root_task_id,
-                        observation_sequence,
-                        trigger,
-                        packet,
-                    ) {
-                        Ok(PrSourceCapturePersistOutcome::Stored(capture)) => {
-                            tracing::info!(
-                                root_task_id,
-                                pr_url,
-                                observation_sequence,
-                                packet_hash = %capture.packet_hash,
-                                complete = capture.complete,
-                                "review-guide source capture: stored immutable comparison packet",
-                            );
-                            enqueue_review_guide_generation(&work_db, &feature_flags, &capture);
-                        }
-                        Ok(PrSourceCapturePersistOutcome::Existing(capture)) => tracing::debug!(
-                            root_task_id,
-                            pr_url,
-                            observation_sequence,
-                            existing_sequence = capture.observation_sequence,
-                            "review-guide source capture: comparison packet already present",
-                        ),
-                        Ok(PrSourceCapturePersistOutcome::IgnoredStaleObservation) => tracing::debug!(
-                            root_task_id,
-                            pr_url,
-                            observation_sequence,
-                            "review-guide source capture: ignored delayed observation",
-                        ),
-                        Err(error) => record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error),
+                apply_capture_result(
+                    CapturePersistContext {
+                        work_db: &work_db,
+                        feature_flags: &feature_flags,
+                        root_task_id: &root_task_id,
+                        pr_url: &pr_url,
                     },
-                    Err(error) => {
-                        if let Err(count_error) = work_db.record_pr_review_guide_source_retry_error(&pr_url, &rest_identity) {
-                            tracing::warn!(?count_error, "could not count failed source retry");
-                        }
-                        record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error);
+                    trigger,
+                    &rest_identity,
+                    &result,
+                    observation_sequence,
+                );
+                #[cfg(test)]
+                run_after_capture_persist(&guard.key);
+                if let Some(snapshot) = release_in_flight_claim(&mut guard, observation_sequence, pass == 1) {
+                    if snapshot != observation_sequence {
+                        apply_capture_result(
+                            CapturePersistContext {
+                                work_db: &work_db,
+                                feature_flags: &feature_flags,
+                                root_task_id: &root_task_id,
+                                pr_url: &pr_url,
+                            },
+                            trigger,
+                            &rest_identity,
+                            &result,
+                            snapshot,
+                        );
                     }
-                }
-                let mut captures = in_flight_captures().lock().unwrap_or_else(|error| error.into_inner());
-                let latest_sequence = *guard.sequence.lock().unwrap_or_else(|error| error.into_inner());
-                if latest_sequence == observation_sequence || pass == 1 {
-                    if latest_sequence != observation_sequence {
-                        tracing::warn!(root_task_id, pr_url, observation_sequence, latest_sequence,
-                            "review-guide source capture: coalescing retry limit reached; next observation will reconcile");
-                    }
-                    captures.remove(&guard.key);
-                    guard.active = false;
                     break;
                 }
             }
@@ -633,6 +730,107 @@ fn enqueue_review_guide_generation(
     }
 }
 
+struct CapturePersistContext<'a> {
+    work_db: &'a WorkDb,
+    feature_flags: &'a FeatureFlagsStore,
+    root_task_id: &'a str,
+    pr_url: &'a str,
+}
+
+fn apply_capture_result(
+    ctx: CapturePersistContext<'_>,
+    trigger: PrSourceCaptureTrigger,
+    rest_identity: &PinnedComparison,
+    result: &Result<SourcePacket>,
+    observation_sequence: i64,
+) {
+    let CapturePersistContext {
+        work_db,
+        feature_flags,
+        root_task_id,
+        pr_url,
+    } = ctx;
+    match result {
+        Ok(packet) => {
+            match work_db.persist_pr_review_guide_source_capture(root_task_id, observation_sequence, trigger, packet) {
+                Ok(PrSourceCapturePersistOutcome::Stored(capture)) => {
+                    tracing::info!(
+                        root_task_id,
+                        pr_url,
+                        observation_sequence,
+                        packet_hash = %capture.packet_hash,
+                        complete = capture.complete,
+                        "review-guide source capture: stored immutable comparison packet",
+                    );
+                    enqueue_review_guide_generation(work_db, feature_flags, &capture);
+                }
+                Ok(PrSourceCapturePersistOutcome::Existing(capture)) => tracing::debug!(
+                    root_task_id,
+                    pr_url,
+                    observation_sequence,
+                    existing_sequence = capture.observation_sequence,
+                    "review-guide source capture: comparison packet already present",
+                ),
+                Ok(PrSourceCapturePersistOutcome::IgnoredStaleObservation) => tracing::debug!(
+                    root_task_id,
+                    pr_url,
+                    observation_sequence,
+                    "review-guide source capture: ignored delayed observation",
+                ),
+                Err(error) => record_capture_failure(work_db, root_task_id, pr_url, observation_sequence, error),
+            }
+        }
+        Err(error) => {
+            if let Err(count_error) = work_db.record_pr_review_guide_source_retry_error(pr_url, rest_identity) {
+                tracing::warn!(?count_error, "could not count failed source retry");
+            }
+            record_capture_failure(work_db, root_task_id, pr_url, observation_sequence, error);
+        }
+    }
+}
+
+/// Drop the in-flight claim under the map mutex and return the coalesced
+/// sequence. Map lock then sequence lock, matching [`InFlightGuard::acquire_locked`].
+///
+/// When `force` is false, a newer coalesced sequence leaves the claim in
+/// place so another persist pass can run. An arrival injected after the
+/// equal-sequence read is still snapshotted and returned so it can be
+/// persisted outside the lock.
+fn release_in_flight_claim(guard: &mut InFlightGuard, persisted: i64, force: bool) -> Option<i64> {
+    if !guard.active {
+        return None;
+    }
+    let mut captures = in_flight_captures().lock().unwrap_or_else(|error| error.into_inner());
+    let peeked = *guard.sequence.lock().unwrap_or_else(|error| error.into_inner());
+    if peeked != persisted && !force {
+        return None;
+    }
+    #[cfg(test)]
+    run_before_in_flight_claim_release(&guard.sequence);
+    let snapshot = *guard.sequence.lock().unwrap_or_else(|error| error.into_inner());
+    captures.remove(&guard.key);
+    guard.active = false;
+    Some(snapshot)
+}
+
+fn acquire_in_flight_claim(
+    root: &str,
+    url: &str,
+    endpoints: &PinnedComparison,
+    sequence: i64,
+) -> Option<InFlightGuard> {
+    let mut captures = in_flight_captures().lock().unwrap_or_else(|error| error.into_inner());
+    InFlightGuard::acquire_locked(
+        &mut captures,
+        (
+            format!("{root}:{url}"),
+            endpoints.base_sha.clone(),
+            endpoints.head_sha.clone(),
+        ),
+        sequence,
+    )
+}
+
 pub fn prepare_capture(
     db: &WorkDb,
     root: &str,
@@ -649,16 +847,7 @@ pub fn prepare_capture(
     if select(db, root, url, &endpoints.base_sha, &endpoints.head_sha, sequence)? {
         return Ok(None);
     }
-    let mut captures = in_flight_captures().lock().unwrap_or_else(|error| error.into_inner());
-    Ok(InFlightGuard::acquire_locked(
-        &mut captures,
-        (
-            format!("{root}:{url}"),
-            endpoints.base_sha.clone(),
-            endpoints.head_sha.clone(),
-        ),
-        sequence,
-    ))
+    Ok(acquire_in_flight_claim(root, url, endpoints, sequence))
 }
 
 pub struct InFlightGuard {
