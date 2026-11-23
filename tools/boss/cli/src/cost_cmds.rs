@@ -202,8 +202,9 @@ pub(crate) struct CostSeriesArgs {
     #[arg(long)]
     pub(crate) until: Option<String>,
 
-    /// Bucket width: `hour`, `day`, `week`, or `month`. Omitted lets the
-    /// engine choose from the window span and coarsen at the 5,000-cell cap.
+    /// Bucket width: `hour`, `day`, `week`, or `month` (UTC calendar months).
+    /// Omitted lets the engine choose from the window span and coarsen at the
+    /// 5,000-cell cap. All bucket starts are UTC-aligned (week = Monday).
     #[arg(long, value_name = "WIDTH")]
     pub(crate) bucket: Option<boss_protocol::UsageBucketWidth>,
 
@@ -973,7 +974,7 @@ fn format_bucket_width_secs(bucket_secs: i64) -> String {
         3_600 => "hour (3,600s)".to_owned(),
         86_400 => "day (86,400s)".to_owned(),
         604_800 => "week (604,800s)".to_owned(),
-        2_592_000 => "month (2,592,000s)".to_owned(),
+        2_592_000 => "month (UTC calendar)".to_owned(),
         other => format!("{other}s"),
     }
 }
@@ -1051,6 +1052,9 @@ fn print_usage_series_report(report: &boss_protocol::TokenUsageSeriesReport, usd
         tz.label,
         format_bucket_width_secs(report.bucket_secs),
     );
+    if tz.offset_s != 0 {
+        println!("  Bucket starts are UTC-aligned (week = Monday, month = calendar month).");
+    }
     if let Some(dim) = report.group_by {
         println!("  Grouped by {dim}.");
     }

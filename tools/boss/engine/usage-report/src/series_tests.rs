@@ -100,6 +100,20 @@ fn engine_chooses_bucket_width_from_window_span() {
     // Week buckets align to Monday 00:00:00 UTC (epoch 4 * 86_400 = 1970-01-05).
     let week_start = bucket_start_epoch_s(DAY0 + 123, UsageBucketWidth::Week);
     assert_eq!((week_start - 4 * DAY).rem_euclid(7 * DAY), 0);
+
+    // Month buckets align to UTC calendar-month starts, not 30-day epoch blocks.
+    // DAY0 is 2026-09-22T00:00:00Z; its month starts 21 days earlier.
+    assert_eq!(bucket_start_epoch_s(DAY0, UsageBucketWidth::Month), DAY0 - 21 * DAY);
+    assert_eq!(
+        bucket_start_epoch_s(DAY0 + 9 * DAY, UsageBucketWidth::Month),
+        DAY0 + 9 * DAY,
+        "2026-10-01 is itself a month start"
+    );
+    assert_eq!(bucket_start_epoch_s(0, UsageBucketWidth::Month), 0);
+    // 2024-02-29 12:00 UTC (leap day) belongs to February, not a 30-day block.
+    let leap_noon: i64 = 1_709_208_000; // 2024-02-29T12:00:00Z
+    let feb_2024: i64 = 1_706_745_600; // 2024-02-01T00:00:00Z
+    assert_eq!(bucket_start_epoch_s(leap_noon, UsageBucketWidth::Month), feb_2024);
 }
 
 #[test]
@@ -542,6 +556,19 @@ fn coverage_emits_notes_for_every_boundary_and_pricing_gap() {
     let note_codes: Vec<&str> = report.coverage.notes.iter().map(|n| n.code.as_str()).collect();
     assert!(note_codes.contains(&note::CAPTURE_STARTED), "{note_codes:?}");
     assert!(note_codes.contains(&note::RETENTION_BOUNDED), "{note_codes:?}");
+    let retention = report
+        .coverage
+        .notes
+        .iter()
+        .find(|n| n.code == note::RETENTION_BOUNDED)
+        .unwrap();
+    assert!(
+        retention.detail.contains("never-started")
+            && retention.detail.contains("per-work-item floor")
+            && retention.detail.contains("worker run"),
+        "{}",
+        retention.detail
+    );
     assert!(note_codes.contains(&note::ACTIVE_TIME_MISSING), "{note_codes:?}");
     assert!(note_codes.contains(&note::PRICING_GAPS), "{note_codes:?}");
 
@@ -698,6 +725,136 @@ fn exceeding_cell_cap_coarsens_bucket_width_and_preserves_every_token() {
     );
 }
 
+#[test]
+fn explicit_month_request_over_cap_keeps_every_fact_and_notes_the_overage() {
+    // 6 groups × 2 UTC calendar months (Sep 22 and Oct 1 of 2026) = 12 cells.
+    // cell_cap 10 cannot coarsen past Month, so the grid is returned with a note.
+    let mut runs = Vec::new();
+    for (g, driver) in ["d0", "d1", "d2", "d3", "d4", "d5"].iter().enumerate() {
+        for (offset, day) in [0_i64, 9].iter().enumerate() {
+            let mut r = with_tokens(
+                run(
+                    &format!("r{g}_{offset}"),
+                    &format!("e{g}_{offset}"),
+                    "t1",
+                    DAY0 + day * DAY + g as i64,
+                ),
+                Some(10),
+                Some(0),
+                Some(0),
+                Some(0),
+                Some(1_000),
+            );
+            r.driver = RecordedDriver::LaunchTuple((*driver).to_owned());
+            runs.push(r);
+        }
+    }
+    let q = UsageSeriesQuery {
+        bucket: Some(UsageBucketWidth::Month),
+        group_by: Some(UsageDimension::Driver),
+        cell_cap: 10,
+        ..series_query(DAY0, DAY0 + 40 * DAY)
+    };
+    let report = build_usage_series_report(
+        &q,
+        &UsageSeriesRecords {
+            runs,
+            finished_executions: Vec::new(),
+            tasks: vec![task("t1", "t1", None)],
+        },
+        None,
+    );
+    assert_eq!(report.bucket_secs, UsageBucketWidth::Month.bucket_secs());
+    let cells: usize = report.buckets.iter().map(|b| b.cells.len()).sum();
+    assert_eq!(cells, 12);
+    let tokens: i64 = report
+        .buckets
+        .iter()
+        .flat_map(|b| b.cells.iter())
+        .map(|c| c.measurement.total_tokens)
+        .sum();
+    assert_eq!(tokens, 12 * 10);
+    assert!(
+        report
+            .coverage
+            .notes
+            .iter()
+            .any(|n| n.code == note::CELL_CAP_EXCEEDED && n.detail.contains("12") && n.detail.contains("10")),
+        "{:?}",
+        report.coverage.notes
+    );
+    assert!(
+        report.coverage.notes.iter().all(|n| n.code != note::BUCKET_COARSENED),
+        "an explicit month request must not claim coarsening stayed within the cap: {:?}",
+        report.coverage.notes
+    );
+}
+
+#[test]
+fn coarsening_into_month_that_still_exceeds_cap_notes_the_overage() {
+    // 40 day-buckets × 6 groups coarsens Day → Week → Month (2 calendar months
+    // × 6 groups = 12 cells) against cell_cap 10.
+    let mut runs = Vec::new();
+    for day in 0..40 {
+        for (g, driver) in ["d0", "d1", "d2", "d3", "d4", "d5"].iter().enumerate() {
+            let mut r = with_tokens(
+                run(
+                    &format!("d{day}_{g}"),
+                    &format!("e{day}_{g}"),
+                    "t1",
+                    DAY0 + day * DAY + g as i64,
+                ),
+                Some(5),
+                Some(0),
+                Some(0),
+                Some(0),
+                Some(1_000),
+            );
+            r.driver = RecordedDriver::LaunchTuple((*driver).to_owned());
+            runs.push(r);
+        }
+    }
+    let q = UsageSeriesQuery {
+        bucket: Some(UsageBucketWidth::Day),
+        group_by: Some(UsageDimension::Driver),
+        cell_cap: 10,
+        ..series_query(DAY0, DAY0 + 45 * DAY)
+    };
+    let report = build_usage_series_report(
+        &q,
+        &UsageSeriesRecords {
+            runs,
+            finished_executions: Vec::new(),
+            tasks: vec![task("t1", "t1", None)],
+        },
+        None,
+    );
+    assert_eq!(report.bucket_secs, UsageBucketWidth::Month.bucket_secs());
+    let tokens: i64 = report
+        .buckets
+        .iter()
+        .flat_map(|b| b.cells.iter())
+        .map(|c| c.measurement.total_tokens)
+        .sum();
+    assert_eq!(tokens, 40 * 6 * 5);
+    let coarsen = report
+        .coverage
+        .notes
+        .iter()
+        .find(|n| n.code == note::BUCKET_COARSENED)
+        .expect("coarsening note");
+    assert!(
+        coarsen.detail.contains("month") && coarsen.detail.contains("above the 10 cell cap"),
+        "{}",
+        coarsen.detail
+    );
+    assert!(
+        report.coverage.notes.iter().any(|n| n.code == note::CELL_CAP_EXCEEDED),
+        "{:?}",
+        report.coverage.notes
+    );
+}
+
 // ── Validation & JSON round-trip ─────────────────────────────────────────
 
 #[test]
@@ -733,4 +890,90 @@ fn query_validation_and_report_json_round_trip() {
     let json = serde_json::to_value(&report).unwrap();
     let decoded: TokenUsageSeriesReport = serde_json::from_value(json).unwrap();
     assert_eq!(decoded, report);
+}
+
+#[test]
+fn in_window_execution_with_pre_window_run_groups_and_filters_by_observed_model() {
+    let since = DAY0 + 2 * DAY;
+    let until = DAY0 + 3 * DAY;
+    let q = UsageSeriesQuery {
+        bucket: Some(UsageBucketWidth::Day),
+        group_by: Some(UsageDimension::Model),
+        filters: vec![
+            UsageFilter {
+                dimension: UsageDimension::Model,
+                values: vec!["claude-sonnet-4".to_owned()],
+            },
+            UsageFilter {
+                dimension: UsageDimension::Coverage,
+                values: vec!["measured".to_owned()],
+            },
+        ],
+        ..series_query(since, until)
+    };
+    let mut r = with_tokens(
+        run("r_old", "e1", "t1", DAY0 + 100),
+        Some(400),
+        Some(100),
+        Some(0),
+        Some(0),
+        Some(60_000),
+    );
+    r.run_model = Some("claude-sonnet-4".to_owned());
+    let mut e = exec("e1", "t1", "completed", since + 200);
+    e.execution_model = Some("opus".to_owned());
+    let recs = UsageSeriesRecords {
+        runs: vec![r],
+        finished_executions: vec![e],
+        tasks: vec![task("t1", "t1", None)],
+    };
+    let report = build_usage_series_report(&q, &recs, None);
+    assert_eq!(report.groups, vec!["claude-sonnet-4"]);
+    assert_eq!(report.buckets.len(), 1);
+    assert_eq!(report.buckets[0].start_epoch_s, since);
+    let cell = &report.buckets[0].cells[0];
+    assert_eq!(cell.executions_completed, 1);
+    assert_eq!(
+        cell.measurement.runs_total, 0,
+        "the pre-window run must not enter bucket measurement"
+    );
+    assert!(
+        report.coverage.notes.iter().all(|n| n.code != note::DIMENSION_STARTED),
+        "observed model/coverage from the pre-window run must not look unrecorded: {:?}",
+        report.coverage.notes
+    );
+}
+
+#[test]
+fn orphan_revision_completed_in_window_is_not_counted_as_a_chain_root() {
+    let q = UsageSeriesQuery {
+        bucket: Some(UsageBucketWidth::Day),
+        ..series_query(DAY0, DAY0 + 2 * DAY)
+    };
+    let mut orphan = task("orphan", "orphan", Some(DAY0 + 100));
+    orphan.kind = "revision".to_owned();
+    let r = with_tokens(
+        run("r_orphan", "e_orphan", "orphan", DAY0 + 50),
+        Some(80),
+        Some(20),
+        Some(0),
+        Some(0),
+        Some(1_000),
+    );
+    let report = build_usage_series_report(
+        &q,
+        &UsageSeriesRecords {
+            runs: vec![r],
+            finished_executions: Vec::new(),
+            tasks: vec![orphan],
+        },
+        None,
+    );
+    let cell = &report.buckets[0].cells[0];
+    assert_eq!(cell.measurement.total_tokens, 100);
+    assert_eq!(
+        cell.tasks_completed, 0,
+        "an orphan revision must not count as a completed chain-root task"
+    );
+    assert_eq!(cell.tasks_completed_cost.runs_total, 0);
 }

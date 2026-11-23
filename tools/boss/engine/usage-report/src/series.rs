@@ -44,7 +44,9 @@
 //!   out-of-window runs) to the bucket of `tasks.completed_at`.
 //! * **Coarsen, never truncate.** Past [`DEFAULT_CELL_CAP`] cells, the builder
 //!   coarsens the bucket width along `hour → day → week → month` and emits a
-//!   `bucket_coarsened` note instead of silently dropping buckets.
+//!   `bucket_coarsened` note instead of silently dropping buckets. If the
+//!   coarsest width still exceeds the cap (or `month` was requested and is
+//!   already over), every fact is kept and a `cell_cap_exceeded` note says so.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -54,7 +56,8 @@ use boss_protocol::{
 };
 
 use crate::classify::{
-    ClassifyContext, NONE_VALUE, RunFacts, UsdEstimator, classify, dimension_value, finalize_kept, known_total,
+    ClassifyContext, DimensionSource, RunFacts, UsdEstimator, classify, count_caveat_codes, dimension_value,
+    dimension_value_of, driver_source_of, has_recorded_dimension, known_total, latest_run, price_if_requested,
     spend_class,
 };
 use crate::fold::RunFold;
@@ -89,8 +92,8 @@ pub struct UsageSeriesQuery {
     /// When `tasks.completed_at` went live (`COMPLETED_AT_MIGRATION_EPOCH_S`);
     /// terminal tasks before this were backfilled with `created_at`.
     pub completed_at_start_epoch_s: i64,
-    /// The age past which failed, abandoned, orphaned and cancelled
-    /// executions are pruned (`DEFAULT_RETENTION_MAX_AGE_SECS`).
+    /// The age past which never-started prunable executions are eligible
+    /// for retention (`DEFAULT_RETENTION_MAX_AGE_SECS`).
     pub retention_max_age_secs: i64,
     pub bucket: Option<UsageBucketWidth>,
     pub group_by: Option<UsageDimension>,
@@ -130,12 +133,51 @@ pub fn choose_bucket_width(since_epoch_s: i64, until_epoch_s: i64) -> UsageBucke
 }
 
 /// Start timestamp (epoch seconds) of the bucket containing `epoch_s`.
+/// Hour and day are UTC-midnight aligned; week is Monday 00:00:00 UTC;
+/// month is the UTC calendar-month start.
 pub fn bucket_start_epoch_s(epoch_s: i64, width: UsageBucketWidth) -> i64 {
     let secs = width.bucket_secs();
     match width {
         UsageBucketWidth::Week => WEEK_EPOCH_OFFSET_S + (epoch_s - WEEK_EPOCH_OFFSET_S).div_euclid(secs) * secs,
-        UsageBucketWidth::Hour | UsageBucketWidth::Day | UsageBucketWidth::Month => epoch_s.div_euclid(secs) * secs,
+        UsageBucketWidth::Hour | UsageBucketWidth::Day => epoch_s.div_euclid(secs) * secs,
+        UsageBucketWidth::Month => month_start_epoch_s(epoch_s),
     }
+}
+
+/// UTC calendar-month start containing `epoch_s`.
+fn month_start_epoch_s(epoch_s: i64) -> i64 {
+    let days = epoch_s.div_euclid(DAY_SECS);
+    let (year, month, _) = civil_from_epoch_days(days);
+    epoch_days_from_civil(year, month, 1) * DAY_SECS
+}
+
+/// Days since Unix epoch for a UTC civil date (Howard Hinnant's algorithm).
+fn epoch_days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let mut year = i64::from(year);
+    let month = i64::from(month);
+    let day = i64::from(day);
+    if month <= 2 {
+        year -= 1;
+    }
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+fn civil_from_epoch_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z - era * 146_097;
+    let year_of_era = (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let mp = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    (year as i32, month as u32, day as u32)
 }
 
 /// Builds the bucketed usage series report. `pricer` is `Some` exactly when
@@ -162,7 +204,7 @@ pub fn build_usage_series_report(
         .filter(|run| seen_runs.insert(run.run_id.as_str()))
         .map(|run| {
             let mut facts = classify(run, tasks.get(run.work_item_id.as_str()).copied());
-            finalize_kept(&mut facts, &classify_ctx);
+            price_if_requested(&mut facts, &classify_ctx);
             facts
         })
         .collect();
@@ -228,9 +270,11 @@ pub fn build_usage_series_report(
         .iter()
         .filter(|task| seen_tasks.insert(task.task_id.as_str()))
         .filter_map(|task| {
-            // Only chain roots are counted as completed tasks; revisions' runs
-            // are already attributed to their chain root's inclusive cost.
-            if root_of(task, &tasks) != task.task_id.as_str() {
+            // Only non-revision chain roots are counted, matching the SQL seed
+            // (`t.kind != 'revision'`). An orphan revision whose parent is
+            // missing resolves `root_of` to itself and must not be counted:
+            // its out-of-window chain runs were never fetched.
+            if task.kind == "revision" || root_of(task, &tasks) != task.task_id.as_str() {
                 return None;
             }
             let completed_at = task.completed_at_epoch_s?;
@@ -265,6 +309,8 @@ pub fn build_usage_series_report(
         width = next;
         grid = bucket_facts(width, query.group_by, &window_runs, &finished_execs, &completed_tasks);
     }
+    let cell_count = grid.cell_count();
+    let over_cell_cap = cell_count > query.cell_cap;
 
     // 5. Render order of groups, cells, buckets.
     let (groups, group_labels) = order_groups(query.group_by, &grid);
@@ -346,10 +392,14 @@ pub fn build_usage_series_report(
         query,
         initial_width,
         width,
-        &window_runs,
-        &finished_execs,
-        &completed_tasks,
-        &gaps,
+        &classify_ctx,
+        (over_cell_cap, cell_count),
+        CoverageFacts {
+            window_runs: &window_runs,
+            finished_execs: &finished_execs,
+            completed_tasks: &completed_tasks,
+            gaps: &gaps,
+        },
     );
 
     TokenUsageSeriesReport::builder()
@@ -383,27 +433,19 @@ fn root_of<'t>(task: &'t UsageTaskRecord, tasks: &HashMap<&str, &UsageTaskRecord
 /// implementation/design runs on the root (latest), else any direct root run,
 /// else any run in the chain.
 fn representative_run_for_task<'a>(root_task_id: &str, chain_runs: &[&'a RunFacts<'a>]) -> Option<&'a RunFacts<'a>> {
-    let pick_latest = |runs: &mut dyn Iterator<Item = &'a RunFacts<'a>>| {
-        runs.max_by(|a, b| {
-            a.rec
-                .run_created_at_epoch_s
-                .cmp(&b.rec.run_created_at_epoch_s)
-                .then_with(|| a.rec.run_id.cmp(&b.rec.run_id))
-        })
-    };
-    pick_latest(&mut chain_runs.iter().copied().filter(|facts| {
+    latest_run(chain_runs.iter().copied().filter(|facts| {
         facts.rec.work_item_id == root_task_id
             && matches!(facts.spend_class, SpendClass::Implementation | SpendClass::Design)
     }))
     .or_else(|| {
-        pick_latest(
-            &mut chain_runs
+        latest_run(
+            chain_runs
                 .iter()
                 .copied()
                 .filter(|facts| facts.rec.work_item_id == root_task_id),
         )
     })
-    .or_else(|| pick_latest(&mut chain_runs.iter().copied()))
+    .or_else(|| latest_run(chain_runs.iter().copied()))
 }
 
 struct ExecFact<'a> {
@@ -416,30 +458,7 @@ struct ExecFact<'a> {
 
 impl<'a> ExecFact<'a> {
     fn latest_run(&self) -> Option<&'a RunFacts<'a>> {
-        self.runs.iter().copied().max_by(|a, b| {
-            a.rec
-                .run_created_at_epoch_s
-                .cmp(&b.rec.run_created_at_epoch_s)
-                .then_with(|| a.rec.run_id.cmp(&b.rec.run_id))
-        })
-    }
-
-    fn effective_driver(&self) -> Option<&'a str> {
-        self.exec.driver.as_deref().filter(|slug| !slug.is_empty())
-    }
-
-    fn effective_driver_source(&self) -> DriverSource {
-        match self.effective_driver() {
-            None => DriverSource::Unknown,
-            Some(_) if self.exec.driver_source == DriverSource::Resolved => DriverSource::Resolved,
-            Some(_) => DriverSource::LaunchTuple,
-        }
-    }
-
-    fn observed_model(&self) -> Option<&'a str> {
-        self.latest_run()
-            .and_then(|facts| facts.rec.run_model.as_deref())
-            .or(self.exec.execution_model.as_deref())
+        latest_run(self.runs.iter().copied())
     }
 
     fn coverage(&self) -> Option<RunCoverage> {
@@ -457,65 +476,38 @@ impl<'a> ExecFact<'a> {
         }
     }
 
-    fn dimension_value(&self, dimension: UsageDimension) -> (String, String) {
-        let same = |value: &str| (value.to_owned(), value.to_owned());
-        let none = |label: &str| (NONE_VALUE.to_owned(), label.to_owned());
-        match dimension {
-            UsageDimension::Product => match self.task {
-                Some(task) => (
-                    task.product_id.clone(),
-                    task.product_name.clone().unwrap_or_else(|| task.product_id.clone()),
-                ),
-                None => none("(no task)"),
-            },
-            UsageDimension::Project => match self.task.and_then(|t| t.project_id.as_deref().map(|id| (id, t))) {
-                Some((id, task)) => (
-                    id.to_owned(),
-                    task.project_name.clone().unwrap_or_else(|| id.to_owned()),
-                ),
-                None => none("(no project)"),
-            },
-            UsageDimension::TaskKind => self.task.map_or_else(|| none("(no task)"), |t| same(&t.kind)),
-            UsageDimension::ExecutionKind => same(&self.exec.execution_kind),
-            UsageDimension::SpendClass => same(spend_class(&self.exec.execution_kind).as_str()),
-            UsageDimension::Driver => self.effective_driver().map_or_else(|| none("not recorded"), same),
-            UsageDimension::Model => self.observed_model().map_or_else(|| none("(no model recorded)"), same),
-            UsageDimension::Effort => self
-                .exec
-                .execution_effort
-                .as_deref()
-                .or(self.task.and_then(|t| t.effort_level.as_deref()))
-                .map_or_else(|| none("(none)"), same),
-            UsageDimension::Reasoning => self
-                .task
-                .and_then(|t| t.reasoning.as_deref())
-                .map_or_else(|| none("(none)"), same),
-            UsageDimension::TaskStatus => self.task.map_or_else(|| none("(no task)"), |t| same(&t.status)),
-            UsageDimension::ExecutionStatus => same(&self.exec.execution_status),
-            UsageDimension::Coverage => self
-                .coverage()
-                .map_or_else(|| none("(no runs)"), |cov| same(cov.as_str())),
-            UsageDimension::Host => self
-                .latest_run()
-                .map(|f| f.rec.run_host_id.as_str())
-                .or(self.exec.execution_host_id.as_deref())
-                .map_or_else(|| none("(none)"), same),
+    fn dimension_source(&self) -> DimensionSource<'a> {
+        let latest = self.latest_run();
+        let driver = self.exec.driver.as_deref().filter(|slug| !slug.is_empty());
+        DimensionSource {
+            task: self.task,
+            execution_kind: Some(self.exec.execution_kind.as_str()),
+            execution_status: Some(self.exec.execution_status.as_str()),
+            execution_effort: self.exec.execution_effort.as_deref(),
+            execution_model: self.exec.execution_model.as_deref(),
+            driver,
+            driver_source: driver_source_of(driver, self.exec.driver_source),
+            run_model: latest.and_then(|facts| facts.rec.run_model.as_deref()),
+            coverage: self.coverage(),
+            host_id: latest
+                .map(|facts| facts.rec.run_host_id.as_str())
+                .or(self.exec.execution_host_id.as_deref()),
+            spend_class: Some(spend_class(&self.exec.execution_kind)),
         }
     }
 
+    fn dimension_value(&self, dimension: UsageDimension) -> (&str, &str) {
+        dimension_value_of(&self.dimension_source(), dimension)
+    }
+
     fn has_recorded_dimension(&self, dimension: UsageDimension) -> bool {
-        match dimension {
-            UsageDimension::Driver => self.effective_driver_source() == DriverSource::LaunchTuple,
-            UsageDimension::Model => self.observed_model().is_some(),
-            UsageDimension::Effort => self.exec.execution_effort.is_some(),
-            _ => self.dimension_value(dimension).0 != NONE_VALUE,
-        }
+        has_recorded_dimension(&self.dimension_source(), dimension)
     }
 
     fn passes_filters(&self, filters: &[(UsageDimension, HashSet<&str>)]) -> bool {
         filters.iter().all(|(dimension, values)| {
             let (value, _) = self.dimension_value(*dimension);
-            values.contains(value.as_str())
+            values.contains(value)
         })
     }
 }
@@ -528,78 +520,42 @@ struct CompletedTaskFact<'a> {
 }
 
 impl<'a> CompletedTaskFact<'a> {
-    fn dimension_value(&self, dimension: UsageDimension) -> (String, String) {
-        let same = |value: &str| (value.to_owned(), value.to_owned());
-        let none = |label: &str| (NONE_VALUE.to_owned(), label.to_owned());
-        match dimension {
-            UsageDimension::Product => (
-                self.task.product_id.clone(),
-                self.task
-                    .product_name
-                    .clone()
-                    .unwrap_or_else(|| self.task.product_id.clone()),
-            ),
-            UsageDimension::Project => match self.task.project_id.as_deref() {
-                Some(id) => (
-                    id.to_owned(),
-                    self.task.project_name.clone().unwrap_or_else(|| id.to_owned()),
-                ),
-                None => none("(no project)"),
-            },
-            UsageDimension::TaskKind => same(&self.task.kind),
-            UsageDimension::TaskStatus => same(&self.task.status),
-            UsageDimension::Reasoning => self.task.reasoning.as_deref().map_or_else(|| none("(none)"), same),
-            UsageDimension::Effort => self
-                .representative
-                .and_then(|facts| facts.rec.execution_effort.as_deref())
-                .or(self.task.effort_level.as_deref())
-                .map_or_else(|| none("(none)"), same),
-            UsageDimension::ExecutionKind
-            | UsageDimension::SpendClass
-            | UsageDimension::Driver
-            | UsageDimension::Model
-            | UsageDimension::ExecutionStatus
-            | UsageDimension::Coverage
-            | UsageDimension::Host => match self.representative {
-                Some(facts) => dimension_value(facts, dimension),
-                None => match dimension {
-                    UsageDimension::Driver => none("not recorded"),
-                    UsageDimension::Model => none("(no model recorded)"),
-                    _ => none("(none)"),
-                },
+    fn dimension_source(&self) -> DimensionSource<'a> {
+        match self.representative {
+            Some(facts) => {
+                let mut src = DimensionSource::from_run(facts);
+                src.task = Some(self.task);
+                src
+            }
+            None => DimensionSource {
+                task: Some(self.task),
+                execution_kind: None,
+                execution_status: None,
+                execution_effort: None,
+                execution_model: None,
+                driver: None,
+                driver_source: DriverSource::Unknown,
+                run_model: None,
+                coverage: None,
+                host_id: None,
+                spend_class: None,
             },
         }
     }
 
+    fn dimension_value(&self, dimension: UsageDimension) -> (&str, &str) {
+        dimension_value_of(&self.dimension_source(), dimension)
+    }
+
     fn has_recorded_dimension(&self, dimension: UsageDimension) -> bool {
-        match dimension {
-            UsageDimension::Driver => self
-                .representative
-                .is_some_and(|facts| facts.rec.driver.source() == DriverSource::LaunchTuple),
-            UsageDimension::Model => self
-                .representative
-                .is_some_and(|facts| facts.rec.run_model.is_some() || facts.rec.execution_model.is_some()),
-            UsageDimension::Effort => self
-                .representative
-                .is_some_and(|facts| facts.rec.execution_effort.is_some()),
-            _ => self.dimension_value(dimension).0 != NONE_VALUE,
-        }
+        has_recorded_dimension(&self.dimension_source(), dimension)
     }
 
     fn passes_filters(&self, filters: &[(UsageDimension, HashSet<&str>)]) -> bool {
         filters.iter().all(|(dimension, values)| {
             let (value, _) = self.dimension_value(*dimension);
-            values.contains(value.as_str())
+            values.contains(value)
         })
-    }
-}
-
-fn run_has_recorded_dimension(facts: &RunFacts<'_>, dimension: UsageDimension) -> bool {
-    match dimension {
-        UsageDimension::Driver => facts.rec.driver.source() == DriverSource::LaunchTuple,
-        UsageDimension::Model => facts.rec.run_model.is_some() || facts.rec.execution_model.is_some(),
-        UsageDimension::Effort => facts.rec.execution_effort.is_some(),
-        _ => dimension_value(facts, dimension).0 != NONE_VALUE,
     }
 }
 
@@ -725,7 +681,10 @@ fn bucket_facts<'a>(
     for exec in finished_execs {
         let bucket = bucket_start_epoch_s(exec.exec.execution_finished_at_epoch_s, width);
         let (group, label) = match group_by {
-            Some(dimension) => exec.dimension_value(dimension),
+            Some(dimension) => {
+                let (value, label) = exec.dimension_value(dimension);
+                (value.to_owned(), label.to_owned())
+            }
             None => (ALL_GROUP.to_owned(), "All".to_owned()),
         };
         grid.group_labels.entry(group.clone()).or_insert(label);
@@ -740,7 +699,10 @@ fn bucket_facts<'a>(
     for task in completed_tasks {
         let bucket = bucket_start_epoch_s(task.completed_at_epoch_s, width);
         let (group, label) = match group_by {
-            Some(dimension) => task.dimension_value(dimension),
+            Some(dimension) => {
+                let (value, label) = task.dimension_value(dimension);
+                (value.to_owned(), label.to_owned())
+            }
             None => (ALL_GROUP.to_owned(), "All".to_owned()),
         };
         grid.group_labels.entry(group.clone()).or_insert(label);
@@ -783,15 +745,27 @@ fn order_groups(group_by: Option<UsageDimension>, grid: &BucketGrid<'_>) -> (Vec
 
 // ── Coverage and boundary notes ───────────────────────────────────────────
 
+struct CoverageFacts<'a> {
+    window_runs: &'a [&'a RunFacts<'a>],
+    finished_execs: &'a [ExecFact<'a>],
+    completed_tasks: &'a [CompletedTaskFact<'a>],
+    gaps: &'a BTreeSet<String>,
+}
+
 fn build_coverage(
     query: &UsageSeriesQuery,
     initial_width: UsageBucketWidth,
     final_width: UsageBucketWidth,
-    window_runs: &[&RunFacts<'_>],
-    finished_execs: &[ExecFact<'_>],
-    completed_tasks: &[CompletedTaskFact<'_>],
-    gaps: &BTreeSet<String>,
+    classify_ctx: &ClassifyContext<'_>,
+    (over_cell_cap, cell_count): (bool, usize),
+    facts: CoverageFacts<'_>,
 ) -> UsageSeriesCoverage {
+    let CoverageFacts {
+        window_runs,
+        finished_execs,
+        completed_tasks,
+        gaps,
+    } = facts;
     let earliest_fact = window_runs
         .iter()
         .map(|f| f.rec.run_created_at_epoch_s)
@@ -816,7 +790,7 @@ fn build_coverage(
             for &facts in window_runs {
                 observe(
                     facts.rec.run_created_at_epoch_s,
-                    run_has_recorded_dimension(facts, dimension),
+                    has_recorded_dimension(&DimensionSource::from_run(facts), dimension),
                 );
             }
             for exec in finished_execs {
@@ -841,8 +815,8 @@ fn build_coverage(
     let mut total_measured_runs: u32 = 0;
     let mut runs_excluded_from_active_hour: u32 = 0;
     for &facts in window_runs {
-        for caveat in &facts.caveats {
-            *by_caveat.entry(caveat.code.as_str()).or_default() += 1;
+        for code in count_caveat_codes(facts, classify_ctx) {
+            *by_caveat.entry(code).or_default() += 1;
         }
         if facts.coverage != RunCoverage::Unmeasured {
             total_measured_runs += 1;
@@ -894,7 +868,7 @@ fn build_coverage(
             code: note::RETENTION_BOUNDED.to_owned(),
             epoch_s: Some(retention_cutoff),
             detail: format!(
-                "the window starts more than {} days ago; failed, abandoned, orphaned and cancelled executions older than that are pruned, so older buckets undercount them",
+                "the window starts more than {} days ago; never-started failed, abandoned, orphaned and cancelled executions older than that are pruned past a per-work-item floor, so older buckets can undercount those never-started rows. Executions that had a worker run are retained",
                 query.retention_max_age_secs / DAY_SECS
             ),
         });
@@ -919,11 +893,29 @@ fn build_coverage(
         });
     }
     if final_width != initial_width {
+        let detail = if over_cell_cap {
+            format!(
+                "bucket width coarsened from {initial_width} to {final_width}; the coarsest width still produces {cell_count} cells, above the {} cell cap. Every fact is kept",
+                query.cell_cap
+            )
+        } else {
+            format!(
+                "bucket width coarsened from {initial_width} to {final_width} to stay within the {} cell cap",
+                query.cell_cap
+            )
+        };
         notes.push(UsageSeriesNote {
             code: note::BUCKET_COARSENED.to_owned(),
             epoch_s: None,
+            detail,
+        });
+    }
+    if over_cell_cap {
+        notes.push(UsageSeriesNote {
+            code: note::CELL_CAP_EXCEEDED.to_owned(),
+            epoch_s: None,
             detail: format!(
-                "bucket width coarsened from {initial_width} to {final_width} to stay within the {} cell cap",
+                "{final_width} buckets produce {cell_count} cells, above the {} cell cap. Every fact is kept; narrow the range or group by fewer values to shrink the grid",
                 query.cell_cap
             ),
         });

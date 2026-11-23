@@ -6,8 +6,8 @@
 //! to re-derive one.
 
 use boss_protocol::{
-    DRIVER_SLUG_AGY, DRIVER_SLUG_CLAUDE, DRIVER_SLUG_CODEX, DRIVER_SLUG_GROK, ExecutionKind, InputConvention,
-    RunCoverage, SpendClass, TokenClasses, UsageCaveat, UsageDimension,
+    DRIVER_SLUG_AGY, DRIVER_SLUG_CLAUDE, DRIVER_SLUG_CODEX, DRIVER_SLUG_GROK, DriverSource, ExecutionKind,
+    InputConvention, RunCoverage, SpendClass, TokenClasses, UsageCaveat, UsageDimension,
 };
 
 pub(crate) use crate::fold::UsdOutcome;
@@ -143,8 +143,14 @@ pub(crate) fn classify<'a>(rec: &'a UsageRunRecord, task: Option<&'a UsageTaskRe
 
 /// Populates pricing and caveats on a run that survived filtering and the cap.
 pub(crate) fn finalize_kept(facts: &mut RunFacts<'_>, ctx: &ClassifyContext<'_>) {
-    facts.usd = price_run(facts.rec, facts.driver, facts.coverage, facts.convention, ctx.pricer);
+    price_if_requested(facts, ctx);
     facts.caveats = caveats(facts, ctx);
+}
+
+/// Prices a run when the caller requested USD. The series path uses this
+/// without attaching per-run caveat detail strings.
+pub(crate) fn price_if_requested(facts: &mut RunFacts<'_>, ctx: &ClassifyContext<'_>) {
+    facts.usd = price_run(facts.rec, facts.driver, facts.coverage, facts.convention, ctx.pricer);
 }
 
 /// The execution kind's spend class. The match is exhaustive over
@@ -215,6 +221,16 @@ pub(crate) fn token_classes(rec: &UsageRunRecord, coverage: RunCoverage) -> Opti
 /// floor and the run's coverage says so.
 pub(crate) fn known_total(rec: &UsageRunRecord, coverage: RunCoverage) -> Option<i64> {
     (coverage != RunCoverage::Unmeasured).then(|| run_tokens(rec).known_total())
+}
+
+/// Launch-tuple vs resolved vs unknown, from the effective slug and how it
+/// was obtained. Shared by execution grouping (separate slug + source fields).
+pub(crate) fn driver_source_of(driver: Option<&str>, source: DriverSource) -> DriverSource {
+    match driver.filter(|driver| !driver.is_empty()) {
+        None => DriverSource::Unknown,
+        Some(_) if source == DriverSource::Resolved => DriverSource::Resolved,
+        Some(_) => DriverSource::LaunchTuple,
+    }
 }
 
 fn price_run(
@@ -326,46 +342,163 @@ pub(crate) fn model_label(rec: &UsageRunRecord) -> String {
         .unwrap_or_else(|| "(no model recorded)".to_owned())
 }
 
+/// Fields a dimension reads. Built from a run, from an execution (latest-run
+/// model/host, aggregated coverage) or from a completed task (representative
+/// run), so group keys and labels cannot drift across those grains.
+#[derive(Clone, Copy, bon::Builder)]
+pub(crate) struct DimensionSource<'a> {
+    pub task: Option<&'a UsageTaskRecord>,
+    pub execution_kind: Option<&'a str>,
+    pub execution_status: Option<&'a str>,
+    pub execution_effort: Option<&'a str>,
+    pub execution_model: Option<&'a str>,
+    pub driver: Option<&'a str>,
+    pub driver_source: DriverSource,
+    pub run_model: Option<&'a str>,
+    pub coverage: Option<RunCoverage>,
+    pub host_id: Option<&'a str>,
+    pub spend_class: Option<SpendClass>,
+}
+
+impl<'a> DimensionSource<'a> {
+    pub(crate) fn from_run(facts: &'a RunFacts<'a>) -> Self {
+        Self {
+            task: facts.task,
+            execution_kind: Some(facts.rec.execution_kind.as_str()),
+            execution_status: Some(facts.rec.execution_status.as_str()),
+            execution_effort: facts.rec.execution_effort.as_deref(),
+            execution_model: facts.rec.execution_model.as_deref(),
+            driver: facts.driver,
+            driver_source: facts.rec.driver.source(),
+            run_model: facts.rec.run_model.as_deref(),
+            coverage: Some(facts.coverage),
+            host_id: Some(facts.rec.run_host_id.as_str()),
+            spend_class: Some(facts.spend_class),
+        }
+    }
+}
+
 /// A run's value for a dimension: the machine value filters match on, and the
 /// label a client shows. Both are borrowed so scanning the window for filter
 /// counts and grouping allocates nothing per run.
-pub(crate) fn dimension_value<'a>(facts: &RunFacts<'a>, dimension: UsageDimension) -> (&'a str, &'a str) {
-    let rec = facts.rec;
-    let task = facts.task;
+pub(crate) fn dimension_value<'a>(facts: &'a RunFacts<'a>, dimension: UsageDimension) -> (&'a str, &'a str) {
+    dimension_value_of(&DimensionSource::from_run(facts), dimension)
+}
+
+pub(crate) fn dimension_value_of<'a>(src: &DimensionSource<'a>, dimension: UsageDimension) -> (&'a str, &'a str) {
     let same = |value: &'a str| (value, value);
     let none = |label: &'static str| (NONE_VALUE, label);
     match dimension {
-        UsageDimension::Product => match task {
+        UsageDimension::Product => match src.task {
             Some(task) => (
                 task.product_id.as_str(),
                 task.product_name.as_deref().unwrap_or(task.product_id.as_str()),
             ),
             None => none("(no task)"),
         },
-        UsageDimension::Project => match task.and_then(|task| task.project_id.as_deref().map(|id| (id, task))) {
+        UsageDimension::Project => match src
+            .task
+            .and_then(|task| task.project_id.as_deref().map(|id| (id, task)))
+        {
             Some((id, task)) => (id, task.project_name.as_deref().unwrap_or(id)),
             None => none("(no project)"),
         },
-        UsageDimension::TaskKind => task.map_or_else(|| none("(no task)"), |task| same(task.kind.as_str())),
-        UsageDimension::ExecutionKind => same(rec.execution_kind.as_str()),
-        UsageDimension::SpendClass => same(facts.spend_class.as_str()),
-        UsageDimension::Driver => facts.driver.map_or_else(|| none("not recorded"), same),
-        UsageDimension::Model => rec
-            .run_model
-            .as_deref()
-            .or(rec.execution_model.as_deref())
-            .map_or_else(|| none("(no model recorded)"), same),
-        UsageDimension::Effort => rec
-            .execution_effort
-            .as_deref()
-            .or(task.and_then(|task| task.effort_level.as_deref()))
+        UsageDimension::TaskKind => src
+            .task
+            .map_or_else(|| none("(no task)"), |task| same(task.kind.as_str())),
+        UsageDimension::ExecutionKind => src
+            .execution_kind
+            .filter(|kind| !kind.is_empty())
             .map_or_else(|| none("(none)"), same),
-        UsageDimension::Reasoning => task
+        UsageDimension::SpendClass => src
+            .spend_class
+            .map_or_else(|| none("(none)"), |class| same(class.as_str())),
+        UsageDimension::Driver => src.driver.map_or_else(|| none("not recorded"), same),
+        UsageDimension::Model => src
+            .run_model
+            .or(src.execution_model)
+            .map_or_else(|| none("(no model recorded)"), same),
+        UsageDimension::Effort => src
+            .execution_effort
+            .or(src.task.and_then(|task| task.effort_level.as_deref()))
+            .map_or_else(|| none("(none)"), same),
+        UsageDimension::Reasoning => src
+            .task
             .and_then(|task| task.reasoning.as_deref())
             .map_or_else(|| none("(none)"), same),
-        UsageDimension::TaskStatus => task.map_or_else(|| none("(no task)"), |task| same(task.status.as_str())),
-        UsageDimension::ExecutionStatus => same(rec.execution_status.as_str()),
-        UsageDimension::Coverage => same(facts.coverage.as_str()),
-        UsageDimension::Host => same(rec.run_host_id.as_str()),
+        UsageDimension::TaskStatus => src
+            .task
+            .map_or_else(|| none("(no task)"), |task| same(task.status.as_str())),
+        UsageDimension::ExecutionStatus => src
+            .execution_status
+            .filter(|status| !status.is_empty())
+            .map_or_else(|| none("(none)"), same),
+        UsageDimension::Coverage => src
+            .coverage
+            .map_or_else(|| none("(no runs)"), |coverage| same(coverage.as_str())),
+        UsageDimension::Host => src.host_id.map_or_else(|| none("(none)"), same),
     }
+}
+
+/// Whether a dimension has a recorded (not placeholder) value. Driver uses
+/// the launch-tuple source so `dimension_started` tracks when slugs were
+/// written on the execution row, not later resolution.
+pub(crate) fn has_recorded_dimension(src: &DimensionSource<'_>, dimension: UsageDimension) -> bool {
+    match dimension {
+        UsageDimension::Driver => src.driver_source == DriverSource::LaunchTuple,
+        UsageDimension::Model => src.run_model.is_some() || src.execution_model.is_some(),
+        UsageDimension::Effort => src.execution_effort.is_some(),
+        _ => dimension_value_of(src, dimension).0 != NONE_VALUE,
+    }
+}
+
+/// Latest run by `created_at`, then `run_id`. Shared by execution grouping
+/// and completed-task representative selection.
+pub(crate) fn latest_run<'a, I>(runs: I) -> Option<&'a RunFacts<'a>>
+where
+    I: IntoIterator<Item = &'a RunFacts<'a>>,
+{
+    runs.into_iter().max_by(|a, b| {
+        a.rec
+            .run_created_at_epoch_s
+            .cmp(&b.rec.run_created_at_epoch_s)
+            .then_with(|| a.rec.run_id.cmp(&b.rec.run_id))
+    })
+}
+
+/// Tally caveat codes without allocating per-run detail strings.
+pub(crate) fn count_caveat_codes(facts: &RunFacts<'_>, ctx: &ClassifyContext<'_>) -> Vec<&'static str> {
+    let rec = facts.rec;
+    let measured = facts.coverage != RunCoverage::Unmeasured;
+    let mut codes = Vec::new();
+    if rec.run_created_at_epoch_s < ctx.capture_start_epoch_s {
+        codes.push(caveat::PRE_CAPTURE);
+    }
+    if facts.driver.is_none() {
+        codes.push(caveat::DRIVER_NOT_RECORDED);
+    }
+    if measured && facts.convention == InputConvention::Gross {
+        codes.push(caveat::GROSS_INPUT);
+    }
+    if measured && facts.driver == Some(DRIVER_SLUG_CLAUDE) {
+        codes.push(caveat::SUBAGENTS_EXCLUDED);
+    }
+    if rec.run_model.as_deref() == Some(SYNTHETIC_MODEL) {
+        codes.push(caveat::SYNTHETIC_MODEL);
+    }
+    if rec.run_model.is_none() && rec.execution_model.is_some() {
+        codes.push(caveat::MODEL_FROM_LAUNCH_TUPLE);
+    }
+    if facts.coverage == RunCoverage::Partial {
+        codes.push(caveat::TOKENS_PARTIAL);
+    }
+    if rec.usage_unavailable.is_some() {
+        codes.push(caveat::USAGE_UNAVAILABLE);
+    }
+    match facts.usd {
+        UsdOutcome::Estimate(_) => codes.push(caveat::ESTIMATE_ONLY),
+        UsdOutcome::Unpriceable(cause::UNKNOWN_MODEL) => codes.push(caveat::UNPRICED_MODEL),
+        UsdOutcome::Unpriceable(_) | UsdOutcome::NotRequested => {}
+    }
+    codes
 }

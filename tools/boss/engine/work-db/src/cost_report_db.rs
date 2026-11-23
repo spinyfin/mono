@@ -487,6 +487,8 @@ impl WorkDb {
     ///   `work_runs_created_at_epoch_idx`),
     /// * every `work_executions` row with `finished_at` in `[since, until)`
     ///   (for `executions_completed` and `distinct_prs`),
+    /// * out-of-window runs of those finished executions (attribution only:
+    ///   model, host, coverage for grouping/filters — not bucket measurement),
     /// * every chain-root task with `completed_at` in `[since, until)`, all of
     ///   its descendant revisions (including legacy nested chains), and any
     ///   out-of-window runs belonging to those chains so `tasks_completed_cost`
@@ -532,6 +534,36 @@ impl WorkDb {
                 .prepare(&exec_sql)?
                 .query_map(params![since_epoch_s, until_epoch_s], map_usage_execution_record)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+
+            // Runs of in-window finished executions that started before `since`
+            // (or after `until`) so grouping by model/coverage/host uses the
+            // observed latest run, not the launch alias. These are not added
+            // to bucket measurement; the builder keeps measurement on
+            // `wr.created_at` in `[since, until)`.
+            if !finished_executions.is_empty() {
+                let mut exec_ids: Vec<&str> = finished_executions
+                    .iter()
+                    .map(|exec| exec.execution_id.as_str())
+                    .collect();
+                exec_ids.sort_unstable();
+                exec_ids.dedup();
+                let extra_exec_run_sql = format!(
+                    "SELECT {USAGE_RUN_COLUMNS}
+                     FROM work_runs wr
+                     JOIN work_executions we ON we.id = wr.execution_id
+                     WHERE we.id IN (SELECT value FROM json_each(?1))
+                       AND (CAST(wr.created_at AS INTEGER) < ?2 OR CAST(wr.created_at AS INTEGER) >= ?3)
+                     ORDER BY CAST(wr.created_at AS INTEGER) ASC, wr.id ASC"
+                );
+                let extra_exec_runs = tx
+                    .prepare(&extra_exec_run_sql)?
+                    .query_map(
+                        params![query_ensure::id_array(&exec_ids), since_epoch_s, until_epoch_s],
+                        map_usage_run_record,
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                runs.extend(extra_exec_runs);
+            }
 
             // All chain-root tasks completed in [since, until) plus every
             // descendant revision in their chains. `UNION` deduplicates and
@@ -1372,5 +1404,80 @@ mod tests {
         // 13 seed tasks total: 3 are revisions (b_rev1, b_rev2, c_ghost_rev),
         // 1 completed pre-capture (h_precapture) => 9 completed chain-root tasks in 7d.
         assert_eq!(completed_tasks_total, 9);
+    }
+
+    #[test]
+    fn usage_series_loads_pre_window_runs_of_in_window_finished_executions() {
+        use boss_protocol::{UsageBucketWidth, UsageDimension, UsageFilter};
+        use boss_usage_report::{UsageSeriesQuery, build_usage_series_report};
+
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let conn = db.connect().unwrap();
+        insert_task(&conn, "t_open", &product_id, "chore", None);
+        conn.execute(
+            "UPDATE tasks SET status = 'active', completed_at = NULL WHERE id = 't_open'",
+            [],
+        )
+        .unwrap();
+        insert_run_with_driver(
+            &conn,
+            "r_early",
+            "e_late",
+            "t_open",
+            "chore_implementation",
+            1_000,
+            Some("claude"),
+        );
+        conn.execute(
+            "UPDATE work_executions SET finished_at = '5000', model = 'opus' WHERE id = 'e_late'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE work_runs SET model = 'claude-sonnet-4', input_tokens = 40, output_tokens = 10,
+                 cache_creation_tokens = 0, cache_read_tokens = 0 WHERE id = 'r_early'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let records = db.usage_series_records_for_window(4_000, 6_000).unwrap();
+        assert!(
+            records
+                .runs
+                .iter()
+                .any(|r| r.run_id == "r_early" && r.run_model.as_deref() == Some("claude-sonnet-4")),
+            "the execution's only run predates `since` and must still be loaded for grouping"
+        );
+        assert_eq!(records.finished_executions.len(), 1);
+
+        let q = UsageSeriesQuery::builder()
+            .since_epoch_s(4_000)
+            .until_epoch_s(6_000)
+            .generated_at_epoch_s(6_000)
+            .capture_start_epoch_s(0)
+            .completed_at_start_epoch_s(0)
+            .retention_max_age_secs(14 * 86_400)
+            .bucket(UsageBucketWidth::Hour)
+            .group_by(UsageDimension::Model)
+            .filters(vec![
+                UsageFilter {
+                    dimension: UsageDimension::Model,
+                    values: vec!["claude-sonnet-4".into()],
+                },
+                UsageFilter {
+                    dimension: UsageDimension::Coverage,
+                    values: vec!["measured".into()],
+                },
+            ])
+            .build();
+        let report = build_usage_series_report(&q, &records, None);
+        assert_eq!(report.groups, vec!["claude-sonnet-4"]);
+        assert_eq!(report.buckets[0].cells[0].executions_completed, 1);
+        assert_eq!(
+            report.buckets[0].cells[0].measurement.runs_total, 0,
+            "the pre-window run is attribution-only"
+        );
     }
 }

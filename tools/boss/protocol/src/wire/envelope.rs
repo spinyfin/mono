@@ -1,5 +1,6 @@
-//! Envelope and request-helper DTOs split out of `wire.rs` to keep it under
-//! the file-size limit.
+//! Frontend wire envelopes (`FrontendRequestEnvelope`, `FrontendEventEnvelope`)
+//! and request-helper DTOs (`TaskListQuery`, `UnpopulatePreservedTask`),
+//! re-exported from `wire`.
 
 use serde::{Deserialize, Serialize};
 

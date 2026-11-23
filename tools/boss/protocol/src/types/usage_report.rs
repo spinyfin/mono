@@ -509,7 +509,10 @@ impl UsageBucketWidth {
         }
     }
 
-    /// Fixed width of one bucket in seconds.
+    /// Nominal width of one bucket in seconds. Hour, day and week are exact
+    /// UTC alignments; `month` is the mean 30-day length used for the cell-cap
+    /// heuristic and `bucket_secs` on the wire. Actual month bucket starts are
+    /// UTC calendar-month midnights (see `bucket_start_epoch_s`).
     pub const fn bucket_secs(self) -> i64 {
         match self {
             Self::Hour => 3_600,
@@ -629,9 +632,9 @@ pub struct UsageBucket {
 
 /// A coverage note on [`UsageSeriesCoverage::notes`]: carries the note code
 /// (`capture_started`, `dimension_started`, `retention_bounded`,
-/// `pricing_gaps`, `bucket_coarsened`, `active_time_missing`), the optional
-/// boundary instant (`epoch_s`) so a chart can shade before it, and a
-/// human-readable explanation.
+/// `pricing_gaps`, `bucket_coarsened`, `cell_cap_exceeded`,
+/// `active_time_missing`), the optional boundary instant (`epoch_s`) so a
+/// chart can shade before it, and a human-readable explanation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageSeriesNote {
     pub code: String,

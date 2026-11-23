@@ -160,6 +160,8 @@ pub struct UsageExecutionRecord {
 /// Everything the series builder needs for one window.
 ///
 /// * `runs` holds every `work_runs` row created in `[since, until)` **plus**
+///   out-of-window runs of executions that finished in `[since, until)`
+///   (so grouping by model/coverage/host sees the observed latest run) **plus**
 ///   every all-time `work_runs` row belonging to the revision chain of any
 ///   root task completed in `[since, until)` (so `tasks_completed_cost`
 ///   includes out-of-window runs). The builder filters to `[since, until)` for
