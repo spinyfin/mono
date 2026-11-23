@@ -35,6 +35,8 @@ if [[ ! -e "${tmux_bin}" ]]; then
       printf '  %s/\n' "${entry##*/}" >&2
     elif [[ -e "${entry}" ]]; then
       printf '  %s (%s bytes)\n' "${entry##*/}" "$(wc -c < "${entry}" | tr -d '[:space:]')" >&2
+    elif [[ -L "${entry}" ]]; then
+      printf '  %s -> %s (dangling symlink)\n' "${entry##*/}" "$(readlink "${entry}")" >&2
     fi
   done
   exit 1
