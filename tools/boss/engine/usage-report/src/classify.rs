@@ -10,6 +10,8 @@ use boss_protocol::{
     InputConvention, RunCoverage, SpendClass, TokenClasses, UsageCaveat, UsageDimension,
 };
 
+pub(crate) use crate::fold::UsdOutcome;
+use crate::fold::{RunSample, RunTokens};
 use crate::record::{UsageRunRecord, UsageTaskRecord};
 
 /// Caveat codes, closed for this engine build. A client labels the ones it
@@ -89,14 +91,6 @@ impl<F: Fn(&str, PricedTokens) -> Option<f64>> UsdEstimator for F {
     }
 }
 
-/// The USD outcome for one run.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum UsdOutcome {
-    NotRequested,
-    Estimate(f64),
-    Unpriceable(&'static str),
-}
-
 /// One run with everything the builders derive from it.
 #[derive(bon::Builder)]
 pub(crate) struct RunFacts<'a> {
@@ -109,6 +103,18 @@ pub(crate) struct RunFacts<'a> {
     pub caveats: Vec<UsageCaveat>,
     pub task: Option<&'a UsageTaskRecord>,
     pub driver: Option<&'a str>,
+}
+
+impl RunFacts<'_> {
+    /// This run as the shared accumulator sees it.
+    pub(crate) fn sample(&self) -> RunSample<'_> {
+        RunSample {
+            tokens: run_tokens(self.rec),
+            agent_active_ms: self.rec.agent_active_ms,
+            usage_unavailable: self.rec.usage_unavailable.as_deref(),
+            usd: self.usd,
+        }
+    }
 }
 
 /// What classification needs from the request.
@@ -174,31 +180,20 @@ pub fn input_convention(driver: Option<&str>) -> InputConvention {
     }
 }
 
-/// The four classes that decide measurement state. Cache-creation TTL splits
-/// are detail of `cache_creation` and never decide state.
-fn core_classes(rec: &UsageRunRecord) -> [(&'static str, Option<i64>); 4] {
-    [
-        ("input", rec.input_tokens),
-        ("output", rec.output_tokens),
-        ("cache_creation", rec.cache_creation_tokens),
-        ("cache_read", rec.cache_read_tokens),
-    ]
+fn run_tokens(rec: &UsageRunRecord) -> RunTokens {
+    RunTokens {
+        input: rec.input_tokens,
+        output: rec.output_tokens,
+        cache_creation: rec.cache_creation_tokens,
+        cache_read: rec.cache_read_tokens,
+    }
 }
 
 /// Measurement state, matching `CostMeasurement`'s own counting: a run is
 /// measured when any class is present, zero when all four are exactly zero,
 /// and partial when it is measured but a class is NULL.
 pub fn run_coverage(rec: &UsageRunRecord) -> RunCoverage {
-    let classes = core_classes(rec);
-    if classes.iter().all(|(_, value)| value.is_none()) {
-        RunCoverage::Unmeasured
-    } else if classes.iter().any(|(_, value)| value.is_none()) {
-        RunCoverage::Partial
-    } else if classes.iter().all(|(_, value)| *value == Some(0)) {
-        RunCoverage::Zero
-    } else {
-        RunCoverage::Measured
-    }
+    run_tokens(rec).coverage()
 }
 
 /// The run's token classes, `None` when unmeasured.
@@ -217,7 +212,7 @@ pub(crate) fn token_classes(rec: &UsageRunRecord, coverage: RunCoverage) -> Opti
 /// Never coalesces an unreported class to zero: a partial run's figure is a
 /// floor and the run's coverage says so.
 pub(crate) fn known_total(rec: &UsageRunRecord, coverage: RunCoverage) -> Option<i64> {
-    (coverage != RunCoverage::Unmeasured).then(|| core_classes(rec).into_iter().filter_map(|(_, value)| value).sum())
+    (coverage != RunCoverage::Unmeasured).then(|| run_tokens(rec).known_total())
 }
 
 pub(crate) fn driver_source(rec: &UsageRunRecord) -> DriverSource {
@@ -307,7 +302,8 @@ fn caveats(facts: &RunFacts<'_>, ctx: &ClassifyContext<'_>) -> Vec<UsageCaveat> 
         push(caveat::MODEL_FROM_LAUNCH_TUPLE, rec.execution_model.clone());
     }
     if facts.coverage == RunCoverage::Partial {
-        let missing: Vec<&str> = core_classes(rec)
+        let missing: Vec<&str> = run_tokens(rec)
+            .classes()
             .into_iter()
             .filter(|(_, value)| value.is_none())
             .map(|(name, _)| name)

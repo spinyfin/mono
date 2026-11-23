@@ -14,10 +14,12 @@
 //! in the engine and reaches the builders through [`UsdEstimator`].
 
 pub mod classify;
+pub mod fold;
 pub mod record;
 pub mod rows;
 
 pub use classify::{PricedTokens, UsdEstimator, cause, caveat, input_convention, run_coverage, spend_class};
+pub use fold::{RunFold, RunSample, RunTokens, UsdOutcome};
 pub use record::{UsageRunRecord, UsageTaskRecord, UsageWindowRecords};
 pub use rows::{DEFAULT_RUN_CAP, MAX_GROUP_LEVELS, UsageRowsQuery, build_usage_rows_report, note};
 

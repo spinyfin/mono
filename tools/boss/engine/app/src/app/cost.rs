@@ -200,9 +200,7 @@ pub(super) async fn handle_get_token_usage_rows(ctx: Dispatch, req: FrontendRequ
 mod tests {
     use super::super::tests::{make_session_sink, test_server_state};
     use super::*;
-    use boss_engine_runtime::cost_report::{CostRunRecord, build_window_cost_report};
     use boss_protocol::{UsageDimension, UsageFilter};
-    use boss_usage_report::{UsageRunRecord, UsageWindowRecords};
 
     async fn ask(
         state: &Arc<ServerState>,
@@ -305,109 +303,5 @@ mod tests {
             panic!("expected WorkError, got {payload:?}");
         };
         assert!(message.contains("at most 2"), "{message}");
-    }
-
-    /// `boss cost window` and the usage rows request read the same runs, so
-    /// their totals must agree. The two accumulate independently (the builder
-    /// crate cannot depend on the runtime crate that owns the first), so this
-    /// is the test that stops them drifting.
-    #[test]
-    fn usage_overall_matches_the_cost_window_total_for_the_same_runs() {
-        // (driver, input, output, cache_creation, cache_read, active_ms, usage_unavailable)
-        type Row = (
-            &'static str,
-            Option<i64>,
-            Option<i64>,
-            Option<i64>,
-            Option<i64>,
-            Option<i64>,
-            Option<&'static str>,
-        );
-        let rows: [Row; 6] = [
-            ("claude", Some(100), Some(50), Some(10), Some(5), Some(1_000), None),
-            (
-                "claude",
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some("No provider token usage observed"),
-            ),
-            ("grok", Some(20), Some(4), None, Some(9), None, None),
-            ("codex", Some(500), Some(60), Some(0), Some(400), Some(2_000), None),
-            ("claude", Some(0), Some(0), Some(0), Some(0), Some(0), None),
-            (
-                "agy",
-                Some(30),
-                Some(2),
-                None,
-                Some(8),
-                None,
-                Some("One or more provider responses omit valid input, output, or cache-read usage"),
-            ),
-        ];
-        let mut cost_records = Vec::new();
-        let mut usage_runs = Vec::new();
-        for (index, (driver, input, output, cache_creation, cache_read, active_ms, unavailable)) in
-            rows.into_iter().enumerate()
-        {
-            let id = format!("r{index}");
-            cost_records.push(
-                CostRunRecord::builder()
-                    .run_id(&id)
-                    .execution_id(format!("e{index}"))
-                    .work_item_id("t")
-                    .work_item_name("t")
-                    .execution_kind("chore_implementation")
-                    .execution_status("completed")
-                    .run_status("completed")
-                    .created_at_epoch_s(5_000 + index as i64)
-                    .driver(driver)
-                    .maybe_input_tokens(input)
-                    .maybe_output_tokens(output)
-                    .maybe_cache_creation_tokens(cache_creation)
-                    .maybe_cache_read_tokens(cache_read)
-                    .maybe_agent_active_ms(active_ms)
-                    .maybe_usage_unavailable(unavailable.map(str::to_owned))
-                    .build(),
-            );
-            let mut run = UsageRunRecord::builder()
-                .run_id(&id)
-                .run_status("completed")
-                .run_created_at_epoch_s(5_000 + index as i64)
-                .run_host_id("local")
-                .execution_id(format!("e{index}"))
-                .work_item_id("t")
-                .execution_kind("chore_implementation")
-                .execution_status("completed")
-                .execution_created_at_epoch_s(5_000 + index as i64)
-                .driver(driver)
-                .build();
-            run.input_tokens = input;
-            run.output_tokens = output;
-            run.cache_creation_tokens = cache_creation;
-            run.cache_read_tokens = cache_read;
-            run.agent_active_ms = active_ms;
-            run.usage_unavailable = unavailable.map(str::to_owned);
-            usage_runs.push(run);
-        }
-        let window = build_window_cost_report(1_000, 9_000, &cost_records, false, 9_000);
-        let query = UsageRowsQuery::builder()
-            .since_epoch_s(1_000)
-            .until_epoch_s(9_000)
-            .generated_at_epoch_s(9_000)
-            .capture_start_epoch_s(0)
-            .retention_max_age_secs(boss_work_db::DEFAULT_RETENTION_MAX_AGE_SECS)
-            .build();
-        let usage = build_usage_rows_report(
-            &query,
-            &UsageWindowRecords {
-                runs: usage_runs,
-                tasks: Vec::new(),
-            },
-            None,
-        );
-        assert_eq!(usage.overall, window.overall);
     }
 }
