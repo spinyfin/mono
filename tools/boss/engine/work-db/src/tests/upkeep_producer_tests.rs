@@ -478,6 +478,16 @@ const PRODUCERS: &[Producer] = &[
         seed: seed_stuck_todo_execution,
         nominated: |db| db.promote_todo_autostart_stuck_executions().unwrap(),
     },
+    Producer {
+        name: "blocked-PR sweep (list_blocked_pr_sweep_candidates)",
+        stance: Stance::Excludes,
+        seed: seed_in_review,
+        nominated: |db| {
+            ids(db.list_blocked_pr_sweep_candidates().unwrap(), |c| {
+                c.work_item_id.clone()
+            })
+        },
+    },
     // Listings shared with recording facts: still nominate a parked row; the
     // consumer withholds the upkeep half (see `boss_engine_merge_poller`).
     Producer {
@@ -648,6 +658,10 @@ fn registered_producer_names_are_unique() {
 /// Candidate-listing functions that are deliberately not upkeep producers, each
 /// with the reason a parked row needs no exclusion there.
 const NOT_UPKEEP: &[(&str, &str)] = &[
+    (
+        "list_pr_blocked_remediations",
+        "reads one work item's remediation ledger for budget counting; it nominates nothing",
+    ),
     (
         "list_dead_post_merge_review_batch_member_candidates",
         "its owning task is `done` (the PR merged), and a done row is never parked",

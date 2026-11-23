@@ -1156,13 +1156,17 @@ async fn sweep_drives_full_conflict_resolve_cycle() {
     assert_eq!(outcome4.total_transitions(), 0);
 
     // Event trail: conflict in flight → (no work-item event on resolve since
-    // parent didn't change status). Poll-state events excluded.
+    // parent didn't change status). Poll-state events excluded, and so are
+    // the blocked-PR sweep's own `blocked_pr_*` publishes: those carry the
+    // card's stored reason, not a lifecycle transition.
     let reasons: Vec<String> = publisher
         .events
         .lock()
         .await
         .iter()
-        .filter(|(p, w, r)| p == &product && w == &chore && r != "pr_poll_state_updated")
+        .filter(|(p, w, r)| {
+            p == &product && w == &chore && r != "pr_poll_state_updated" && !r.starts_with("blocked_pr_")
+        })
         .map(|(_, _, r)| r.clone())
         .collect();
     assert_eq!(
@@ -1322,10 +1326,24 @@ async fn opt_out_label_blocks_conflict_flip_through_sweep() {
     assert_eq!(outcome.conflict_flagged, 0);
     assert_eq!(outcome.total_transitions(), 0);
     match db.get_work_item(&chore).unwrap() {
-        WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::InReview),
+        WorkItem::Chore(t) => {
+            assert_eq!(t.status, TaskStatus::InReview);
+            // The blocked-PR sweep still explains the stalled card. The
+            // opt-out label lives only in the probe result, so the stored
+            // reason can only say that nothing is running.
+            assert_eq!(
+                t.review_blocked_reason.as_deref(),
+                Some("merge conflict with main; no resolution attempt is running yet")
+            );
+        }
         other => panic!("expected chore, got {other:?}"),
     }
-    assert!(publisher.lifecycle_reasons().await.is_empty());
+    // That diagnosis is the pass's only publish; it is not a lifecycle
+    // transition (`total_transitions` above stayed 0).
+    assert_eq!(
+        publisher.lifecycle_reasons().await,
+        vec!["blocked_pr_diagnosed".to_owned()]
+    );
 }
 
 /// Complement test: a `failed` crz must NOT be re-armed (churn guard
@@ -1433,9 +1451,11 @@ async fn unknown_mergeability_does_not_retire_merge_conflict() {
         other => panic!("expected chore, got {other:?}"),
     }
 
-    // No lifecycle event must have been emitted.
-    assert!(
-        publisher.lifecycle_reasons().await.is_empty(),
+    // No lifecycle event must have been emitted; the blocked-PR sweep's
+    // reason publish for the still-blocked card is not one.
+    assert_eq!(
+        publisher.lifecycle_reasons().await,
+        vec!["blocked_pr_diagnosed".to_owned()],
         "no lifecycle event expected while mergeable=UNKNOWN"
     );
 }

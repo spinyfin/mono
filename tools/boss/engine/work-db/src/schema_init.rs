@@ -894,6 +894,10 @@ mod floor_tests {
                 }),
             ),
             (
+                super::super::blocked_pr::MIGRATION_ID,
+                Box::new(|c| super::super::blocked_pr::migrate(c).unwrap()),
+            ),
+            (
                 cancel_provenance::MIGRATION_ID,
                 Box::new(|c| {
                     c.execute_batch(

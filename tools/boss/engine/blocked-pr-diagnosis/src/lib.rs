@@ -1,20 +1,21 @@
 //! Why a Review-lane card is blocked or stalled, as one human-readable
 //! sentence plus the one safe thing the engine may do about it.
 //!
-//! Callers gather [`BlockedFacts`] for an open Boss-tracked PR and call
-//! [`diagnose`]. This crate owns the rules: which category the facts fall
-//! into, how that category reads on the card, and whether the engine
-//! re-kicks an existing path ([`Action::RedispatchRevision`]) or hands the
-//! card to a human ([`Action::NeedsHuman`]). It is pure so every category
-//! is unit-testable without a database.
+//! The engine's blocked-PR sweep (`blocked_pr_sweep` in `engine/merge-poller`)
+//! gathers [`BlockedFacts`] for every open Boss-tracked PR from the work
+//! database and calls [`diagnose`]. This crate owns the rules: which
+//! category the facts fall into, how that category reads on the card, and
+//! whether the engine re-kicks an existing path ([`Action::RedispatchRevision`])
+//! or hands the card to a human ([`Action::NeedsHuman`]). It is pure so every
+//! category is unit-testable without a database.
 //!
 //! [`is_review_blocked`] is the same Blocked rule as the engine's
-//! `classify_review_section` in work-db. A blocked-PR sweep that gathers
-//! these facts, and a parity test that the two stay in lockstep, both land
-//! with #3242. The same rules also cover cards that are *not* in the
-//! Blocked section but have silently stopped progressing (a revision whose
-//! worker died, an automated review that was reaped at its generation cap),
-//! so "blocked" here means "will not reach merge without something happening".
+//! `classify_review_section` in work-db; the merge poller has a parity test that the
+//! two stay in lockstep. The sweep also diagnoses cards that are *not* in
+//! the Blocked section but have silently stopped progressing (a revision
+//! whose worker died, an automated review that was reaped at its generation
+//! cap), so "blocked" here means "will not reach merge without something
+//! happening".
 //!
 //! Statuses stay wire strings (`status: String`) because the facts are
 //! gathered straight from database rows and the sweep must keep running on a
