@@ -9,10 +9,8 @@
 //! 4. fold the surviving runs into `overall`, coverage and notes;
 //! 5. emit the task tree, once, or once per group when grouping.
 //!
-//! Every sum is made by one [`Acc`], which reproduces `CostMeasurement`'s
-//! contract: a run with no recorded class is unmeasured and excluded from
-//! every sum, a class is unknown when any measured run lacks it, and nothing
-//! ever coalesces NULL to zero.
+//! Every sum is made by one [`RunFold`], the same accumulator `boss cost`
+//! uses, so the NULL-versus-zero contract is implemented once.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -22,8 +20,9 @@ use boss_protocol::{
     UsageFilter, UsageGroup, UsageGroupKey, UsageNote,
 };
 
-use crate::classify::{ClassifyContext, RunFacts, UsdEstimator, UsdOutcome, classify, dimension_value, driver_source};
+use crate::classify::{ClassifyContext, RunFacts, UsdEstimator, classify, dimension_value, driver_source};
 use crate::classify::{known_total, model_label, token_classes};
+use crate::fold::{RunFold, UsdOutcome};
 use crate::record::{UsageRunRecord, UsageTaskRecord, UsageWindowRecords};
 
 /// The most runs one reply carries. Past it the most recent runs are kept
@@ -137,7 +136,7 @@ pub fn build_usage_rows_report(
     }
 
     // 4. Totals, coverage, notes.
-    let overall = measure(want_usd, &kept);
+    let overall = measure(&kept);
     let gaps = pricing_gaps(&kept);
     let coverage = coverage(query, &kept, &gaps, want_usd);
 
@@ -150,7 +149,6 @@ pub fn build_usage_rows_report(
         tasks: &tasks,
         in_window_per_task: &in_window_per_task,
         roll_up: query.roll_up_revisions,
-        want_usd,
     };
     let (task_nodes, taskless, groups) = if query.group_by.is_empty() {
         let (task_nodes, taskless) = build_tree(&ctx, &kept);
@@ -180,114 +178,18 @@ pub fn build_usage_rows_report(
 
 // ── Accumulation ──────────────────────────────────────────────────────────
 
-/// Running totals for one set of runs, folded in one pass. Mirrors the
-/// accumulator behind `boss cost`, so `overall` here and `boss cost window`
-/// agree on the same runs (a test in the engine pins that).
-#[derive(Default, bon::Builder)]
-struct Acc {
-    want_usd: bool,
-    total: u32,
-    measured: u32,
-    unmeasured: u32,
-    zero: u32,
-    input: i64,
-    output: i64,
-    cache_creation: i64,
-    cache_read: i64,
-    agent_active_ms: i64,
-    unknown_classes: BTreeSet<&'static str>,
-    unavailable: BTreeSet<String>,
-    priced_runs: u32,
-    priced_usd: f64,
-    usd_partial: bool,
-}
-
-impl Acc {
-    fn new(want_usd: bool) -> Self {
-        Self {
-            want_usd,
-            ..Self::default()
-        }
-    }
-
-    fn add(&mut self, facts: &RunFacts<'_>) {
-        let rec = facts.rec;
-        self.total += 1;
-        if let Some(reason) = &rec.usage_unavailable {
-            self.unavailable.insert(reason.clone());
-        }
-        if facts.coverage == RunCoverage::Unmeasured {
-            self.unmeasured += 1;
-            return;
-        }
-        self.measured += 1;
-        if facts.coverage == RunCoverage::Zero {
-            self.zero += 1;
-        }
-        for (name, value, sum) in [
-            ("input", rec.input_tokens, &mut self.input),
-            ("output", rec.output_tokens, &mut self.output),
-            ("cache_creation", rec.cache_creation_tokens, &mut self.cache_creation),
-            ("cache_read", rec.cache_read_tokens, &mut self.cache_read),
-        ] {
-            match value {
-                Some(count) => *sum += count,
-                None => {
-                    self.unknown_classes.insert(name);
-                }
-            }
-        }
-        self.agent_active_ms += rec.agent_active_ms.unwrap_or(0);
-        match facts.usd {
-            UsdOutcome::NotRequested => {}
-            UsdOutcome::Estimate(usd) => {
-                self.priced_runs += 1;
-                self.priced_usd += usd;
-            }
-            UsdOutcome::Unpriceable(_) => self.usd_partial = true,
-        }
-    }
-
-    /// A class is known only when a run was measured and no measured run lacks it.
-    fn class(&self, name: &str, value: i64) -> Option<i64> {
-        (self.measured > 0 && !self.unknown_classes.contains(name)).then_some(value)
-    }
-
-    fn finish(&self) -> CostMeasurement {
-        CostMeasurement::builder()
-            .agent_active_ms(self.agent_active_ms)
-            .maybe_cache_creation_tokens(self.class("cache_creation", self.cache_creation))
-            .maybe_cache_read_tokens(self.class("cache_read", self.cache_read))
-            .estimated_usd_partial(self.want_usd && self.usd_partial)
-            .maybe_input_tokens(self.class("input", self.input))
-            .maybe_output_tokens(self.class("output", self.output))
-            .tokens_partial(!self.unknown_classes.is_empty())
-            .usage_unavailable(self.unavailable.iter().cloned().collect())
-            .runs_measured(self.measured)
-            .runs_total(self.total)
-            .runs_unmeasured(self.unmeasured)
-            .runs_zero(self.zero)
-            .total_tokens(self.input + self.output + self.cache_creation + self.cache_read)
-            .maybe_estimated_usd((self.want_usd && self.priced_runs > 0).then_some(self.priced_usd))
-            .build()
-    }
-}
-
-fn measure(want_usd: bool, runs: &[&RunFacts<'_>]) -> CostMeasurement {
-    let mut acc = Acc::new(want_usd);
+fn measure(runs: &[&RunFacts<'_>]) -> CostMeasurement {
+    let mut fold = RunFold::default();
     for facts in runs {
-        acc.add(facts);
+        fold.add(&facts.sample());
     }
-    acc.finish()
+    fold.finish()
 }
 
-fn spend_class_buckets(want_usd: bool, runs: &[&RunFacts<'_>]) -> Vec<CostBucket> {
-    let mut by_class: BTreeMap<SpendClass, Acc> = BTreeMap::new();
+fn spend_class_buckets(runs: &[&RunFacts<'_>]) -> Vec<CostBucket> {
+    let mut by_class: BTreeMap<SpendClass, RunFold> = BTreeMap::new();
     for facts in runs {
-        by_class
-            .entry(facts.spend_class)
-            .or_insert_with(|| Acc::new(want_usd))
-            .add(facts);
+        by_class.entry(facts.spend_class).or_default().add(&facts.sample());
     }
     let mut buckets: Vec<CostBucket> = by_class
         .into_iter()
@@ -434,7 +336,6 @@ struct TreeCtx<'a> {
     tasks: &'a HashMap<&'a str, &'a UsageTaskRecord>,
     in_window_per_task: &'a HashMap<&'a str, u32>,
     roll_up: bool,
-    want_usd: bool,
 }
 
 impl TreeCtx<'_> {
@@ -471,7 +372,7 @@ fn build_groups(
                 value,
                 label,
             });
-            let measurement = measure(ctx.want_usd, &members);
+            let measurement = measure(&members);
             if dims.len() > 1 {
                 UsageGroup::builder()
                     .key(key.clone())
@@ -503,7 +404,7 @@ fn build_groups(
 fn build_tree(ctx: &TreeCtx<'_>, runs: &[&RunFacts<'_>]) -> (Vec<TaskUsageNode>, Vec<ExecutionUsageNode>) {
     let (task_runs, taskless_runs): (Vec<&RunFacts<'_>>, Vec<&RunFacts<'_>>) =
         runs.iter().copied().partition(|facts| facts.task.is_some());
-    let taskless = execution_nodes(ctx, &taskless_runs);
+    let taskless = execution_nodes(&taskless_runs);
 
     let mut by_task: BTreeMap<&str, Vec<&RunFacts<'_>>> = BTreeMap::new();
     for facts in task_runs {
@@ -519,7 +420,7 @@ fn build_tree(ctx: &TreeCtx<'_>, runs: &[&RunFacts<'_>]) -> (Vec<TaskUsageNode>,
     let mut top: Vec<TaskUsageNode> = Vec::new();
     for (root_id, member_ids) in chains {
         let chain_runs: Vec<&RunFacts<'_>> = member_ids.iter().flat_map(|id| by_task[id].iter().copied()).collect();
-        let inclusive = measure(ctx.want_usd, &chain_runs);
+        let inclusive = measure(&chain_runs);
         if ctx.roll_up {
             let root_record = ctx.tasks[root_id];
             let own: &[&RunFacts<'_>] = by_task.get(root_id).map(Vec::as_slice).unwrap_or(&[]);
@@ -563,15 +464,15 @@ fn task_node(ctx: &TreeCtx<'_>, task: &UsageTaskRecord, runs: &[&RunFacts<'_>]) 
     TaskUsageNode::builder()
         .task_id(&task.task_id)
         .chain_root_id(ctx.root_of(task))
-        .direct(measure(ctx.want_usd, runs))
+        .direct(measure(runs))
         .is_chain_root(ctx.root_of(task) == task.task_id)
         .kind(&task.kind)
         .name(&task.name)
         .product_id(&task.product_id)
         .runs_outside_window(task.run_count_all_time.saturating_sub(in_window))
         .status(&task.status)
-        .by_spend_class(spend_class_buckets(ctx.want_usd, runs))
-        .executions(execution_nodes(ctx, runs))
+        .by_spend_class(spend_class_buckets(runs))
+        .executions(execution_nodes(runs))
         .maybe_completed_at_epoch_s(task.completed_at_epoch_s)
         .maybe_effort_current(task.effort_level.clone())
         .maybe_pr_url(task.pr_url.clone())
@@ -581,7 +482,7 @@ fn task_node(ctx: &TreeCtx<'_>, task: &UsageTaskRecord, runs: &[&RunFacts<'_>]) 
         .build()
 }
 
-fn execution_nodes(ctx: &TreeCtx<'_>, runs: &[&RunFacts<'_>]) -> Vec<ExecutionUsageNode> {
+fn execution_nodes(runs: &[&RunFacts<'_>]) -> Vec<ExecutionUsageNode> {
     let mut by_execution: BTreeMap<&str, Vec<&RunFacts<'_>>> = BTreeMap::new();
     for facts in runs {
         by_execution
@@ -606,7 +507,7 @@ fn execution_nodes(ctx: &TreeCtx<'_>, runs: &[&RunFacts<'_>]) -> Vec<ExecutionUs
                 .created_at_epoch_s(rec.execution_created_at_epoch_s)
                 .driver_source(driver_source(rec))
                 .kind(&rec.execution_kind)
-                .measurement(measure(ctx.want_usd, &members))
+                .measurement(measure(&members))
                 .spend_class(first.spend_class)
                 .status(&rec.execution_status)
                 .runs(members.iter().map(|facts| run_row(facts)).collect())

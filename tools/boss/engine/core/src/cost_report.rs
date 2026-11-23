@@ -15,15 +15,17 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use boss_protocol::{
-    CostBucket, CostMeasurement, CostTopRow, DRIVER_SLUG_AGY, DRIVER_SLUG_GROK, ExecutionCostRow, TaskCostReport,
-    TopCostReport, WindowCostReport,
+    CostBucket, CostTopRow, DRIVER_SLUG_AGY, DRIVER_SLUG_GROK, ExecutionCostRow, TaskCostReport, TopCostReport,
+    WindowCostReport,
 };
+
+use boss_usage_report::{RunFold, RunSample, RunTokens, UsdOutcome, cause};
 
 use crate::cost_pricing;
 
 pub mod sol {
     //! PR-family aggregation. Retried and revised work stays in its enrollment arm.
-    use super::Accumulator;
+    use super::{RunFold, fold_record};
     use boss_protocol::{SolArmReport, SolComparisonReport};
     use std::collections::BTreeSet;
 
@@ -40,22 +42,22 @@ pub mod sol {
                 let merged = cohort.iter().filter(|pr| pr.merged).count() as u64;
                 let revisions = cohort.iter().filter(|pr| pr.merged).map(|pr| pr.revisions).sum();
                 let findings = cohort.iter().map(|pr| pr.findings).sum();
-                let mut cost = Accumulator::default();
+                let mut cost = RunFold::default();
                 let mut gaps = BTreeSet::new();
                 let (mut measured_tokens, mut measured_prs) = (0u64, 0u64);
                 for pr in cohort.iter().filter(|pr| pr.merged) {
-                    let mut family = Accumulator::default();
+                    let mut family = RunFold::default();
                     for run in &pr.runs {
-                        cost.add(run, false, &mut gaps);
-                        family.add(run, false, &mut gaps);
+                        fold_record(&mut cost, run, false, &mut gaps);
+                        fold_record(&mut family, run, false, &mut gaps);
                     }
-                    let family = family.finish(false);
+                    let family = family.finish();
                     if !pr.runs.is_empty() && family.runs_unmeasured == 0 {
                         measured_tokens += family.total_tokens as u64;
                         measured_prs += 1;
                     }
                 }
-                let measured = cost.finish(false);
+                let measured = cost.finish();
                 let tokens_per_pr = ratio(measured_tokens, measured_prs);
                 SolArmReport::builder()
                     .arm(arm)
@@ -192,133 +194,37 @@ pub use boss_engine_storage_values::{CostRunRecord, CostRunRecordBuilder};
 const NO_VALUE_LABEL: &str = "(none)";
 const NO_MODEL_GAP_LABEL: &str = "(no model recorded)";
 
-/// Run-count breakdown within one [`Accumulator`]: measured/unmeasured/zero
-/// per the NULL-vs-zero contract, plus the total folded in.
-#[derive(Default)]
-struct RunCounts {
-    total: u32,
-    measured: u32,
-    unmeasured: u32,
-    zero: u32,
-}
-
-/// Summed token counts within one [`Accumulator`], across only its
-/// measured runs.
-#[derive(Default)]
-struct TokenTotals {
-    input: i64,
-    output: i64,
-    cache_creation: i64,
-    cache_read: i64,
-}
-
-impl TokenTotals {
-    fn sum(&self) -> i64 {
-        self.input + self.output + self.cache_creation + self.cache_read
-    }
-}
-
-/// Running total for one grouping bucket. Folds [`CostRunRecord`]s one at
-/// a time so every report can build every bucket in a single pass.
-#[derive(Default, bon::Builder)]
-#[builder(on(String, into))]
-struct Accumulator {
-    counts: RunCounts,
-    tokens: TokenTotals,
-    agent_active_ms: i64,
-    priced_runs: u32,
-    priced_usd: f64,
-    partial: bool,
-    unknown_categories: BTreeSet<&'static str>,
-    unavailable: BTreeSet<String>,
-}
-
-impl Accumulator {
-    /// Folds one record in. `gaps` collects the distinct unpriced model
-    /// strings seen across the whole report (not just this bucket) so the
-    /// caller can surface them once at the report level.
-    fn add(&mut self, record: &CostRunRecord, want_usd: bool, gaps: &mut BTreeSet<String>) {
-        self.counts.total += 1;
-        if let Some(reason) = &record.usage_unavailable {
-            self.unavailable.insert(reason.clone());
-        }
-        if !run_is_measured(record) {
-            self.counts.unmeasured += 1;
-            return;
-        }
-        self.counts.measured += 1;
-        if token_fields(record).iter().all(|(_, value)| *value == Some(0)) {
-            self.counts.zero += 1;
-        }
-        fold_category(
-            &mut self.unknown_categories,
-            &mut self.tokens.input,
-            "input",
-            record.input_tokens,
-        );
-        fold_category(
-            &mut self.unknown_categories,
-            &mut self.tokens.output,
-            "output",
-            record.output_tokens,
-        );
-        fold_category(
-            &mut self.unknown_categories,
-            &mut self.tokens.cache_creation,
-            "cache_creation",
-            record.cache_creation_tokens,
-        );
-        fold_category(
-            &mut self.unknown_categories,
-            &mut self.tokens.cache_read,
-            "cache_read",
-            record.cache_read_tokens,
-        );
-        self.agent_active_ms += record.agent_active_ms.unwrap_or(0);
-        if want_usd {
-            match price_for_record(record).and_then(|price| {
-                cost_pricing::estimate_usd(
-                    price,
-                    record.input_tokens.unwrap_or(0),
-                    record.output_tokens.unwrap_or(0),
-                    record.cache_creation_tokens.unwrap_or(0),
-                    record.cache_read_tokens.unwrap_or(0),
-                )
-            }) {
-                Some(usd) => {
-                    self.priced_runs += 1;
-                    self.priced_usd += usd;
-                }
-                None => {
-                    self.partial = true;
-                    gaps.insert(record.model.as_deref().unwrap_or(NO_MODEL_GAP_LABEL).to_owned());
-                }
+/// Folds one record into `fold`. `gaps` collects the distinct unpriced model
+/// strings seen across the whole report (not just this bucket) so the caller
+/// can surface them once at the report level. Pricing is attempted only for a
+/// measured run: an unmeasured one has nothing to price and is not a gap.
+fn fold_record(fold: &mut RunFold, record: &CostRunRecord, want_usd: bool, gaps: &mut BTreeSet<String>) {
+    let tokens = run_tokens(record);
+    let usd = if !want_usd || !tokens.is_measured() {
+        UsdOutcome::NotRequested
+    } else {
+        match price_for_record(record).and_then(|price| {
+            cost_pricing::estimate_usd(
+                price,
+                record.input_tokens.unwrap_or(0),
+                record.output_tokens.unwrap_or(0),
+                record.cache_creation_tokens.unwrap_or(0),
+                record.cache_read_tokens.unwrap_or(0),
+            )
+        }) {
+            Some(usd) => UsdOutcome::Estimate(usd),
+            None => {
+                gaps.insert(record.model.as_deref().unwrap_or(NO_MODEL_GAP_LABEL).to_owned());
+                UsdOutcome::Unpriceable(cause::UNKNOWN_MODEL)
             }
         }
-    }
-
-    fn category(&self, name: &str, value: i64) -> Option<i64> {
-        (self.counts.measured > 0 && !self.unknown_categories.contains(name)).then_some(value)
-    }
-
-    fn finish(&self, want_usd: bool) -> CostMeasurement {
-        CostMeasurement::builder()
-            .agent_active_ms(self.agent_active_ms)
-            .maybe_cache_creation_tokens(self.category("cache_creation", self.tokens.cache_creation))
-            .maybe_cache_read_tokens(self.category("cache_read", self.tokens.cache_read))
-            .estimated_usd_partial(want_usd && self.partial)
-            .maybe_input_tokens(self.category("input", self.tokens.input))
-            .maybe_output_tokens(self.category("output", self.tokens.output))
-            .tokens_partial(!self.unknown_categories.is_empty())
-            .usage_unavailable(self.unavailable.iter().cloned().collect())
-            .runs_measured(self.counts.measured)
-            .runs_total(self.counts.total)
-            .runs_unmeasured(self.counts.unmeasured)
-            .runs_zero(self.counts.zero)
-            .total_tokens(self.tokens.sum())
-            .maybe_estimated_usd((want_usd && self.priced_runs > 0).then_some(self.priced_usd))
-            .build()
-    }
+    };
+    fold.add(&RunSample {
+        tokens,
+        agent_active_ms: record.agent_active_ms,
+        usage_unavailable: record.usage_unavailable.as_deref(),
+        usd,
+    });
 }
 
 // Subscription-backed Grok/Antigravity model names are not verified API rates.
@@ -341,29 +247,12 @@ fn price_for_record(record: &CostRunRecord) -> Option<cost_pricing::ModelPriceUs
     record.model.as_deref().and_then(cost_pricing::price_for_model)
 }
 
-fn token_fields(record: &CostRunRecord) -> [(&'static str, Option<i64>); 4] {
-    [
-        ("input", record.input_tokens),
-        ("output", record.output_tokens),
-        ("cache_creation", record.cache_creation_tokens),
-        ("cache_read", record.cache_read_tokens),
-    ]
-}
-
-fn run_is_measured(record: &CostRunRecord) -> bool {
-    token_fields(record).iter().any(|(_, value)| value.is_some())
-}
-
-fn known_tokens(record: &CostRunRecord) -> i64 {
-    token_fields(record).iter().filter_map(|(_, value)| *value).sum()
-}
-
-fn fold_category(unknown: &mut BTreeSet<&'static str>, dest: &mut i64, name: &'static str, value: Option<i64>) {
-    match value {
-        Some(n) => *dest += n,
-        None => {
-            unknown.insert(name);
-        }
+fn run_tokens(record: &CostRunRecord) -> RunTokens {
+    RunTokens {
+        input: record.input_tokens,
+        output: record.output_tokens,
+        cache_creation: record.cache_creation_tokens,
+        cache_read: record.cache_read_tokens,
     }
 }
 
@@ -371,12 +260,12 @@ fn label_or_none(value: Option<&str>) -> String {
     value.map(str::to_owned).unwrap_or_else(|| NO_VALUE_LABEL.to_owned())
 }
 
-fn finish_buckets(map: BTreeMap<String, Accumulator>, want_usd: bool) -> Vec<CostBucket> {
+fn finish_buckets(map: BTreeMap<String, RunFold>) -> Vec<CostBucket> {
     let mut buckets: Vec<CostBucket> = map
         .into_iter()
         .map(|(label, acc)| CostBucket {
             label,
-            measurement: acc.finish(want_usd),
+            measurement: acc.finish(),
         })
         .collect();
     // Highest-spend bucket first — the decision-relevant ordering for a
@@ -406,26 +295,26 @@ pub fn build_task_cost_report(
         kind: String,
         status: String,
         models: BTreeSet<String>,
-        acc: Accumulator,
+        acc: RunFold,
     }
 
-    let mut overall = Accumulator::default();
+    let mut overall = RunFold::default();
     let mut gaps: BTreeSet<String> = BTreeSet::new();
     let mut exec_order: Vec<String> = Vec::new();
     let mut exec_map: HashMap<String, ExecutionAcc> = HashMap::new();
 
     for record in records {
-        overall.add(record, want_usd, &mut gaps);
+        fold_record(&mut overall, record, want_usd, &mut gaps);
         let entry = exec_map.entry(record.execution_id.clone()).or_insert_with(|| {
             exec_order.push(record.execution_id.clone());
             ExecutionAcc {
                 kind: record.execution_kind.clone(),
                 status: record.execution_status.clone(),
                 models: BTreeSet::new(),
-                acc: Accumulator::default(),
+                acc: RunFold::default(),
             }
         });
-        entry.acc.add(record, want_usd, &mut gaps);
+        fold_record(&mut entry.acc, record, want_usd, &mut gaps);
         if let Some(model) = &record.model {
             entry.models.insert(model.clone());
         }
@@ -440,7 +329,7 @@ pub fn build_task_cost_report(
                 kind: entry.kind,
                 models: entry.models.into_iter().collect(),
                 status: entry.status,
-                measurement: entry.acc.finish(want_usd),
+                measurement: entry.acc.finish(),
             }
         })
         .collect();
@@ -451,7 +340,7 @@ pub fn build_task_cost_report(
         .by_execution(by_execution)
         .generated_at_epoch_s(generated_at_epoch_s)
         .name(name)
-        .overall(overall.finish(want_usd))
+        .overall(overall.finish())
         .pricing_gaps(gaps.into_iter().collect())
         .build()
 }
@@ -468,47 +357,61 @@ pub fn build_window_cost_report(
     want_usd: bool,
     generated_at_epoch_s: i64,
 ) -> WindowCostReport {
-    let mut overall = Accumulator::default();
+    let mut overall = RunFold::default();
     let mut gaps: BTreeSet<String> = BTreeSet::new();
-    let mut by_kind: BTreeMap<String, Accumulator> = BTreeMap::new();
-    let mut by_driver: BTreeMap<String, Accumulator> = BTreeMap::new();
-    let mut by_model: BTreeMap<String, Accumulator> = BTreeMap::new();
-    let mut by_reasoning: BTreeMap<String, Accumulator> = BTreeMap::new();
-    let mut by_effort_level: BTreeMap<String, Accumulator> = BTreeMap::new();
+    let mut by_kind: BTreeMap<String, RunFold> = BTreeMap::new();
+    let mut by_driver: BTreeMap<String, RunFold> = BTreeMap::new();
+    let mut by_model: BTreeMap<String, RunFold> = BTreeMap::new();
+    let mut by_reasoning: BTreeMap<String, RunFold> = BTreeMap::new();
+    let mut by_effort_level: BTreeMap<String, RunFold> = BTreeMap::new();
 
     for record in records {
-        overall.add(record, want_usd, &mut gaps);
-        by_driver
-            .entry(label_or_none(record.driver.as_deref()))
-            .or_default()
-            .add(record, want_usd, &mut gaps);
-        by_kind
-            .entry(record.execution_kind.clone())
-            .or_default()
-            .add(record, want_usd, &mut gaps);
-        by_model
-            .entry(label_or_none(record.model.as_deref()))
-            .or_default()
-            .add(record, want_usd, &mut gaps);
-        by_reasoning
-            .entry(label_or_none(record.reasoning.as_deref()))
-            .or_default()
-            .add(record, want_usd, &mut gaps);
-        by_effort_level
-            .entry(label_or_none(record.effort_level.as_deref()))
-            .or_default()
-            .add(record, want_usd, &mut gaps);
+        fold_record(&mut overall, record, want_usd, &mut gaps);
+        fold_record(
+            by_driver.entry(label_or_none(record.driver.as_deref())).or_default(),
+            record,
+            want_usd,
+            &mut gaps,
+        );
+        fold_record(
+            by_kind.entry(record.execution_kind.clone()).or_default(),
+            record,
+            want_usd,
+            &mut gaps,
+        );
+        fold_record(
+            by_model.entry(label_or_none(record.model.as_deref())).or_default(),
+            record,
+            want_usd,
+            &mut gaps,
+        );
+        fold_record(
+            by_reasoning
+                .entry(label_or_none(record.reasoning.as_deref()))
+                .or_default(),
+            record,
+            want_usd,
+            &mut gaps,
+        );
+        fold_record(
+            by_effort_level
+                .entry(label_or_none(record.effort_level.as_deref()))
+                .or_default(),
+            record,
+            want_usd,
+            &mut gaps,
+        );
     }
 
     WindowCostReport::builder()
-        .by_driver(finish_buckets(by_driver, want_usd))
-        .by_effort_level(finish_buckets(by_effort_level, want_usd))
-        .by_kind(finish_buckets(by_kind, want_usd))
-        .by_model(finish_buckets(by_model, want_usd))
-        .by_reasoning(finish_buckets(by_reasoning, want_usd))
+        .by_driver(finish_buckets(by_driver))
+        .by_effort_level(finish_buckets(by_effort_level))
+        .by_kind(finish_buckets(by_kind))
+        .by_model(finish_buckets(by_model))
+        .by_reasoning(finish_buckets(by_reasoning))
         .capture_start_epoch_s(TOKEN_CAPTURE_START_EPOCH_S)
         .generated_at_epoch_s(generated_at_epoch_s)
-        .overall(overall.finish(want_usd))
+        .overall(overall.finish())
         .pricing_gaps(gaps.into_iter().collect())
         .since_epoch_s(since_epoch_s)
         .spans_capture_boundary(since_epoch_s < TOKEN_CAPTURE_START_EPOCH_S)
@@ -535,11 +438,11 @@ pub fn build_top_cost_report(
     let mut rows: Vec<CostTopRow> = Vec::new();
 
     for record in records {
-        if !run_is_measured(record) {
+        if !run_tokens(record).is_measured() {
             excluded_unmeasured_count += 1;
             continue;
         }
-        let total_tokens = known_tokens(record);
+        let total_tokens = run_tokens(record).known_total();
 
         let estimated_usd = want_usd.then(|| price_for_record(record)).flatten().and_then(|price| {
             cost_pricing::estimate_usd(

@@ -26,6 +26,7 @@ boss-execution-runner = { path = "../../execution-runner" }
 boss-execution-contracts = { path = "../../execution-contracts" }
 boss-observation-contracts = { path = "../../observation-contracts" }
 boss-engine-storage-values = { path = "../../storage-values" }
+boss-usage-report = { path = "../../usage-report" }
 boss-work-db = { path = "../../work-db" }
 boss-host-execution = { path = "../../host-execution" }
 boss-host-enrollment = { path = "../../host-enrollment" }
