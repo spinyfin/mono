@@ -138,6 +138,41 @@ impl MergeProbe for CommandMergeProbe {
             .map(|(url, result)| (url, result.map(ShallowProbe::from_full)))
             .collect()
     }
+
+    async fn is_pr_behind_base(&self, pr_url: &str, probe: &PrLifecycleProbe) -> Result<bool> {
+        if boss_observation_contracts::probe_reports_behind(probe) {
+            return Ok(true);
+        }
+        let (owner, repo, _) = parse_pr_url_parts(pr_url).context("invalid GitHub PR URL")?;
+        let base_branch = probe
+            .base_ref_name
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("PR probe for {pr_url} did not report baseRefName"))?;
+        let head_sha = probe
+            .head_ref_oid
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("PR probe for {pr_url} did not report headRefOid"))?;
+        let slug = format!("{owner}/{repo}");
+        let endpoint = boss_github::compare::gh_compare_endpoint(&slug, base_branch, head_sha);
+        let args = boss_github::compare::gh_compare_api_args(&endpoint, ".behind_by");
+        let output = boss_gh_telemetry::scope(boss_gh_telemetry::callers::MERGE_WHEN_READY, self.output(&args))
+            .await
+            .with_context(|| format!("failed to spawn `gh api {endpoint}`"))?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "`gh api {endpoint}` failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let behind_by: u64 = stdout
+            .trim()
+            .parse()
+            .with_context(|| format!("unexpected `.behind_by` from `gh api {endpoint}`: {:?}", stdout.trim()))?;
+        Ok(behind_by > 0)
+    }
 }
 
 /// How much of a PR a batched probe asks GitHub for.

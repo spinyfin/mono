@@ -1518,3 +1518,63 @@ fn batched_probe_rejects_checks_for_a_previous_head() {
     let error = parse_probe_json("https://github.com/foo/bar/pull/3277", &flat.to_string(), None).unwrap_err();
     assert!(error.to_string().contains("does not match current PR head"));
 }
+
+#[tokio::test]
+async fn command_merge_probe_is_pr_behind_base_fast_paths_behind_and_falls_back_to_compare() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let response_body = Arc::new(std::sync::Mutex::new("3\n".to_owned()));
+    let calls_ref = calls.clone();
+    let body_ref = response_body.clone();
+    let mut probe_client = CommandMergeProbe::new();
+    probe_client.test_runner = Some(Arc::new(move |_args| {
+        calls_ref.fetch_add(1, Ordering::SeqCst);
+        let stdout = body_ref.lock().unwrap().clone().into_bytes();
+        Box::pin(async move {
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout,
+                stderr: Vec::new(),
+            })
+        })
+    }));
+
+    let pr_url = "https://github.com/spinyfin/mono/pull/999";
+    let behind_probe = PrLifecycleProbe::builder()
+        .url(pr_url)
+        .state(PrLifecycleState::Open(OpenPrStatus::clean()))
+        .base_ref_name("main")
+        .head_ref_oid("head-1")
+        .labels(Vec::new())
+        .review(PrReviewState::Unknown)
+        .raw_merge_state_status("BEHIND")
+        .build();
+    assert!(probe_client.is_pr_behind_base(pr_url, &behind_probe).await.unwrap());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "BEHIND should short-circuit without gh compare"
+    );
+
+    let blocked_probe = PrLifecycleProbe::builder()
+        .url(pr_url)
+        .state(PrLifecycleState::Open(OpenPrStatus::clean()))
+        .base_ref_name("main")
+        .head_ref_oid("head-1")
+        .labels(Vec::new())
+        .review(PrReviewState::Unknown)
+        .raw_merge_state_status("BLOCKED")
+        .build();
+    assert!(probe_client.is_pr_behind_base(pr_url, &blocked_probe).await.unwrap());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "BLOCKED must consult compare .behind_by"
+    );
+
+    *response_body.lock().unwrap() = "0\n".to_owned();
+    assert!(!probe_client.is_pr_behind_base(pr_url, &blocked_probe).await.unwrap());
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}

@@ -45,10 +45,13 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                 return;
             }
         };
-        let (pr_url, task_status, product_id) = match &item {
-            WorkItem::Task(task) | WorkItem::Chore(task) => {
-                (task.pr_url.clone(), task.status.clone(), task.product_id.clone())
-            }
+        let (pr_url, task_status, blocked_reason, product_id) = match &item {
+            WorkItem::Task(task) | WorkItem::Chore(task) => (
+                task.pr_url.clone(),
+                task.status.clone(),
+                task.blocked_reason.clone(),
+                task.product_id.clone(),
+            ),
             _ => {
                 refuse_merge_when_ready(
                     &sink,
@@ -59,7 +62,13 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                 return;
             }
         };
-        if task_status != TaskStatus::InReview {
+        let ci_blocked_reason = if task_status == TaskStatus::InReview {
+            None
+        } else if task_status == TaskStatus::Blocked
+            && matches!(blocked_reason.as_deref(), Some("ci_failure" | "ci_failure_exhausted"))
+        {
+            blocked_reason
+        } else {
             refuse_merge_when_ready(
                 &sink,
                 &request_id,
@@ -67,7 +76,7 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                 format!("merge_when_ready: task is not in review (status: {task_status})"),
             );
             return;
-        }
+        };
         let pr_url = match pr_url.filter(|s| !s.is_empty()) {
             Some(u) => u,
             None => {
@@ -130,6 +139,26 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                     return;
                 }
             };
+        if let Some(ci_blocked_reason) = ci_blocked_reason {
+            super::review_ci_rebase::handle_ci_failure_merge_rebase(
+                super::review_ci_rebase::CiFailureMergeRebaseContext {
+                    server_state,
+                    work_db,
+                    sink,
+                    request_id,
+                    product_id,
+                    product_name: product.name,
+                    product_slug: product.slug,
+                    work_item_id,
+                    pr_url,
+                    blocked_reason: ci_blocked_reason,
+                    mechanism,
+                    confirmed_revisions: confirmed_now,
+                },
+            )
+            .await;
+            return;
+        }
         match mechanism {
             boss_engine_runtime::merge_mechanism::MergeMechanism::Direct => {
                 // Spawn the GitHub interaction so the main loop isn't blocked.
@@ -346,7 +375,12 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
 /// been accepted, so a failed write is logged rather than surfaced: with no
 /// recorded request, a failed attempt returns the item to Review with no
 /// merge-request explanation on the card.
-fn remember_merge_request(work_db: &WorkDb, work_item_id: &str, pr_url: &str, approved_head_sha: Option<&str>) -> bool {
+pub(super) fn remember_merge_request(
+    work_db: &WorkDb,
+    work_item_id: &str,
+    pr_url: &str,
+    approved_head_sha: Option<&str>,
+) -> bool {
     match work_db.record_merge_intent(work_item_id, pr_url, approved_head_sha) {
         Ok(_) => true,
         Err(err) => {
@@ -748,7 +782,7 @@ fn reply_duplicate_trunk_merge_click(
 
 /// Pre-branch Merge-click refusal: log a production-visible record, then
 /// send the matching `WorkError`.
-fn refuse_merge_when_ready(sink: &Arc<SessionSink>, request_id: &str, work_item_id: &str, message: String) {
+pub(super) fn refuse_merge_when_ready(sink: &Arc<SessionSink>, request_id: &str, work_item_id: &str, message: String) {
     tracing::warn!(
         %work_item_id,
         reason = %message,

@@ -2376,6 +2376,7 @@ pub(crate) fn clear_blocked_ci_failure_in_tx(
             SET status             = 'in_review',
                 blocked_reason     = NULL,
                 blocked_attempt_id = NULL,
+                blocked_detail     = NULL,
                 last_status_actor  = ?5,
                 updated_at         = ?3
           WHERE id = ?1

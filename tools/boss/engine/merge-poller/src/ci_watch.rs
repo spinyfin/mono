@@ -416,7 +416,63 @@ pub async fn on_ci_failure_detected(
         log_ci_failure_deferred(candidate, "empty_failures", None);
         return false;
     }
-    if auto_pr_maintenance_disabled(work_db, candidate, &probe.labels) {
+    let maintenance_disabled = auto_pr_maintenance_disabled(work_db, candidate, &probe.labels);
+    let post_rebase_reason = match work_db.get_ci_merge_rebase(&candidate.work_item_id, &candidate.pr_url) {
+        Ok(Some(rebase)) => {
+            let Some(head_sha) = probe.head_ref_oid.as_deref() else {
+                log_ci_failure_deferred(candidate, "ci_merge_rebase_missing_head_sha", None);
+                return false;
+            };
+            if rebase.head_sha_before.as_deref() == Some(head_sha)
+                && rebase.rebased_head_sha.as_deref() != Some(head_sha)
+            {
+                log_ci_failure_deferred(candidate, "ci_merge_rebase_stale_pre_rebase_head", None);
+                return false;
+            }
+            let reason = format!("rebased onto {}; CI still failing", rebase.base_branch);
+            let consumed = match work_db.stop_ci_merge_rebase_for_failure(
+                &candidate.work_item_id,
+                &candidate.pr_url,
+                &reason,
+                !maintenance_disabled,
+            ) {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::warn!(
+                        work_item_id = %candidate.work_item_id,
+                        pr_url = %candidate.pr_url,
+                        ?err,
+                        "ci_watch: failed to stop post-rebase merge after CI failure",
+                    );
+                    false
+                }
+            };
+            if maintenance_disabled {
+                if consumed {
+                    publisher
+                        .publish_work_item_changed(
+                            &candidate.product_id,
+                            &candidate.work_item_id,
+                            "ci_merge_rebase_still_failing",
+                        )
+                        .await;
+                }
+                return consumed;
+            }
+            consumed.then_some(reason)
+        }
+        Ok(None) => None,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                ?err,
+                "ci_watch: failed to inspect pending ci_merge_rebase; continuing",
+            );
+            None
+        }
+    };
+    if maintenance_disabled {
         log_ci_failure_deferred(candidate, "auto_pr_maintenance_disabled", None);
         return false;
     }
@@ -607,6 +663,12 @@ pub async fn on_ci_failure_detected(
     if used >= budget {
         match work_db.mark_chore_blocked_ci_failure_exhausted(&candidate.work_item_id, &candidate.pr_url) {
             Ok(Some(_)) => {
+                if let Some(reason) = post_rebase_reason.as_deref()
+                    && let Err(err) =
+                        work_db.set_ci_failure_blocked_detail(&candidate.work_item_id, &candidate.pr_url, reason)
+                {
+                    tracing::warn!(work_item_id = %candidate.work_item_id, ?err, "ci_watch: failed to stamp post-rebase blocked_detail");
+                }
                 publisher
                     .publish_work_item_changed(
                         &candidate.product_id,
@@ -749,7 +811,15 @@ pub async fn on_ci_failure_detected(
     let task_result =
         work_db.mark_chore_blocked_ci_failure(&candidate.work_item_id, &candidate.pr_url, attempt_id.as_deref());
     let task_transitioned = match task_result {
-        Ok(Some(_)) => true,
+        Ok(Some(_)) => {
+            if let Some(reason) = post_rebase_reason.as_deref()
+                && let Err(err) =
+                    work_db.set_ci_failure_blocked_detail(&candidate.work_item_id, &candidate.pr_url, reason)
+            {
+                tracing::warn!(work_item_id = %candidate.work_item_id, ?err, "ci_watch: failed to stamp post-rebase blocked_detail");
+            }
+            true
+        }
         Ok(None) => {
             // ci_failure is the lowest-priority blocked reason (design §Q2:
             // dependency > review_feedback > merge_conflict >

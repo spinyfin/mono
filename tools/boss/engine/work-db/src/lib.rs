@@ -858,6 +858,7 @@ mod boothby;
 mod cached_task_runtimes;
 mod chain_helpers;
 mod ci_failure_identity;
+mod ci_merge_rebase;
 mod comment_thread_entries;
 mod comments;
 mod conflict_deferral;
@@ -1104,6 +1105,7 @@ pub use audit_misc::canonicalize_worker_branch_prefix;
 pub use automations::AutomationFireRecord;
 pub use board_patch::WorkRuntimePatch;
 pub use boothby::{BoothbyActionContext, BoothbyActionGuard};
+pub use ci_merge_rebase::CiMergeRebase;
 pub use exec_tail::ClearedExecutionWorkspace;
 pub use execution_retention::{
     DEFAULT_RETENTION_KEEP_PER_WORK_ITEM, DEFAULT_RETENTION_MAX_AGE_SECS, ExecutionPruneOutcome,
