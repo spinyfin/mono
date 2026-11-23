@@ -337,8 +337,9 @@ pub(crate) fn render_review_worker_claude_md(
          checkout, so bare `jj log`/`jj show`/`jj diff` can fail with no `.jj`\n\
          found — always pass `-R {workspace_path}` explicitly:\n\
          \n\
-         - `jj log -R {workspace_path}`, `jj show -R {workspace_path}`,\n\
-           `jj diff -R {workspace_path}` — browse history and diffs.\n\
+         - `jj log -R {workspace_path} --ignore-working-copy --no-pager`,\n\
+           `jj show -R {workspace_path} --ignore-working-copy --no-pager --git`,\n\
+           `jj diff -R {workspace_path} --ignore-working-copy --no-pager --git` — browse history and diffs.\n\
          - `gh pr diff <url>` — fetch the PR diff.\n\
          - `gh pr view <url>` — read the PR description.\n\
          \n\

@@ -48,6 +48,7 @@ mod oauth_refresh;
 mod permissions;
 mod preflight;
 mod progress;
+mod reviewer;
 mod teardown_settle;
 mod transcript;
 mod turn_end_recovery;
