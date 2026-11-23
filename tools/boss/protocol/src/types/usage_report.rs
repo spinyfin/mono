@@ -671,7 +671,17 @@ pub struct UsageSeriesCoverage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct TokenUsageSeriesReport {
+    /// Nominal width of one bucket in seconds (`3_600` for hour, `86_400` for
+    /// day, `604_800` for week, nominal `2_592_000` for month). For
+    /// [`UsageBucketWidth::Month`], buckets are UTC calendar months (28–31
+    /// days), so `bucket_secs` is nominal only: each month bucket ends where
+    /// the next UTC calendar month starts, not at `start_epoch_s + bucket_secs`.
     pub bucket_secs: i64,
+    /// Effective bucket width (requested or engine-chosen, possibly coarsened
+    /// to stay under the cell cap). Hour, day and week buckets have fixed
+    /// length `bucket_secs`; `month` buckets are UTC calendar months, each
+    /// ending where the next UTC calendar month starts.
+    pub bucket_width: UsageBucketWidth,
     pub capture_start_epoch_s: i64,
     pub coverage: UsageSeriesCoverage,
     pub generated_at_epoch_s: i64,

@@ -14,7 +14,6 @@
 use super::*;
 
 use boss_engine_storage_values::CostRunRecord;
-use boss_protocol::DriverSource;
 use boss_usage_report::{
     RecordedDriver, UsageExecutionRecord, UsageRunRecord, UsageSeriesRecords, UsageTaskRecord, UsageWindowRecords,
 };
@@ -165,24 +164,28 @@ fn map_usage_run_record(row: &Row) -> rusqlite::Result<UsageRunRecord> {
 /// one bad row never makes the whole window unreadable.
 fn fill_resolved_drivers(db: &WorkDb, runs: &mut [UsageRunRecord]) {
     let mut resolved: HashMap<String, Option<String>> = HashMap::new();
-    fill_resolved_drivers_with_cache(db, runs, &mut resolved);
+    fill_resolved_drivers_with_cache(
+        db,
+        runs.iter_mut().map(|run| (run.execution_id.as_str(), &mut run.driver)),
+        &mut resolved,
+    );
 }
 
-fn fill_resolved_drivers_with_cache(
+fn fill_resolved_drivers_with_cache<'a>(
     db: &WorkDb,
-    runs: &mut [UsageRunRecord],
+    items: impl IntoIterator<Item = (&'a str, &'a mut RecordedDriver)>,
     resolved: &mut HashMap<String, Option<String>>,
 ) {
-    for run in runs {
-        if run.driver.slug().is_some() {
+    for (execution_id, driver) in items {
+        if driver.slug().is_some() {
             continue;
         }
-        let slug = resolved.entry(run.execution_id.clone()).or_insert_with(|| {
-            match db.get_execution_driver_slug(&run.execution_id) {
+        let slug = resolved.entry(execution_id.to_owned()).or_insert_with(|| {
+            match db.get_execution_driver_slug(execution_id) {
                 Ok(slug) => slug.filter(|s| !s.is_empty()),
                 Err(err) => {
                     tracing::warn!(
-                        execution_id = %run.execution_id,
+                        execution_id = %execution_id,
                         error = %format!("{err:#}"),
                         "failed to resolve driver for usage report execution; leaving unknown"
                     );
@@ -190,46 +193,10 @@ fn fill_resolved_drivers_with_cache(
                 }
             }
         });
-        run.driver = match slug.as_deref() {
+        *driver = match slug.as_deref() {
             Some(slug) => RecordedDriver::Resolved(slug.to_owned()),
             None => RecordedDriver::Unknown,
         };
-    }
-}
-
-fn fill_resolved_execution_drivers_with_cache(
-    db: &WorkDb,
-    executions: &mut [UsageExecutionRecord],
-    resolved: &mut HashMap<String, Option<String>>,
-) {
-    for exec in executions {
-        if exec.driver.as_deref().is_some_and(|slug| !slug.is_empty()) {
-            continue;
-        }
-        if !resolved.contains_key(&exec.execution_id) {
-            let slug = match db.get_execution_driver_slug(&exec.execution_id) {
-                Ok(slug) => slug.filter(|s| !s.is_empty()),
-                Err(err) => {
-                    tracing::warn!(
-                        execution_id = %exec.execution_id,
-                        error = %format!("{err:#}"),
-                        "failed to resolve driver for usage report execution; leaving unknown"
-                    );
-                    None
-                }
-            };
-            resolved.insert(exec.execution_id.clone(), slug);
-        }
-        match resolved.get(&exec.execution_id).and_then(|slug| slug.as_deref()) {
-            Some(slug) => {
-                exec.driver = Some(slug.to_owned());
-                exec.driver_source = DriverSource::Resolved;
-            }
-            None => {
-                exec.driver = None;
-                exec.driver_source = DriverSource::Unknown;
-            }
-        }
     }
 }
 
@@ -251,13 +218,10 @@ const USAGE_EXECUTION_COLUMNS: &str = "
 ";
 
 fn map_usage_execution_record(row: &Row) -> rusqlite::Result<UsageExecutionRecord> {
-    let driver: Option<String> = row.get(9)?;
-    let driver = driver.filter(|slug| !slug.is_empty());
-    let driver_source = if driver.is_some() {
-        DriverSource::LaunchTuple
-    } else {
-        DriverSource::Unknown
-    };
+    let driver = row
+        .get::<_, Option<String>>(9)?
+        .filter(|slug| !slug.is_empty())
+        .map_or(RecordedDriver::Unknown, RecordedDriver::LaunchTuple);
     Ok(UsageExecutionRecord {
         execution_id: row.get(0)?,
         work_item_id: row.get(1)?,
@@ -269,7 +233,6 @@ fn map_usage_execution_record(row: &Row) -> rusqlite::Result<UsageExecutionRecor
         execution_pr_url: row.get(7)?,
         execution_host_id: row.get(8)?,
         driver,
-        driver_source,
         execution_model: row.get(10)?,
         execution_effort: row.get(11)?,
     })
@@ -648,8 +611,17 @@ impl WorkDb {
             tx.commit()?;
         }
         let mut resolved: HashMap<String, Option<String>> = HashMap::new();
-        fill_resolved_drivers_with_cache(self, &mut runs, &mut resolved);
-        fill_resolved_execution_drivers_with_cache(self, &mut finished_executions, &mut resolved);
+        fill_resolved_drivers_with_cache(
+            self,
+            runs.iter_mut()
+                .map(|run| (run.execution_id.as_str(), &mut run.driver))
+                .chain(
+                    finished_executions
+                        .iter_mut()
+                        .map(|exec| (exec.execution_id.as_str(), &mut exec.driver)),
+                ),
+            &mut resolved,
+        );
         Ok(UsageSeriesRecords {
             runs,
             finished_executions,

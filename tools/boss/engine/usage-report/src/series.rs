@@ -56,9 +56,8 @@ use boss_protocol::{
 };
 
 use crate::classify::{
-    ClassifyContext, DimensionSource, RunFacts, UsdEstimator, classify, count_caveat_codes, dimension_value,
-    dimension_value_of, driver_source_of, has_recorded_dimension, known_total, latest_run, price_if_requested,
-    spend_class,
+    ClassifyContext, DimensionSource, RunFacts, UsdEstimator, classify, dimension_value, dimension_value_of,
+    for_each_caveat_code, has_recorded_dimension, known_total, latest_run, price_if_requested, spend_class,
 };
 use crate::fold::RunFold;
 use crate::record::{UsageExecutionRecord, UsageSeriesRecords, UsageTaskRecord};
@@ -92,8 +91,10 @@ pub struct UsageSeriesQuery {
     /// When `tasks.completed_at` went live (`COMPLETED_AT_MIGRATION_EPOCH_S`);
     /// terminal tasks before this were backfilled with `created_at`.
     pub completed_at_start_epoch_s: i64,
-    /// The age past which never-started prunable executions are eligible
-    /// for retention (`DEFAULT_RETENTION_MAX_AGE_SECS`).
+    /// The age past which never-started failed, abandoned, orphaned and
+    /// cancelled executions become eligible for pruning
+    /// (`DEFAULT_RETENTION_MAX_AGE_SECS`); executions with a worker run are
+    /// kept.
     pub retention_max_age_secs: i64,
     pub bucket: Option<UsageBucketWidth>,
     pub group_by: Option<UsageDimension>,
@@ -404,6 +405,7 @@ pub fn build_usage_series_report(
 
     TokenUsageSeriesReport::builder()
         .bucket_secs(width.bucket_secs())
+        .bucket_width(width)
         .capture_start_epoch_s(query.capture_start_epoch_s)
         .coverage(coverage)
         .generated_at_epoch_s(query.generated_at_epoch_s)
@@ -478,15 +480,14 @@ impl<'a> ExecFact<'a> {
 
     fn dimension_source(&self) -> DimensionSource<'a> {
         let latest = self.latest_run();
-        let driver = self.exec.driver.as_deref().filter(|slug| !slug.is_empty());
         DimensionSource {
             task: self.task,
             execution_kind: Some(self.exec.execution_kind.as_str()),
             execution_status: Some(self.exec.execution_status.as_str()),
             execution_effort: self.exec.execution_effort.as_deref(),
             execution_model: self.exec.execution_model.as_deref(),
-            driver,
-            driver_source: driver_source_of(driver, self.exec.driver_source),
+            driver: self.exec.driver.slug(),
+            driver_source: self.exec.driver.source(),
             run_model: latest.and_then(|facts| facts.rec.run_model.as_deref()),
             coverage: self.coverage(),
             host_id: latest
@@ -815,9 +816,9 @@ fn build_coverage(
     let mut total_measured_runs: u32 = 0;
     let mut runs_excluded_from_active_hour: u32 = 0;
     for &facts in window_runs {
-        for code in count_caveat_codes(facts, classify_ctx) {
+        for_each_caveat_code(facts, classify_ctx, |code| {
             *by_caveat.entry(code).or_default() += 1;
-        }
+        });
         if facts.coverage != RunCoverage::Unmeasured {
             total_measured_runs += 1;
             if facts.rec.agent_active_ms.is_none() {

@@ -223,16 +223,6 @@ pub(crate) fn known_total(rec: &UsageRunRecord, coverage: RunCoverage) -> Option
     (coverage != RunCoverage::Unmeasured).then(|| run_tokens(rec).known_total())
 }
 
-/// Launch-tuple vs resolved vs unknown, from the effective slug and how it
-/// was obtained. Shared by execution grouping (separate slug + source fields).
-pub(crate) fn driver_source_of(driver: Option<&str>, source: DriverSource) -> DriverSource {
-    match driver.filter(|driver| !driver.is_empty()) {
-        None => DriverSource::Unknown,
-        Some(_) if source == DriverSource::Resolved => DriverSource::Resolved,
-        Some(_) => DriverSource::LaunchTuple,
-    }
-}
-
 fn price_run(
     rec: &UsageRunRecord,
     driver: Option<&str>,
@@ -282,55 +272,67 @@ fn price_run(
     }
 }
 
-fn caveats(facts: &RunFacts<'_>, ctx: &ClassifyContext<'_>) -> Vec<UsageCaveat> {
+/// Single source of truth for per-run caveat predicates. Detail strings are
+/// computed lazily so callers that only need caveat codes (such as
+/// `build_usage_series_report`) avoid per-run allocations without duplicating
+/// any predicate.
+fn visit_caveats(
+    facts: &RunFacts<'_>,
+    ctx: &ClassifyContext<'_>,
+    mut visit: impl FnMut(&'static str, &dyn Fn() -> Option<String>),
+) {
     let rec = facts.rec;
     let measured = facts.coverage != RunCoverage::Unmeasured;
-    let mut out = Vec::new();
-    let mut push = |code: &str, detail: Option<String>| {
-        out.push(UsageCaveat {
-            code: code.to_owned(),
-            detail,
-        })
-    };
 
     if rec.run_created_at_epoch_s < ctx.capture_start_epoch_s {
-        push(caveat::PRE_CAPTURE, None);
+        visit(caveat::PRE_CAPTURE, &|| None);
     }
     if facts.driver.is_none() {
-        push(caveat::DRIVER_NOT_RECORDED, None);
+        visit(caveat::DRIVER_NOT_RECORDED, &|| None);
     }
     if measured && facts.convention == InputConvention::Gross {
-        push(caveat::GROSS_INPUT, None);
+        visit(caveat::GROSS_INPUT, &|| None);
     }
     if measured && facts.driver == Some(DRIVER_SLUG_CLAUDE) {
-        push(caveat::SUBAGENTS_EXCLUDED, None);
+        visit(caveat::SUBAGENTS_EXCLUDED, &|| None);
     }
     if rec.run_model.as_deref() == Some(SYNTHETIC_MODEL) {
-        push(caveat::SYNTHETIC_MODEL, rec.execution_model.clone());
+        visit(caveat::SYNTHETIC_MODEL, &|| rec.execution_model.clone());
     }
     if rec.run_model.is_none() && rec.execution_model.is_some() {
-        push(caveat::MODEL_FROM_LAUNCH_TUPLE, rec.execution_model.clone());
+        visit(caveat::MODEL_FROM_LAUNCH_TUPLE, &|| rec.execution_model.clone());
     }
     if facts.coverage == RunCoverage::Partial {
-        let missing: Vec<&str> = run_tokens(rec)
-            .classes()
-            .into_iter()
-            .filter(|(_, value)| value.is_none())
-            .map(|(name, _)| name)
-            .collect();
-        push(
-            caveat::TOKENS_PARTIAL,
-            Some(format!("not reported: {}", missing.join(", "))),
-        );
+        visit(caveat::TOKENS_PARTIAL, &|| {
+            let missing: Vec<&str> = run_tokens(rec)
+                .classes()
+                .into_iter()
+                .filter(|(_, value)| value.is_none())
+                .map(|(name, _)| name)
+                .collect();
+            Some(format!("not reported: {}", missing.join(", ")))
+        });
     }
     if let Some(reason) = &rec.usage_unavailable {
-        push(caveat::USAGE_UNAVAILABLE, Some(reason.clone()));
+        visit(caveat::USAGE_UNAVAILABLE, &|| Some(reason.clone()));
     }
     match facts.usd {
-        UsdOutcome::Estimate(_) => push(caveat::ESTIMATE_ONLY, None),
-        UsdOutcome::Unpriceable(cause::UNKNOWN_MODEL) => push(caveat::UNPRICED_MODEL, Some(model_label(rec))),
+        UsdOutcome::Estimate(_) => visit(caveat::ESTIMATE_ONLY, &|| None),
+        UsdOutcome::Unpriceable(cause::UNKNOWN_MODEL) => {
+            visit(caveat::UNPRICED_MODEL, &|| Some(model_label(rec)));
+        }
         UsdOutcome::Unpriceable(_) | UsdOutcome::NotRequested => {}
     }
+}
+
+fn caveats(facts: &RunFacts<'_>, ctx: &ClassifyContext<'_>) -> Vec<UsageCaveat> {
+    let mut out = Vec::new();
+    visit_caveats(facts, ctx, |code, detail| {
+        out.push(UsageCaveat {
+            code: code.to_owned(),
+            detail: detail(),
+        });
+    });
     out
 }
 
@@ -466,39 +468,120 @@ where
     })
 }
 
-/// Tally caveat codes without allocating per-run detail strings.
+/// Visit each caveat code for a run without allocating per-run detail strings
+/// or a temporary `Vec`.
+pub(crate) fn for_each_caveat_code(
+    facts: &RunFacts<'_>,
+    ctx: &ClassifyContext<'_>,
+    mut visit: impl FnMut(&'static str),
+) {
+    visit_caveats(facts, ctx, |code, _| visit(code));
+}
+
+/// Collect caveat codes without allocating per-run detail strings.
+#[cfg(test)]
 pub(crate) fn count_caveat_codes(facts: &RunFacts<'_>, ctx: &ClassifyContext<'_>) -> Vec<&'static str> {
-    let rec = facts.rec;
-    let measured = facts.coverage != RunCoverage::Unmeasured;
     let mut codes = Vec::new();
-    if rec.run_created_at_epoch_s < ctx.capture_start_epoch_s {
-        codes.push(caveat::PRE_CAPTURE);
-    }
-    if facts.driver.is_none() {
-        codes.push(caveat::DRIVER_NOT_RECORDED);
-    }
-    if measured && facts.convention == InputConvention::Gross {
-        codes.push(caveat::GROSS_INPUT);
-    }
-    if measured && facts.driver == Some(DRIVER_SLUG_CLAUDE) {
-        codes.push(caveat::SUBAGENTS_EXCLUDED);
-    }
-    if rec.run_model.as_deref() == Some(SYNTHETIC_MODEL) {
-        codes.push(caveat::SYNTHETIC_MODEL);
-    }
-    if rec.run_model.is_none() && rec.execution_model.is_some() {
-        codes.push(caveat::MODEL_FROM_LAUNCH_TUPLE);
-    }
-    if facts.coverage == RunCoverage::Partial {
-        codes.push(caveat::TOKENS_PARTIAL);
-    }
-    if rec.usage_unavailable.is_some() {
-        codes.push(caveat::USAGE_UNAVAILABLE);
-    }
-    match facts.usd {
-        UsdOutcome::Estimate(_) => codes.push(caveat::ESTIMATE_ONLY),
-        UsdOutcome::Unpriceable(cause::UNKNOWN_MODEL) => codes.push(caveat::UNPRICED_MODEL),
-        UsdOutcome::Unpriceable(_) | UsdOutcome::NotRequested => {}
-    }
+    for_each_caveat_code(facts, ctx, |code| codes.push(code));
     codes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::record::RecordedDriver;
+
+    struct FixedPricer;
+
+    impl UsdEstimator for FixedPricer {
+        fn estimate_usd(&self, model: &str, _tokens: PricedTokens) -> Option<f64> {
+            (model == "claude-sonnet-4").then_some(1.25)
+        }
+    }
+
+    fn base_run(id: &str, created_at: i64) -> UsageRunRecord {
+        UsageRunRecord::builder()
+            .run_id(id)
+            .run_status("completed")
+            .run_created_at_epoch_s(created_at)
+            .run_host_id("host-1")
+            .execution_id("e1")
+            .work_item_id("t1")
+            .execution_kind("task_implementation")
+            .execution_status("completed")
+            .execution_created_at_epoch_s(created_at)
+            .build()
+    }
+
+    #[test]
+    fn count_caveat_codes_matches_caveats_across_every_condition() {
+        let capture_start = 1_000;
+        let pricer = FixedPricer;
+        let ctx = ClassifyContext {
+            capture_start_epoch_s: capture_start,
+            pricer: Some(&pricer),
+        };
+
+        // 1. Pre-capture + driver_not_recorded + model_from_launch_tuple + usage_unavailable
+        let mut r_pre = base_run("r_pre", capture_start - 10);
+        r_pre.driver = RecordedDriver::Unknown;
+        r_pre.execution_model = Some("opus".to_owned());
+        r_pre.usage_unavailable = Some("transcript missing".to_owned());
+
+        // 2. Codex gross_input + tokens_partial
+        let mut r_codex = base_run("r_codex", capture_start + 10);
+        r_codex.driver = RecordedDriver::LaunchTuple(DRIVER_SLUG_CODEX.to_owned());
+        r_codex.input_tokens = Some(100);
+        r_codex.output_tokens = Some(20);
+
+        // 3. Claude subagents_excluded + estimate_only (priced USD)
+        let mut r_claude_priced = base_run("r_claude_priced", capture_start + 20);
+        r_claude_priced.driver = RecordedDriver::LaunchTuple(DRIVER_SLUG_CLAUDE.to_owned());
+        r_claude_priced.run_model = Some("claude-sonnet-4".to_owned());
+        r_claude_priced.input_tokens = Some(100);
+        r_claude_priced.output_tokens = Some(20);
+        r_claude_priced.cache_creation_tokens = Some(0);
+        r_claude_priced.cache_read_tokens = Some(0);
+
+        // 4. Claude synthetic_model + unpriced_model (unknown model USD)
+        let mut r_synthetic = base_run("r_synthetic", capture_start + 30);
+        r_synthetic.driver = RecordedDriver::LaunchTuple(DRIVER_SLUG_CLAUDE.to_owned());
+        r_synthetic.run_model = Some(SYNTHETIC_MODEL.to_owned());
+        r_synthetic.execution_model = Some("sonnet".to_owned());
+        r_synthetic.input_tokens = Some(100);
+        r_synthetic.output_tokens = Some(20);
+        r_synthetic.cache_creation_tokens = Some(0);
+        r_synthetic.cache_read_tokens = Some(0);
+
+        let runs = [r_pre, r_codex, r_claude_priced, r_synthetic];
+        let mut seen_codes = std::collections::BTreeSet::new();
+        for rec in &runs {
+            let mut facts = classify(rec, None);
+            price_if_requested(&mut facts, &ctx);
+            let from_caveats: Vec<String> = caveats(&facts, &ctx).into_iter().map(|c| c.code).collect();
+            let from_codes: Vec<String> = count_caveat_codes(&facts, &ctx)
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            assert_eq!(from_codes, from_caveats, "caveat code mismatch for {}", rec.run_id);
+            seen_codes.extend(from_codes);
+        }
+
+        let expected_all: std::collections::BTreeSet<String> = [
+            caveat::PRE_CAPTURE,
+            caveat::DRIVER_NOT_RECORDED,
+            caveat::GROSS_INPUT,
+            caveat::SUBAGENTS_EXCLUDED,
+            caveat::SYNTHETIC_MODEL,
+            caveat::MODEL_FROM_LAUNCH_TUPLE,
+            caveat::TOKENS_PARTIAL,
+            caveat::USAGE_UNAVAILABLE,
+            caveat::ESTIMATE_ONLY,
+            caveat::UNPRICED_MODEL,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        assert_eq!(seen_codes, expected_all, "parity test must cover every caveat code");
+    }
 }

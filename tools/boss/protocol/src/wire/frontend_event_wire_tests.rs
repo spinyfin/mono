@@ -435,6 +435,7 @@ fn token_usage_rows_report() -> crate::TokenUsageRowsReport {
 fn token_usage_series_report() -> crate::TokenUsageSeriesReport {
     crate::TokenUsageSeriesReport::builder()
         .bucket_secs(86_400)
+        .bucket_width(crate::UsageBucketWidth::Day)
         .capture_start_epoch_s(1_785_144_180)
         .coverage(crate::UsageSeriesCoverage::builder().build())
         .generated_at_epoch_s(1_747_000_000)

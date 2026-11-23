@@ -969,13 +969,12 @@ fn format_optional_average(value: Option<f64>) -> String {
 
 // ── `boss cost series` ────────────────────────────────────────────────
 
-fn format_bucket_width_secs(bucket_secs: i64) -> String {
-    match bucket_secs {
-        3_600 => "hour (3,600s)".to_owned(),
-        86_400 => "day (86,400s)".to_owned(),
-        604_800 => "week (604,800s)".to_owned(),
-        2_592_000 => "month (UTC calendar)".to_owned(),
-        other => format!("{other}s"),
+fn format_bucket_width(width: boss_protocol::UsageBucketWidth) -> &'static str {
+    match width {
+        boss_protocol::UsageBucketWidth::Hour => "hour (3,600s)",
+        boss_protocol::UsageBucketWidth::Day => "day (86,400s)",
+        boss_protocol::UsageBucketWidth::Week => "week (604,800s)",
+        boss_protocol::UsageBucketWidth::Month => "month (UTC calendar)",
     }
 }
 
@@ -1050,7 +1049,7 @@ fn print_usage_series_report(report: &boss_protocol::TokenUsageSeriesReport, usd
         format_epoch(report.since_epoch_s, tz),
         format_epoch(report.until_epoch_s, tz),
         tz.label,
-        format_bucket_width_secs(report.bucket_secs),
+        format_bucket_width(report.bucket_width),
     );
     if tz.offset_s != 0 {
         println!("  Bucket starts are UTC-aligned (week = Monday, month = calendar month).");
@@ -1368,6 +1367,7 @@ mod tests {
         let unmeasured_m = measurement(1, 0, 0);
         let report = boss_protocol::TokenUsageSeriesReport::builder()
             .bucket_secs(86_400)
+            .bucket_width(boss_protocol::UsageBucketWidth::Day)
             .capture_start_epoch_s(1_785_144_180)
             .coverage(boss_protocol::UsageSeriesCoverage::builder().build())
             .generated_at_epoch_s(1_790_121_600)

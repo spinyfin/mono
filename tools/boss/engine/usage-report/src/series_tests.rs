@@ -62,7 +62,7 @@ fn exec(id: &str, item: &str, status: &str, finished_at: i64) -> UsageExecutionR
         .execution_status(status)
         .execution_created_at_epoch_s(finished_at - 60)
         .execution_finished_at_epoch_s(finished_at)
-        .driver("claude")
+        .driver(RecordedDriver::LaunchTuple("claude".into()))
         .build()
 }
 
@@ -662,6 +662,7 @@ fn exceeding_cell_cap_coarsens_bucket_width_and_preserves_every_token() {
         tasks: vec![task("t1", "t1", None)],
     };
     let report = build_usage_series_report(&q, &recs, None);
+    assert_eq!(report.bucket_width, UsageBucketWidth::Day);
     assert_eq!(report.bucket_secs, UsageBucketWidth::Day.bucket_secs());
     assert_eq!(report.buckets.len(), 1);
     assert_eq!(report.buckets[0].cells.len(), 3);
@@ -708,6 +709,7 @@ fn exceeding_cell_cap_coarsens_bucket_width_and_preserves_every_token() {
         },
         None,
     );
+    assert_eq!(multi.bucket_width, UsageBucketWidth::Month);
     assert_eq!(multi.bucket_secs, UsageBucketWidth::Month.bucket_secs());
     let multi_tokens: i64 = multi
         .buckets
@@ -764,6 +766,7 @@ fn explicit_month_request_over_cap_keeps_every_fact_and_notes_the_overage() {
         },
         None,
     );
+    assert_eq!(report.bucket_width, UsageBucketWidth::Month);
     assert_eq!(report.bucket_secs, UsageBucketWidth::Month.bucket_secs());
     let cells: usize = report.buckets.iter().map(|b| b.cells.len()).sum();
     assert_eq!(cells, 12);
@@ -829,6 +832,7 @@ fn coarsening_into_month_that_still_exceeds_cap_notes_the_overage() {
         },
         None,
     );
+    assert_eq!(report.bucket_width, UsageBucketWidth::Month);
     assert_eq!(report.bucket_secs, UsageBucketWidth::Month.bucket_secs());
     let tokens: i64 = report
         .buckets

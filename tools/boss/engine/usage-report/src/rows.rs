@@ -68,8 +68,10 @@ pub struct UsageRowsQuery {
     pub generated_at_epoch_s: i64,
     /// Before this instant no run has token data (`TOKEN_CAPTURE_START_EPOCH_S`).
     pub capture_start_epoch_s: i64,
-    /// The age past which never-started prunable executions are eligible
-    /// for retention (`DEFAULT_RETENTION_MAX_AGE_SECS`).
+    /// The age past which never-started failed, abandoned, orphaned and
+    /// cancelled executions become eligible for pruning
+    /// (`DEFAULT_RETENTION_MAX_AGE_SECS`); executions with a worker run are
+    /// kept.
     pub retention_max_age_secs: i64,
     #[builder(default)]
     pub filters: Vec<UsageFilter>,

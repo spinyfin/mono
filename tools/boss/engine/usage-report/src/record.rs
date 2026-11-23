@@ -146,11 +146,9 @@ pub struct UsageExecutionRecord {
     pub execution_started_at_epoch_s: Option<i64>,
     pub execution_pr_url: Option<String>,
     pub execution_host_id: Option<String>,
-    /// Effective driver: the launch tuple when present, otherwise the slug
-    /// resolved for a NULL launch tuple, otherwise `None`.
-    pub driver: Option<String>,
-    #[builder(default = DriverSource::Unknown)]
-    pub driver_source: DriverSource,
+    /// Effective driver and how it was obtained.
+    #[builder(default)]
+    pub driver: RecordedDriver,
     /// `work_executions.model`: the model alias the execution launched with.
     pub execution_model: Option<String>,
     /// `work_executions.effort_level`: the effort the execution launched with.
