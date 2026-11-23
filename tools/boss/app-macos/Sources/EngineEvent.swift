@@ -277,6 +277,9 @@ enum EngineEvent {
     /// registered engine counter and gauge, sorted by name. Drives the
     /// Metrics debug pane's initial load and its polling timer.
     case metricsListLiveResult(entries: [EngineMetric])
+    /// Reply to `get_token_usage_rows`. `requestId` is the envelope id so
+    /// a stale generation can be dropped after a toolbar change.
+    case tokenUsageRows(report: TokenUsageRowsReport, requestId: String?)
     /// Response to `list_attention_items_for_work_item` — open and
     /// resolved attention items for a given product/work-item id.
     case attentionItemsForWorkItemList(workItemID: String, items: [WorkAttentionItem])

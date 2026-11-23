@@ -63,6 +63,7 @@ extension ChatViewModel {
         case .engineRequest(let requestId, let request):
             handleEngineRequest(requestId: requestId, request: request)
         case .disconnected:
+            failTokenUsageOnDisconnect()
             // The engine ends a capture with its session.
             remotePaneViewer.connectionLost()
             failOutstandingMergeRequests(message: "Connection lost while requesting merge. Check the PR before retrying.")
@@ -231,6 +232,7 @@ extension ChatViewModel {
         case .workItemRefused(let id, let code, let message, let suggestedAction, let requestId):
             handleWorkItemRefused(id: id, code: code, message: message, suggestedAction: suggestedAction, requestId: requestId)
         case .workError(let message, let requestId):
+            if receiveTokenUsageError(message: message, requestId: requestId) { return }
             if navigatorReviewGuides.fail(message: message, requestID: requestId) { return }
             failBoardRead(requestID: requestId)
             if settleOffsiteBackupError(message, requestID: requestId) { return }
@@ -364,6 +366,7 @@ extension ChatViewModel {
             if affected.isEmpty { handle(.error(message: message)); return }
             for id in affected { bounceBackAdmissionCheck(taskID: id, message: message) }
         case .error(let message, let requestId):
+            if receiveTokenUsageError(message: message, requestId: requestId) { return }
             if navigatorReviewGuides.fail(message: message, requestID: requestId) { return }
             failBoardRead(requestID: requestId)
             if let requestId,
@@ -457,6 +460,8 @@ extension ChatViewModel {
             registeredHosts.removeAll { $0.hostId == id }
         case .metricsListLiveResult(let entries):
             engineMetrics = entries
+        case .tokenUsageRows(let report, let requestId):
+            receiveTokenUsageRows(report, requestId: requestId)
         case .projectDesignDocResolved(let output):
             applyResolvedProjectDesignDoc(output)
         case .executionLabelsResolved(let labels):

@@ -1447,6 +1447,13 @@ final class EngineClient: @unchecked Sendable {
             let raw = payload["entries"] as? [[String: Any]] ?? []
             let entries = raw.compactMap(parseEngineMetric)
             emit(.metricsListLiveResult(entries: entries))
+        case "token_usage_rows":
+            if let reportRaw = payload["report"],
+               let report = TokenUsageRowsReport.parse(reportRaw) {
+                emit(.tokenUsageRows(report: report, requestId: envelopeRequestId))
+            } else {
+                emit(.error(message: "received invalid token_usage_rows payload", requestId: envelopeRequestId))
+            }
         case "attention_items_for_work_item_list":
             let workItemID = payload["work_item_id"] as? String ?? ""
             let raw = payload["items"] as? [[String: Any]] ?? []

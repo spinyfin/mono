@@ -10,8 +10,11 @@ private let appOpenLog = Logger(subsystem: "dev.spinyfin.bossmacapp", category: 
 @main
 struct BossMacApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var chatModel = BossMetricsCapture.enabled
-        ? BossMetricsCapture.model : ChatViewModel(paths: BossEnginePaths.production())
+    @StateObject private var chatModel: ChatViewModel = {
+        if BossMetricsCapture.enabled { return BossMetricsCapture.model }
+        if TokenUsageCapture.enabled { return TokenUsageCapture.model }
+        return ChatViewModel(paths: BossEnginePaths.production())
+    }()
 
     var body: some Scene {
         WindowGroup {
@@ -74,6 +77,7 @@ struct BossMacApp: App {
                 Divider()
                 LogViewerCommand()
                 MetricsCommand()
+                TokenUsageCommand()
                 UIStallsCommand()
                 TerminalLoopCommand()
             }
@@ -192,6 +196,12 @@ struct BossMacApp: App {
         .environmentObject(chatModel)
         .defaultSize(width: 720, height: 520)
 
+        Window("Token Usage", id: "token-usage") {
+            TokenUsageWindow()
+        }
+        .environmentObject(chatModel)
+        .defaultSize(width: 1180, height: 720)
+
         Window("UI Stalls", id: "ui-stalls") {
             UIStallsViewer()
         }
@@ -293,6 +303,25 @@ private struct MetricsCommand: View {
             }
         }
         .keyboardShortcut("m", modifiers: [.command, .shift])
+    }
+}
+
+private struct TokenUsageCommand: View {
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
+    @AppStorage("boss.tokenUsage.visible", store: BossDefaults.store) private var isOpen = false
+
+    var body: some View {
+        Button("Token Usage") {
+            if isOpen {
+                isOpen = false
+                dismissWindow(id: "token-usage")
+            } else {
+                isOpen = true
+                openWindow(id: "token-usage")
+            }
+        }
+        .keyboardShortcut("o", modifiers: [.command, .shift])
     }
 }
 
@@ -535,6 +564,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else if let path = BossCaptureArgs.shared.captureTo {
             if BossMetricsCapture.enabled {
                 BossMetricsCapture.schedule(to: path, after: BossCaptureArgs.shared.captureAfter)
+            } else if TokenUsageCapture.enabled {
+                TokenUsageCapture.schedule(to: path, after: BossCaptureArgs.shared.captureAfter)
             } else {
                 BossWindowCapture.scheduleCapture(
                     to: path,

@@ -1,7 +1,7 @@
 # Boss: Token Usage window — the app never adds two token counts together
 
 - **Date:** 2026-10-28
-- **Status:** Design. The engine rows request, its crate, projection, `boss cost rows` caller and seed fixture are implemented (first entry below); the series request and both app entries are not.
+- **Status:** Design. The engine rows request, its crate, projection, `boss cost rows` caller and seed fixture, and the app Token Usage table window are implemented; the series request and the over-time tab are not.
 - **Revised:** 2026-11-23, against `spinyfin/mono` `main` after #3799 (Grok and Antigravity token capture). Grok and Antigravity now record tokens as **net** input, so the earlier statements that Grok records nothing and that Grok input is gross are corrected throughout; `work_runs.usage_unavailable` is the per-run capture status this design reserved; the driver, `usage_unavailable` and projection paths moved (`engine/work-db`, `engine/app`). Where this revision and an older sentence disagree, this revision wins.
 - **Product:** Boss. **Project:** Token Usage window (`proj_18e2c00c59cb8790_22c`, slug `token-usage-window`).
 - **Deliverable:** this document. The task breakdown at the end is the handoff to scheduling.
@@ -263,7 +263,7 @@ When the performance-metrics design's `GetMetricSeries` lands, `TokenUsageSeries
 
 ### 6. The Token Usage window
 
-**Registration.** `Window("Token Usage", id: "token-usage")` in `BossMacApp.swift` next to Metrics, with a `TokenUsageCommand` in the `CommandGroup(after: .windowList)` block holding `@AppStorage("boss.tokenUsage.visible")` and a shortcut that is free (Cmd+Shift+L, M, T and U are taken by Logs, Metrics, Terminal Loop and UI Stalls). Default size 1180×720, minimum 900×520.
+**Registration.** `Window("Token Usage", id: "token-usage")` in `BossMacApp.swift` next to Metrics, with a `TokenUsageCommand` in the `CommandGroup(after: .windowList)` block holding `@AppStorage("boss.tokenUsage.visible")` and `Cmd+Shift+O` (Cmd+Shift+K, L, M, T and U are taken by CommentLayer, Logs, Metrics, Terminal Loop and UI Stalls). Default size 1180×720, minimum 900×520.
 
 **Layout.** A toolbar row, a hierarchical table, an inspector on the right, and a footer.
 
@@ -274,17 +274,18 @@ When the performance-metrics design's `GetMetricSeries` lands, `TokenUsageSeries
 
 **Presentation invariants.** One Swift formatter owns every figure; unit tests pin each row of this table, which restates the cost-attribution design's "what the system shows where it cannot attribute" for the app:
 
-| Situation                     | Shown                                                                                                                               |
-| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| Unmeasured run                | `—` with "not instrumented" (pre-capture) or "not recorded" (post-capture NULL). Never `0`.                                         |
-| Measured zero                 | `0`, coverage complete. The only path to a displayed zero.                                                                          |
-| Node with partial coverage    | The figure, the `measured/total` ratio adjacent, and a "floor" label.                                                               |
-| Node with no measured runs    | `—` and the reason (the dominant caveat).                                                                                           |
-| USD                           | `est. $x.xx`, hidden when unpriceable, marked partial when any run in the set was unpriceable, never `$0.00` on an unpriceable set. |
-| `<synthetic>` model           | The literal string with a warning icon; launched model in the tooltip. Never replaced.                                              |
-| Gross-input driver            | `gross` marker on Total; sort-by-Total note when conventions mix.                                                                   |
-| Chain root                    | Inclusive bold beside direct; list and footer totals sum direct only.                                                               |
-| Window spans capture boundary | Footer banner; every figure labelled a floor.                                                                                       |
+| Situation                       | Shown                                                                                                                                                                                                                                                         |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Unmeasured run                  | `—` with "not instrumented" (pre-capture) or the per-run `usage_unavailable` reason (post-capture NULL). Never `0`. Never a Grok-specific "records nothing" string.                                                                                           |
+| Measured zero                   | `0`, coverage complete. The only path to a displayed zero.                                                                                                                                                                                                    |
+| Class unknown on a measured run | That cell only is `—` / "unknown" (e.g. Grok and Antigravity cache creation). Distinct from a whole-node unmeasured `—` / "not recorded". Never `0`.                                                                                                          |
+| Node with partial coverage      | The figure, the `measured/total` ratio adjacent, and a "floor" label.                                                                                                                                                                                         |
+| Node with no measured runs      | `—` and the reason (the dominant caveat, or `usage_unavailable` verbatim).                                                                                                                                                                                    |
+| USD                             | `est. $x.xx`; Grok and Antigravity show `unpriced (subscription)` (`subscription_unpriced`), never `$0.00` and never a pricing-gap warning; other unpriceable causes hide the figure; marked partial when any priced-eligible run in the set was unpriceable. |
+| `<synthetic>` model             | The literal string with a warning icon; launched model in the tooltip. Never replaced.                                                                                                                                                                        |
+| Gross-input driver              | `gross` marker on Total; sort-by-Total note when conventions mix.                                                                                                                                                                                             |
+| Chain root                      | Inclusive bold beside direct; list and footer totals sum direct only.                                                                                                                                                                                         |
+| Window spans capture boundary   | Footer banner; every figure labelled a floor.                                                                                                                                                                                                                 |
 
 **Errors.** A failed or timed-out request shows an inline banner inside the window and keeps the last reply dimmed; no alert, per `app-macos/AGENTS.md`.
 
