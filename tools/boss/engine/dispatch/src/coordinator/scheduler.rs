@@ -2,7 +2,6 @@
 //! drain, chain-serialization holds, and automation preemption. Part of the
 //! `coordinator` module split; see [`super`] for the struct and shared types.
 use super::predecessor_hold::PredecessorHold;
-use super::spoke_in_doubt::waitable_spoke_lease;
 use super::*;
 
 /// A queued answer agent older than this is unusual enough to require an
@@ -2864,10 +2863,9 @@ impl ExecutionCoordinator {
                 .release_lease_after_proven_never_started(&current, &lease_id, self.host_adapter().as_ref())
                 .await;
         }
-        // Park already returned the row to ready without spending the retry
-        // budget. A drain that re-claims before this runs must not count the
-        // same unanswered lease as a start failure.
-        if waitable_spoke_lease(err).is_some() {
+        // Parked attempts were already returned to ready without spending the
+        // retry budget; do not record a pre-start failure or unclaim them again.
+        if err.is::<super::spoke_in_doubt::SpokeAttemptParked>() {
             return;
         }
         if current.status != ExecutionStatus::Claimed {

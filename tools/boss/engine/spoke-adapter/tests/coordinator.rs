@@ -687,8 +687,16 @@ async fn a_disconnected_host_is_never_charged_for_an_admitted_lease(other_host: 
     })
     .await;
     // The clock stays held: only the intentionally unanswered lease's command
-    // deadline is advanced, and stream liveness timers cannot fire.
-    timing::guarded(timing::advancing(|| attention_open(&fx, &execution.id))).await;
+    // deadline is advanced, and stream liveness timers cannot fire. The
+    // invariant is checked on every step, not only at the end: a charged
+    // attempt waits out a wall-clock backoff and its retry is kicked from a
+    // timer on the held clock, so no later pass would ever open the item and
+    // the charge would surface as this wait hanging.
+    timing::guarded(timing::advancing(|| {
+        assert_never_failed(&fx, &execution.id);
+        attention_open(&fx, &execution.id)
+    }))
+    .await;
     timing::guarded(async {
         let seen = peer.commands();
         let cursor = Cursor {
@@ -755,6 +763,75 @@ async fn a_host_disconnected_across_many_passes_never_fails_an_admitted_lease() 
 #[tokio::test]
 async fn a_better_ranked_host_never_takes_over_an_admitted_lease() {
     a_disconnected_host_is_never_charged_for_an_admitted_lease(true).await;
+}
+
+/// The coordinator bounds a lease call with a backstop of its own, which can
+/// elapse before the adapter's command deadline does. The lease command is
+/// stored and sent by then, so the host may have granted it: that is a wait on
+/// the host, never a failed start.
+#[tokio::test]
+async fn a_lease_backstop_that_elapses_on_an_admitted_lease_parks_without_spending_the_retry_budget() {
+    timing::hold();
+    timing::guarded(async {
+        let fx = Fixture::with_frozen_liveness(workspace_slack(300)).await;
+        let mut env = env(&fx, 1).await;
+        // Shorter than the adapter's five-second command deadline, so the
+        // backstop is what ends the attempt.
+        env.coordinator = Arc::new(
+            Arc::into_inner(env.coordinator)
+                .unwrap()
+                .with_cube_lease_timeout(Duration::from_secs(1)),
+        );
+        let execution = triage(&fx, &env, "lease backstop");
+        let peer = fx
+            .spoke(
+                Box::new(|command| if is_lease(command) { None } else { answer(command) }),
+                None,
+                0,
+            )
+            .await;
+        env.coordinator.kick();
+        // The lease is stored and on the wire; the attempt now waits on timers
+        // alone, so the one advance below cannot overtake work in flight.
+        timing::condition(|| peer.commands().iter().any(is_lease)).await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        timing::condition(|| fx.db.get_execution(&execution.id).unwrap().status == ExecutionStatus::Ready).await;
+
+        let row = fx.db.get_execution(&execution.id).unwrap();
+        assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
+        let parked = row.last_error.as_deref().unwrap_or_default();
+        assert!(
+            parked.contains("spoke lease unresolved") && parked.contains("timed out after 1s"),
+            "{row:?}"
+        );
+        assert_never_failed(&fx, &execution.id);
+        assert!(!released(&peer.commands()));
+
+        // A forced launch of the parked attempt still surfaces the underlying
+        // lease cause in its single-line Display (`to_string()`), not just a
+        // generic parked-attempt marker.
+        let forced = tokio::spawn({
+            let coordinator = Arc::clone(&env.coordinator);
+            let execution_id = execution.id.clone();
+            async move {
+                coordinator
+                    .force_dispatch(
+                        &execution_id,
+                        boss_execution_contracts::DispatchAdmission::OperatorForced,
+                    )
+                    .await
+            }
+        });
+        timing::advancing(|| forced.is_finished()).await;
+        let forced_err = forced.await.unwrap().unwrap_err();
+        assert!(
+            forced_err
+                .to_string()
+                .contains("cube workspace lease timed out after 1s"),
+            "force_dispatch should keep the underlying lease cause in to_string(): {forced_err:#}"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]

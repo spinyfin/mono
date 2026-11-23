@@ -228,6 +228,34 @@ build_provenance_rs(
     visibility = ["//tools/boss/build-provenance:__pkg__"],
 )
 
+# Always-stamped sibling of :build_provenance_rs, the positive control for
+# the analysis tests below.
+build_provenance_rs(
+    name = "build_provenance_rs_stamped",
+    testonly = True,
+    out = "build_provenance_stamped.rs",
+    stamp = 1,
+)
+
+# The wall-clock build time is in volatile-status.txt, whose content differs
+# on every build. An unstamped build_provenance_rs must not take it as an
+# input: its output would then differ every time the action ran, relinking
+# both engine binaries at an unchanged commit, and no remote cache entry
+# could match. A stamped (release) build embeds the time.
+stamp_inputs_analysis_test(
+    name = "build_provenance_rs_unstamped_no_build_time_input_test",
+    expect_stable_status = False,
+    status_file = "volatile-status.txt",
+    target_under_test = ":build_provenance_rs",
+)
+
+stamp_inputs_analysis_test(
+    name = "build_provenance_rs_stamped_has_build_time_input_test",
+    expect_stable_status = True,
+    status_file = "volatile-status.txt",
+    target_under_test = ":build_provenance_rs_stamped",
+)
+
 # Human-facing release driver (design doc Q4 Phase 3).
 # Signs, notarizes, and staples the Boss installer .pkg.
 #

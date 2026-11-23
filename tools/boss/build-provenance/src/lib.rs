@@ -1,6 +1,6 @@
-//! Engine build provenance: the stamped release version, commit sha,
-//! working-tree dirty flag, and build wall-clock time, stamped at Bazel
-//! build time.
+//! Engine build provenance: the commit sha and working-tree dirty flag,
+//! stamped at Bazel build time, plus the release version and build
+//! wall-clock time on a stamped (`--config=release`) build.
 //!
 //! **This crate is a leaf, and must stay one.** Its generated source
 //! (`//tools/boss/installer:build_provenance_rs`, read from Bazel's
@@ -49,14 +49,16 @@ pub fn git_dirty() -> bool {
     stamp::GIT_DIRTY
 }
 
-/// ISO-8601 UTC timestamp of the build that last produced this commit's
-/// provenance stamp, or `"unknown"` on a Cargo (non-Bazel) build. Bazel
-/// does not re-run the stamping action just because wall-clock time
-/// passed (the value comes from the volatile-status file, which is
-/// excluded from the action cache key), so this may lag a later rebuild
-/// of the same commit — use [`git_sha`] plus a binary content fingerprint
-/// (see `engine::build_info::binary_fingerprint`) to tell two builds of
-/// the same commit apart.
+/// ISO-8601 UTC timestamp of a stamped (`--config=release`) build, or
+/// `"unknown"` on an unstamped Bazel build and on a Cargo build. An
+/// unstamped binary is a function of its commit, not of when it was built:
+/// if the build time were compiled in, rebuilding an unchanged commit would
+/// relink the engine and prevent any remote cache hit. Even when stamped, Bazel
+/// does not re-run the stamping action just because wall-clock time passed,
+/// so the value may lag a later rebuild of the same commit — use [`git_sha`]
+/// plus a binary content fingerprint (see
+/// `engine::build_info::binary_fingerprint`) to tell two builds of the same
+/// commit apart.
 pub fn build_time() -> &'static str {
     stamp::BUILD_TIME
 }

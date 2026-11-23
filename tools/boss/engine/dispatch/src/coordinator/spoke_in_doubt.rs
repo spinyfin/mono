@@ -41,6 +41,7 @@ impl ExecutionCoordinator {
             "spoke lease unresolved; parked for {}s: {err:#}",
             timing.lease_park_delay.as_secs()
         );
+        let mut parked = true;
         match self
             .work_db
             .park_pre_start_attempt(&execution.id, timing.lease_park_delay, &note)
@@ -54,19 +55,29 @@ impl ExecutionCoordinator {
                 });
             }
             Ok(false) => {}
-            Err(park_err) => tracing::error!(
-                execution_id = %execution.id,
-                error = %format!("{park_err:#}"),
-                "could not park an execution whose spoke lease is in doubt",
-            ),
+            Err(park_err) => {
+                parked = false;
+                tracing::error!(
+                    execution_id = %execution.id,
+                    error = %format!("{park_err:#}"),
+                    "could not park an execution whose spoke lease is in doubt; falling back to the failed-start path",
+                );
+            }
         }
-        tracing::warn!(
-            execution_id = %execution.id,
-            error = %format!("{err:#}"),
-            "spoke lease unresolved; attempt parked without spending the retry budget",
-        );
+        if parked {
+            tracing::warn!(
+                execution_id = %execution.id,
+                error = %format!("{err:#}"),
+                "spoke lease unresolved; attempt parked without spending the retry budget",
+            );
+        }
         self.raise_spoke_in_doubt_attention(execution, "workspace lease", &err, timing.attention_after);
-        err
+        if parked {
+            anyhow::Error::new(SpokeAttemptParked(err))
+        } else {
+            // The row may still be claimed; let the scheduler's unclaim fallback run.
+            err
+        }
     }
 
     /// Park an attempt that could not reach the host holding its in-doubt
@@ -88,6 +99,14 @@ impl ExecutionCoordinator {
         #[cfg(any(test, feature = "test-support"))]
         self.note_spoke_pass_complete(&execution.id);
         err
+    }
+
+    /// Whether a spoke host holds this execution's assignment right now (see
+    /// [`WorkDb::spoke_host_holding_execution`]): its lease command may have
+    /// been stored by the very attempt that is asking. A failed read answers
+    /// "no", which leaves the caller on the ordinary failed-start path.
+    pub(super) fn held_by_spoke_host(&self, execution_id: &str) -> bool {
+        matches!(self.work_db.spoke_host_holding_execution(execution_id), Ok(Some(_)))
     }
 
     /// File the in-doubt attention item once the assignment has waited past
@@ -530,9 +549,51 @@ impl ExecutionCoordinator {
     }
 }
 
+/// Marker attached by [`ExecutionCoordinator::park_in_doubt_spoke_lease`] as
+/// a transparent error wrapper once the attempt has actually been parked
+/// without spending the retry budget. Its `Display` and `source()` delegate
+/// to the inner error so single-line callers such as `force_dispatch` keep the
+/// underlying cause without duplicating it in `{:#}`.
+#[derive(Debug)]
+pub(super) struct SpokeAttemptParked(anyhow::Error);
+
+impl std::fmt::Display for SpokeAttemptParked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for SpokeAttemptParked {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
+
 pub(super) fn waitable_spoke_lease(err: &anyhow::Error) -> Option<&LeaseOutcomeUncertain> {
-    err.chain()
-        .find_map(|cause| cause.downcast_ref::<LeaseOutcomeUncertain>())
+    err.chain().find_map(|cause| {
+        cause.downcast_ref::<LeaseOutcomeUncertain>().or_else(|| {
+            cause
+                .downcast_ref::<SpokeAttemptParked>()
+                .and_then(|p| waitable_spoke_lease(&p.0))
+        })
+    })
+}
+
+/// The coordinator's own lease backstop elapsed before the transport returned.
+/// That is the absence of an answer, not an answer: it says nothing about
+/// whether the host granted the lease. Typed so the caller can tell it from a
+/// lease the host actually refused.
+#[derive(Debug, thiserror::Error)]
+#[error("cube workspace lease timed out after {}s", .0.as_secs())]
+pub(super) struct LeaseBackstopElapsed(pub(super) Duration);
+
+pub(super) fn lease_backstop_elapsed(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.is::<LeaseBackstopElapsed>()
+            || cause
+                .downcast_ref::<SpokeAttemptParked>()
+                .is_some_and(|p| lease_backstop_elapsed(&p.0))
+    })
 }
 
 /// Whether the execution has been cancelled or finished. A failed read is not
@@ -540,4 +601,34 @@ pub(super) fn waitable_spoke_lease(err: &anyhow::Error) -> Option<&LeaseOutcomeU
 /// release state a worker may still be using.
 pub(super) fn execution_no_longer_runnable(work_db: &WorkDb, execution_id: &str) -> Result<bool> {
     Ok(work_db.get_execution(execution_id)?.status.is_terminal())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spoke_attempt_parked_preserves_display_and_chain() {
+        let inner = anyhow::Error::new(LeaseOutcomeUncertain {
+            host_id: "host-1".to_owned(),
+            command_id: "cmd-1".to_owned(),
+            reason: "host did not answer".to_owned(),
+            settled: false,
+        });
+        let inner_display = inner.to_string();
+        let inner_alt = format!("{inner:#}");
+        let parked = anyhow::Error::new(SpokeAttemptParked(inner));
+
+        assert!(parked.is::<SpokeAttemptParked>());
+        assert_eq!(parked.to_string(), inner_display);
+        assert_eq!(format!("{parked:#}"), inner_alt);
+        assert!(waitable_spoke_lease(&parked).is_some());
+
+        let backstop = anyhow::Error::new(LeaseBackstopElapsed(Duration::from_secs(90)));
+        let backstop_display = backstop.to_string();
+        let parked_backstop = anyhow::Error::new(SpokeAttemptParked(backstop));
+        assert!(parked_backstop.is::<SpokeAttemptParked>());
+        assert_eq!(parked_backstop.to_string(), backstop_display);
+        assert!(lease_backstop_elapsed(&parked_backstop));
+    }
 }

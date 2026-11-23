@@ -39,7 +39,9 @@
 //!
 //! 1. The engine binary's filesystem mtime, evaluated at startup — the
 //!    fallback [`build_time`] reports when the stamped provenance value
-//!    is unavailable (a Cargo build).
+//!    is unavailable (a Cargo build, or an unstamped Bazel build, which
+//!    compiles no build time in so that its binary depends on the commit
+//!    alone).
 //! 2. **Binary content fingerprint** — short SHA-256 of the engine
 //!    binary's bytes, computed once at first call to
 //!    [`binary_fingerprint`]. Survives a Bazel cache hit that doesn't
@@ -76,7 +78,8 @@ pub struct Provenance {
     /// `true` if the tree had uncommitted changes (or unresolved jj
     /// conflicts) at build time.
     pub git_dirty: bool,
-    /// ISO-8601 UTC wall-clock time of the build that produced the stamp.
+    /// ISO-8601 UTC wall-clock time of the build that produced the stamp;
+    /// `"unknown"` on an unstamped (non-release) build.
     pub build_time: &'static str,
 }
 
