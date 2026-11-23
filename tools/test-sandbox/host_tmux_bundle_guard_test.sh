@@ -3,6 +3,12 @@
 # Guard: the bundled macOS @host_tmux//:tmux binary and its lib/*.dylib
 # runfiles must be self-contained: every Mach-O load command must point at
 # /usr/lib/, /System/, or an @loader_path/ target that exists in runfiles.
+#
+# The argument is @host_tmux//:macos_bundle, which is that binary wherever the
+# host running Bazel has a tmux. A host with none has nothing to bundle: its
+# @host_tmux//:tmux is an exit-127 stub with no tmux.bin, :macos_bundle is
+# incompatible there, and Bazel skips this test. So a tmux.bin missing below
+# always means a bundle that should exist and does not.
 
 set -euo pipefail
 
@@ -22,6 +28,15 @@ bundle_dir="$(cd "$(dirname "${tmux_entry}")" && pwd)"
 tmux_bin="${bundle_dir}/tmux.bin"
 if [[ ! -e "${tmux_bin}" ]]; then
   printf 'FAIL: bundled binary %s does not exist beside %s\n' "${tmux_bin}" "${tmux_entry}" >&2
+  # Name what is there: a lone small `tmux` is a script, not a bundle.
+  printf 'runfiles in %s:\n' "${bundle_dir}" >&2
+  for entry in "${bundle_dir}"/*; do
+    if [[ -d "${entry}" ]]; then
+      printf '  %s/\n' "${entry##*/}" >&2
+    elif [[ -e "${entry}" ]]; then
+      printf '  %s (%s bytes)\n' "${entry##*/}" "$(wc -c < "${entry}" | tr -d '[:space:]')" >&2
+    fi
+  done
   exit 1
 fi
 
