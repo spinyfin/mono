@@ -25,8 +25,8 @@
 use super::*;
 use boss_engine_proposal_validation::{ProposalCounts, check_rate_caps};
 use boss_protocol::{
-    Attention, AttentionGroup, ProposalDecider, ProposalErrorCode, ProposalKind, ProposalState,
-    ProposalSubmissionError, WorkerProposal,
+    Attention, AttentionGroup, OperatorAnswerType, OperatorQuestionView, ProposalDecider, ProposalErrorCode,
+    ProposalKind, ProposalState, ProposalSubmissionError, WorkerProposal,
 };
 
 // ---- input types ----
@@ -1121,6 +1121,92 @@ fn record_supersede_close_authorization(
         params![proposal_id, auth_json],
     )?;
     Ok(())
+}
+
+/// No on a plain yes-no or ordinary prerequisite question: record the
+/// declined path and grant nothing, matching [`choice_block`].
+pub(super) fn declined_block(question: &OperatorQuestionView, timestamp: &str) -> String {
+    let no_label = question.answer_type.option_labels().map(|labels| labels.no.as_str());
+    let mut lines = format!(
+        "\n\n---\n\n## Recorded answer ({timestamp})\n\n\
+- **Question the previous worker asked:** {}\n\
+- **Answer:** {}\n",
+        question.text,
+        no_label.unwrap_or("No")
+    );
+    let no_heading = format!("{}:", no_label.unwrap_or("No"));
+    if let Some(no_path) = boss_protocol::explanation_section(&question.explanation, &no_heading) {
+        lines.push_str(&format!(
+            "- **The worker's {} path:** {no_path}\n",
+            no_label.unwrap_or("No")
+        ));
+    }
+    lines.push_str(&format!(
+        "- **The worker's explanation:** {}\n\
+- **Asked by run:** `{}`\n\n\
+The repo owner recorded this decline on the kanban. Proceed with the declined path named above. It grants no authorization: it does not authorize bypassing any check or exceeding any limit.\n",
+        question.explanation, question.execution_id
+    ));
+    lines
+}
+
+/// The brief addendum for a multiple-choice answer: the chosen option,
+/// verbatim. Unlike [`authorization_block`] it grants nothing beyond
+/// the decision itself.
+pub(super) fn choice_block(question: &OperatorQuestionView, choice: &str, timestamp: &str) -> String {
+    format!(
+        "\n\n---\n\n## Recorded answer ({timestamp})\n\n\
+- **Question the previous worker asked:** {}\n\
+- **Options offered:** {}\n\
+- **Operator chose:** {choice}\n\
+- **The worker's explanation:** {}\n\
+- **Asked by run:** `{}`\n\n\
+The operator recorded this choice on the kanban. Proceed with the chosen option. It decides exactly the question above and nothing broader: it does not authorize bypassing any check or exceeding any limit.\n",
+        question.text,
+        match &question.answer_type {
+            OperatorAnswerType::MultipleChoice { choices } => choices.join(" / "),
+            _ => String::new(),
+        },
+        question.explanation,
+        question.execution_id
+    )
+}
+
+pub(super) fn authorization_block(question: &OperatorQuestionView, timestamp: &str) -> String {
+    format!(
+        "\n\n---\n\n## Repo owner approval ({timestamp})\n\n\
+- **Question the previous worker asked:** {}\n\
+- **Answer:** Yes\n\
+- **The worker's explanation:** {}\n\
+- **Asked by run:** `{}`\n\n\
+The repo owner recorded this answer. It is explicit, human-granted approval for exactly what the question asks and nothing broader. Treat it as the authorization the worker rules require before relaxing a check or exceeding a limit for this task; state in the PR body that this was approved by the repo owner on the date above. It does not authorize bypassing any other check, and it does not change what the repository's checks enforce.\n",
+        question.text, question.explanation, question.execution_id
+    )
+}
+
+/// The bypass answer to a split-vs-file-count-bypass question: keep this change
+/// in one PR, recording the approved file count separately from the free-form
+/// bypass reason.
+pub(super) fn file_count_bypass_authorization_block(
+    question: &OperatorQuestionView,
+    spec: boss_protocol::FileCountBypassSpec,
+    timestamp: &str,
+) -> String {
+    // A question asked before options were named records the plain "No".
+    let answer = question
+        .answer_type
+        .option_labels()
+        .map_or("No", |labels| labels.no.as_str());
+    format!(
+        "\n\n---\n\n## Repo owner approval ({timestamp})\n\n\
+- **Question the previous worker asked:** {}\n\
+- **Answer:** {answer} — keep this change in one PR\n\
+- **Authorized exception:** change/file-count for this PR only, up to {} files (repository limit {})\n\
+- **The worker's explanation:** {}\n\
+- **Asked by run:** `{}`\n\n\
+The repo owner recorded this answer. It is explicit, human-granted approval to finish this change as a single PR by declaring `BYPASS_CHANGE_FILE_COUNT=Split-vs-bypass question answered {answer} by the repo owner on {timestamp}; one-PR exception for this PR only` in the commit description. Checkleft does not enforce the approved count. Before pushing, compare the non-deleted file count from `jj diff --stat` against the PR base with the approved bound above and ask again if it is over. It does not authorize bypassing any other check, raising any other limit, or using the exception on a different PR. State in the PR body that this file-count exception was approved by the repo owner on the date above.\n",
+        question.text, spec.files, spec.limit, question.explanation, question.execution_id
+    )
 }
 
 // ---- tests ----

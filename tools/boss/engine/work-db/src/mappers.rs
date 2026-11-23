@@ -1,4 +1,5 @@
 use super::*;
+use boss_protocol::{OperatorQuestion, OperatorQuestionRecord, OperatorQuestionStatus, OperatorQuestionView};
 
 pub(crate) fn collect_rows<T>(
     rows: rusqlite::MappedRows<'_, impl FnMut(&Row<'_>) -> rusqlite::Result<T>>,
@@ -1144,6 +1145,64 @@ pub(crate) fn map_automation_run(row: &Row<'_>) -> rusqlite::Result<boss_protoco
         repeat_count: 1,
     })
 }
+
+pub(super) fn map_question(row: &Row<'_>) -> rusqlite::Result<OperatorQuestionRecord> {
+    let json: String = row.get("question_json")?;
+    let question: OperatorQuestion = serde_json::from_str(&json)
+        .map_err(|err| rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(err)))?;
+    let answer: Option<String> = row.get("answer_json")?;
+    let answer = answer
+        .map(|json| serde_json::from_str(&json))
+        .transpose()
+        .map_err(|err| rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(err)))?;
+    let status: String = row.get("status")?;
+    let dismissal = row
+        .get::<_, Option<String>>("dismissal_json")?
+        .map(|json| serde_json::from_str::<boss_protocol::OperatorQuestionDismissal>(&json))
+        .transpose()
+        .map_err(|err| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err)))?;
+    let supersede_close = row
+        .get::<_, Option<String>>("supersede_close_json")?
+        .map(|json| serde_json::from_str::<boss_protocol::SupersedeCloseAuthorization>(&json))
+        .transpose()
+        .map_err(|err| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err)))?;
+    Ok(OperatorQuestionRecord::builder()
+        .question(
+            OperatorQuestionView::builder()
+                .id(row.get::<_, String>("id")?)
+                .text(question.text)
+                .answer_type(question.answer_type)
+                .explanation(question.explanation)
+                .asked_at(row.get::<_, String>("created_at")?)
+                .execution_id(row.get::<_, String>("execution_id")?)
+                .maybe_run_summary(row.get::<_, Option<String>>("run_summary")?)
+                .build(),
+        )
+        .work_item_id(row.get::<_, String>("work_item_id")?)
+        .status(match status.as_str() {
+            _ if dismissal.is_some() => OperatorQuestionStatus::Dismissed,
+            "open" => OperatorQuestionStatus::Open,
+            "answered" => OperatorQuestionStatus::Answered,
+            _ => OperatorQuestionStatus::Withdrawn,
+        })
+        .maybe_answer(answer)
+        .maybe_answered_by(row.get::<_, Option<String>>("answered_by")?)
+        .maybe_answered_at(row.get::<_, Option<String>>("answered_at")?)
+        .maybe_withdrawn_reason(if dismissal.is_some() {
+            None
+        } else {
+            row.get::<_, Option<String>>("withdrawn_reason")?
+        })
+        .maybe_dismissal(dismissal)
+        .maybe_supersede_close(supersede_close)
+        .build())
+}
+
+/// The one select `map_question` reads: every `operator_questions` column
+/// plus the declaring run's summary. Append a `WHERE` clause.
+pub(super) const OPERATOR_QUESTION_RECORD_SELECT: &str = "SELECT *, (SELECT json_extract(payload_json, '$.summary') \
+     FROM worker_proposals WHERE worker_proposals.id = operator_questions.proposal_id) AS run_summary \
+     FROM operator_questions";
 
 #[cfg(test)]
 mod tests {
