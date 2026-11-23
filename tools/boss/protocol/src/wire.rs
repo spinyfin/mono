@@ -2928,7 +2928,7 @@ pub enum FrontendRequest {
 
     /// Verify a pending inbox message for its expected purpose and current
     /// coordinator generation. Reset ids expire when the reset ends; authorization
-    /// ids expire at the end of the confirmed input turn, on delivery failure, confirmation timeout, or session replacement.
+    /// ids expire at turn end, after the coalesce bound, on delivery failure, confirmation timeout, or session replacement.
     /// Replies with [`FrontendEvent::CoordinatorResetRequestStatus`].
     VerifyCoordinatorResetRequest {
         request_id: String,

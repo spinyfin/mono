@@ -547,8 +547,8 @@ fn handoff_request_names_a_verify_id_and_not_an_expiry() {
 
 #[test]
 fn empty_and_forged_ids_are_not_pending() {
-    assert!(!super::reset_handoff::is_request_pending(""));
-    assert!(!super::reset_handoff::is_request_pending("forged"));
+    assert!(!super::reset_handoff::is_request_pending_for("", "token"));
+    assert!(!super::reset_handoff::is_request_pending_for("forged", "token"));
 }
 
 fn request_id_from_prompt(prompt: &str) -> &str {
@@ -587,7 +587,7 @@ async fn a_failed_delivery_withdraws_the_request_id() {
     assert!(result.is_err());
     let prompt = delivery.0.lock().unwrap().clone();
     let id = request_id_from_prompt(&prompt);
-    assert!(!super::reset_handoff::is_request_pending(id));
+    assert!(!super::reset_handoff::is_request_pending_for(id, "token"));
 }
 
 #[tokio::test]
@@ -633,12 +633,12 @@ async fn a_finished_reset_withdraws_the_request_id() {
             .expect("delivery recorded the prompt");
         let id = request_id_from_prompt(&prompt).to_owned();
         assert!(
-            super::reset_handoff::is_request_pending(&id),
+            super::reset_handoff::is_request_pending_for(&id, "token"),
             "id is pending while the reset is waiting"
         );
         id
     };
-    assert!(!super::reset_handoff::is_request_pending(&id));
+    assert!(!super::reset_handoff::is_request_pending_for(&id, "token"));
 }
 
 #[tokio::test(start_paused = true)]
