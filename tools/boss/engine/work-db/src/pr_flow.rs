@@ -361,9 +361,6 @@ impl WorkDb {
         }
 
         let mut pending = PendingEvents::new();
-        if new_status != task.status {
-            cascade_dependents_after_prereq_status_change(&mut pending, &tx, &task.id, new_status.as_str(), &now)?;
-        }
 
         // Comment-intent-classification design §"Reconciliation": a
         // revision's claimed comments are addressed the moment its commit
@@ -389,6 +386,14 @@ impl WorkDb {
              WHERE id = ?1",
             params![execution_id, now, pr_url, pr_head_after, superseded_by_pr],
         )?;
+
+        // Cascade after the execution is marked `completed`: `gating_prereqs_for`
+        // treats an `in_review` revision with a non-terminal execution as a live
+        // chain writer, so cascading before the execution update left dependents
+        // gated and their executions in `waiting_dependency`.
+        if new_status != task.status {
+            cascade_dependents_after_prereq_status_change(&mut pending, &tx, &task.id, new_status.as_str(), &now)?;
+        }
 
         // Update the most-recent run for this execution: if a summary is
         // provided and the run's existing summary is empty, capture it.
