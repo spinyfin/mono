@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use super::support::no_processes;
 use super::support::{
     ExpectedCommand, FAKE_CUBE_EXECUTABLE, FakeRunner, audit_events, lease_runner_for, seed_mono_repo,
     with_database_path,
@@ -498,6 +499,7 @@ fn lease_requests_the_store_upkeep_once_a_day_through_the_runner_and_starts_noth
     let again = FakeRunner::failing_every_command();
     crate::app::gc::maybe_trigger_pool_gc(
         &again,
+        &no_processes(),
         &mut Store::open_at(&database_path).unwrap(),
         Some(&database_path),
         now,

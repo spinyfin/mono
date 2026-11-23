@@ -1,3 +1,4 @@
+use super::support::no_processes;
 use super::support::{
     ExpectedCommand, FakeRunner, audit_events, gc_exec_sweep_command, gc_exec_unpublished_command, gc_noop_command,
     head_status_command, head_status_output, lease_runner_for, release_guard_reusable_command, release_runner_for,
@@ -564,6 +565,7 @@ fn pool_gc_backlog_retriggers_before_24h_elapsed() {
 
     maybe_trigger_pool_gc(
         &FakeRunner::failing_every_command(),
+        &no_processes(),
         &mut store,
         Some(&database_path),
         now,
@@ -604,6 +606,7 @@ fn pool_gc_skips_before_24h_when_no_backlog() {
 
     maybe_trigger_pool_gc(
         &FakeRunner::failing_every_command(),
+        &no_processes(),
         &mut store,
         Some(&database_path),
         now,
@@ -810,7 +813,15 @@ fn gc_resets_aged_dirty_workspace_to_clean() {
     ];
     script.extend(reset_after_fetch_commands_for(&ws_path));
     let runner = FakeRunner::new(script);
-    gc_aged_unhealthy_workspaces(&runner, &store, Some(&database_path), fake_now, max_age_secs, None);
+    gc_aged_unhealthy_workspaces(
+        &runner,
+        &no_processes(),
+        &store,
+        Some(&database_path),
+        fake_now,
+        max_age_secs,
+        None,
+    );
     runner.assert_exhausted();
 
     let ws_after = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
@@ -847,6 +858,7 @@ fn gc_aged_unhealthy_workspaces_stops_at_deadline() {
     let deadline = Instant::now() - Duration::from_secs(1);
     let recycled = gc_aged_unhealthy_workspaces(
         &runner,
+        &no_processes(),
         &store,
         Some(&database_path),
         fake_now,
@@ -886,7 +898,15 @@ fn gc_resets_aged_conflicted_workspace_to_clean() {
     ];
     script.extend(reset_after_fetch_commands_for(&ws_path));
     let runner = FakeRunner::new(script);
-    gc_aged_unhealthy_workspaces(&runner, &store, Some(&database_path), fake_now, max_age_secs, None);
+    gc_aged_unhealthy_workspaces(
+        &runner,
+        &no_processes(),
+        &store,
+        Some(&database_path),
+        fake_now,
+        max_age_secs,
+        None,
+    );
     runner.assert_exhausted();
 
     let ws_after = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
@@ -922,7 +942,15 @@ fn gc_reclaims_aged_quarantined_workspace_once_nothing_is_orphaned() {
     script.extend(reset_after_fetch_commands_for(&ws_path));
     let runner = FakeRunner::new(script);
 
-    let recycled = gc_aged_unhealthy_workspaces(&runner, &store, Some(&database_path), fake_now, max_age_secs, None);
+    let recycled = gc_aged_unhealthy_workspaces(
+        &runner,
+        &no_processes(),
+        &store,
+        Some(&database_path),
+        fake_now,
+        max_age_secs,
+        None,
+    );
     runner.assert_exhausted();
     assert_eq!(recycled, 1);
 
@@ -939,6 +967,92 @@ fn gc_reclaims_aged_quarantined_workspace_once_nothing_is_orphaned() {
     assert_eq!(cleared.len(), 1);
     assert_eq!(cleared[0]["source"], "unhealthy_gc");
     assert_eq!(cleared[0]["reuse_reason"], "nothing_orphaned");
+}
+
+/// A quarantine taken for live processes must survive the retention window
+/// while they are alive: resetting would rewrite the working copy under them.
+#[test]
+fn gc_keeps_an_aged_quarantined_workspace_with_a_surviving_occupant() {
+    use workspace_procs_testing::{StaticProcessTable, fake_process};
+    let (tempdir, database_path) = with_database_path();
+    let (store, ws_path) = setup_unhealthy_gc_scenario(&tempdir, &database_path);
+    store
+        .update_workspace_health("mono", "mono-agent-001", crate::metadata::WorkspaceHealth::Quarantined)
+        .expect("mark quarantined");
+    let ws = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
+    let fake_now = ws.unhealthy_since_epoch_s.unwrap() + 6 * 86_400;
+
+    let canonical = std::fs::canonicalize(&ws_path).unwrap();
+    let table = StaticProcessTable::new(
+        vec![fake_process(40, 1, "tool", Some(canonical.to_str().unwrap()))],
+        900,
+    );
+    table.immortal(40);
+    // Nothing may be issued: no probe, no reset.
+    let runner = FakeRunner::default();
+    let recycled = gc_aged_unhealthy_workspaces(
+        &runner,
+        &table,
+        &store,
+        Some(&database_path),
+        fake_now,
+        5 * 86_400,
+        None,
+    );
+    runner.assert_exhausted();
+    assert_eq!(recycled, 0);
+
+    let ws_after = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
+    assert_eq!(
+        ws_after.health_status,
+        Some(crate::metadata::WorkspaceHealth::Quarantined)
+    );
+    let reaped: Vec<_> = audit_events(&tempdir)
+        .into_iter()
+        .filter(|e| e["event"] == "workspace.processes_reaped")
+        .collect();
+    assert_eq!(reaped.len(), 1);
+    assert_eq!(reaped[0]["phase"], "retention");
+    assert_eq!(reaped[0]["processes"]["survivors"][0]["pid"], 40);
+}
+
+/// Leftovers of a holder whose lease expired long ago are reaped, after which
+/// the normal probe-and-reset proceeds.
+#[test]
+fn gc_reaps_a_killable_occupant_before_resetting_an_aged_workspace() {
+    use workspace_procs_testing::{StaticProcessTable, fake_process};
+    let (tempdir, database_path) = with_database_path();
+    let (store, ws_path) = setup_unhealthy_gc_scenario(&tempdir, &database_path);
+    store
+        .update_workspace_health("mono", "mono-agent-001", crate::metadata::WorkspaceHealth::Quarantined)
+        .expect("mark quarantined");
+    let ws = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
+    let fake_now = ws.unhealthy_since_epoch_s.unwrap() + 6 * 86_400;
+
+    let canonical = std::fs::canonicalize(&ws_path).unwrap();
+    let table = StaticProcessTable::new(
+        vec![fake_process(40, 1, "tool", Some(canonical.to_str().unwrap()))],
+        900,
+    );
+    let mut script = vec![
+        ExpectedCommand::ok(ws_path.to_path_buf(), "jj", &["git", "fetch"], ""),
+        head_status_command(&ws_path, &head_status_output("abcd1234", true, "", "", "")),
+        unpushed_probe_command(&ws_path, ""),
+    ];
+    script.extend(reset_after_fetch_commands_for(&ws_path));
+    let runner = FakeRunner::new(script);
+    let recycled = gc_aged_unhealthy_workspaces(
+        &runner,
+        &table,
+        &store,
+        Some(&database_path),
+        fake_now,
+        5 * 86_400,
+        None,
+    );
+    runner.assert_exhausted();
+    assert_eq!(recycled, 1);
+    assert!(!table.is_alive(40));
 }
 
 /// The protection that must survive the retention TTL: a workspace whose `@`
@@ -961,7 +1075,15 @@ fn gc_leaves_quarantined_workspace_with_unpushed_work_alone_inside_the_ttl() {
 
     // Nothing may be issued at all: the workspace is not even a candidate yet.
     let runner = FakeRunner::default();
-    let recycled = gc_aged_unhealthy_workspaces(&runner, &store, Some(&database_path), fake_now, max_age_secs, None);
+    let recycled = gc_aged_unhealthy_workspaces(
+        &runner,
+        &no_processes(),
+        &store,
+        Some(&database_path),
+        fake_now,
+        max_age_secs,
+        None,
+    );
     runner.assert_exhausted();
     assert_eq!(recycled, 0);
 
@@ -1006,7 +1128,15 @@ fn gc_salvages_unpushed_work_before_reclaiming_past_the_ttl() {
     script.extend(reset_after_fetch_commands_for(&ws_path));
     let runner = FakeRunner::new(script);
 
-    let recycled = gc_aged_unhealthy_workspaces(&runner, &store, Some(&database_path), fake_now, max_age_secs, None);
+    let recycled = gc_aged_unhealthy_workspaces(
+        &runner,
+        &no_processes(),
+        &store,
+        Some(&database_path),
+        fake_now,
+        max_age_secs,
+        None,
+    );
     runner.assert_exhausted();
     assert_eq!(recycled, 1, "an expired retention is reclaimed once salvaged");
 
@@ -1080,7 +1210,15 @@ fn gc_leaves_workspace_retained_when_salvage_fails() {
         ),
     ]);
 
-    let recycled = gc_aged_unhealthy_workspaces(&runner, &store, Some(&database_path), fake_now, max_age_secs, None);
+    let recycled = gc_aged_unhealthy_workspaces(
+        &runner,
+        &no_processes(),
+        &store,
+        Some(&database_path),
+        fake_now,
+        max_age_secs,
+        None,
+    );
     runner.assert_exhausted();
     assert_eq!(recycled, 0, "a workspace whose work could not be captured is not reset");
 
@@ -1162,7 +1300,15 @@ fn gc_skips_recently_unhealthy_workspace() {
 
     // No reset commands should be issued.
     let runner = FakeRunner::default();
-    gc_aged_unhealthy_workspaces(&runner, &store, Some(&database_path), fake_now, max_age_secs, None);
+    gc_aged_unhealthy_workspaces(
+        &runner,
+        &no_processes(),
+        &store,
+        Some(&database_path),
+        fake_now,
+        max_age_secs,
+        None,
+    );
     runner.assert_exhausted();
 
     let ws_after = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
@@ -1241,7 +1387,15 @@ fn gc_refuses_to_reclaim_when_the_unpushed_stack_exceeds_the_salvage_cap() {
     script.extend(salvage_commands_for(&ws_path, &log, &[]));
     let runner = FakeRunner::new(script);
 
-    let recycled = gc_aged_unhealthy_workspaces(&runner, &store, Some(&database_path), fake_now, max_age_secs, None);
+    let recycled = gc_aged_unhealthy_workspaces(
+        &runner,
+        &no_processes(),
+        &store,
+        Some(&database_path),
+        fake_now,
+        max_age_secs,
+        None,
+    );
     runner.assert_exhausted();
     assert_eq!(recycled, 0, "a stack too long to export completely is not reclaimed");
 
@@ -1309,7 +1463,15 @@ fn gc_refuses_to_reclaim_when_the_salvage_log_comes_back_empty() {
     script.extend(salvage_commands_for(&ws_path, "", &[]));
     let runner = FakeRunner::new(script);
 
-    let recycled = gc_aged_unhealthy_workspaces(&runner, &store, Some(&database_path), fake_now, max_age_secs, None);
+    let recycled = gc_aged_unhealthy_workspaces(
+        &runner,
+        &no_processes(),
+        &store,
+        Some(&database_path),
+        fake_now,
+        max_age_secs,
+        None,
+    );
     runner.assert_exhausted();
     assert_eq!(recycled, 0, "an empty capture is not a successful salvage");
 
@@ -1385,7 +1547,15 @@ fn gc_discards_the_salvage_record_when_the_reset_fails() {
     ));
     let runner = FakeRunner::new(script);
 
-    let recycled = gc_aged_unhealthy_workspaces(&runner, &store, Some(&database_path), fake_now, max_age_secs, None);
+    let recycled = gc_aged_unhealthy_workspaces(
+        &runner,
+        &no_processes(),
+        &store,
+        Some(&database_path),
+        fake_now,
+        max_age_secs,
+        None,
+    );
     runner.assert_exhausted();
     assert_eq!(recycled, 0);
 
@@ -1463,7 +1633,15 @@ fn salvage_record_attributes_the_holder_and_task_from_the_prior_lease() {
     script.extend(reset_after_fetch_commands_for(&ws_path));
     let runner = FakeRunner::new(script);
 
-    let recycled = gc_aged_unhealthy_workspaces(&runner, &store, Some(&database_path), fake_now, 86_400, None);
+    let recycled = gc_aged_unhealthy_workspaces(
+        &runner,
+        &no_processes(),
+        &store,
+        Some(&database_path),
+        fake_now,
+        86_400,
+        None,
+    );
     runner.assert_exhausted();
     assert_eq!(recycled, 1);
 
@@ -1547,6 +1725,7 @@ fn aged_quarantined_rows_count_as_backlog_so_gc_retries_in_minutes() {
     store.set_pool_metadata_i(POOL_GC_LAST_AT_KEY, now - (10 * 60)).unwrap();
     maybe_trigger_pool_gc(
         &FakeRunner::failing_every_command(),
+        &no_processes(),
         &mut store,
         Some(&database_path),
         now,
@@ -1623,6 +1802,7 @@ fn gc_bounds_the_reuse_probe_by_the_remaining_pass_deadline() {
     let started = Instant::now();
     let recycled = gc_aged_unhealthy_workspaces(
         &runner,
+        &no_processes(),
         &store,
         Some(&database_path),
         fake_now,
@@ -1686,6 +1866,7 @@ fn gc_defers_a_probe_whose_remaining_budget_is_too_small_to_spawn() {
     let started = Instant::now();
     let recycled = gc_aged_unhealthy_workspaces(
         &runner,
+        &no_processes(),
         &store,
         Some(&database_path),
         fake_now,

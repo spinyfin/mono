@@ -71,7 +71,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner};
-use crate::config::PoolConfig;
 use crate::lock::RepoLock;
 use crate::metadata::{RepoRecord, WorkspaceRecord, WorkspaceState};
 use crate::store::{Store, WorkspaceListFilter};
@@ -82,8 +81,9 @@ use crate::app::disk::{DiskSpace, human_bytes};
 use crate::app::errors::Result;
 use crate::app::health::probe_workspace_reuse;
 use crate::app::jj::{self, budgeted_timeout, cleanup_workspace_logs, workspace_path_exists};
-use crate::app::process_guard::{SweepPhase, ensure_no_live_processes_in, sweep_is_noteworthy, sweep_json};
+use crate::app::process_guard::{SweepPhase, ensure_no_live_processes_or, sweep_is_noteworthy, sweep_json};
 use crate::app::util::repo_lock_path;
+use workspace_procs::WorkspaceProcessTable;
 
 /// Wall-clock bound for the purely local jj subprocesses this module spawns:
 /// the tracked-files probe and the `jj workspace forget` that de-registers a
@@ -374,6 +374,7 @@ pub(super) fn compact_free_workspaces(
 /// deliberate and explained at the acquisition site in `trim_one_repo`.
 pub(super) fn trim_free_workspaces_to_mark(
     runner: &dyn CommandRunner,
+    process_table: &dyn WorkspaceProcessTable,
     store: &Store,
     database_path: Option<&Path>,
     now_epoch_s: i64,
@@ -396,26 +397,40 @@ pub(super) fn trim_free_workspaces_to_mark(
         }
         report.merge(trim_one_repo(
             runner,
+            process_table,
             store,
             database_path,
-            &pool,
             repo_record,
-            now_epoch_s,
-            deadline,
+            TrimPass {
+                mark: pool.max_free_workspaces(&repo_record.repo),
+                now_epoch_s,
+                deadline,
+            },
         ));
     }
     report
 }
 
-fn trim_one_repo(
-    runner: &dyn CommandRunner,
-    store: &Store,
-    database_path: Option<&Path>,
-    pool: &PoolConfig,
-    repo_record: &RepoRecord,
+/// Per-repo inputs of one trim pass.
+struct TrimPass {
+    mark: usize,
     now_epoch_s: i64,
     deadline: Option<Instant>,
+}
+
+fn trim_one_repo(
+    runner: &dyn CommandRunner,
+    process_table: &dyn WorkspaceProcessTable,
+    store: &Store,
+    database_path: Option<&Path>,
+    repo_record: &RepoRecord,
+    pass: TrimPass,
 ) -> ReclaimReport {
+    let TrimPass {
+        mark,
+        now_epoch_s,
+        deadline,
+    } = pass;
     let repo = repo_record.repo.as_str();
     // Lazy: discovered on first use (inside `remove_workspace_from_disk`), so
     // a repo pass that ends up removing nothing pays for no `bazel info`
@@ -425,7 +440,6 @@ fn trim_one_repo(
     // down — rather than another cube-managed workspace (which could be
     // mid-removal itself in the same pass).
     let bazel_root_cache = BazelUserRootCache::new(runner, repo_record.source.clone().into_iter().collect());
-    let mark = pool.max_free_workspaces(repo);
     let free = free_workspaces(store, repo);
     let mut report = ReclaimReport::default();
 
@@ -546,6 +560,20 @@ fn trim_one_repo(
         // under the same id. It is the mirror of the `.incoming-` staging
         // `auto_create_workspace` uses for the inverse operation. A rename is
         // one inode operation, so the lock still costs microseconds.
+        //
+        // The process reap (SIGTERM, grace, SIGKILL, settle, three table
+        // scans) is therefore NOT inside it: it runs here, before the lock. A
+        // workspace that is free and survives the lock-held `still_free`
+        // re-check below was free throughout the reap, and anything that
+        // appears in it afterwards is caught by the staged-name sweep that
+        // precedes the unlink.
+        if let Err(e) = reap_before_staging(process_table, database_path, repo_record, record) {
+            eprintln!(
+                "cube: pool trim: {}: not removing it, a process verification failed: {e}",
+                record.workspace_id,
+            );
+            continue;
+        }
         let lock_path = match repo_lock_path(repo, database_path) {
             Ok(path) => path,
             Err(e) => {
@@ -574,7 +602,7 @@ fn trim_one_repo(
                 );
                 continue;
             }
-            stage_workspace_for_removal(runner, database_path, repo_record, record, deadline)
+            stage_prepared_workspace(runner, repo_record, record, deadline)
         };
         let staged_path = match staged {
             Ok(path) => path,
@@ -598,6 +626,7 @@ fn trim_one_repo(
             free_on_disk,
         };
         match remove_workspace_from_disk(
+            process_table,
             database_path,
             repo_record,
             record,
@@ -685,13 +714,28 @@ pub(super) fn removal_staging_name(workspace_id: &str) -> String {
 /// `provision.rs` that created the attachment, bounded by
 /// [`LOCAL_JJ_CMD_TIMEOUT`] like every other subprocess here, and best-effort:
 /// a failure leaves cosmetic cruft in the shared store, not a broken pool.
+#[cfg(test)]
 pub(super) fn stage_workspace_for_removal(
     runner: &dyn CommandRunner,
+    process_table: &dyn WorkspaceProcessTable,
     database_path: Option<&Path>,
     repo_record: &RepoRecord,
     record: &WorkspaceRecord,
     deadline: Option<Instant>,
 ) -> Result<PathBuf> {
+    reap_before_staging(process_table, database_path, repo_record, record)?;
+    stage_prepared_workspace(runner, repo_record, record, deadline)
+}
+
+/// Clear a leftover staging directory and kill whatever still runs inside the
+/// workspace, refusing if anything survives or verification fails. The slow
+/// half of staging, so callers holding the repo lock run it beforehand.
+pub(super) fn reap_before_staging(
+    process_table: &dyn WorkspaceProcessTable,
+    database_path: Option<&Path>,
+    repo_record: &RepoRecord,
+    record: &WorkspaceRecord,
+) -> Result<()> {
     let staged_path = repo_record
         .workspace_root
         .join(removal_staging_name(&record.workspace_id));
@@ -700,7 +744,9 @@ pub(super) fn stage_workspace_for_removal(
         // Clearing it is what lets the rename below succeed — `fs::rename`
         // onto a non-empty directory fails. It may still have occupants
         // (that is one way a pass dies here), so the same guard applies.
-        let sweep = ensure_no_live_processes_in(&record.workspace_id, &staged_path)?;
+        let sweep = ensure_no_live_processes_or(process_table, &record.workspace_id, &staged_path, |refused| {
+            audit_processes_reaped(database_path, record, "remove-leftover", refused);
+        })?;
         audit_processes_reaped(database_path, record, "remove-leftover", &sweep);
         fs::remove_dir_all(&staged_path).map_err(|source| crate::app::errors::CubeError::WorkspaceDirRemove {
             path: staged_path.clone(),
@@ -711,8 +757,23 @@ pub(super) fn stage_workspace_for_removal(
     // running inside it. Kill what a finished run left behind; if something
     // survives, refuse (loudly, with its pid) and leave the directory where a
     // later pass — or an operator — can find it. See `process_guard`.
-    let sweep = ensure_no_live_processes_in(&record.workspace_id, &record.workspace_path)?;
+    let sweep = ensure_no_live_processes_or(process_table, &record.workspace_id, &record.workspace_path, |refused| {
+        audit_processes_reaped(database_path, record, "remove", refused)
+    })?;
     audit_processes_reaped(database_path, record, "remove", &sweep);
+    Ok(())
+}
+
+/// The lock-held half of staging: one rename and the shared-store forget.
+fn stage_prepared_workspace(
+    runner: &dyn CommandRunner,
+    repo_record: &RepoRecord,
+    record: &WorkspaceRecord,
+    deadline: Option<Instant>,
+) -> Result<PathBuf> {
+    let staged_path = repo_record
+        .workspace_root
+        .join(removal_staging_name(&record.workspace_id));
     fs::rename(&record.workspace_path, &staged_path).map_err(|source| {
         crate::app::errors::CubeError::WorkspaceDirRemove {
             path: record.workspace_path.clone(),
@@ -785,6 +846,7 @@ fn audit_processes_reaped(
 /// is nothing left for the unlink to race, so the seconds it takes on a ~600 MB
 /// checkout are seconds no lease or release for this repo spends blocked.
 fn remove_workspace_from_disk(
+    process_table: &dyn WorkspaceProcessTable,
     database_path: Option<&Path>,
     repo_record: &RepoRecord,
     record: &WorkspaceRecord,
@@ -797,7 +859,9 @@ fn remove_workspace_from_disk(
     // re-parented since the pre-stage sweep is found here as living inside
     // `.removing-<id>`. A survivor fails the removal rather than being
     // unlinked out from under.
-    let sweep = ensure_no_live_processes_in(&record.workspace_id, staged_path)?;
+    let sweep = ensure_no_live_processes_or(process_table, &record.workspace_id, staged_path, |refused| {
+        audit_processes_reaped(database_path, record, "remove-staged", refused);
+    })?;
     audit_processes_reaped(database_path, record, "remove-staged", &sweep);
     let before = DiskSpace::probe(&repo_record.workspace_root).ok();
     fs::remove_dir_all(staged_path).map_err(|source| crate::app::errors::CubeError::WorkspaceDirRemove {

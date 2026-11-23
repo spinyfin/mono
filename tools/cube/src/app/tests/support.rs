@@ -715,3 +715,9 @@ impl ExpectedCommand {
 pub(super) fn init_repo_with_branch(path: &Path, branch: &str) {
     boss_engine_test_git::init_repo_with_branch(path, branch);
 }
+
+/// A process table with nothing in it: a stand-in for a host where no
+/// workspace has an occupant, so tests never read or signal real processes.
+pub(super) fn no_processes() -> workspace_procs_testing::StaticProcessTable {
+    workspace_procs_testing::StaticProcessTable::new(vec![], 900)
+}

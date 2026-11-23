@@ -1,6 +1,7 @@
 //! Tests for the disk-reclamation passes: build-artifact compaction and the
 //! free-workspace high-water-mark trim.
 
+use super::support::no_processes;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -544,7 +545,8 @@ fn a_staged_workspace_cannot_be_rediscovered_and_re_registered() {
 
     let runner = FakeRunner::new(vec![forget_registration(&workspace_root, &source, "mono-agent-001")]);
     store.forget_workspace("mono", "mono-agent-001").expect("forget row");
-    let staged = stage_workspace_for_removal(&runner, None, &repo_record, &record, None).expect("stage");
+    let staged =
+        stage_workspace_for_removal(&runner, &no_processes(), None, &repo_record, &record, None).expect("stage");
     runner.assert_exhausted();
 
     assert!(!record.workspace_path.exists(), "the prefixed name is gone");
@@ -589,7 +591,8 @@ fn staging_clears_a_leftover_from_a_pass_that_died_mid_removal() {
 
     let runner = FakeRunner::new(vec![]);
     store.forget_workspace("mono", "mono-agent-001").expect("forget row");
-    let staged = stage_workspace_for_removal(&runner, None, &repo_record, &record, None).expect("stage");
+    let staged =
+        stage_workspace_for_removal(&runner, &no_processes(), None, &repo_record, &record, None).expect("stage");
     runner.assert_exhausted();
 
     assert_eq!(staged, leftover);
@@ -626,7 +629,7 @@ fn trim_removes_the_most_idle_surplus_down_to_the_mark() {
     script.push(forget_registration(&workspace_root, &source, "mono-agent-002"));
     let runner = FakeRunner::new(script);
 
-    let report = trim_free_workspaces_to_mark(&runner, &store, Some(&database_path), NOW, None);
+    let report = trim_free_workspaces_to_mark(&runner, &no_processes(), &store, Some(&database_path), NOW, None);
     runner.assert_exhausted();
 
     assert_eq!(report.workspaces_removed, 2);
@@ -661,7 +664,7 @@ fn trim_does_nothing_when_the_free_count_is_at_or_under_the_mark() {
 
     // No expectations: nothing should even be probed.
     let runner = FakeRunner::new(vec![]);
-    let report = trim_free_workspaces_to_mark(&runner, &store, Some(&database_path), NOW, None);
+    let report = trim_free_workspaces_to_mark(&runner, &no_processes(), &store, Some(&database_path), NOW, None);
     runner.assert_exhausted();
 
     assert_eq!(report.workspaces_removed, 0);
@@ -690,7 +693,7 @@ fn trim_never_removes_a_workspace_holding_unpushed_work() {
     let mut script = trim_probe_holds_work(&ws1);
     script.extend(trim_probe_holds_work(&ws2));
     let runner = FakeRunner::new(script);
-    let report = trim_free_workspaces_to_mark(&runner, &store, Some(&database_path), NOW, None);
+    let report = trim_free_workspaces_to_mark(&runner, &no_processes(), &store, Some(&database_path), NOW, None);
     runner.assert_exhausted();
 
     assert_eq!(report.workspaces_removed, 0);
@@ -727,7 +730,7 @@ fn trim_keeps_a_workspace_whose_reuse_probe_errors() {
     script.extend(trim_probe_holds_work(&ws2));
     let runner = FakeRunner::new(script);
 
-    let report = trim_free_workspaces_to_mark(&runner, &store, Some(&database_path), NOW, None);
+    let report = trim_free_workspaces_to_mark(&runner, &no_processes(), &store, Some(&database_path), NOW, None);
     runner.assert_exhausted();
 
     assert_eq!(report.workspaces_removed, 0);
@@ -762,7 +765,7 @@ fn trim_neither_counts_nor_removes_leased_workspaces() {
     }
 
     let runner = FakeRunner::new(vec![]);
-    let report = trim_free_workspaces_to_mark(&runner, &store, Some(&database_path), NOW, None);
+    let report = trim_free_workspaces_to_mark(&runner, &no_processes(), &store, Some(&database_path), NOW, None);
     runner.assert_exhausted();
 
     assert_eq!(report.workspaces_removed, 0);
@@ -800,7 +803,7 @@ fn a_row_whose_directory_is_already_gone_does_not_inflate_the_surplus() {
     script.push(bazel_root_probe(&source));
     let runner = FakeRunner::new(script);
 
-    let report = trim_free_workspaces_to_mark(&runner, &store, Some(&database_path), NOW, None);
+    let report = trim_free_workspaces_to_mark(&runner, &no_processes(), &store, Some(&database_path), NOW, None);
     runner.assert_exhausted();
 
     assert_eq!(report.workspaces_removed, 1, "one real surplus workspace, not two");
@@ -843,6 +846,7 @@ fn a_removal_drops_the_registry_row_before_it_touches_the_directory() {
     let report = if unlink_is_blocked {
         Some(trim_free_workspaces_to_mark(
             &runner,
+            &no_processes(),
             &store,
             Some(&database_path),
             NOW,
@@ -907,6 +911,7 @@ fn a_surplus_the_last_trim_could_not_act_on_does_not_pin_the_gc_at_five_minutes(
 
     maybe_trigger_pool_gc(
         &FakeRunner::failing_every_command(),
+        &no_processes(),
         &mut store,
         Some(&database_path),
         now,

@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use workspace_procs::{ReapReport, Scope, SystemWorkspaceProcessTable, WorkspaceProcessTable, reap};
+use workspace_procs::{ReapReport, Scope, WorkspaceProcessTable, reap};
 
 use crate::app::errors::{CubeError, Result};
 
@@ -87,15 +87,6 @@ pub(super) fn sweep_workspace_processes(
     report
 }
 
-/// [`sweep_workspace_processes`] against the real process table.
-pub(super) fn sweep_live_workspace_processes(
-    workspace_id: &str,
-    workspace_path: &Path,
-    phase: SweepPhase,
-) -> ReapReport {
-    sweep_workspace_processes(&SystemWorkspaceProcessTable, workspace_id, workspace_path, phase)
-}
-
 /// A refused removal retains its complete sweep for auditing and diagnostics.
 #[derive(Debug, thiserror::Error)]
 #[error("{error}")]
@@ -115,19 +106,34 @@ pub(super) fn ensure_no_live_processes(
     if report.is_clean() {
         return Ok(report);
     }
-    Err(Box::new(RemovalRefusal {
-        error: CubeError::WorkspaceBusy {
+    // Named survivors are a known hazard; an inspection failure with none is
+    // an unverified directory, which reads differently and is retried.
+    let error = match &report.error {
+        Some(error) if report.survivors.is_empty() => CubeError::WorkspaceUnverified {
             path: workspace_path.to_path_buf(),
-            processes: report.error.clone().unwrap_or_else(|| report.survivor_summary()),
+            error: error.clone(),
         },
-        report,
-    }))
+        _ => CubeError::WorkspaceBusy {
+            path: workspace_path.to_path_buf(),
+            processes: report.survivor_summary(),
+        },
+    };
+    Err(Box::new(RemovalRefusal { error, report }))
 }
 
-/// [`ensure_no_live_processes`] against the real process table.
-pub(super) fn ensure_no_live_processes_in(workspace_id: &str, workspace_path: &Path) -> Result<ReapReport> {
-    ensure_no_live_processes(&SystemWorkspaceProcessTable, workspace_id, workspace_path)
-        .map_err(|refusal| refusal.error)
+/// [`ensure_no_live_processes`] for callers that only propagate the error. A
+/// refusal still carries the partial signal report, so `on_refusal` receives
+/// it first (to audit the signals that were sent before verification failed).
+pub(super) fn ensure_no_live_processes_or(
+    table: &dyn WorkspaceProcessTable,
+    workspace_id: &str,
+    workspace_path: &Path,
+    on_refusal: impl FnOnce(&ReapReport),
+) -> Result<ReapReport> {
+    ensure_no_live_processes(table, workspace_id, workspace_path).map_err(|refusal| {
+        on_refusal(&refusal.report);
+        refusal.error
+    })
 }
 
 /// Read-only occupancy verification for expired leases and prospective claims.
@@ -147,8 +153,54 @@ pub(super) fn inspect_workspace_processes(table: &dyn WorkspaceProcessTable, wor
     }
 }
 
-pub(super) fn inspect_live_workspace_processes(workspace_path: &Path) -> ReapReport {
-    inspect_workspace_processes(&SystemWorkspaceProcessTable, workspace_path)
+/// One read of the process table, classified against any number of
+/// workspaces. A lease checks every free workspace of a repo while holding the
+/// repo lock; listing the table once keeps that cost independent of the pool
+/// size.
+pub(super) struct ProcessSnapshot<'a> {
+    table: &'a dyn WorkspaceProcessTable,
+    processes: std::result::Result<Vec<workspace_procs::LiveProcess>, String>,
+}
+
+impl<'a> ProcessSnapshot<'a> {
+    pub(super) fn capture(table: &'a dyn WorkspaceProcessTable) -> Self {
+        Self {
+            table,
+            processes: table.list().map_err(|error| error.to_string()),
+        }
+    }
+
+    /// Read-only occupancy of one workspace, as of the capture.
+    pub(super) fn inspect(&self, workspace_path: &Path) -> ReapReport {
+        match &self.processes {
+            Ok(processes) => {
+                match workspace_procs::scan_processes(self.table, processes, &Scope::for_workspace(workspace_path)) {
+                    Ok(scan) => ReapReport {
+                        survivors: scan.owned,
+                        spared: scan.spared,
+                        passes: 1,
+                        ..ReapReport::default()
+                    },
+                    Err(error) => ReapReport {
+                        error: Some(error.to_string()),
+                        ..ReapReport::default()
+                    },
+                }
+            }
+            Err(error) => ReapReport {
+                error: Some(error.clone()),
+                ..ReapReport::default()
+            },
+        }
+    }
+}
+
+/// Whether a read-only inspection found a live holder. An unreadable process
+/// table is a fact about the host, not about this workspace: it is reported
+/// but never treated as occupancy, so one unreadable process cannot take every
+/// workspace out of circulation.
+pub(super) fn is_occupied(report: &ReapReport) -> bool {
+    !report.survivors.is_empty()
 }
 
 /// Whether the sweep did anything worth an audit line.
@@ -282,7 +334,7 @@ mod tests {
         };
         let err = CubeError::WorkspaceBusy {
             path: PathBuf::from(WS),
-            processes: report.error.clone().unwrap_or_else(|| report.survivor_summary()),
+            processes: report.survivor_summary(),
         };
         let text = err.to_string();
         assert!(text.contains("40 (zsh)"), "{text}");
@@ -375,7 +427,32 @@ mod verification_tests {
         for fail_at in [0, 1, 2] {
             let error = ensure_no_live_processes(&failing(fail_at), "test", Path::new("/pool/test")).unwrap_err();
             assert!(error.to_string().contains("process list unavailable"), "{error}");
+            assert!(
+                matches!(error.error, CubeError::WorkspaceUnverified { .. }),
+                "an inspection failure is not a survivor: {error}"
+            );
+            assert!(!error.to_string().contains("after SIGTERM and SIGKILL"), "{error}");
         }
+    }
+    #[test]
+    fn one_listing_classifies_every_workspace_and_never_signals() {
+        let mut other = fake_process(50, 1, "tool", Some("/pool/b"));
+        other.argv = vec!["tool".into()];
+        let table = StaticProcessTable::new(vec![fake_process(40, 1, "tool", Some("/pool/a")), other], 900);
+        let snapshot = ProcessSnapshot::capture(&table);
+        assert_eq!(snapshot.inspect(Path::new("/pool/a")).survivor_summary(), "40 (tool)");
+        assert_eq!(snapshot.inspect(Path::new("/pool/b")).survivor_summary(), "50 (tool)");
+        assert!(snapshot.inspect(Path::new("/pool/c")).is_clean());
+        assert!(table.signals().is_empty());
+    }
+    #[test]
+    fn an_unreadable_table_is_reported_but_is_not_occupancy() {
+        let table = failing(0);
+        let snapshot = ProcessSnapshot::capture(&table);
+        let report = snapshot.inspect(Path::new("/pool/test"));
+        assert!(!report.is_clean());
+        assert!(!is_occupied(&report));
+        assert_eq!(report.error.as_deref(), Some("process list unavailable"));
     }
     #[test]
     fn post_term_failure_retains_signal_audit() {

@@ -573,8 +573,9 @@ done: a backgrounded subshell from a tool command that was cut short, a test
 binary stranded in a Bazel sandbox. They re-parent to launchd and nothing that
 walks down from the holder's shell finds them. cube owns workspace usability,
 so before a lease is released (`workspace release`, `force-release`) and before
-a directory is removed (`workspace remove --expunge`, the pool trim) cube
-sweeps the process table for processes whose working directory is inside the
+a directory is removed (`workspace remove --expunge`, the pool trim, broken-empty
+husk cleanup during a lease, `repo remove --purge-workspaces`, and the
+aged-unhealthy reset) cube sweeps the process table for processes whose working directory is inside the
 workspace — under whatever name it currently has, so a staged
 `.removing-<id>` directory counts — or inside its Bazel output base, kills them
 (`SIGTERM`, a two-second grace, `SIGKILL`), and logs each one with pid, command
@@ -588,10 +589,16 @@ the directory if any owned process survives or if the process table, an individu
 process, or its working directory cannot be inspected.
 
 Lease expiry does not prove that a holder has finished. Expiry and claim-time
-checks scan without sending signals. Occupied or uninspectable workspaces are
-durably quarantined with a process audit; ordinary lease selection continues to
-another workspace or provisions a new one, without resetting the prior holder’s
-working copy. Setup-failure release sweeps use the `setup_failed` phase. A warm
+checks scan without sending signals, reading the process table once per lease
+and classifying every free workspace against that one listing. Workspaces with
+live occupants are durably quarantined with a process audit (a workspace that is
+already quarantined is not re-inspected or re-audited); ordinary lease selection
+continues to another workspace or provisions a new one, without resetting the
+prior holder’s working copy. A process table that cannot be read is a fact about
+the host, not about any one workspace: the lease reports it on stderr and goes
+on without process gating rather than quarantining the pool. The aged-unhealthy
+reset reaps whatever the long-expired holder left behind first, and keeps the
+workspace quarantined if anything survives or cannot be verified. Setup-failure release sweeps use the `setup_failed` phase. A warm
 Bazel server alone is audited on removal, but does not create release audit noise.
 The scan itself lives in `lib/rust/workspace_procs`, shared with the engine; see
 `tools/boss/docs/run-process-teardown.md`.

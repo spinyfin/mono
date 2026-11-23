@@ -191,6 +191,13 @@ impl ReapReport {
 /// Classify every live process against `scope`. Read-only.
 pub fn scan(table: &dyn WorkspaceProcessTable, scope: &Scope) -> io::Result<Scan> {
     let processes = table.list()?;
+    scan_processes(table, &processes, scope)
+}
+
+/// [`scan`] against an already-listed process table. Classifying many scopes
+/// (every free workspace in a pool) against one listing costs one table read
+/// instead of one per scope.
+pub fn scan_processes(table: &dyn WorkspaceProcessTable, processes: &[LiveProcess], scope: &Scope) -> io::Result<Scan> {
     let by_pid: HashMap<i32, &LiveProcess> = processes.iter().map(|p| (p.pid, p)).collect();
     let protected = ancestry(table.own_pid(), &by_pid);
     let roots: HashSet<i32> = scope
@@ -225,7 +232,7 @@ pub fn scan(table: &dyn WorkspaceProcessTable, scope: &Scope) -> io::Result<Scan
 
     let mut owned = Vec::new();
     let mut spared = Vec::new();
-    for process in &processes {
+    for process in processes {
         if process.pid <= 1 || protected.contains(&process.pid) {
             continue;
         }

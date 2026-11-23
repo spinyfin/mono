@@ -609,4 +609,62 @@ mod broken_empty_removal_tests {
         assert!(path.join("leftover").exists());
         assert_eq!(store.list_workspaces("mono").unwrap().len(), 1);
     }
+    fn audited(tempdir: &tempfile::TempDir) -> Vec<serde_json::Value> {
+        let mut events = Vec::new();
+        if let Ok(read) = fs::read_dir(tempdir.path().join("audit")) {
+            for entry in read.flatten() {
+                for line in fs::read_to_string(entry.path()).unwrap().lines() {
+                    events.push(serde_json::from_str::<serde_json::Value>(line).unwrap());
+                }
+            }
+        }
+        events
+            .into_iter()
+            .filter(|e| e["event"] == "workspace.processes_reaped")
+            .collect()
+    }
+
+    #[test]
+    fn husk_reap_is_audited_with_the_remove_phase_and_the_killed_pid() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let (mut store, path) = seeded(&tempdir);
+        let database = tempdir.path().join("cube.db");
+        let table = StaticProcessTable::new(vec![fake_process(40, 1, "tool", Some(path.to_str().unwrap()))], 900);
+        gc_broken_empty_workspace(&table, &mut store, Some(&database), "mono", "mono-agent-001", &path).unwrap();
+        let events = audited(&tempdir);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["phase"], "remove");
+        assert_eq!(events[0]["workspace_id"], "mono-agent-001");
+        assert_eq!(events[0]["processes"]["killed"][0]["pid"], 40);
+    }
+
+    #[test]
+    fn refused_husk_still_audits_its_partial_sweep() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let (mut store, path) = seeded(&tempdir);
+        let database = tempdir.path().join("cube.db");
+        let table = StaticProcessTable::new(vec![fake_process(40, 1, "tool", Some(path.to_str().unwrap()))], 900);
+        table.immortal(40);
+        gc_broken_empty_workspace(&table, &mut store, Some(&database), "mono", "mono-agent-001", &path).unwrap();
+        let events = audited(&tempdir);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["phase"], "remove");
+        assert_eq!(events[0]["processes"]["killed"][0]["pid"], 40);
+        assert_eq!(events[0]["processes"]["survivors"][0]["pid"], 40);
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let (mut store, path) = seeded(&tempdir);
+        let database = tempdir.path().join("cube.db");
+        gc_broken_empty_workspace(
+            &UnreadableTable,
+            &mut store,
+            Some(&database),
+            "mono",
+            "mono-agent-001",
+            &path,
+        )
+        .unwrap();
+        let events = audited(&tempdir);
+        assert_eq!(events[0]["processes"]["error"], "process list unavailable");
+    }
 }
