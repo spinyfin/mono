@@ -37,6 +37,7 @@ home, /Volumes or a mounted volume, /System, /Library, /private, /var, and the
 /net and /home autofs maps. Only the root of a recursive walk is judged, so an
 ordinary read of one specific file outside the workspace is untouched.
 """
+import fnmatch
 import json
 import os
 import re
@@ -89,6 +90,13 @@ RECOVERY = (
     "editors, lsof, etc.). If progress needs a human to inspect or recover "
     "engine state, use `\"$BOSS_BIN\" propose blocked --reason \"<specific question>\"`. "
     "Do not work around this gate."
+)
+
+GLOB_LIMIT_REASON = (
+    "Blocked: this wildcard matches too many paths for the guard to verify that "
+    "none of them is inside the engine data directory. Narrow the pattern to "
+    "the directory you need (for example a specific subdirectory or file "
+    "extension) and retry."
 )
 
 # -- Broad-traversal boundary ------------------------------------------------
@@ -430,131 +438,105 @@ def emit(decision, reason=None):
 
 "#,
         crate::render_conversation_scratch!(),
+        crate::render_command_tokenizer!("", ""),
+        crate::render_nested_shell_bodies!(),
+        crate::render_scratch_safe_programs!(),
         r#"
-def conversation_scratch_path(candidate, cwd, payload):
-    # The root comes from engine-owned hook wiring, never the payload.
-    # Bracket constructs Python's glob does not model (`[[`, `[^`) can
-    # expand to a name the worker created as a link out of scratch, so those
-    # spellings keep the data-dir check.
-    if any(marker in candidate for marker in ("[[", "[!", "[^")):
-        return False
-    base = conversation_scratch_base(os.environ.get("BOSS_AGY_SCRATCH_ROOT"), payload.get("session_id"))
-    return conversation_scratch_contains(canonical(candidate, cwd), base)
+# Heredoc bodies fed to these programs are data. Every other consumer (a
+# shell, an interpreter, `source`, `xargs`, awk, sqlite3, a script, anything
+# unknown) may execute or interpret its stdin, so its body is inspected like
+# command text. The test is on the unstripped program: a wrapper such as
+# `xargs cat` is not `cat`.
+HEREDOC_DATA_CONSUMERS = {
+    "cat", "tee", "head", "tail", "wc", "sort", "uniq", "cut", "tr", "grep",
+    "rg", "base64", "shasum", "md5", "md5sum", "sha256sum", "diff", "cmp",
+}
+# Programs that neither run nor interpret text they are handed, so a command
+# made only of these never executes a heredoc body that another heredoc wrote.
+NON_EXECUTING_PROGRAMS = HEREDOC_DATA_CONSUMERS | {
+    "cd", "ls", "echo", "printf", "pwd", "mkdir", "touch", "true", "false", ":",
+    "chmod", "rm", "mv", "cp", "stat", "file", "find", "sleep",
+}
+BODY_WORD_RE = re.compile(r"[^\s'\"()\[\],;=<>|&`{}]+")
+BODY_LITERAL_RE = re.compile(r"\"([^\"\n]+)\"|'([^'\n]+)'")
+ASSIGNMENT_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 
 
-SCRATCH_SAFE_PROGRAMS = frozenset((
-    "cat", "head", "tail", "wc", "ls", "echo", "printf", "true", "false", ":",
-    "pwd", "test", "[", "dirname", "basename", "cd", "pushd", "popd",
-))
-SHELL_PROGRAMS = frozenset(("sh", "bash", "zsh", "dash", "ksh"))
-COMMAND_DELIMS = frozenset(("&&", "||", ";", "|", "&", "|&"))
-WRAPPER_PROGRAMS = frozenset((
-    "env", "command", "builtin", "exec", "nohup", "stdbuf", "setsid",
-    "caffeinate", "time", "nice",
-))
+def raw_program(group):
+    for token in without_redirections(list(group)):
+        if token in ("{", "(", "!", "time") or ASSIGNMENT_TOKEN_RE.match(token):
+            continue
+        return os.path.basename(token.lstrip("({"))
+    return ""
 
 
-def lex_shell(text):
-    lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|")
-    lexer.whitespace_split = True
-    lexer.commenters = ""
-    return list(lexer)
-
-
-def split_token_groups(tokens):
-    groups, current = [], []
-    for token in tokens:
-        if token in COMMAND_DELIMS:
-            if current:
-                groups.append(current)
-                current = []
-        else:
-            current.append(token)
-    if current:
-        groups.append(current)
+def body_candidate_groups(body):
+    # A body that is run (or interpreted) is read three ways so no spelling
+    # hides in it: as whitespace-split words, as complete quoted string
+    # literals (a path containing a space survives only whole), and as shell
+    # command groups (which resolve quoting and backslash-escaped spaces).
+    groups = [BODY_WORD_RE.findall(body)]
+    for match in BODY_LITERAL_RE.finditer(body):
+        groups.append([match.group(1) or match.group(2)])
+    try:
+        groups.extend(list(group) for group in command_groups(body))
+    except Exception:
+        pass
     return groups
 
 
-def c_bodies(tokens):
-    bodies = []
-    for index, token in enumerate(tokens):
-        prog = os.path.basename(token.lstrip("({"))
-        if prog not in SHELL_PROGRAMS:
-            continue
-        for j, arg in enumerate(tokens[index + 1:], index + 1):
-            if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", arg) and j + 1 < len(tokens):
-                bodies.append(tokens[j + 1])
-                break
-    return bodies
+def heredoc_body_groups(group):
+    body = getattr(group, "body", "")
+    if not body or raw_program(group) in HEREDOC_DATA_CONSUMERS:
+        return []
+    rest = strip_prefixes(group)
+    return [(os.path.basename(rest[0]) if rest else "", body)]
 
 
-def program_uses_pattern_file(tokens):
-    prog = os.path.basename(tokens[0].lstrip("({")) if tokens else ""
-    flags = {"grep": ("-f", "--file"), "rg": ("-f", "--file"), "sed": ("-f", "--file")}.get(prog, ())
-    for arg in tokens[1:]:
-        if arg == "--":
-            break
-        if arg in flags or any(arg.startswith(flag + "=") for flag in flags if flag.startswith("--")):
-            return True
-        if arg.startswith("-") and not arg.startswith("--"):
-            for flag in flags:
-                if len(flag) == 2 and flag[1] in arg[1:]:
-                    return True
-    return False
-
-
-def sed_is_scratch_safe(tokens):
-    has_n = False
-    for arg in tokens[1:]:
-        if arg == "--":
-            break
-        if arg in ("-i", "--in-place") or arg.startswith("--in-place="):
-            return False
-        if arg.startswith("-") and not arg.startswith("--") and "i" in arg[1:]:
-            return False
-        if arg in ("-n", "--quiet", "--silent") or (
-                arg.startswith("-") and not arg.startswith("--") and "n" in arg[1:]):
-            has_n = True
-    return has_n
-
-
-def group_program_tokens(tokens):
-    index = 0
-    while index < len(tokens) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[index]):
-        index += 1
-    while index < len(tokens) and os.path.basename(tokens[index].lstrip("({")) in WRAPPER_PROGRAMS:
-        index += 1
-        while index < len(tokens) and tokens[index].startswith("-"):
-            if tokens[index] == "--":
-                index += 1
-                break
-            index += 1
-    return tokens[index:]
-
-
-def group_is_scratch_safe(tokens):
-    rest = group_program_tokens(tokens)
-    if not rest:
-        return True
-    prog = os.path.basename(rest[0].lstrip("({"))
-    if prog in SCRATCH_SAFE_PROGRAMS:
-        return True
-    if prog in ("grep", "rg") and not program_uses_pattern_file(rest):
-        return True
-    if prog == "sed" and sed_is_scratch_safe(rest):
-        return True
-    return False
-
-
-def flatten_token_groups(tokens):
+def flatten_command_groups(command):
+    # Nested shell bodies come from the shared extractor the adapter uses; a
+    # shape that extractor cannot see into (`bash script.sh`) is ordinary
+    # worker activity here, so its reason is not a denial. The test for a
+    # heredoc body is fail-closed: it is data only when its consumer is in
+    # HEREDOC_DATA_CONSUMERS itself. Every other consumer's body, and a body
+    # piped into any other consumer (`cat <<EOF | xargs cat`, `| awk ...`,
+    # `| sqlite3`), is inspected: as commands for a shell, as words and whole
+    # quoted literals otherwise. When the command contains anything that is
+    # not known to be inert at all, the remaining heredoc bodies it writes
+    # (`cat <<EOF > s.sh; ./s.sh`) are inspected too.
     groups = []
-    for group in split_token_groups(tokens):
-        groups.append(group)
-        for body in c_bodies(group):
-            inner = lex_shell(body)
-            nested, _ = flatten_token_groups(inner)
-            groups.extend(nested)
-    return groups, True
+    data_bodies = []
+    state = {"executes": False}
+    def inspect(program, body):
+        if program in SHELL_PROGRAMS or program in ("", "source", ".", "eval"):
+            walk(body)
+        else:
+            groups.extend(body_candidate_groups(body))
+    def walk(text):
+        for group in command_groups(text):
+            groups.append(group)
+            bodies, _reason = shell_nested_bodies(group)
+            for body in bodies:
+                walk(body)
+            for program, body in heredoc_body_groups(group):
+                inspect(program, body)
+            program = raw_program(group)
+            if program and program not in NON_EXECUTING_PROGRAMS:
+                state["executes"] = True
+            if program not in HEREDOC_DATA_CONSUMERS:
+                rest = strip_prefixes(group)
+                stripped = os.path.basename(rest[0]) if rest else ""
+                for source in getattr(group, "pipe_sources", None) or []:
+                    body = getattr(source, "body", "") or ""
+                    if body:
+                        inspect(stripped, body)
+            if getattr(group, "body", ""):
+                data_bodies.append(group.body)
+    walk(command)
+    if state["executes"]:
+        for body in data_bodies:
+            groups.extend(body_candidate_groups(body))
+    return groups
 
 
 def main():
@@ -601,14 +583,13 @@ def main():
             command = masked
         raw_command = command
         try:
-            tokens = lex_shell(command)
-        except Exception:
-            tokens = command.split()
-        try:
-            bash_groups, _ = flatten_token_groups(tokens)
+            bash_groups = flatten_command_groups(command)
         except Exception:
             emit("block", MALFORMED + " Detail: a nested -c body could not be parsed.")
+        tokens = []
         for group in bash_groups:
+            tokens.extend(group)
+            tokens.append(";")
             candidates.extend(group)
         # Creating a link inside the conversation allowance is how a later
         # (or same-command) read walks out of scratch. `ln` / `cp -s` / `cp -l`
@@ -659,14 +640,45 @@ def main():
 
     scratch_candidates = []
 
-    def consider(candidate, skip_scratch):
+    def consider(candidate, skip_scratch, expand=False):
         try:
             resolved = canonical(candidate, cwd)
-            if skip_scratch and conversation_scratch_path(candidate, cwd, payload):
-                scratch_candidates.append(candidate)
+            scratch_base = conversation_scratch_base(
+                os.environ.get("BOSS_AGY_SCRATCH_ROOT"), payload.get("session_id"))
+            in_scratch = skip_scratch and conversation_scratch_contains(resolved, scratch_base)
+            # Only a shell operand is glob-expanded. A native tool's path (and
+            # an apply_patch filename) is a literal name, so a `[` or `*` in it
+            # is just a character and its resolved path is judged as written.
+            if not (expand and any(char in candidate for char in "*?[")):
+                if in_scratch:
+                    scratch_candidates.append(candidate)
+                    return
+                if is_inside(resolved, data_dir):
+                    emit("block", RECOVERY)
                 return
-            if is_inside(resolved, data_dir):
+            # A wildcard also names whatever the shell matches, including an
+            # entry that is a link into the data directory, so the literal
+            # canonical check always runs (a zero-match glob such as
+            # `<data>/x*` creates a file) and the expansion is judged on top
+            # of it. Only a skippable, lexically-in-scratch spelling may have
+            # matches that stay inside this conversation's allowance.
+            # A spelling Python's glob cannot model never gets the scratch
+            # exemption, whatever it matches today.
+            if glob_wildcard_uses_unmodeled_brackets(candidate) and is_inside(resolved, data_dir):
                 emit("block", RECOVERY)
+            if not in_scratch and is_inside(resolved, data_dir):
+                emit("block", RECOVERY)
+            matches, complete = glob_expand_conservative(expanded_path(candidate, cwd))
+            if not complete:
+                # A truncated expansion is not a superset of the shell's, so
+                # nothing it left out can be approved.
+                emit("block", GLOB_LIMIT_REASON)
+            for match in matches:
+                real = os.path.realpath(match)
+                if in_scratch and conversation_scratch_contains(real, scratch_base):
+                    continue
+                if is_inside(real, data_dir):
+                    emit("block", RECOVERY)
         except Exception:
             return
 
@@ -680,7 +692,7 @@ def main():
                 if key in seen:
                     continue
                 seen.add(key)
-                consider(candidate, skip)
+                consider(candidate, skip, True)
         named = [c for c in candidates if isinstance(c, str)]
         for candidate in named:
             if any(candidate in group for group in bash_groups):

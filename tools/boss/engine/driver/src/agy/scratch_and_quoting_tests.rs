@@ -37,7 +37,7 @@ fn payload_for(conversation: Option<&str>, tool: &str, args: Value) -> Value {
     payload
 }
 
-fn command_in(fx: &Fixture, conversation: Option<&str>, command: &str) -> Value {
+pub(super) fn command_in(fx: &Fixture, conversation: Option<&str>, command: &str) -> Value {
     payload_for(
         conversation,
         "run_command",
@@ -53,12 +53,12 @@ fn verdict(fx: &Fixture, payload: &Value) -> (String, String) {
     )
 }
 
-fn assert_allowed(fx: &Fixture, payload: &Value, what: &str) {
+pub(super) fn assert_allowed(fx: &Fixture, payload: &Value, what: &str) {
     let (decision, detail) = verdict(fx, payload);
     assert_eq!(decision, "auto_approve", "{what}: {detail}");
 }
 
-fn assert_denied(fx: &Fixture, payload: &Value, what: &str) -> String {
+pub(super) fn assert_denied(fx: &Fixture, payload: &Value, what: &str) -> String {
     let (decision, detail) = verdict(fx, payload);
     assert_eq!(decision, "deny", "{what}: {detail}");
     detail
@@ -532,27 +532,25 @@ fn shell_bodies_are_still_inspected_and_python_bodies_are_not_run_as_shell() {
     assert_command_allowed(&fx, "python3 -c 'print(`1`)  # not shell'");
 }
 
-fn relative_from(from_dir: &Path, to: &Path) -> PathBuf {
-    let from = fs::canonicalize(from_dir).unwrap();
-    let to = if to.exists() {
-        fs::canonicalize(to).unwrap()
-    } else {
-        to.to_path_buf()
-    };
-    let mut cursor = from.as_path();
-    let mut up = PathBuf::new();
-    loop {
-        if to.starts_with(cursor) {
-            return up.join(to.strip_prefix(cursor).unwrap());
-        }
-        match cursor.parent() {
-            Some(parent) => {
-                up.push("..");
-                cursor = parent;
-            }
-            None => return up.join(&to),
-        }
-    }
+pub(super) fn relative_from(from_dir: &Path, to: &Path) -> PathBuf {
+    crate::test_support::relative_from(from_dir, to)
+}
+
+pub(super) fn run_approved(fx: &Fixture, command: &str) {
+    assert_command_allowed(fx, command);
+    let status = Command::new("bash")
+        .arg("-c")
+        .arg(command)
+        .current_dir(fx.workspace())
+        .status()
+        .unwrap();
+    assert!(status.success(), "{command}");
+}
+
+pub(super) fn prepare_link_via_command(fx: &Fixture, name: &str, target: &Path) -> PathBuf {
+    let prepared = fx.tmp.path().join(name);
+    run_approved(fx, &format!("ln -s {} {}", target.display(), prepared.display()));
+    prepared
 }
 
 #[test]
@@ -818,4 +816,242 @@ fn unquoted_heredoc_apostrophe_does_not_hide_arithmetic() {
         reason.contains("cannot be inspected") || reason.contains("denied") || reason.contains("substitution"),
         "{reason}"
     );
+}
+
+#[test]
+fn quoted_heredoc_does_not_disable_expanding_heredoc_quote_neutralisation() {
+    let fx = Fixture::new("run-quoted-then-expanding");
+    fx.install(WorkerKind::Standard);
+    let command = "cat <<'A'\nx\nA\ncat <<B\ndon't\nB\nx='a''[$(id)]'\n(( x ))";
+    let reason = assert_command_denied(&fx, command);
+    assert!(
+        reason.contains("cannot be inspected") || reason.contains("denied") || reason.contains("substitution"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn same_command_mv_cd_rg_cannot_read_boss_state_through_scratch_link() {
+    let fx = Fixture::new("run-scratch-mv-cd-rg");
+    let data = fx.tmp.path().join("homes/.transcript-store");
+    fs::create_dir_all(&data).unwrap();
+    fs::write(data.join("state.db"), "secret\n").unwrap();
+    fx.install_with(WorkerKind::Standard, |config| config.data_dir = Some(data.clone()));
+    seed_conversation(&fx);
+    let scratch = conversation_dir(&fx).join("scratch");
+    let hooks = fx.process_home.join(".gemini/config/hooks.json");
+    let to_data = relative_from(&scratch, &data);
+    let to_hooks = relative_from(&scratch, &hooks);
+    let prepared_data = prepare_link_via_command(&fx, "prepared-up", &to_data);
+    let prepared_hooks = prepare_link_via_command(&fx, "prepared-hooks", &to_hooks);
+    for command in [
+        format!(
+            "mv {} {}/up\ncd {}/up\nrg -a --hidden --no-ignore .",
+            prepared_data.display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "mv {} {}/up && cd {}/up && rg -a --hidden --no-ignore .",
+            prepared_data.display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "bash -c 'mv {} {}/up'; bash -c 'cat {}/up/state.db'",
+            prepared_data.display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "true\nbash -c 'true\nmv {} {}/up'; bash -c 'cat {}/up/state.db'",
+            prepared_data.display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "mv {} {}/hooks\ncd {}/hooks\nrg -a --hidden --no-ignore .",
+            prepared_hooks.display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "bash -c 'mv {} {}/hooks'; bash -c 'cat {}/hooks/hooks.json'",
+            prepared_hooks.display(),
+            scratch.display(),
+            scratch.display()
+        ),
+    ] {
+        assert_command_denied(&fx, &command);
+    }
+}
+
+#[test]
+fn posix_class_later_in_bracket_does_not_get_empty_glob_exemption() {
+    let fx = Fixture::new("run-scratch-posix-later");
+    let data = fx.tmp.path().join("homes/.transcript-store");
+    fs::create_dir_all(&data).unwrap();
+    fs::write(data.join("state.db"), "secret\n").unwrap();
+    fx.install_with(WorkerKind::Standard, |config| config.data_dir = Some(data.clone()));
+    seed_conversation(&fx);
+    let scratch = conversation_dir(&fx).join("scratch");
+    let hooks = fx.process_home.join(".gemini/config/hooks.json");
+    let to_data = relative_from(&scratch, &data);
+    let to_hooks = relative_from(&scratch, &hooks);
+    let prepared_data = prepare_link_via_command(&fx, "prepared-up", &to_data);
+    run_approved(&fx, &format!("mv {} {}/up", prepared_data.display(), scratch.display()));
+    let prepared_hooks = prepare_link_via_command(&fx, "prepared-hooks", &to_hooks);
+    run_approved(
+        &fx,
+        &format!("mv {} {}/hooks.json", prepared_hooks.display(), scratch.display()),
+    );
+    for command in [
+        format!("cat {}/[a[:lower:]]p/state.db", scratch.display()),
+        format!("cat {}/[x[=u=]]p/state.db", scratch.display()),
+        format!("cat {}/[x[.u.]]p/state.db", scratch.display()),
+        format!("cat {}/[a[:lower:]]ooks.json", scratch.display()),
+    ] {
+        assert_command_denied(&fx, &command);
+    }
+}
+
+#[test]
+fn python_body_realpath_denies_scratch_link_to_protected_state() {
+    let fx = Fixture::new("run-python-scratch-link");
+    let data = fx.tmp.path().join("homes/.transcript-store");
+    fs::create_dir_all(&data).unwrap();
+    fs::write(data.join("state.db"), "secret\n").unwrap();
+    fx.install_with(WorkerKind::Standard, |config| config.data_dir = Some(data.clone()));
+    seed_conversation(&fx);
+    let scratch = conversation_dir(&fx).join("scratch");
+    let to_data = relative_from(&scratch, &data);
+    let prepared = prepare_link_via_command(&fx, "prepared-up", &to_data);
+    run_approved(&fx, &format!("mv {} {}/up", prepared.display(), scratch.display()));
+    for command in [
+        format!("python3 -c 'print(open(\"{}/up/state.db\").read())'", scratch.display()),
+        format!(
+            "cd {} && python3 -c 'print(open(\"up/state.db\").read())'",
+            scratch.display()
+        ),
+        format!(
+            "python3 - <<'PY'\nprint(open(\"{}/up/state.db\").read())\nPY",
+            scratch.display()
+        ),
+    ] {
+        let reason = assert_command_denied(&fx, &command);
+        assert!(
+            reason.contains("protected") || reason.contains("denied"),
+            "{command}: {reason}"
+        );
+    }
+}
+
+#[test]
+fn python_scan_allows_workspace_subdir_and_benign_brain_text() {
+    let fx = Fixture::new("run-python-subdir-brain");
+    fx.install(WorkerKind::Standard);
+    seed_conversation(&fx);
+    let subdir = fx.workspace().join("tools/boss");
+    fs::create_dir_all(&subdir).unwrap();
+    let payload = payload_for(
+        Some(CONVERSATION),
+        "run_command",
+        json!({
+            "CommandLine": "python3 -c 'import re; print(re.sub(r\"(a)\", r\"\\1\\1\", \"a\"))'",
+            "Cwd": subdir,
+        }),
+    );
+    assert_allowed(&fx, &payload, "python regex backreference from workspace subdir");
+    assert_command_allowed(&fx, r#"python3 -c 'print("brain\nx")'"#);
+    assert_command_allowed(&fx, r#"python3 -c 'open("data/brain/x.json")'"#);
+}
+
+#[test]
+fn python_bodies_that_compose_a_path_cannot_reach_a_scratch_link() {
+    let fx = Fixture::new("run-python-composed-link");
+    let data = fx.tmp.path().join("homes/.transcript-store");
+    fs::create_dir_all(&data).unwrap();
+    fs::write(data.join("state.db"), "secret\n").unwrap();
+    fx.install_with(WorkerKind::Standard, |config| config.data_dir = Some(data.clone()));
+    seed_conversation(&fx);
+    let scratch = conversation_dir(&fx).join("scratch");
+    let hooks = fx.process_home.join(".gemini/config/hooks.json");
+    let prepared_data = prepare_link_via_command(&fx, "prepared-up", &relative_from(&scratch, &data));
+    run_approved(&fx, &format!("mv {} {}/up", prepared_data.display(), scratch.display()));
+    let prepared_hooks = prepare_link_via_command(&fx, "prepared-hooks", &relative_from(&scratch, &hooks));
+    run_approved(
+        &fx,
+        &format!("mv {} {}/hooks.json", prepared_hooks.display(), scratch.display()),
+    );
+    let s = scratch.display().to_string();
+    for parts in [vec!["up", "state.db"], vec!["hooks.json"]] {
+        let rel = parts.join("/");
+        let quoted = parts.iter().map(|p| format!("\"{p}\"")).collect::<Vec<_>>();
+        let snippets = [
+            format!("open(\"{s}/\" \"{rel}\").read()"),
+            format!("import os; os.chdir(\"{s}\"); open(\"{rel}\").read()"),
+            format!("import os; open(os.path.join(\"{s}\", {})).read()", quoted.join(", ")),
+            format!("open(\"{s}\" + \"/{rel}\").read()"),
+            format!(
+                "from pathlib import Path; (Path(\"{s}\") / {}).read_text()",
+                quoted.join(" / ")
+            ),
+        ];
+        for snippet in snippets {
+            for command in [
+                format!("python3 -c '{snippet}'"),
+                format!("python3 - <<'PY'\n{snippet}\nPY"),
+            ] {
+                assert_command_denied(&fx, &command);
+            }
+        }
+    }
+}
+
+#[test]
+fn bracket_globs_cannot_reach_a_scratch_link_through_any_component() {
+    let fx = Fixture::new("run-scratch-glob-components");
+    let data = fx.tmp.path().join("homes/.transcript-store");
+    fs::create_dir_all(&data).unwrap();
+    fs::write(data.join("state.db"), "secret\n").unwrap();
+    fx.install_with(WorkerKind::Standard, |config| config.data_dir = Some(data.clone()));
+    seed_conversation(&fx);
+    let scratch = conversation_dir(&fx).join("scratch");
+    fs::create_dir_all(scratch.join("a")).unwrap();
+    let prepared_up = prepare_link_via_command(&fx, "prepared-up", &relative_from(&scratch, &data));
+    run_approved(&fx, &format!("mv {} {}/up", prepared_up.display(), scratch.display()));
+    let prepared_nested = prepare_link_via_command(&fx, "prepared-nested", &relative_from(&scratch.join("a"), &data));
+    run_approved(
+        &fx,
+        &format!("mv {} {}/a/up", prepared_nested.display(), scratch.display()),
+    );
+    let s = scratch.display();
+    for command in [
+        format!("cat {s}/[]a[:lower:]]p/state.db"),
+        format!("cat {s}/[]x[=u=]]p/state.db"),
+        format!("cat {s}/[][:lower:]]p/state.db"),
+        format!("cat {s}/[u]p/state.db"),
+        format!("cat {s}/[a]/[]a[:lower:]]p/state.db"),
+        format!("cat {s}/[a]/[u]p/state.db"),
+    ] {
+        assert_command_denied(&fx, &command);
+    }
+}
+
+#[test]
+fn nested_shell_bodies_and_no_path_programs_do_not_inherit_their_own_distrust() {
+    let fx = Fixture::new("run-scratch-nested-own-trust");
+    fx.install(WorkerKind::Standard);
+    seed_conversation(&fx);
+    let scratch = conversation_dir(&fx).join("scratch");
+    fs::write(scratch.join("gen.py"), "print('gen')\n").unwrap();
+    let s = scratch.display();
+    for command in [
+        format!("bash -c 'cp x {s}/y'"),
+        format!("bash -c 'cd {s} && python3 gen.py'"),
+        format!("cd {s} && python3 gen.py; echo done"),
+        format!("cd {s} && python3 gen.py && true"),
+    ] {
+        assert_command_allowed(&fx, &command);
+    }
 }

@@ -845,3 +845,6 @@ mod scratch_and_quoting_tests;
 
 #[path = "scratch_workspace_tests.rs"]
 mod scratch_workspace_tests;
+
+#[path = "python_scratch_tests.rs"]
+mod python_scratch_tests;
