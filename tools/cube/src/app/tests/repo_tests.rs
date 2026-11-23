@@ -1366,6 +1366,40 @@ mod purge_verification {
     }
 
     #[test]
+    fn purge_audits_the_remove_phase_for_reaped_and_refused_directories() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tempdir.path()).unwrap();
+        let database = root.join("state.db");
+        let killable = root.join("mono-agent-001");
+        let stuck = root.join("mono-agent-002");
+        std::fs::create_dir_all(&killable).unwrap();
+        std::fs::create_dir_all(&stuck).unwrap();
+        let table = StaticProcessTable::new(
+            vec![
+                fake_process(40, 1, "tool", Some(killable.to_str().unwrap())),
+                fake_process(41, 1, "tool", Some(stuck.to_str().unwrap())),
+            ],
+            900,
+        );
+        table.immortal(41);
+        purge_workspace_trees(&table, Some(&database), "mono", &[killable.clone(), stuck.clone()]).unwrap();
+        let events: Vec<_> = super::super::support::audit_events(&tempdir)
+            .into_iter()
+            .filter(|e| e["event"] == "workspace.processes_reaped")
+            .collect();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(events.iter().all(|e| e["phase"] == "remove"));
+        let reaped = events.iter().find(|e| e["workspace_id"] == "mono-agent-001").unwrap();
+        assert_eq!(reaped["processes"]["killed"][0]["pid"], 40);
+        let refused = events.iter().find(|e| e["workspace_id"] == "mono-agent-002").unwrap();
+        assert_eq!(
+            refused["processes"]["killed"][0]["pid"], 41,
+            "partial signals are audited"
+        );
+        assert_eq!(refused["processes"]["survivors"][0]["pid"], 41);
+    }
+
+    #[test]
     fn purge_retains_directories_when_the_process_table_is_unreadable() {
         let tempdir = tempfile::tempdir().unwrap();
         let ws = std::fs::canonicalize(tempdir.path()).unwrap().join("mono-agent-001");
@@ -1455,6 +1489,24 @@ mod purge_verification {
                 assert!(
                     ids.contains(&"mono-agent-005"),
                     "fresh workspace should exist; saw {ids:?}"
+                );
+
+                // What the lease did about the occupant is a function of the
+                // injected table alone: an occupied husk is quarantined by the
+                // read-only preamble; an unreadable table
+                // says nothing about the husk and quarantines nothing.
+                let husk = rows.iter().find(|r| r.workspace_id == "mono-agent-004").unwrap();
+                let fresh = rows.iter().find(|r| r.workspace_id == "mono-agent-005").unwrap();
+                assert_eq!(
+                    husk.health_status == Some(crate::metadata::WorkspaceHealth::Quarantined),
+                    !unreadable,
+                    "unreadable={unreadable}: {:?}",
+                    husk.health_status
+                );
+                assert_ne!(
+                    fresh.health_status,
+                    Some(crate::metadata::WorkspaceHealth::Quarantined),
+                    "an unreadable process table must not quarantine the freshly minted workspace"
                 );
             }
         }

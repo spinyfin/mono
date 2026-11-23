@@ -16,6 +16,7 @@ use crate::app::errors::Result;
 use crate::app::health::probe_workspace_reuse;
 use crate::app::jj::{self, run_jj, run_jj_network, workspace_path_exists};
 use crate::app::pr_head;
+use crate::app::process_guard::ensure_no_live_processes_or;
 use crate::app::reclaim::{compact_free_workspaces, has_free_workspace_surplus, trim_free_workspaces_to_mark};
 use crate::app::reconcile::reconcile_free_workspace_health;
 use crate::app::reset::reset_workspace_after_fetch_within;
@@ -25,6 +26,7 @@ use crate::app::salvage::{
 };
 use crate::app::store_gc::{spawn_detached_store_gc, store_gc_due};
 use crate::app::util::current_epoch_s;
+use workspace_procs::WorkspaceProcessTable;
 
 /// Pool-wide gc runs at most once per 24 hours (when there is no known
 /// backlog), triggered from `cube workspace lease`.
@@ -208,6 +210,22 @@ fn dedup_bookmark_names(output: &str, keep: impl Fn(&str) -> bool) -> Vec<String
         .collect()
 }
 
+/// Audit a retention-time process reap that killed something or left a
+/// survivor; a quiet sweep is the normal case.
+fn audit_retention_reap(database_path: Option<&Path>, record: &WorkspaceRecord, sweep: &workspace_procs::ReapReport) {
+    if !crate::app::process_guard::sweep_is_noteworthy(sweep, crate::app::process_guard::SweepPhase::Remove) {
+        return;
+    }
+    audit!(
+        database_path,
+        "workspace.processes_reaped",
+        repo = record.repo,
+        workspace_id = record.workspace_id,
+        phase = "retention",
+        processes = crate::app::process_guard::sweep_json(sweep),
+    );
+}
+
 /// Cheap, read-only check for whether any aged-unhealthy candidate currently
 /// exists that `gc_aged_unhealthy_workspaces` would pick up — used to decide
 /// whether a completed-but-partial pass should be retried after
@@ -293,12 +311,14 @@ fn aged_unhealthy_since(record: &WorkspaceRecord, threshold_epoch_s: i64) -> Opt
 /// `last_pool_gc_at`.
 pub(super) fn maybe_trigger_pool_gc(
     runner: &dyn CommandRunner,
+    process_table: &dyn WorkspaceProcessTable,
     store: &mut Store,
     database_path: Option<&Path>,
     now_epoch_s: i64,
 ) -> Result<()> {
     maybe_trigger_pool_gc_with_spawner(
         runner,
+        process_table,
         store,
         database_path,
         now_epoch_s,
@@ -308,6 +328,7 @@ pub(super) fn maybe_trigger_pool_gc(
 
 pub(super) fn maybe_trigger_pool_gc_with_spawner(
     runner: &dyn CommandRunner,
+    process_table: &dyn WorkspaceProcessTable,
     store: &mut Store,
     database_path: Option<&Path>,
     now_epoch_s: i64,
@@ -351,7 +372,7 @@ pub(super) fn maybe_trigger_pool_gc_with_spawner(
     let db_path_owned = database_path.map(Path::to_path_buf);
     let deadline = Instant::now() + POOL_GC_TIME_BUDGET;
     if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_pool_gc_background(runner, db_path_owned, deadline, spawn_cleanup);
+        run_pool_gc_background(runner, process_table, db_path_owned, deadline, spawn_cleanup);
     })) {
         eprintln!("cube: auto gc: pass panicked: {panic:?}");
     }
@@ -370,6 +391,7 @@ pub(super) fn maybe_trigger_pool_gc_with_spawner(
 /// processes (see `store_gc` for the one that fork-bombed a dev Mac).
 fn run_pool_gc_background(
     runner: &dyn CommandRunner,
+    process_table: &dyn WorkspaceProcessTable,
     database_path: Option<std::path::PathBuf>,
     deadline: Instant,
     spawn_cleanup: &dyn Fn(Option<&Path>) -> std::io::Result<()>,
@@ -447,6 +469,7 @@ fn run_pool_gc_background(
     if let Ok(now) = current_epoch_s() {
         gc_aged_unhealthy_workspaces(
             runner,
+            process_table,
             &store,
             database_path.as_deref(),
             now,
@@ -495,7 +518,14 @@ fn run_pool_gc_background(
     // stuck-dirty workspaces (making them provably empty of work, hence
     // eligible here) and reconcile has just relabelled whatever recovered.
     if let Ok(now) = current_epoch_s() {
-        let trimmed = trim_free_workspaces_to_mark(runner, &store, database_path.as_deref(), now, Some(deadline));
+        let trimmed = trim_free_workspaces_to_mark(
+            runner,
+            process_table,
+            &store,
+            database_path.as_deref(),
+            now,
+            Some(deadline),
+        );
         if trimmed.workspaces_removed > 0 {
             eprintln!(
                 "cube: auto gc: removed {} surplus free workspace(s), reclaiming {}",
@@ -760,6 +790,7 @@ pub(super) fn reclaim_quarantined_workspace(
 /// workspace gc` verb, which isn't on the lease dispatch hot path.
 pub(super) fn gc_aged_unhealthy_workspaces(
     runner: &dyn CommandRunner,
+    process_table: &dyn WorkspaceProcessTable,
     store: &Store,
     database_path: Option<&Path>,
     now_epoch_s: i64,
@@ -822,6 +853,26 @@ pub(super) fn gc_aged_unhealthy_workspaces(
 
         let prior_health = record.health_status.map(|h| h.as_str()).unwrap_or("unknown");
         let age_secs = now_epoch_s.saturating_sub(unhealthy_since);
+
+        // Resetting rewrites the working copy, so nothing may still be running
+        // in it. Whatever the prior holder left behind is reaped first (the
+        // lease is long gone); if anything survives or the table cannot be
+        // read, the workspace stays retained, quarantine included, and the
+        // next pass tries again.
+        let reaped =
+            ensure_no_live_processes_or(process_table, &record.workspace_id, &record.workspace_path, |refused| {
+                audit_retention_reap(database_path, &record, refused);
+            });
+        match reaped {
+            Ok(sweep) => audit_retention_reap(database_path, &record, &sweep),
+            Err(error) => {
+                eprintln!(
+                    "cube: retention: {}: leaving retained, processes not cleared: {error}",
+                    record.workspace_id,
+                );
+                continue;
+            }
+        }
 
         // Look before touching anything. The probe fetches first, so the
         // "does any remote already have this?" verdict is current rather than

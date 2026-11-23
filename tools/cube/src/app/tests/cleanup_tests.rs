@@ -641,6 +641,7 @@ fn slow_periodic_cleanup_does_not_delay_a_lease_claim() {
     let command = std::cell::RefCell::new(command);
     crate::app::gc::maybe_trigger_pool_gc_with_spawner(
         &FakeRunner::failing_every_command(),
+        &super::support::no_processes(),
         &mut pool.store,
         Some(&pool.database_path),
         crate::app::util::current_epoch_s().unwrap(),
@@ -720,6 +721,7 @@ fn low_free_space_retriggers_the_pool_gc_well_before_24h() {
         let _healthy = testing::with_reading(AMPLE_TEST_VOLUME);
         maybe_trigger_pool_gc(
             &FakeRunner::failing_every_command(),
+            &super::support::no_processes(),
             &mut pool.store,
             Some(&pool.database_path),
             now,
@@ -737,6 +739,7 @@ fn low_free_space_retriggers_the_pool_gc_well_before_24h() {
     let _low = testing::with_reading(volume_with_free(low - GIB));
     maybe_trigger_pool_gc(
         &FakeRunner::failing_every_command(),
+        &super::support::no_processes(),
         &mut pool.store,
         Some(&pool.database_path),
         now,
@@ -776,6 +779,7 @@ fn a_pass_that_could_not_clean_anything_does_not_pin_the_short_interval() {
 
     maybe_trigger_pool_gc(
         &FakeRunner::failing_every_command(),
+        &super::support::no_processes(),
         &mut pool.store,
         Some(&pool.database_path),
         now,

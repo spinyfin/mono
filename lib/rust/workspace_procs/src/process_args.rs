@@ -24,9 +24,14 @@ fn read_sysctl(name: &mut [c_int], buffer: &mut [u8]) -> Option<usize> {
 
 #[cfg(target_os = "macos")]
 pub fn arguments(pid: u32) -> Option<Vec<String>> {
-    let mut size = [0; size_of::<c_int>()];
-    read_sysctl(&mut [libc::CTL_KERN, libc::KERN_ARGMAX], &mut size)?;
-    let capacity = usize::try_from(c_int::from_ne_bytes(size)).ok()?;
+    // `kern.argmax` is fixed for the life of the boot; read it once rather
+    // than once per process of an enumeration.
+    static ARGMAX: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let capacity = (*ARGMAX.get_or_init(|| {
+        let mut size = [0; size_of::<c_int>()];
+        read_sysctl(&mut [libc::CTL_KERN, libc::KERN_ARGMAX], &mut size)?;
+        usize::try_from(c_int::from_ne_bytes(size)).ok()
+    }))?;
     let mut buffer = vec![0; capacity];
     let len = read_sysctl(
         &mut [libc::CTL_KERN, libc::KERN_PROCARGS2, pid.try_into().ok()?],

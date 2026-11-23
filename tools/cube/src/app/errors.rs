@@ -69,6 +69,17 @@ pub enum CubeError {
          SIGTERM and SIGKILL: {processes}"
     )]
     WorkspaceBusy { path: PathBuf, processes: String },
+    /// Cube could not establish whether anything is running inside a
+    /// workspace directory (the process table was unreadable, in the initial
+    /// scan or after signalling), so it did not remove it.
+    #[error(
+        "refusing to remove workspace directory `{path}`: could not verify that no process is running inside it: {error}"
+    )]
+    WorkspaceUnverified { path: PathBuf, error: String },
+    /// A read-only occupancy check found live processes inside a workspace a
+    /// lease was about to hand over. Nothing was signalled or removed.
+    #[error("workspace directory `{path}` is occupied by running processes (none were signalled): {processes}")]
+    WorkspaceOccupied { path: PathBuf, processes: String },
     #[error("failed to remove bazel output base `{path}`: {source}")]
     BazelOutputBaseRemove { path: PathBuf, source: io::Error },
     #[error("failed to create repo source directory `{path}`: {source}")]
@@ -250,6 +261,8 @@ impl CubeError {
             | Self::WorkspaceDirRead { .. }
             | Self::WorkspaceDirRemove { .. }
             | Self::WorkspaceBusy { .. }
+            | Self::WorkspaceUnverified { .. }
+            | Self::WorkspaceOccupied { .. }
             | Self::BazelOutputBaseRemove { .. }
             | Self::RepoSourceDirCreate { .. }
             | Self::StateDbIo { .. }
