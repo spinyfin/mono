@@ -415,6 +415,18 @@ impl BranchVerifier for StubBranchVerifier {
 }
 
 #[derive(Default)]
+struct RecordingProbeFlags {
+    /// The pending nudge has been written and is waiting for its turn, rather
+    /// than sitting in the queue, so it cannot be withdrawn.
+    nudge_in_flight: std::sync::atomic::AtomicBool,
+    /// When set, a queued turn-boundary ask stays pending until the test
+    /// clears it, so later sweeps retry delivery instead of charging a new
+    /// strike.
+    hold_pending_turn_boundary: std::sync::atomic::AtomicBool,
+    pending_turn_boundary: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Default)]
 pub struct RecordingProbeQueuer {
     pub calls: std::sync::Mutex<Vec<(String, String)>>,
     pub clear_calls: std::sync::Mutex<Vec<String>>,
@@ -422,12 +434,79 @@ pub struct RecordingProbeQueuer {
     /// What [`ProbeQueuer::nudge_delivery`] answers. `None` is the trait
     /// default (`Settled`): every nudge arrived.
     pub delivery: std::sync::Mutex<Option<NudgeDelivery>>,
-    /// The pending nudge has been written and is waiting for its turn, rather
-    /// than sitting in the queue, so it cannot be withdrawn.
-    pub nudge_in_flight: std::sync::atomic::AtomicBool,
+    flags: RecordingProbeFlags,
 }
 
 impl ProbeQueuer for RecordingProbeQueuer {
+    fn queue_probe_at_turn_boundary(&self, run_id: &str, text: &str) -> bool {
+        if self
+            .flags
+            .hold_pending_turn_boundary
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && self
+                .flags
+                .pending_turn_boundary
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
+        self.queue_probe(run_id, text);
+        if self
+            .flags
+            .hold_pending_turn_boundary
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.flags
+                .pending_turn_boundary
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        true
+    }
+
+    fn can_queue_turn_boundary_probe(&self, _run_id: &str) -> bool {
+        !self
+            .flags
+            .pending_turn_boundary
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn has_pending_turn_boundary_probe(&self, _run_id: &str) -> bool {
+        self.flags
+            .pending_turn_boundary
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn retry_pending_turn_boundary_probe(&self, run_id: &str) {
+        if self
+            .flags
+            .pending_turn_boundary
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.deliver_calls
+                .lock()
+                .expect("RecordingProbeQueuer mutex poisoned")
+                .push(run_id.to_owned());
+        }
+    }
+
+    fn clear_pending_turn_boundary_probes(&self, run_id: &str, _reason: &str) -> bool {
+        if !self
+            .flags
+            .pending_turn_boundary
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
+        self.flags
+            .pending_turn_boundary
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.clear_calls
+            .lock()
+            .expect("RecordingProbeQueuer mutex poisoned")
+            .push(run_id.to_owned());
+        true
+    }
+
     fn queue_probe(&self, run_id: &str, text: &str) {
         self.calls
             .lock()
@@ -461,7 +540,7 @@ impl ProbeQueuer for RecordingProbeQueuer {
     /// taken back, unless the test marked it in flight; anything else has
     /// nothing left to withdraw.
     fn withdraw_nudge(&self, _run_id: &str, _reason: &str) -> bool {
-        if self.nudge_in_flight.load(std::sync::atomic::Ordering::SeqCst) {
+        if self.flags.nudge_in_flight.load(std::sync::atomic::Ordering::SeqCst) {
             return false;
         }
         let mut delivery = self.delivery.lock().expect("RecordingProbeQueuer mutex poisoned");
@@ -481,6 +560,25 @@ impl RecordingProbeQueuer {
 
     pub fn snapshot(&self) -> Vec<(String, String)> {
         self.calls.lock().expect("RecordingProbeQueuer mutex poisoned").clone()
+    }
+
+    /// The first write recovered; later sweeps may charge a new strike.
+    pub fn mark_turn_boundary_probe_delivered(&self) {
+        self.flags
+            .pending_turn_boundary
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn set_nudge_in_flight(&self, in_flight: bool) {
+        self.flags
+            .nudge_in_flight
+            .store(in_flight, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn hold_pending_turn_boundary(&self, hold: bool) {
+        self.flags
+            .hold_pending_turn_boundary
+            .store(hold, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn clear_snapshot(&self) -> Vec<String> {
@@ -2164,6 +2262,8 @@ mod pr_created_seam;
 mod review_skip_verdicts;
 #[cfg(test)]
 mod revision_delivery;
+#[cfg(test)]
+mod run_done_backstop;
 #[cfg(test)]
 mod status_ledger;
 #[cfg(test)]
