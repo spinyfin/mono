@@ -1024,14 +1024,6 @@ impl WorkerPool {
         inner.workers.iter().filter_map(|w| w.execution_id.clone()).collect()
     }
 
-    /// Format a worker id for slot `slot_id`. Inverse of
-    /// [`slot_id_from_worker_id`]; both sides of the
-    /// engine-owns-allocation refactor lean on this string format
-    /// being stable so `worker-{N}` and slot N stay 1:1.
-    pub fn worker_id_for_slot(slot_id: u8) -> String {
-        format!("worker-{}", slot_id)
-    }
-
     /// Number of slots whose execution already has a workspace lease.
     /// Used by the dispatcher's interactive-pool concurrency gate
     /// (`MAX_CONCURRENT_INTERACTIVE_WORKERS`). Slots that are only
@@ -1097,43 +1089,10 @@ impl WorkerPool {
     }
 }
 
-/// Parse the trailing 1-indexed slot number out of a worker id.
-/// Regular-pool `worker-{N}` ids map directly to slot N.
-/// Automation-pool `auto-worker-{N}` ids map to slot
-/// `N + MAX_WORKER_POOL_SIZE`; review-pool `review-{N}` ids map to
-/// slot `N + MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE`; progression-pool
-/// `progression-{N}` ids map to slot
-/// `N + MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE + MAX_REVIEW_POOL_SIZE`,
-/// so the four pools occupy disjoint slot ranges. With the current geometry
-/// (`MAX_WORKER_POOL_SIZE = 16`) that is `1..=16` interactive (Bridge
-/// Crew 1..=8, Lower Decks 9..=16), `17..=24` automation, `25..=40`
-/// review, `41..=44` progression — so "auto-worker-1" → slot 17,
-/// "review-1" → slot 25, "progression-1" → slot 41, never colliding with
-/// another pool's range. Every boundary is derived from
-/// the pool-size constants, so bumping [`WORKER_PAGE_COUNT`] shifts the
-/// automation/review ranges up in lock-step on both the engine and app.
-///
-/// Returns `None` for ids that don't match any recognised shape
-/// or whose suffix isn't a positive `u8`. Callers should treat
-/// `None` as a programming error — the only producer is
-/// [`WorkerPool::claim_worker`].
+/// Decode a valid legacy worker ID using the protocol's frozen slot ranges.
+/// Rejects out-of-range ordinals instead of aliasing another pool.
 pub fn slot_id_from_worker_id(worker_id: &str) -> Option<u8> {
-    if let Some(suffix) = worker_id.strip_prefix(PROGRESSION_WORKER_ID_PREFIX) {
-        let ordinal = suffix.parse::<u8>().ok().filter(|n| *n >= 1)? as usize;
-        return u8::try_from(ordinal + MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE + MAX_REVIEW_POOL_SIZE).ok();
-    }
-    if let Some(suffix) = worker_id.strip_prefix(REVIEW_WORKER_ID_PREFIX) {
-        let ordinal = suffix.parse::<u8>().ok().filter(|n| *n >= 1)? as usize;
-        return u8::try_from(ordinal + MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE).ok();
-    }
-    if let Some(suffix) = worker_id.strip_prefix(AUTOMATION_WORKER_ID_PREFIX) {
-        let ordinal = suffix.parse::<u8>().ok().filter(|n| *n >= 1)? as usize;
-        return u8::try_from(ordinal + MAX_WORKER_POOL_SIZE).ok();
-    }
-    if let Some(suffix) = worker_id.strip_prefix("worker-") {
-        return suffix.parse::<u8>().ok().filter(|n| *n >= 1);
-    }
-    None
+    boss_protocol::worker_identity::WorkerSlotIdentity::from_legacy_worker_id(worker_id)?.to_legacy_slot()
 }
 
 pub use boss_engine_storage_values::pool_policy::{
@@ -1141,36 +1100,21 @@ pub use boss_engine_storage_values::pool_policy::{
     pool_driver_slug_for_execution_kind,
 };
 
-/// Derive the canonical worker-id string for a pane slot id.
-/// Inverse of [`slot_id_from_worker_id`]: regular-pool slots
-/// (1..=MAX_WORKER_POOL_SIZE) produce `"worker-{N}"`; automation-pool
-/// slots (MAX_WORKER_POOL_SIZE < slot ≤ MAX_WORKER_POOL_SIZE +
-/// MAX_AUTOMATION_POOL_SIZE) produce `"auto-worker-{M}"`; review-pool
-/// slots (the next [`MAX_REVIEW_POOL_SIZE`]) produce `"review-{M}"`, and
-/// progression-pool slots (beyond that) produce `"progression-{M}"`, where M
-/// is the slot's offset from the start of the owning pool's range. Callers that
-/// release a pane slot must use this instead of
-/// [`WorkerPool::worker_id_for_slot`] to ensure the release is
-/// routed to the correct pool.
+/// Format a valid legacy slot using the shared protocol codec, or `None` for
+/// zero or unallocated slots (45 through 199).
+pub fn try_worker_id_for_slot(slot_id: u8) -> Option<String> {
+    boss_protocol::worker_identity::WorkerSlotIdentity::from_legacy_slot(slot_id)
+        .and_then(|identity| identity.to_legacy_worker_id())
+}
+
+/// Format a valid legacy slot using the shared protocol codec.
+///
+/// # Panics
+/// Panics for zero or unallocated slots (45 through 199). Use
+/// [`try_worker_id_for_slot`] when accepting untrusted or unvalidated slot
+/// numbers.
 pub fn worker_id_for_slot(slot_id: u8) -> String {
-    let slot = slot_id as usize;
-    if slot <= MAX_WORKER_POOL_SIZE {
-        format!("worker-{}", slot_id)
-    } else if slot <= MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE {
-        format!("{}{}", AUTOMATION_WORKER_ID_PREFIX, slot - MAX_WORKER_POOL_SIZE)
-    } else if slot <= MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE + MAX_REVIEW_POOL_SIZE {
-        format!(
-            "{}{}",
-            REVIEW_WORKER_ID_PREFIX,
-            slot - MAX_WORKER_POOL_SIZE - MAX_AUTOMATION_POOL_SIZE
-        )
-    } else {
-        format!(
-            "{}{}",
-            PROGRESSION_WORKER_ID_PREFIX,
-            slot - MAX_WORKER_POOL_SIZE - MAX_AUTOMATION_POOL_SIZE - MAX_REVIEW_POOL_SIZE
-        )
-    }
+    try_worker_id_for_slot(slot_id).expect("invalid legacy worker slot")
 }
 
 /// Human-readable page label for an interactive/main-pool `slot_id`, or
@@ -2238,7 +2182,7 @@ mod tests {
         // Covers the full interactive pool — Bridge Crew (1..=8) and Lower
         // Decks (9..=16) — so the second page round-trips 1:1 too.
         for slot in 1u8..=MAX_WORKER_POOL_SIZE as u8 {
-            let worker_id = WorkerPool::worker_id_for_slot(slot);
+            let worker_id = worker_id_for_slot(slot);
             assert_eq!(worker_id, format!("worker-{slot}"));
             assert_eq!(slot_id_from_worker_id(&worker_id), Some(slot));
         }
@@ -2396,6 +2340,80 @@ mod tests {
                 "slot {slot} must produce an automation-pool worker_id, got {back:?}"
             );
         }
+    }
+
+    #[test]
+    fn shared_legacy_codec_preserves_remote_slots_and_rejects_pool_overflow() {
+        for slot in 200..=255 {
+            let id = format!("worker-{slot}");
+            assert_eq!(worker_id_for_slot(slot), id);
+            assert_eq!(slot_id_from_worker_id(&id), Some(slot));
+        }
+        for id in ["worker-17", "worker-32", "auto-worker-9", "review-17", "progression-5"] {
+            assert_eq!(slot_id_from_worker_id(id), None);
+        }
+    }
+
+    #[test]
+    fn try_worker_id_for_slot_handles_invalid_and_valid_slots() {
+        assert_eq!(try_worker_id_for_slot(0), None);
+        for slot in 45..=199 {
+            assert_eq!(try_worker_id_for_slot(slot), None, "slot {slot} must be unallocated");
+        }
+        assert_eq!(try_worker_id_for_slot(1).as_deref(), Some("worker-1"));
+        assert_eq!(try_worker_id_for_slot(16).as_deref(), Some("worker-16"));
+        assert_eq!(try_worker_id_for_slot(17).as_deref(), Some("auto-worker-1"));
+        assert_eq!(try_worker_id_for_slot(25).as_deref(), Some("review-1"));
+        assert_eq!(try_worker_id_for_slot(41).as_deref(), Some("progression-1"));
+        assert_eq!(try_worker_id_for_slot(200).as_deref(), Some("worker-200"));
+        assert_eq!(try_worker_id_for_slot(255).as_deref(), Some("worker-255"));
+    }
+
+    #[test]
+    fn legacy_codec_boundaries_match_pool_size_constants() {
+        use boss_protocol::DispatchPool;
+        use boss_protocol::worker_identity::{WorkerSlotIdentity, WorkerSlotPool};
+
+        let main_end = MAX_WORKER_POOL_SIZE as u8;
+        let auto_end = main_end + MAX_AUTOMATION_POOL_SIZE as u8;
+        let review_end = auto_end + MAX_REVIEW_POOL_SIZE as u8;
+        let progression_end = review_end + MAX_PROGRESSION_POOL_SIZE as u8;
+
+        assert_eq!(
+            WorkerSlotIdentity::from_legacy_slot(main_end),
+            WorkerSlotIdentity::new(WorkerSlotPool::Local(DispatchPool::Main), MAX_WORKER_POOL_SIZE as u32)
+        );
+        assert_eq!(
+            WorkerSlotIdentity::from_legacy_slot(main_end + 1),
+            WorkerSlotIdentity::new(WorkerSlotPool::Local(DispatchPool::Automation), 1)
+        );
+        assert_eq!(
+            WorkerSlotIdentity::from_legacy_slot(auto_end),
+            WorkerSlotIdentity::new(
+                WorkerSlotPool::Local(DispatchPool::Automation),
+                MAX_AUTOMATION_POOL_SIZE as u32
+            )
+        );
+        assert_eq!(
+            WorkerSlotIdentity::from_legacy_slot(auto_end + 1),
+            WorkerSlotIdentity::new(WorkerSlotPool::Local(DispatchPool::Review), 1)
+        );
+        assert_eq!(
+            WorkerSlotIdentity::from_legacy_slot(review_end),
+            WorkerSlotIdentity::new(WorkerSlotPool::Local(DispatchPool::Review), MAX_REVIEW_POOL_SIZE as u32)
+        );
+        assert_eq!(
+            WorkerSlotIdentity::from_legacy_slot(review_end + 1),
+            WorkerSlotIdentity::new(WorkerSlotPool::Local(DispatchPool::Progression), 1)
+        );
+        assert_eq!(
+            WorkerSlotIdentity::from_legacy_slot(progression_end),
+            WorkerSlotIdentity::new(
+                WorkerSlotPool::Local(DispatchPool::Progression),
+                MAX_PROGRESSION_POOL_SIZE as u32
+            )
+        );
+        assert_eq!(WorkerSlotIdentity::from_legacy_slot(progression_end + 1), None);
     }
 
     #[test]

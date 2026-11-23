@@ -25,6 +25,7 @@ mod wire;
 mod work_item_id;
 pub mod work_tree_delta;
 mod worker_event;
+pub mod worker_identity;
 mod worker_names;
 
 pub use board_population::*;

@@ -68,6 +68,30 @@ async fn retire_pane_succeeds_for_husk_slot_with_no_app_session() {
 }
 
 #[tokio::test]
+async fn retire_pane_request_is_idempotent_noop_for_unallocated_and_valid_slots() {
+    let (server_state, _dir) = test_server_state();
+    for slot_id in [0u8, 45u8, 4u8] {
+        let sink = make_session_sink();
+        let ctx = Dispatch::builder()
+            .server_state(server_state.clone())
+            .work_db(Arc::new(server_state.work_db.query_connection().unwrap()))
+            .sink(sink.clone())
+            .session_id("retire-test")
+            .request_id(format!("retire-{slot_id}"))
+            .recv_instant(std::time::Instant::now())
+            .decode_ms(0.0)
+            .build();
+        dispatch::dispatch_request(ctx, FrontendRequest::RetirePane { slot_id }, false).await;
+        let reply = sink.next().await.expect("RetirePane must send a reply");
+        assert!(
+            matches!(reply.payload, FrontendEvent::PaneRetired { slot_id: got } if got == slot_id),
+            "slot {slot_id}: expected PaneRetired, got {:?}",
+            reply.payload
+        );
+    }
+}
+
+#[tokio::test]
 async fn retire_pane_targets_reported_viewer_run_without_worker_registry() {
     // A husk has no engine registry entry; inventory supplies viewer identity,
     // never process ownership. Detach carries that identity across slot reuse.

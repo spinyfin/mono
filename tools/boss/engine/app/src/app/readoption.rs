@@ -358,8 +358,7 @@ impl ServerState {
                          re-dispatch protection rests on its status alone",
                     );
                     None
-                } else {
-                    let worker_id = boss_execution_contracts::worker_id_for_slot(candidate_slot_id);
+                } else if let Some(worker_id) = boss_execution_contracts::try_worker_id_for_slot(candidate_slot_id) {
                     let reclaimed = self.execution_coordinator.reclaim_slot(&worker_id, run_id).await;
                     if reclaimed {
                         Some(candidate_slot_id)
@@ -374,6 +373,8 @@ impl ServerState {
                         );
                         None
                     }
+                } else {
+                    None
                 }
             }
             None => None,
