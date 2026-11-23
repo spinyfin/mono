@@ -154,8 +154,8 @@ pub use boss_execution_contracts::{
 /// is NOT the same as saying automation never counts toward the number
 /// this cap compares against: `busy_count()` counts claimed `worker_pool`
 /// slots whose workspace lease has already succeeded (`working`), and a
-/// spilled automation run (one that overflowed its full home pool onto a
-/// Lower Decks interactive slot via `claim_worker_spill`) IS one of those
+/// spilled automation run (one that overflowed its full home pool onto an
+/// interactive spill-page slot via `claim_worker_spill`) IS one of those
 /// slots once it has a workspace, so it DOES count against this cap. A
 /// slot that is only acquiring a workspace is tracked separately as
 /// lease-pending and is excluded from this comparison — otherwise a
@@ -177,12 +177,12 @@ pub use boss_execution_contracts::{
 /// `drain_ready_queue` is what keeps mainline from starving behind spilled
 /// automation at the cap — a preemption is a trade (one live worker for
 /// another), so it can reclaim a slot from spilled automation without ever
-/// pushing the live count past the cap. The interactive pool has 16 slots
-/// across two pages (Bridge Crew + Lower Decks); the 2026-07-15 full-fleet
-/// saturation experiment (22 live workers, load average ~152) pushed
-/// individual task times past an hour and broke pane spawn acks, which is
-/// why dispatch defaults to one page's worth — the pre-Lower-Decks size —
-/// even though all 16 slots exist.
+/// pushing the live count past the cap. The interactive pool has 32 slots
+/// across four pages (Bridge Crew, Lower Decks, Deck 3, Deck 4); the
+/// 2026-07-15 full-fleet saturation experiment (22 live workers, load
+/// average ~152) pushed individual task times past an hour and broke pane
+/// spawn acks, which is why dispatch defaults to one page's worth — the
+/// Bridge Crew size — even though all 32 slots exist.
 ///
 /// The live cap is settable at runtime via
 /// [`ExecutionCoordinator::set_max_concurrent_interactive_workers`]
@@ -550,7 +550,7 @@ pub struct ExecutionCoordinator {
     /// Dedicated pool for `progression` administrative agents. Its own small
     /// pool (`progression.pool_size`) so a progression run never takes an
     /// interactive slot: it is invisible to the interactive concurrency cap and
-    /// to Lower Decks spillover, nothing spills into it, and it honours the
+    /// to interactive spillover, nothing spills into it, and it honours the
     /// operator and breaker pauses like every other non-review pool.
     #[builder(default = WorkerPool::new_progression(
         boss_engine_storage_values::progression::DEFAULT_POOL_SIZE

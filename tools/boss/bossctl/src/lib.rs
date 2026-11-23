@@ -661,11 +661,11 @@ enum DispatchAction {
         #[command(subcommand)]
         action: focus::FocusAction,
     },
-    /// Get or set the interactive-pool ("Bridge Crew" + "Lower Decks")
-    /// concurrency cap — the ceiling `drain_ready_queue` enforces on live
-    /// main-pool workers separately from the underlying 32-slot worker
-    /// pool. Raising it lets dispatch spill into Lower Decks and the decks
-    /// above it (main workers 9-32)
+    /// Get or set the interactive-pool (Bridge Crew, Lower Decks, Deck 3,
+    /// Deck 4) concurrency cap — the ceiling `drain_ready_queue` enforces on
+    /// live main-pool workers separately from the underlying 32-slot worker
+    /// pool. Raising it lets dispatch spill beyond Bridge Crew onto the
+    /// remaining interactive pages (main workers 9-32)
     /// instead of holding rows once 8 are live; lowering it takes effect
     /// on the very next drain pass. Persisted to `state.db`, so a change
     /// survives an engine restart. Does not affect the review pool, which

@@ -45,13 +45,13 @@ the concurrency ceiling is the main pool's 32.
 **Dynamic capacity is not activated by this groundwork.** No configuration or
 operator action can activate it through this change.
 
-The main pool ceiling was raised from 16 to 32 by splitting the main range
-across the legacy slot byte (above), as a deliberate shortcut: the ordering
-below — raise limits only after every boundary stops requiring a legacy byte —
-was superseded for that change by the repo owner's decision on 2026-11-23. The
-full migration described next is still a separate, optional refactor. It is
-not a prerequisite for the 32-slot main pool, and nothing in the 32-slot change
-migrates wire messages, registry keys or session addressing.
+The 32-slot main pool is an intentional exception to the ordering below:
+splitting main indexes 17–32 into the unallocated legacy slots 45–60 fits
+within the existing legacy slot byte, moves no existing slot number, and
+requires no wire, registry, or session-addressing migration. The full
+migration described next remains a separate, optional refactor and is not a
+prerequisite for the 32-slot ceiling; any further raise beyond the legacy
+slot byte still follows the staged ordering below.
 
 Consumers should first carry the canonical identity internally and use the
 checked codec at existing numeric boundaries. Next, migrate storage, wire

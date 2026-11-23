@@ -8,10 +8,11 @@
 //! per-connection ingress tasks happen to finish — see
 //! [`LiveWorkerStateRegistry::apply_sequenced_event`].
 //!
-//! Keyed by slot id (the interactive pool spans 1..=16 across two pages,
-//! with automation/review above it), not run id — run records finalise
-//! quickly after spawn (they model the spawn act, not the worker's
-//! life). Two consecutive runs in the same slot reuse the slot key.
+//! Keyed by slot id (the interactive pool spans slots 1..=16 and 45..=60
+//! across four pages, with automation/review/progression in 17..=44), not
+//! run id — run records finalise quickly after spawn (they model the spawn
+//! act, not the worker's life). Two consecutive runs in the same slot reuse
+//! the slot key.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -72,7 +73,7 @@ pub use prompt_acceptance::turn_evidence_kind;
 /// item they are bound to), PR reviews and review guides always report
 /// `"review"`, automation triage and other automation-sourced work report
 /// `"automation"`, everything else reports `"main"`. Independent of which physical slot the run
-/// occupies (automation can spill into a main-pool Lower Decks slot).
+/// occupies (automation can spill into a main-pool spill-page slot after Bridge Crew).
 ///
 /// Used at spawn registration to stamp [`LiveWorkerState::pool`] so
 /// `bossctl agents list` can render pool without joining the execution
