@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 /// In-app surface for the main-thread stall log (the shake's "reviewing

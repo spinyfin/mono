@@ -1,6 +1,10 @@
 load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
 
-package(default_visibility = ["//visibility:private"])
+# Warnings are errors; see //tools/boss/app-macos/BUILD.bazel.
+package(
+    default_visibility = ["//visibility:private"],
+    features = ["swift.treat_warnings_as_errors"],
+)
 
 swift_library(
     name = "UpdateCore",

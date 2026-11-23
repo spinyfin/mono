@@ -41,7 +41,15 @@ _ENGINE_BINARY_SWIFT_SOURCE = """enum BossEngineBinary {
     ENGINE_BINARY_BUNDLE_FRAGMENT,
 )
 
-package(default_visibility = ["//visibility:private"])
+# Swift compiler warnings are build errors in this package. The feature is
+# rules_swift's own `-warnings-as-errors`; it is set per package (not with a
+# global --features flag) because a global flag would also reach third-party
+# SwiftPM modules, whose warnings this repo cannot fix. Every package that
+# declares a Swift target must carry this line.
+package(
+    default_visibility = ["//visibility:private"],
+    features = ["swift.treat_warnings_as_errors"],
+)
 
 exports_files([
     "Package.resolved",
