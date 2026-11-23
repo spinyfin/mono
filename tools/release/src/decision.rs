@@ -61,6 +61,13 @@ impl std::fmt::Display for SkipReason {
     }
 }
 
+/// Log line `prepare` prints when it decides the run is a no-op. The
+/// boss-release CI already-tagged skip prints the AlreadyReleased form of
+/// this line without building the release tool.
+pub fn skip_log_line(reason: &SkipReason) -> String {
+    format!("release skipped: {reason}")
+}
+
 /// Decides whether a release run should stop before allocating a new version.
 ///
 /// Idempotency applies to every accepted trigger. Only scheduled runs use
@@ -248,6 +255,12 @@ mod tests {
             }
             .to_string(),
             "no release-affecting changes since demo-v1.0.0"
+        );
+        assert_eq!(
+            skip_log_line(&SkipReason::AlreadyReleased {
+                tag: "boss-v1.0.1102".to_owned()
+            }),
+            "release skipped: HEAD is already boss-v1.0.1102 — re-releasing the same commit is a no-op"
         );
     }
 }

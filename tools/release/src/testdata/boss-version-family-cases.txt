@@ -1,0 +1,16 @@
+# Shared version-family test corpus for tools/boss/release.toml (boss-v, 1.0).
+# Read by both tools/release/src/version.rs and .buildkite/steps/tests/boss_head_release_tag_test.sh.
+boss-v1.0.0 yes
+boss-v1.0.1102 yes
+boss-v1.0.09 yes
+boss-v1.0.18446744073709551615 yes
+boss-v1.0.18446744073709551616 no
+boss-v1.0.99999999999999999999 no
+boss-v1.0.123456789012345678901 no
+boss-v1.0.stale no
+boss-v1.0.1102-rc1 no
+boss-v1.0. no
+boss-v2.0.0 no
+boss-v1.1.0 no
+other-v1.0.0 no
+boss-v no

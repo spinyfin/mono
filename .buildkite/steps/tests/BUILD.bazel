@@ -67,6 +67,24 @@ sh_test(
     data = ["//.buildkite/steps:bazel-server-lock.sh"],
 )
 
+# Script-level test for the cheap already-tagged skip boss-release.sh runs
+# before ci-env.sh builds //tools/release: a fixture whose HEAD is the latest
+# published boss-v1.0.N family release exits without bazel; an older published
+# HEAD, a draft, or an untagged HEAD reaches prepare.
+# Tag matching is the same version-family rule as bin/release prepare.
+sh_test(
+    name = "boss_head_release_tag_test",
+    size = "small",
+    srcs = ["boss_head_release_tag_test.sh"],
+    data = [
+        "//.buildkite/steps:boss-head-release-tag.sh",
+        "//.buildkite/steps:boss-release.sh",
+        "//.buildkite/steps:fetch-boss-tags.sh",
+        "//tools:boss/release.toml",
+        "//tools/release:src/testdata/boss-version-family-cases.txt",
+    ],
+)
+
 # Script-level test for the boss-v* tag sync ci-env.sh runs before its first
 # bazel call: missing boss-v* tags are fetched, deleted boss-v* tags are
 # pruned, moved boss-v* tags are updated, unrelated tags are untouched, and

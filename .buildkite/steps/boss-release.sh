@@ -18,6 +18,51 @@
 # tools/boss/docs/buildkite-shake-secrets-setup.md.
 set -euo pipefail
 
+# Cheap already-tagged skip. ci-env.sh installs bin/release via repobin, which
+# builds //tools/release before `prepare` can see that HEAD is already the
+# latest published boss-v* commit. On a no-op check that build is most of the
+# step. Fetch tags first (Buildkite checkouts do not). Skip here only when:
+#   1. resume-draft (RELEASE_RESUME_DRAFT / CHECKLEFT_RESUME_DRAFT) is not 1,
+#   2. tools/boss/release.toml parses cleanly,
+#   3. HEAD carries a version-family tag, and
+#   4. that tag is also the highest published family GitHub Release (drafts
+#      excluded; other families such as checkleft ignored). Matches
+#      `should_skip` AlreadyReleased: head_sha == last_published_sha.
+# A HEAD pinned to an older published family tag, a draft, a missing release,
+# a gh error, a config parse error, resume-draft, and an untagged HEAD all
+# fall through to `bin/release prepare`. When a family tag is on HEAD (or
+# release.toml fails to parse) and the skip is not taken, one stderr line
+# names the reason.
+# shellcheck source=fetch-boss-tags.sh
+source "$(dirname "${BASH_SOURCE[0]}")/fetch-boss-tags.sh"
+# shellcheck source=boss-head-release-tag.sh
+source "$(dirname "${BASH_SOURCE[0]}")/boss-head-release-tag.sh"
+if ! ci_fetch_boss_tags; then
+  echo "ERROR: failed to fetch boss-v* tags from origin. Refusing to decide a release from stale tags." >&2
+  exit 1
+fi
+if ! ci_boss_load_release_config "tools/boss/release.toml"; then
+  ci_boss_early_skip_not_taken "release.toml parse failed"
+elif tag="$(ci_boss_head_release_tag)"; then
+  if ci_boss_resume_draft_enabled; then
+    ci_boss_early_skip_not_taken "resume-draft set"
+  elif ! ci_boss_github_family_release_rows "${CI_BOSS_RELEASE_REPO}"; then
+    ci_boss_early_skip_not_taken "gh error: ${CI_BOSS_GH_STDERR}"
+  else
+    latest="$(printf '%s\n' "$CI_BOSS_RELEASE_ROWS" | ci_boss_select_latest_published_family_tag || true)"
+    if [[ -n "$latest" && "$latest" == "$tag" ]]; then
+      echo "$(ci_boss_already_released_skip_message "$tag")"
+      exit 0
+    fi
+    head_draft="$(printf '%s\n' "$CI_BOSS_RELEASE_ROWS" | ci_boss_row_draft_for_tag "$tag")"
+    if [[ "$head_draft" == "false" ]]; then
+      ci_boss_early_skip_not_taken "newer published release exists"
+    else
+      ci_boss_early_skip_not_taken "release is a draft"
+    fi
+  fi
+fi
+
 # This step may execute its bazel actions on the remote macOS workers; ci-env.sh
 # decides whether it does (see remote-execution.sh). For this step, opting in is
 # a decision about the shake credentials, which the build below passes through

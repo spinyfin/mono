@@ -126,7 +126,7 @@ pub fn prepare(
         change_paths: &config.change_paths,
         changed_paths: &changed_paths,
     }) {
-        eprintln!("release skipped: {reason}");
+        eprintln!("{}", crate::skip_log_line(&reason));
         return Ok(PrepareOutcome::Skipped);
     }
 

@@ -222,6 +222,8 @@ mod tests {
     const PATCH_MANIFEST: &str = include_str!("testdata/patch-package.toml");
     const ALPHA_TAGS: &str = include_str!("testdata/alpha-tags.txt");
     const PATCH_TAGS: &str = include_str!("testdata/patch-tags.txt");
+    const BOSS_RELEASE_CONFIG: &str = include_str!("../../../tools/boss/release.toml");
+    const BOSS_VERSION_FAMILY_CASES: &str = include_str!("testdata/boss-version-family-cases.txt");
 
     fn tags(contents: &str) -> Vec<String> {
         contents.lines().map(str::to_owned).collect()
@@ -297,6 +299,46 @@ source = "github-generated"
         let next = compute_next_version(&config, "boss-v", None, &[]).expect("compute first version");
 
         assert_eq!(next.version, "1.0.0");
+    }
+
+    #[test]
+    fn boss_version_family_agrees_with_ci_already_tagged_skip() {
+        let config = ReleaseConfig::parse(BOSS_RELEASE_CONFIG).expect("parse tools/boss/release.toml");
+        let mut checked = 0usize;
+        for line in BOSS_VERSION_FAMILY_CASES.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (tag, want) = line.split_once(' ').expect("case line must be '<tag> <yes|no>'");
+            let expected = match want.trim() {
+                "yes" => true,
+                "no" => false,
+                other => panic!("unexpected case expectation {other:?} for {tag}"),
+            };
+            let actual = matching_tag_counter(&config.version, &config.tag_prefix, None, tag)
+                .expect("family check")
+                .is_some();
+            assert_eq!(actual, expected, "tag {tag}");
+            checked += 1;
+        }
+        assert!(checked > 0, "shared corpus must contain at least one case");
+
+        let highest = highest_matching_tag(
+            &config.version,
+            &config.tag_prefix,
+            None,
+            &[
+                "boss-v1.0.stale".to_owned(),
+                "boss-v1.0.9".to_owned(),
+                "boss-v1.0.1102".to_owned(),
+                "boss-v1.0.18446744073709551616".to_owned(),
+                "boss-v2.0.0".to_owned(),
+            ],
+        )
+        .expect("highest")
+        .map(|(_, tag)| tag);
+        assert_eq!(highest.as_deref(), Some("boss-v1.0.1102"));
     }
 
     #[test]
