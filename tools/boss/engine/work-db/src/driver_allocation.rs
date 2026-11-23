@@ -180,6 +180,8 @@ pub const REASON_LEGACY_PERCENTAGE: &str = "percentage";
 /// when every funded driver was at 0%.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriverDecision {
+    /// Actual model frozen after a successful launch; unknown before launch.
+    pub model: Option<String>,
     pub driver: Option<String>,
     pub reason: &'static str,
     pub split_at_decision: Option<DriverTrafficSplit>,
@@ -188,6 +190,7 @@ pub struct DriverDecision {
 impl DriverDecision {
     fn explicit(driver: String) -> Self {
         Self {
+            model: None,
             driver: Some(driver),
             reason: REASON_EXPLICIT,
             split_at_decision: None,
@@ -196,6 +199,7 @@ impl DriverDecision {
 
     fn pool(driver: &'static str) -> Self {
         Self {
+            model: None,
             driver: Some(driver.to_owned()),
             reason: REASON_POOL,
             split_at_decision: None,
@@ -204,6 +208,7 @@ impl DriverDecision {
 
     fn default_no_override() -> Self {
         Self {
+            model: None,
             driver: None,
             reason: REASON_DEFAULT,
             split_at_decision: None,
@@ -212,6 +217,7 @@ impl DriverDecision {
 
     pub(crate) fn allocation_failed(split: Option<DriverTrafficSplit>) -> Self {
         Self {
+            model: None,
             driver: None,
             reason: REASON_ALLOCATION_FAILED,
             split_at_decision: split,
@@ -220,6 +226,7 @@ impl DriverDecision {
 
     fn allocated(driver: &'static str, split: DriverTrafficSplit) -> Self {
         Self {
+            model: None,
             driver: Some(driver.to_owned()),
             reason: REASON_ALLOCATION,
             split_at_decision: Some(split),
@@ -372,7 +379,7 @@ pub(crate) fn get_execution_driver_decision_conn(
     execution_id: &str,
 ) -> Result<Option<DriverDecision>> {
     conn.query_row(
-        "SELECT driver, reason, split_at_decision
+        "SELECT driver, reason, split_at_decision, model
            FROM execution_driver_decisions
           WHERE execution_id = ?1",
         params![execution_id],
@@ -388,6 +395,7 @@ pub(crate) fn get_execution_driver_decision_conn(
             };
             let split_raw: Option<String> = row.get(2)?;
             Ok(DriverDecision {
+                model: row.get(3)?,
                 driver: row.get(0)?,
                 reason,
                 split_at_decision: split_raw.and_then(|raw| serde_json::from_str(&raw).ok()),

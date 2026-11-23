@@ -1142,6 +1142,13 @@ mod floor_tests {
             ),
         ];
         steps.push((
+            "20261122_0432_execution_allocation_model",
+            Box::new(|c| {
+                c.execute_batch("ALTER TABLE execution_driver_decisions ADD COLUMN model TEXT")
+                    .unwrap();
+            }),
+        ));
+        steps.push((
             "20261120_1630_run_usage_unavailable",
             Box::new(|c| {
                 c.execute_batch("ALTER TABLE work_runs ADD COLUMN usage_unavailable TEXT DEFAULT 'No provider token usage observed'")

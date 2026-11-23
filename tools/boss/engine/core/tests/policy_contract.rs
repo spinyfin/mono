@@ -23,18 +23,19 @@ mod cost_pricing {
             let price = ModelPriceUsdPerMillion {
                 input: 3.0,
                 output: 15.0,
-                cache_write: 3.75,
-                cache_read: 0.30,
+                cache_write: Some(3.75),
+                cache_read: Some(0.30),
             };
             // 1M input + 1M output + 1M cache-write + 1M cache-read tokens.
             let usd = estimate_usd(price, 1_000_000, 1_000_000, 1_000_000, 1_000_000);
+            let usd = usd.expect("all token categories have known prices");
             assert!((usd - (3.0 + 15.0 + 3.75 + 0.30)).abs() < 1e-9, "usd={usd}");
         }
 
         #[test]
         fn zero_tokens_estimate_to_zero() {
             let price = price_for_model("sonnet").expect("sonnet priced");
-            assert_eq!(estimate_usd(price, 0, 0, 0, 0), 0.0);
+            assert_eq!(estimate_usd(price, 0, 0, 0, 0), Some(0.0));
         }
     }
 }

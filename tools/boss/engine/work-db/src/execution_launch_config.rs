@@ -16,6 +16,15 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let existing = query_execution(&tx, execution_id).require("execution", execution_id)?;
+        // Seed the selected launch model even when no usage arrives. Observed
+        // transcript models remain authoritative, including mixed-model usage.
+        tx.execute(
+            "UPDATE work_runs SET model = ?2
+             WHERE execution_id = ?1 AND status = 'active' AND model IS NULL
+               AND input_tokens IS NULL AND output_tokens IS NULL
+               AND cache_creation_tokens IS NULL AND cache_read_tokens IS NULL",
+            params![execution_id, model],
+        )?;
         if existing.driver.is_some() || existing.model.is_some() {
             tx.commit()?;
             return Ok(existing);
@@ -29,9 +38,17 @@ impl WorkDb {
              WHERE id = ?1",
             params![execution_id, driver, model, effort_level.map(|level| level.as_str())],
         )?;
+        tx.execute(
+            "UPDATE execution_driver_decisions SET model = ?2 WHERE execution_id = ?1",
+            params![execution_id, model],
+        )?;
         let updated = query_execution(&tx, execution_id)?
             .with_context(|| format!("missing execution after launch-config update: {execution_id}"))?;
         tx.commit()?;
         Ok(updated)
     }
 }
+
+#[cfg(test)]
+#[path = "execution_launch_config_tests.rs"]
+mod tests;

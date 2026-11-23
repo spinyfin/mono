@@ -6,7 +6,7 @@
 use std::fmt;
 use std::path::Path;
 
-use boss_protocol::{EffortLevel, ReasoningMode, TaskKind};
+use boss_protocol::{EffortLevel, ExecutionKind, ReasoningMode, TaskKind};
 
 use boss_engine_driver::DriverRegistry;
 
@@ -196,12 +196,14 @@ pub enum ModelResolutionSource {
     /// Recorded as `sol_experiment` in dispatch events (`spawn_config.model_source`);
     /// the string is kept so earlier and later events stay comparable.
     SolExperiment,
+    ExecutionKind,
     TaskOverride,
     DesignInvestigationTier,
     PoolStrongTier,
     /// The cheap standard tier requested by [`PoolModelTier::Standard`].
     PoolStandardTier,
     Reasoning,
+    WorkTypeKind,
     LegacyKindFloor,
     LegacyEffortTable,
     ProductDefault,
@@ -213,11 +215,13 @@ impl ModelResolutionSource {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::SolExperiment => "sol_experiment",
+            Self::ExecutionKind => "execution_kind",
             Self::TaskOverride => "task_override",
             Self::DesignInvestigationTier => "design_investigation_tier",
             Self::PoolStrongTier => "pool_strong_tier",
             Self::PoolStandardTier => "pool_standard_tier",
             Self::Reasoning => "reasoning",
+            Self::WorkTypeKind => "work_type_kind",
             Self::LegacyKindFloor => "legacy_kind_floor",
             Self::LegacyEffortTable => "legacy_effort_table",
             Self::ProductDefault => "product_default",
@@ -462,13 +466,19 @@ pub fn is_design_or_investigation_tier(kind: Option<&TaskKind>, reasoning: Optio
 /// Tier selection preserves the row's effort mapping; the explicit design
 /// xhigh override still takes precedence over that mapping.
 ///
-/// Ordinary rows use this precedence:
+/// Optional driver work-type tables refine standard effort and can select an
+/// execution role after explicit pins and before pool/row defaults.
+/// Ordinary rows on drivers without that table use this precedence:
 /// 1. `tasks.model_override` (when non-empty after trim).
 /// 2. `pool_model_override` — the owning pool's override, expressed as a
 ///    driver-relative [`PoolModelTier`] rather than a literal model slug.
 ///    Both the automation pool and the review pool set this to
-///    [`PoolModelTier::Strong`] unconditionally, which resolves through the
-///    *selected driver's* menu the same way step 3 does (via
+///    [`PoolModelTier::Strong`] unconditionally. For drivers with a
+///    `work_type_policy`, [`PoolModelTier::Strong`] resolves to
+///    `policy.pool_fallback_model` (e.g. Hydrogen on Antigravity) while named
+///    review and design execution roles are already selected by
+///    `work_type_policy.execution_model` before step 2. Otherwise it resolves
+///    through the *selected driver's* menu the same way step 3 does (via
 ///    [`boss_engine_driver::ModelMenu::model_for_reasoning`]) — so a Claude
 ///    reviewer still lands on Opus and a Codex reviewer lands on Codex's own
 ///    strong-tier model, never on a literal `"opus"` a non-Claude CLI
@@ -528,8 +538,10 @@ pub fn resolve_spawn_config(input: &SpawnResolutionInput) -> Result<SpawnConfig,
 /// emits a token).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolModelTier {
-    /// The strong/high-capability tier for the resolved driver, reached via
-    /// the same lever `tasks.reasoning = investigation` uses:
+    /// The strong/high-capability tier for the resolved driver. Drivers with a
+    /// `work_type_policy` resolve this to `policy.pool_fallback_model` (after
+    /// `work_type_policy.execution_model` has already selected named review and
+    /// design roles). Other drivers reach it via
     /// [`boss_engine_driver::ModelMenu::model_for_reasoning`]`(`[`ReasoningMode::Investigation`]`)`.
     /// Both the automation pool and the review pool request this tier
     /// unconditionally.
@@ -549,6 +561,8 @@ pub enum PoolModelTier {
 /// how they combine.
 #[derive(Debug, Clone, Default, bon::Builder)]
 pub struct SpawnResolutionInput<'a> {
+    pub execution_kind: Option<&'a ExecutionKind>,
+    pub created_via: Option<&'a str>,
     pub effort_level: Option<EffortLevel>,
     /// Explicit row-level model pin. It takes precedence over the dedicated
     /// design/investigation tier as a deliberate human escape hatch.
@@ -603,13 +617,21 @@ pub fn resolve_spawn_config_in(
     let tier_applies = design_or_investigation_tier
         && input.model_override.map(str::trim).is_none_or(str::is_empty)
         && input.pool_model_override.is_none();
+    let execution_model = menu
+        .work_type_policy
+        .and_then(|policy| policy.execution_model(input.execution_kind, input.created_via));
     let (mut model, mut model_source) = if let Some(m) = input.model_override.map(str::trim).filter(|s| !s.is_empty()) {
         (m.to_owned(), ModelResolutionSource::TaskOverride)
+    } else if let Some(model) = execution_model {
+        (model.to_owned(), ModelResolutionSource::ExecutionKind)
     } else if let Some(PoolModelTier::Strong) = input.pool_model_override {
-        // Resolved against the selected driver's menu, same lever as step 3
-        // below — never a literal model slug from another driver's vocabulary.
+        // Work-type policies can keep generic automation cheap. Specific review
+        // and design execution roles were already selected above.
         (
-            (menu.model_for_reasoning)(ReasoningMode::Investigation).to_owned(),
+            menu.work_type_policy
+                .map(|policy| policy.pool_fallback_model)
+                .unwrap_or_else(|| (menu.model_for_reasoning)(ReasoningMode::Investigation))
+                .to_owned(),
             ModelResolutionSource::PoolStrongTier,
         )
     } else if let Some(PoolModelTier::Standard) = input.pool_model_override {
@@ -622,14 +644,18 @@ pub fn resolve_spawn_config_in(
             .design_investigation_model
             .ok_or_else(|| SpawnResolutionError::IneligibleDesignInvestigationDriver { driver: driver.clone() })?;
         (model().to_owned(), ModelResolutionSource::DesignInvestigationTier)
+    } else if let Some((_, model)) = menu
+        .work_type_policy
+        .and_then(|policy| policy.kind_models.iter().find(|(kind, _)| Some(kind) == input.kind))
+    {
+        ((*model).to_owned(), ModelResolutionSource::WorkTypeKind)
     } else if let Some(reasoning) = input.reasoning {
-        // The capability lever. Note what is NOT consulted here: `effort_level`
-        // plays no part, in either direction. That is the whole point — see
-        // this function's doc comment, step 3.
-        (
-            (menu.model_for_reasoning)(reasoning).to_owned(),
-            ModelResolutionSource::Reasoning,
-        )
+        // Drivers may refine standard work by effort; investigation keeps its tier.
+        let model = match (reasoning, menu.work_type_policy) {
+            (ReasoningMode::Standard, Some(policy)) => (policy.standard_model_for_effort)(effort_level),
+            _ => (menu.model_for_reasoning)(reasoning),
+        };
+        (model.to_owned(), ModelResolutionSource::Reasoning)
     } else if matches!(input.kind, Some(TaskKind::DesignPostmortem | TaskKind::Investigation)) {
         (
             (menu.model_for_reasoning)(ReasoningMode::Investigation).to_owned(),
@@ -1083,6 +1109,7 @@ mod tests {
             initial_prompt_filename: "initial-prompt.txt",
             model_menu: DriverModelMenu {
                 resolve_model_effort: None,
+                work_type_policy: None,
                 engine_default: "stub-model",
                 effort_value_for_level: stub_effort_value_for_level,
                 default_model_for_level: stub_default_model_for_level,
@@ -2278,9 +2305,14 @@ mod tests {
                 (EffortLevel::Large, "xhigh"),
                 (EffortLevel::Max, "xhigh"),
             ] {
-                let menu = menu_for_driver_in(&DriverRegistry::default(), "agy").unwrap();
-                let family = (menu.model_for_reasoning)(reasoning);
-                let rung = if rung == "xhigh" && family != "gemini-4-hydrogen" {
+                let family = match reasoning {
+                    ReasoningMode::Investigation => "gemini-4-carbon",
+                    ReasoningMode::Standard if matches!(level, EffortLevel::Trivial | EffortLevel::Small) => {
+                        "gemini-4-hydrogen"
+                    }
+                    ReasoningMode::Standard => "gemini-4-neon",
+                };
+                let rung = if rung == "xhigh" && family == "gemini-4-carbon" {
                     "high"
                 } else {
                     rung
@@ -2523,3 +2555,6 @@ mod tests {
         assert_eq!(cfg.model, "stub-standard");
     }
 }
+
+#[cfg(test)]
+mod work_type_tests;

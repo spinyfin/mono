@@ -28,6 +28,7 @@ pub mod initial_prompt;
 pub mod path_guard;
 pub mod scoped_home;
 pub mod transcript_store;
+pub mod work_type_policy;
 
 /// Wall-clock cap, in seconds, on each of the two sequential subprocesses the
 /// checkleft push guard script runs (the repobin probe, then `checkleft run`).
@@ -509,7 +510,7 @@ pub type ModelEffortResolver = fn(&str, Option<&str>) -> (String, Option<&'stati
 
 /// Per-driver model and effort menu (capability: [`Capability::ModelAndEffortMenu`]).
 ///
-/// All fields are function pointers so the menu can live in a `static`
+/// Static data and function pointers let the menu live in a `static`
 /// [`DriverDescriptor`]. Each driver supplies its own table; `resolve_spawn_config`
 /// resolves model/effort precedence against the selected driver's menu
 /// (design §1.4 / §Mix-and-match).
@@ -519,6 +520,8 @@ pub type ModelEffortResolver = fn(&str, Option<&str>) -> (String, Option<&'stati
 /// force every construction site to change.
 #[derive(Debug, Clone, Copy, bon::Builder)]
 pub struct ModelMenu {
+    /// Optional work-type table. Absent drivers retain reasoning-only selection.
+    pub work_type_policy: Option<work_type_policy::WorkTypeModelPolicy>,
     /// Resolve a selected family and effort into a concrete catalogue id and rung.
     /// Drivers with independent model and effort flags leave this unset.
     pub resolve_model_effort: Option<ModelEffortResolver>,

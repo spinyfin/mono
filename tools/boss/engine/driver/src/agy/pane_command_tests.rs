@@ -98,3 +98,24 @@ fn a_contradicting_effort_is_dropped_from_the_command() {
     assert!(command.contains("--model 'gemini-4-hydrogen-low'"), "{command}");
     assert!(!command.contains("--effort"), "{command}");
 }
+
+#[test]
+fn every_selected_gemini_family_launches_with_matching_thinking_level() {
+    let tmp = tempfile::tempdir().unwrap();
+    let environment = environment(tmp.path());
+    let menu = &super::super::AGY_DESCRIPTOR.model_menu;
+    for (family, expected_rung) in [
+        ("gemini-4-hydrogen", "xhigh"),
+        ("gemini-4-neon", "xhigh"),
+        ("gemini-4-carbon", "high"),
+    ] {
+        let (model, effort) = menu.resolve_model_effort.unwrap()(family, Some("xhigh"));
+        let command = build_agy_pane_command(&environment, &tmp.path().join("c"), &model, effort);
+        assert!(
+            command.contains(&format!(
+                "--model '{family}-{expected_rung}' --effort '{expected_rung}'"
+            )),
+            "{command}"
+        );
+    }
+}

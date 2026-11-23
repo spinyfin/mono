@@ -276,16 +276,18 @@ impl Accumulator {
         );
         self.agent_active_ms += record.agent_active_ms.unwrap_or(0);
         if want_usd {
-            match price_for_record(record) {
-                Some(price) => {
+            match price_for_record(record).and_then(|price| {
+                cost_pricing::estimate_usd(
+                    price,
+                    record.input_tokens.unwrap_or(0),
+                    record.output_tokens.unwrap_or(0),
+                    record.cache_creation_tokens.unwrap_or(0),
+                    record.cache_read_tokens.unwrap_or(0),
+                )
+            }) {
+                Some(usd) => {
                     self.priced_runs += 1;
-                    self.priced_usd += cost_pricing::estimate_usd(
-                        price,
-                        record.input_tokens.unwrap_or(0),
-                        record.output_tokens.unwrap_or(0),
-                        record.cache_creation_tokens.unwrap_or(0),
-                        record.cache_read_tokens.unwrap_or(0),
-                    );
+                    self.priced_usd += usd;
                 }
                 None => {
                     self.partial = true;
@@ -539,7 +541,7 @@ pub fn build_top_cost_report(
         }
         let total_tokens = known_tokens(record);
 
-        let estimated_usd = want_usd.then(|| price_for_record(record)).flatten().map(|price| {
+        let estimated_usd = want_usd.then(|| price_for_record(record)).flatten().and_then(|price| {
             cost_pricing::estimate_usd(
                 price,
                 record.input_tokens.unwrap_or(0),
@@ -869,10 +871,15 @@ mod tests {
 
     #[test]
     fn grok_and_agy_drivers_are_unpriced_even_with_complete_tokens() {
-        for driver in [DRIVER_SLUG_GROK, DRIVER_SLUG_AGY] {
+        for (driver, model) in [
+            (DRIVER_SLUG_GROK, "claude-sonnet-5"),
+            (DRIVER_SLUG_AGY, "gemini-4-hydrogen-low"),
+            (DRIVER_SLUG_AGY, "gemini-4-neon-xhigh"),
+            (DRIVER_SLUG_AGY, "gemini-4-carbon-high"),
+        ] {
             let mut r = measured(record("run_1", "exec_1"), 1_000_000, 0, 0, 0);
             r.driver = Some(driver.to_owned());
-            r.model = Some("claude-sonnet-5".to_owned());
+            r.model = Some(model.to_owned());
             let report = build_task_cost_report("task_1", None, "t", &[r], true, 0);
             assert!(report.overall.estimated_usd.is_none());
             assert!(report.overall.estimated_usd_partial);

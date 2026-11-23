@@ -304,6 +304,16 @@ pub(super) fn all() -> Vec<Migration> {
             apply: task_status_audit::migrate_execution_abandon,
         },
         Migration {
+            id: "20261122_0432_execution_allocation_model".into(),
+            legacy_version: None,
+            apply: |conn| {
+                if !table_has_column(conn, "execution_driver_decisions", "model")? {
+                    conn.execute_batch("ALTER TABLE execution_driver_decisions ADD COLUMN model TEXT")?;
+                }
+                Ok(())
+            },
+        },
+        Migration {
             id: execution_bookmarks::HAS_RECOVERY_HEAD_MIGRATION_ID.into(),
             legacy_version: None,
             apply: execution_bookmarks::migrate_has_recovery_head,

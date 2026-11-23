@@ -370,7 +370,7 @@ mod tests {
         assert_eq!(driver.descriptor().agent_rules_filename, "AGENTS.md");
         assert_eq!(driver.descriptor().binary, "agy");
         assert_eq!(driver.descriptor().label, "Antigravity");
-        assert_eq!(driver.descriptor().model_menu.engine_default, "gemini-4-hydrogen");
+        assert_eq!(driver.descriptor().model_menu.engine_default, "gemini-4-neon");
     }
 
     /// Acceptance: `--driver codex` resolves in the registry and the
