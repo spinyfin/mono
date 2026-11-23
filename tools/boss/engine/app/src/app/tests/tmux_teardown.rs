@@ -1401,7 +1401,7 @@ async fn grok_teardown_stalled_db_does_not_hold_back_kill() {
         conn.execute_batch("BEGIN EXCLUSIVE;").unwrap();
         // Hold long enough for settle/ingest to observe SQLITE_BUSY, then
         // release so the detached persist and identity-clear can finish.
-        let _ = unlock_rx.recv_timeout(Duration::from_millis(400));
+        let _ = unlock_rx.recv_timeout(GROK_STALL_HOLD);
         let _ = conn.execute_batch("ROLLBACK;");
         let _ = unlocked_tx.send(());
     });
@@ -1436,7 +1436,7 @@ async fn grok_teardown_stalled_db_does_not_hold_back_kill() {
         runner.calls()
     );
     assert!(
-        kill_elapsed < Duration::from_millis(1500),
+        kill_elapsed < GROK_KILL_BUDGET,
         "stalled DB must not delay kill-session past the settle bound (kill_elapsed={kill_elapsed:?})"
     );
 
@@ -1458,6 +1458,16 @@ async fn grok_teardown_stalled_db_does_not_hold_back_kill() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+
+/// How long the stalling connection holds its exclusive lock. It is several
+/// times the settle window and below the 5s SQLite busy timeout, so the
+/// post-kill identity clear still succeeds once the lock lifts.
+const GROK_STALL_HOLD: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Kill must land well before the lock lifts: a teardown that waited on the
+/// stalled write would take at least `GROK_STALL_HOLD` and fail this bound
+/// deterministically, with a one second margin for a loaded host.
+const GROK_KILL_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 struct GrokIngestStall {
     unlock: std::sync::mpsc::SyncSender<()>,
@@ -1487,7 +1497,7 @@ fn arm_grok_ingest_db_stall(state: &crate::app::ServerState) -> GrokIngestStall 
         // Hold long enough for settle/ingest to observe SQLITE_BUSY and for
         // kill to proceed, then release so identity-clear and the detached
         // persist can finish. An explicit unlock from the test also unblocks.
-        let _ = unlock_rx.recv_timeout(Duration::from_millis(400));
+        let _ = unlock_rx.recv_timeout(GROK_STALL_HOLD);
         let _ = conn.execute_batch("ROLLBACK;");
         let _ = unlocked_tx.send(());
     });
@@ -1547,18 +1557,18 @@ async fn assert_completed_ingest_outlives_settle(
             "{kind} must not issue kill-session: {:?}",
             runner.calls()
         );
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < Duration::from_millis(1500),
-            "{kind}: stalled completed ingest must not delay teardown (elapsed={elapsed:?})"
-        );
+        // No kill-session exists to time here, and the identity clear after
+        // the settle legitimately waits for the stalled lock, so total
+        // teardown time cannot discriminate; the persisted usage check below
+        // covers this arm.
+        let _ = started;
     } else {
         let kill_at = runner
             .recorded_kill_at()
             .unwrap_or_else(|| panic!("{kind}: kill-session must still run: {:?}", runner.calls()));
         let kill_elapsed = kill_at.saturating_duration_since(started);
         assert!(
-            kill_elapsed < Duration::from_millis(1500),
+            kill_elapsed < GROK_KILL_BUDGET,
             "{kind}: stalled completed ingest must not delay kill-session (kill_elapsed={kill_elapsed:?})"
         );
     }
@@ -1623,7 +1633,7 @@ async fn grok_failed_ingest_usage_unavailable_write_does_not_hold_back_kill() {
     let kill_at = runner.recorded_kill_at().expect("kill-session must still run");
     let kill_elapsed = kill_at.saturating_duration_since(started);
     assert!(
-        kill_elapsed < Duration::from_millis(1500),
+        kill_elapsed < GROK_KILL_BUDGET,
         "failed-ingest usage_unavailable write must not delay kill-session (kill_elapsed={kill_elapsed:?})"
     );
 
