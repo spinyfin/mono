@@ -12,9 +12,9 @@
 // variable that is not set fails the start; nothing has a default.
 //
 //   NL_HUB_DATA            Directory for the stores, on the internal disk.
-//   NL_HUB_CAS_MAX_BYTES   Size of the CAS in bytes. At most 80% of the
-//                          filesystem that holds NL_HUB_DATA, less 5 GB for
-//                          the action cache: the store evicts at this size,
+//   NL_HUB_CAS_MAX_BYTES   Size of the CAS in bytes. 95% of the filesystem
+//                          that holds NL_HUB_DATA, minus 5 GB for the
+//                          action cache: the store evicts at this size,
 //                          and a store that fills its disk first stalls.
 //   NL_HUB_CLIENT_LISTEN   <address>:<port> for Bazel clients and workers'
 //                          cache traffic. Clients name it as

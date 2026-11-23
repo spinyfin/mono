@@ -1,6 +1,6 @@
 # Remote execution: the NativeLink hub and the macOS workers
 
-This directory holds everything that is installed on the hosts that run mono's remote builds on macOS workers: the NativeLink configs, the units that start them, the patches the workers need, the hub's health check, and this runbook. Nothing here is built or read by a build. The files are copied to the hosts by hand, which is why they are in the repository: a change to how the scheduler behaves is a reviewed change, and `tests/config_test.sh` keeps the files consistent with each other.
+This directory holds everything that is installed on the hosts that run mono's remote builds on macOS workers: the NativeLink configs, the units that start them, the patches the workers need, the hub's health check, the hub's restart and CAS exporters, and this runbook. Nothing here is built or read by a build. The files are copied to the hosts by hand, which is why they are in the repository: a change to how the scheduler behaves is a reviewed change, and `tests/config_test.sh` keeps the files consistent with each other. Copying a file whose content already matches the host is a no-op ("Installing or updating hub files").
 
 What decides whether a build executes remotely is elsewhere: [`.buildkite/README.md`](../../.buildkite/README.md) for CI steps and [`tools/test-sandbox/README.md`](../test-sandbox/README.md) for a developer's Mac. The hub schedules the Linux workers too ("Routing" below). Their configs and units are not in this directory: [`.buildkite/linux-agents-runbook.md`](../../.buildkite/linux-agents-runbook.md), "Remote execution workers", describes them.
 
@@ -12,6 +12,10 @@ What decides whether a build executes remotely is elsewhere: [`.buildkite/README
 | `nativelink/nativelink-macos-hub.service`                | `~/.config/systemd/user/` on the hub              | Starts the hub.                                                            |
 | `nativelink/hub-health.sh`                               | `~/nativelink-macos-hub/hub-health.sh` on the hub | The health check.                                                          |
 | `nativelink/nativelink-macos-hub-health.{service,timer}` | `~/.config/systemd/user/` on the hub              | Runs the health check every minute.                                        |
+| `nativelink/hub-textfile-metrics.sh`                     | `~/nativelink-macos-hub/hub-textfile-metrics.sh`  | Hub restart state for node_exporter's textfile collector.                  |
+| `nativelink/nativelink-hub-textfile.{service,timer}`     | `/etc/systemd/system/` on the hub (root)          | Runs the restart exporter every 30 s.                                      |
+| `nativelink/worker-slots-exporter.py`                    | `~/nativelink-macos-hub/worker-slots-exporter.py` | Per-worker slots and CAS eviction figures, on 127.0.0.1:9108.              |
+| `nativelink/nativelink-worker-slots-exporter.service`    | `~/.config/systemd/user/` on the hub              | Starts the slots and CAS exporter.                                         |
 | `nativelink/worker-macos.json5`                          | `~/nativelink/worker-macos.json5` on each Mac     | The worker. The same file on every Mac.                                    |
 | `nativelink/com.brianduff.nativelink.plist`              | `~/Library/LaunchAgents/` on each Mac             | Starts the worker and sets what differs per Mac.                           |
 | `nativelink/action-env.sh`                               | `~/nativelink/action-env.sh` on each Mac          | Wraps every action: picks the Xcode and SDK the action asks for.           |
@@ -19,7 +23,7 @@ What decides whether a build executes remotely is elsewhere: [`.buildkite/README
 
 ## Hosts
 
-The hub is a Linux host with the stores on an internal disk. It runs no actions. Its listen addresses, data directory and store size are in `~/nativelink-macos-hub/hub.env` on that host, which is not in the repository; `hub.json5` lists the variables.
+The hub is a Linux host with the stores on an internal disk. It runs no actions. Its listen addresses, data directory and store size are in `~/nativelink-macos-hub/hub.env` on that host, which is not in the repository; `hub.json5` lists the variables. `NL_HUB_CAS_MAX_BYTES` is 95% of the filesystem that holds `NL_HUB_DATA`, minus 5 GB for the action cache (3734977866444 bytes on the current host).
 
 The workers, as inspected on 2026-11-18:
 
@@ -188,6 +192,16 @@ These limits have not yet run against a day of real traffic on 1.8.6. Expect to 
 
 The check only reports. It does not restart the hub, and nothing else does on a schedule or on a failed check: a scheduler that is running and not scheduling is a fault to look at, and a restart destroys what there is to look at.
 
+## Hub metrics
+
+Two exporters run on the hub so Prometheus can see what NativeLink's own metrics omit: whether the hub has restarted (including an OOM kill), each worker's slots, and how the CAS is filling and evicting.
+
+**Restarts.** The hub is a user systemd unit, which node_exporter's systemd collector cannot see. `hub-textfile-metrics.sh` runs as root every 30 s (`nativelink-hub-textfile.timer`) and writes `/var/lib/prometheus/node-exporter/nativelink_hub.prom` atomically. The figures are systemd's `NRestarts`, the current main process start time, whether the unit is active, the last `Result` (so an `oom-kill` is visible), and the last main-process exit status. The script only reads the unit; it never restarts it.
+
+**Slots and CAS.** `worker-slots-exporter.py` listens on `127.0.0.1:9108/metrics`. On each scrape it asks the hub's admin API (loopback, `NL_HUB_ADMIN_LISTEN`) for each worker's slots and running actions. NativeLink 1.8.6 has no eviction counter, so inserts and evictions are counted from inotify: a rename into `cas-content/d2` is an insert, a rename into `cas-tmp/d2` is an eviction, and the size is in the file name. A walk of `cas-content/d2` every 15 minutes, at nice 19 and idle I/O priority, gives the entry count and content bytes; between walks those are kept current from the counters. The CAS cap it exports (`nativelink_hub_cache_cap_bytes`) is `NL_HUB_CAS_MAX_BYTES` from the _running_ hub process, so an edit of `hub.env` is not reported until the hub itself is restarted. The exporter only reads; it never changes the hub.
+
+Neither exporter binds anything but loopback. Copying the files onto the host is in "Installing or updating hub files"; identical content is a no-op and does not restart the hub.
+
 ## Recovery
 
 Start from the health line. Its problems map to these.
@@ -232,6 +246,61 @@ A hub that needed a restart to schedule again has a bug. With the saved log, ope
 
 **Taking the pool out of use** needs no merge. Remove `CI_BAZEL_REMOTE_EXECUTOR` from an agent's `environment` hook and that agent builds on itself from its next job; comment the `dev-remote-endpoint` lines out of a Mac's `~/.bazelrc`.
 
+## Installing or updating hub files
+
+The files in `nativelink/` are copied onto the hub by hand. `install` always writes, which changes mtime and can make systemd treat a unit as changed; a re-run whose bytes already match the host must leave the host alone. `copy_if_changed` does that: identical content is a no-op.
+
+Do not restart the hub as part of a copy. A changed `hub.json5` is picked up only at the next hub start, which is a person following "Recovery". Restarting the slots exporter (not the hub) is needed only when that script's bytes changed.
+
+```sh
+copy_if_changed() {
+  src=$1 dest=$2 mode=$3
+  if [[ -e "$dest" ]] && cmp -s "$src" "$dest"; then
+    return 0
+  fi
+  install -m "$mode" "$src" "$dest"
+}
+
+sudo_copy_if_changed() {
+  src=$1 dest=$2 mode=$3
+  if sudo test -e "$dest" && sudo cmp -s "$src" "$dest"; then
+    return 0
+  fi
+  sudo install -m "$mode" "$src" "$dest"
+}
+
+NL=~/nativelink-macos-hub
+USER_UNIT=~/.config/systemd/user
+REPO=<checkout>/tools/remote-execution/nativelink
+
+copy_if_changed "$REPO/hub.json5" "$NL/hub.json5" 644
+copy_if_changed "$REPO/hub-health.sh" "$NL/hub-health.sh" 755
+copy_if_changed "$REPO/hub-textfile-metrics.sh" "$NL/hub-textfile-metrics.sh" 755
+copy_if_changed "$REPO/nativelink-macos-hub.service" "$USER_UNIT/nativelink-macos-hub.service" 644
+copy_if_changed "$REPO/nativelink-macos-hub-health.service" "$USER_UNIT/nativelink-macos-hub-health.service" 644
+copy_if_changed "$REPO/nativelink-macos-hub-health.timer" "$USER_UNIT/nativelink-macos-hub-health.timer" 644
+copy_if_changed "$REPO/nativelink-worker-slots-exporter.service" "$USER_UNIT/nativelink-worker-slots-exporter.service" 644
+sudo_copy_if_changed "$REPO/nativelink-hub-textfile.service" /etc/systemd/system/nativelink-hub-textfile.service 644
+sudo_copy_if_changed "$REPO/nativelink-hub-textfile.timer" /etc/systemd/system/nativelink-hub-textfile.timer 644
+
+if [[ -e "$NL/worker-slots-exporter.py" ]] && cmp -s "$REPO/worker-slots-exporter.py" "$NL/worker-slots-exporter.py"; then
+  :
+else
+  install -m 755 "$REPO/worker-slots-exporter.py" "$NL/worker-slots-exporter.py"
+  systemctl --user restart nativelink-worker-slots-exporter.service
+fi
+
+systemctl --user daemon-reload
+sudo systemctl daemon-reload
+systemctl --user enable --now nativelink-macos-hub-health.timer
+systemctl --user enable --now nativelink-worker-slots-exporter.service
+sudo systemctl enable --now nativelink-hub-textfile.timer
+```
+
+`hub.env` stays on the host: it names listen addresses. Do not copy it from the repository.
+
+On a Mac worker the same helper applies to files that are installed unmodified (`worker-macos.json5`, `action-env.sh`). The launchd plist is edited after the first copy (placeholders for this Mac), so a later `cmp` against the repository file will differ; do not overwrite it from the repository.
+
 ## Cutover
 
 From NativeLink 1.6.6 with the hub on `zakalwe` to 1.8.6 with the hub on the Linux host. Everything moves in one window, because the hub and the workers have to change together. The stores start empty: 1.7.0 changed the on-disk layout of a store one way, and starting clean on the new host avoids converting anything. The first builds afterwards are cold.
@@ -250,17 +319,44 @@ It fetches the pinned commit, applies the patches, runs the tests that cover the
 mkdir -p ~/nativelink-macos-hub && cd ~/nativelink-macos-hub
 # the release tarball named under "Version and patches"; check its sha256 before unpacking
 tar xzf nativelink-1.8.6-x86_64-unknown-linux-musl.tar.gz nativelink
-install -m 644 <checkout>/tools/remote-execution/nativelink/hub.json5 .
-install -m 755 <checkout>/tools/remote-execution/nativelink/hub-health.sh .
-install -m 644 <checkout>/tools/remote-execution/nativelink/nativelink-macos-hub*.service \
-  <checkout>/tools/remote-execution/nativelink/nativelink-macos-hub-health.timer ~/.config/systemd/user/
+# copy_if_changed: identical content is a no-op (see "Installing or updating hub files")
+REPO=<checkout>/tools/remote-execution/nativelink
+copy_if_changed() {
+  src=$1 dest=$2 mode=$3
+  if [[ -e "$dest" ]] && cmp -s "$src" "$dest"; then
+    return 0
+  fi
+  install -m "$mode" "$src" "$dest"
+}
+copy_if_changed "$REPO/hub.json5" hub.json5 644
+copy_if_changed "$REPO/hub-health.sh" hub-health.sh 755
+copy_if_changed "$REPO/hub-textfile-metrics.sh" hub-textfile-metrics.sh 755
+copy_if_changed "$REPO/worker-slots-exporter.py" worker-slots-exporter.py 755
+copy_if_changed "$REPO/nativelink-macos-hub.service" ~/.config/systemd/user/nativelink-macos-hub.service 644
+copy_if_changed "$REPO/nativelink-macos-hub-health.service" ~/.config/systemd/user/nativelink-macos-hub-health.service 644
+copy_if_changed "$REPO/nativelink-macos-hub-health.timer" ~/.config/systemd/user/nativelink-macos-hub-health.timer 644
+copy_if_changed "$REPO/nativelink-worker-slots-exporter.service" ~/.config/systemd/user/nativelink-worker-slots-exporter.service 644
+```
+
+The restart-state exporter is a system unit (it writes to node_exporter's textfile directory, which is root-owned):
+
+```sh
+sudo_copy_if_changed() {
+  src=$1 dest=$2 mode=$3
+  if sudo test -e "$dest" && sudo cmp -s "$src" "$dest"; then
+    return 0
+  fi
+  sudo install -m "$mode" "$src" "$dest"
+}
+sudo_copy_if_changed "$REPO/nativelink-hub-textfile.service" /etc/systemd/system/nativelink-hub-textfile.service 644
+sudo_copy_if_changed "$REPO/nativelink-hub-textfile.timer" /etc/systemd/system/nativelink-hub-textfile.timer 644
 ```
 
 Write `~/nativelink-macos-hub/hub.env`. The addresses are this host's own and stay on the host:
 
 ```sh
 NL_HUB_DATA=<a directory on the internal disk>
-NL_HUB_CAS_MAX_BYTES=<at most 80% of that filesystem, less 5 GB, in bytes>
+NL_HUB_CAS_MAX_BYTES=<95% of that filesystem, minus 5 GB, in bytes>
 NL_HUB_CLIENT_LISTEN=<address>:50051
 NL_HUB_WORKER_LISTEN=<address>:50061
 NL_HUB_ADMIN_LISTEN=127.0.0.1:50071
@@ -272,7 +368,10 @@ Then:
 ```sh
 loginctl enable-linger "$USER"
 systemctl --user daemon-reload
+sudo systemctl daemon-reload
 systemctl --user enable --now nativelink-macos-hub.service
+systemctl --user enable --now nativelink-worker-slots-exporter.service
+sudo systemctl enable --now nativelink-hub-textfile.timer
 journalctl --user --unit nativelink-macos-hub.service --output cat | head     # "Ready, listening on …" three times
 curl -s --connect-timeout 10 --max-time 10 -o /dev/null -w '%{http_code}\n' http://<address>:50051/status         # 200
 ```
@@ -288,10 +387,20 @@ launchctl bootout gui/$(id -u)/com.brianduff.nativelink
 cd ~/nativelink
 mv nativelink nativelink-1.6.6 && mv nativelink-1.8.6 nativelink
 ./nativelink --version                                    # nativelink 1.8.6+macos-clonefile.stale-entry
-install -m 644 <checkout>/tools/remote-execution/nativelink/worker-macos.json5 .
-install -m 755 <checkout>/tools/remote-execution/nativelink/action-env.sh .
+REPO=<checkout>/tools/remote-execution/nativelink
+copy_if_changed() {
+  src=$1 dest=$2 mode=$3
+  if [[ -e "$dest" ]] && cmp -s "$src" "$dest"; then
+    return 0
+  fi
+  install -m "$mode" "$src" "$dest"
+}
+copy_if_changed "$REPO/worker-macos.json5" worker-macos.json5 644
+copy_if_changed "$REPO/action-env.sh" action-env.sh 755
 cp ~/Library/LaunchAgents/com.brianduff.nativelink.plist com.brianduff.nativelink.plist.1.6.6
-install -m 644 <checkout>/tools/remote-execution/nativelink/com.brianduff.nativelink.plist ~/Library/LaunchAgents/
+# The plist is edited after this copy (placeholders for this Mac); later updates
+# must not overwrite it from the repository.
+install -m 644 "$REPO/com.brianduff.nativelink.plist" ~/Library/LaunchAgents/
 ```
 
 Edit the placeholders in the installed plist: `USER_HOME`, `WORKER_NAME`, `HUB_HOST` (and the ports, if the hub's are not 50051 and 50061), and the slots and store size from the table under "Hosts". `NL_WORKER_DATA` is a new directory, `~/nativelink/v1.8`, so the 1.6.6 store in `~/nativelink/data` is untouched and a rollback finds it as it left it. Then:
