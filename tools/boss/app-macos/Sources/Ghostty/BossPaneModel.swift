@@ -128,7 +128,11 @@ final class BossPaneModel: ObservableObject {
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)
             .first ?? URL(fileURLWithPath: NSHomeDirectory())
                 .appendingPathComponent("Library/Application Support")
-        let bossSession = appSupport.appendingPathComponent("Boss/boss-session")
+        // A non-production engine launches the coordinator in a directory
+        // beside its own state; never touch the production session there.
+        let bossSession = BossEnginePaths.isolatedCoordinatorSessionDirectory(
+            socketPath: ProcessInfo.processInfo.environment["BOSS_SOCKET_PATH"]
+        ) ?? appSupport.appendingPathComponent("Boss/boss-session")
         try? fm.createDirectory(at: bossSession, withIntermediateDirectories: true)
 
         let claudeDir = bossSession.appendingPathComponent(".claude")

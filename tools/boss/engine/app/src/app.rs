@@ -817,6 +817,10 @@ struct ServerState {
     /// Test seam for the coordinator session directory; see
     /// [`ServerState::coordinator_session_directory`].
     coordinator_working_directory_override: Option<PathBuf>,
+    /// Set only for a non-production engine: the coordinator session
+    /// directory under that engine's state root, and the frontend socket the
+    /// coordinator's `boss` / `bossctl` must reach. `None` for production.
+    coordinator_fixture: Option<CoordinatorFixture>,
     /// Spawn token for which the current app session has acknowledged a
     /// coordinator viewer. Cleared with the app session so a reconnect gets a
     /// fresh attach request.
@@ -1248,7 +1252,32 @@ struct ServerState {
     timer_wheel: std::sync::OnceLock<Arc<TimerWheel>>,
 }
 
+/// Where a non-production engine places its coordinator session.
+#[derive(Debug, Clone)]
+struct CoordinatorFixture {
+    session_directory: PathBuf,
+    socket_path: PathBuf,
+}
+
+impl CoordinatorFixture {
+    /// `None` for the production engine and for configs with no bound socket.
+    fn for_socket(socket_path: Option<&Path>) -> Option<Self> {
+        let socket_path = socket_path?;
+        let isolation = isolation::IsolationPaths::derive(&socket_path.to_string_lossy());
+        Some(Self {
+            session_directory: isolation.coordinator_session_directory()?,
+            socket_path: socket_path.to_path_buf(),
+        })
+    }
+}
+
 impl ServerState {
+    /// The engine socket the coordinator session must export as
+    /// `BOSS_SOCKET_PATH`: `Some` only for a non-production engine.
+    fn coordinator_engine_socket(&self) -> Option<&Path> {
+        self.coordinator_fixture.as_ref().map(|f| f.socket_path.as_path())
+    }
+
     fn resolve_tmux(&self) -> anyhow::Result<boss_tmux::Tmux> {
         boss_tmux::Tmux::resolve(&self.tmux_socket_path)
     }
@@ -1264,9 +1293,10 @@ impl ServerState {
     /// The prepared coordinator session directory: the test override, else the
     /// production directory under Application Support.
     fn coordinator_session_directory(&self) -> anyhow::Result<PathBuf> {
-        match &self.coordinator_working_directory_override {
-            Some(path) => Ok(path.clone()),
-            None => boss_engine_runtime::coordinator_tmux::coordinator_working_directory(),
+        match (&self.coordinator_working_directory_override, &self.coordinator_fixture) {
+            (Some(path), _) => Ok(path.clone()),
+            (None, Some(fixture)) => Ok(fixture.session_directory.clone()),
+            (None, None) => boss_engine_runtime::coordinator_tmux::coordinator_working_directory(),
         }
     }
 
@@ -1906,6 +1936,7 @@ impl ServerState {
                 .maybe_coordinator_tmux_override(coordinator_tmux_override)
                 .maybe_coordinator_working_directory_override(coordinator_working_directory_override)
                 .tmux_socket_path(cfg.work.resolved_tmux_socket_path())
+                .maybe_coordinator_fixture(CoordinatorFixture::for_socket(cfg.work.frontend_socket_path.as_deref()))
                 .execution_coordinator(execution_coordinator)
                 .completion_handler(completion_handler)
                 .cube_client(cube_client_for_state)

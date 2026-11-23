@@ -136,6 +136,10 @@ struct BossEnginePaths {
         else {
             return false
         }
+        return isIsolatedSocket(sock)
+    }
+
+    private static func isIsolatedSocket(_ sock: String) -> Bool {
         let normalized = URL(fileURLWithPath: sock).standardizedFileURL.path
         let legacy = URL(fileURLWithPath: legacyProductionSocket).standardizedFileURL.path
         if normalized == legacy {
@@ -146,6 +150,21 @@ struct BossEnginePaths {
             return false
         }
         return true
+    }
+
+    /// Session directory of a non-production engine, beside that engine's
+    /// own state: `<socket dir>/<socket stem>.boss-session`. Mirrors the
+    /// engine's `IsolationPaths::coordinator_session_directory`, so the app
+    /// prepares exactly the directory the engine launches the coordinator in.
+    /// `nil` for the production profile, whose directory lives under the
+    /// Boss state root. Pure: safe to call from tests.
+    static func isolatedCoordinatorSessionDirectory(socketPath: String?) -> URL? {
+        guard let socketPath, !socketPath.isEmpty, isIsolatedSocket(socketPath) else {
+            return nil
+        }
+        let url = URL(fileURLWithPath: socketPath)
+        let stem = url.deletingPathExtension().lastPathComponent
+        return url.deletingLastPathComponent().appendingPathComponent("\(stem).boss-session", isDirectory: true)
     }
 
     /// Production pid-file path. Honours `BOSS_ENGINE_PID_PATH`;
