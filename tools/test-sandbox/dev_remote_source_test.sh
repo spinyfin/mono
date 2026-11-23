@@ -129,6 +129,8 @@ effective="$(winning_workspace_status common macos dev-remote-endpoint build)"
 effective="$(winning_workspace_status common macos dev-remote-endpoint dev-remote build dev-local)"
 [[ "$effective" == "tools/boss/installer/workspace-status.sh" ]] ||
   fail "--config=dev-local must restore the default stamp script, got '${effective}'"
+line_number 'build:dev-remote --remote_retries=20' > /dev/null
+line_number 'build:dev-remote --remote_retry_max_delay=15s' > /dev/null
 line_number 'build:dev-remote --remote_local_fallback' > /dev/null
 # Without this a result a developer's Mac produced after a fallback is uploaded
 # under the key CI's remote steps use, and a CI step can be satisfied by it.
