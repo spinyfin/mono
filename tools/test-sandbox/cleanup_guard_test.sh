@@ -38,6 +38,7 @@ run_interruption_case() {
   local mode="${2:-normal}"
   local inner_pid=""
   local inner_root=""
+  local capturer=""
   local marker="cleanup-$$-${signal}-${mode}"
   local outputs="${TEST_UNDECLARED_OUTPUTS_DIR:?}/outputs-${marker}"
   local log="${TEST_TMPDIR}/stderr-${marker}"
@@ -83,13 +84,27 @@ run_interruption_case() {
       [[ -s "${hold}.paused" ]] && break
       sleep 0.05
     done
-    [[ -s "${hold}.paused" ]]
-    local capturer
+    if [[ ! -s "${hold}.paused" ]]; then
+      kill -KILL -- "-${inner_pid}" 2>/dev/null || true
+      wait "${inner_pid}" 2>/dev/null || true
+      printf '%s\n' "capturer did not reach the hold" >&2
+      return 1
+    fi
     read -r capturer <"${hold}.paused"
-    [[ ! -e "${outputs}/timeout-${child_pid}/complete" ]]
+    if [[ -e "${outputs}/timeout-${child_pid}/complete" ]]; then
+      kill -KILL -- "-${inner_pid}" 2>/dev/null || true
+      wait "${inner_pid}" 2>/dev/null || true
+      printf '%s\n' "capturer completed before takeover" >&2
+      return 1
+    fi
     # Kill the real lock holder with its wrapper, leaving the test group
     # alive for the independent watchdog to recapture before cleanup.
-    kill -0 "${capturer}"
+    if ! kill -0 "${capturer}" 2>/dev/null; then
+      kill -KILL -- "-${inner_pid}" 2>/dev/null || true
+      wait "${inner_pid}" 2>/dev/null || true
+      printf '%s\n' "capturer exited before takeover" >&2
+      return 1
+    fi
   elif [[ "${mode}" == "dropped" ]]; then
     rm -rf "${outputs}"
   fi
@@ -107,6 +122,13 @@ run_interruption_case() {
       fi
       sleep 0.05
     done
+    if [[ -n "${capturer}" ]]; then
+      ! kill -0 "${capturer}" 2>/dev/null || {
+        printf 'capturer survived %s: %s\n' "${signal}" "${capturer}" >&2
+        kill -KILL "${capturer}" 2>/dev/null || true
+        return 1
+      }
+    fi
   else
     kill "-${signal}" "${inner_pid}"
     wait "${inner_pid}" 2>/dev/null || true
@@ -117,6 +139,8 @@ run_interruption_case() {
     [[ ! -e "${outputs}" ]]
     grep -q "timeout stacks pid=${child_pid} .*Thread_" "${log}"
     grep -q "timeout stacks pid=${descendant_pid} .*Thread_" "${log}"
+    grep -q "test thread backtraces: not retained (output directory unavailable)" "${log}"
+    ! grep -q "test thread backtraces: /" "${log}" || { printf '%s\n' 'log names a deleted backtrace path' >&2; return 1; }
   elif [[ "${signal}" == "TERM" || "${signal}" == "KILL" ]]; then
     local pid report
     for pid in "${child_pid}" "${descendant_pid}"; do

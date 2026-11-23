@@ -54,7 +54,7 @@ def summarize(pid, command, report):
     sys.stderr.flush()
 
 
-def capture(pid, command, output, sample_runtime):
+def capture(pid, command, output, sample_runtime, retain_reports=True):
     path = output / f"threads-{pid}.txt"
     with path.open("w") as report:
         report.write(f"pid={pid} command={command}\n")
@@ -69,11 +69,12 @@ def capture(pid, command, output, sample_runtime):
             report.write(f"\nstack capture exit={result.returncode}\n")
         except (OSError, subprocess.TimeoutExpired) as error:
             report.write(f"\nstack capture unavailable: {error}\n")
-    print(f"test thread backtraces: {path}", file=sys.stderr, flush=True)
+    if retain_reports:
+        print(f"test thread backtraces: {path}", file=sys.stderr, flush=True)
     summarize(pid, command, path)
 
 
-def capture_members(members, output, sample_runtime, group):
+def capture_members(members, output, sample_runtime, group, retain_reports=True):
     (output / "processes.txt").write_text(
         f"test={os.environ.get('TEST_TARGET', 'unknown')} group={group}\n"
         + "".join(f"{pid} {command}\n" for pid, command in members)
@@ -81,7 +82,10 @@ def capture_members(members, output, sample_runtime, group):
     # Each sample captures every thread. Sample members concurrently so a
     # subprocess blocked below the test harness is included before cleanup.
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(members))) as pool:
-        list(pool.map(lambda member: capture(*member, output, sample_runtime), members))
+        list(pool.map(
+            lambda member: capture(*member, output, sample_runtime, retain_reports),
+            members,
+        ))
 
 
 def undeclared_root():
@@ -121,8 +125,13 @@ def capture_to_stderr_only(group, ps_runtime, sample_runtime):
     except (OSError, subprocess.SubprocessError) as error:
         print(f"could not enumerate test process group {group}: {error}", file=sys.stderr, flush=True)
         return
+    print(
+        "test thread backtraces: not retained (output directory unavailable)",
+        file=sys.stderr,
+        flush=True,
+    )
     with tempfile.TemporaryDirectory() as directory:
-        capture_members(members, Path(directory), sample_runtime, group)
+        capture_members(members, Path(directory), sample_runtime, group, retain_reports=False)
 
 
 def main():
@@ -147,7 +156,10 @@ def main():
         if hold and Path(hold).exists():
             Path(hold).unlink()
             Path(hold + ".paused").write_text(f"{os.getpid()}\n")
-            while True:
+            # Bound so a supervisor that fails before killing this holder
+            # cannot leave the capturer, wrapper, and fixture parked forever.
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline:
                 time.sleep(0.05)
         members = group_members(group, ps_runtime)
         capture_members(members, output, sample_runtime, group)

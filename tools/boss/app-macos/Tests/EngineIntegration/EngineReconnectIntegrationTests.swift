@@ -4,32 +4,6 @@ import os
 @testable import Boss
 
 final class EngineReconnectIntegrationTests: XCTestCase {
-    /// The fixture announces the bind on stdout. Startup is not part of the
-    /// slow-subscriber timing contract; Bazel bounds the whole test instead.
-    private func waitForEngineReady(socket: String, output: FileHandle) throws {
-        // Consume each available chunk: a fixed-length read can wait for more
-        // bytes even after the engine has announced readiness and gone quiet.
-        try waitForEngineReady(socket: socket) { output.availableData }
-    }
-
-    private func waitForEngineReady(socket: String, read: () throws -> Data) throws {
-        let ready = Data("boss-engine listening on \(socket)".utf8)
-        var pending = Data()
-        while true {
-            let chunk = try read()
-            guard !chunk.isEmpty else {
-                throw NSError(domain: "EngineFixture", code: 1, userInfo: [
-                    NSLocalizedDescriptionKey: "engine stdout closed before announcing \(socket)",
-                ])
-            }
-            pending.append(chunk)
-            while let newline = pending.firstIndex(of: 0x0A) {
-                if pending[..<newline] == ready { return }
-                pending.removeSubrange(...newline)
-            }
-        }
-    }
-
     func testReadinessDoesNotWaitForStdoutToClose() throws {
         let output = Pipe()
         defer {
@@ -37,7 +11,7 @@ final class EngineReconnectIntegrationTests: XCTestCase {
             try? output.fileHandleForWriting.close()
         }
         try output.fileHandleForWriting.write(contentsOf: Data("boss-engine listening on /retry.sock\n".utf8))
-        try waitForEngineReady(socket: "/retry.sock", output: output.fileHandleForReading)
+        try EngineFixtureReadiness.waitForListening(socket: "/retry.sock", output: output.fileHandleForReading)
     }
 
     func testReadinessWaitsForCompleteAnnouncementForRequestedSocket() throws {
@@ -47,7 +21,7 @@ final class EngineReconnectIntegrationTests: XCTestCase {
             Data("ck".utf8),
             Data("\n".utf8),
         ]
-        try waitForEngineReady(socket: "/retry.sock") {
+        try EngineFixtureReadiness.waitForListening(socket: "/retry.sock") {
             chunks.isEmpty ? Data() : chunks.removeFirst()
         }
         XCTAssertTrue(chunks.isEmpty, "readiness requires the complete line, including its newline")
@@ -58,7 +32,7 @@ final class EngineReconnectIntegrationTests: XCTestCase {
         defer { try? output.fileHandleForReading.close() }
         try output.fileHandleForWriting.write(contentsOf: Data("boss-engine listening on /other.sock\n".utf8))
         try output.fileHandleForWriting.close()
-        XCTAssertThrowsError(try waitForEngineReady(socket: "/retry.sock", output: output.fileHandleForReading)) { error in
+        XCTAssertThrowsError(try EngineFixtureReadiness.waitForListening(socket: "/retry.sock", output: output.fileHandleForReading)) { error in
             XCTAssertTrue(error.localizedDescription.contains("stdout closed before announcing /retry.sock"))
         }
     }
@@ -99,7 +73,7 @@ final class EngineReconnectIntegrationTests: XCTestCase {
         // Only the child owns the write end, so an early exit reaches EOF.
         try output.fileHandleForWriting.close()
         do {
-            try waitForEngineReady(socket: socket, output: output.fileHandleForReading)
+            try EngineFixtureReadiness.waitForListening(socket: socket, output: output.fileHandleForReading)
         } catch {
             XCTFail("\(error): \((try? String(contentsOf: logURL, encoding: .utf8)) ?? "engine log unavailable")")
             return

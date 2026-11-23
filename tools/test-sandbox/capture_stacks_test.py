@@ -169,6 +169,68 @@ class CaptureTest(unittest.TestCase):
         self.assertFalse(capture_stacks.wait_until_deadline_or_wrapper_exit(30, gone.pid))
         self.assertLess(time.monotonic() - started, 2)
 
+    def test_capture_hold_exits_after_deadline_and_captures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hold = Path(directory) / "hold"
+            hold.write_text("")
+            clock = [0.0]
+
+            def monotonic():
+                return clock[0]
+
+            def sleep(seconds):
+                clock[0] += seconds
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "TEST_UNDECLARED_OUTPUTS_DIR": directory,
+                        "TEST_TARGET": "//test",
+                        "MONO_CAPTURE_TEST_HOLD": str(hold),
+                    },
+                ),
+                patch("sys.argv", ["capture_stacks.py", "11", "/runtime"]),
+                patch.object(capture_stacks, "group_members", return_value=[(11, "test")]),
+                patch.object(capture_stacks, "capture") as capture,
+                patch.object(capture_stacks.time, "monotonic", monotonic),
+                patch.object(capture_stacks.time, "sleep", sleep),
+            ):
+                capture_stacks.main()
+            self.assertFalse(hold.exists())
+            self.assertEqual((Path(directory) / "hold.paused").read_text(), f"{os.getpid()}\n")
+            self.assertEqual(capture.call_count, 1)
+            self.assertGreaterEqual(clock[0], 60)
+
+    def test_retained_capture_names_the_report_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stderr = io.StringIO()
+            with (
+                patch.object(subprocess, "run", side_effect=FileNotFoundError("sample missing")),
+                contextlib.redirect_stderr(stderr),
+            ):
+                capture_stacks.capture(11, "work_db_test", Path(directory), Path("/runtime"))
+            path = Path(directory) / "threads-11.txt"
+            self.assertIn(f"test thread backtraces: {path}", stderr.getvalue())
+
+    def test_stderr_only_capture_does_not_name_a_deleted_report(self):
+        def fake_sample(args, **kwargs):
+            kwargs["stdout"].write("    10 Thread_1: blocked_test\n  mutex_wait_leaf\n")
+            return subprocess.CompletedProcess(args, 0)
+
+        stderr = io.StringIO()
+        with (
+            patch.object(capture_stacks, "group_members", return_value=[(11, "test")]),
+            patch.object(subprocess, "run", side_effect=fake_sample),
+            contextlib.redirect_stderr(stderr),
+        ):
+            capture_stacks.capture_to_stderr_only(11, Path("/runtime"), Path("/runtime"))
+        text = stderr.getvalue()
+        self.assertIn("test thread backtraces: not retained (output directory unavailable)", text)
+        self.assertNotIn("test thread backtraces: /", text)
+        self.assertIn("timeout stacks pid=11", text)
+        self.assertIn("Thread_1: blocked_test", text)
+
 
 if __name__ == "__main__":
     unittest.main()

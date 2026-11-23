@@ -13,7 +13,6 @@ final class NavigatorLifecycleIntegrationTests: XCTestCase {
     func testRevisionQuestionReviewMergeKeepsRootAndDraft() async throws {
         let fixture = try NavigatorEngineFixture()
         defer { fixture.stop() }
-        try await wait("engine ready") { FileManager.default.fileExists(atPath: fixture.socket) }
         try fixture.sql("""
             INSERT INTO products(id,name,slug,status,created_at,updated_at,auto_pr_maintenance_enabled)
             VALUES ('prod_nav','Navigator lifecycle','navigator-lifecycle','active','100','100',0);
@@ -30,6 +29,10 @@ final class NavigatorLifecycleIntegrationTests: XCTestCase {
         model.engine.start()
         defer { model.engine.stop() }
         try await wait("app connected") { model.isConnected }
+        // connect() succeeds as soon as the socket is bound. The engine does
+        // not accept until post-bind startup finishes, so wait for a real
+        // reply before asserting navigator projection.
+        try await wait("product listed") { model.products.contains { $0.id == "prod_nav" } }
         try await refresh(model, section: .working)
         model.setWorkViewMode(.navigator)
         model.selectWorkCard("task_nav_root")
@@ -171,7 +174,7 @@ final class NavigatorLifecycleIntegrationTests: XCTestCase {
     }
 
     private func wait(_ label: String, until predicate: () -> Bool) async throws {
-        let deadline = Date().addingTimeInterval(15)
+        let deadline = Date().addingTimeInterval(60)
         while !predicate(), Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
         guard predicate() else { throw NSError(domain: "NavigatorLifecycle", code: 1, userInfo: [NSLocalizedDescriptionKey: label]) }
     }
@@ -197,6 +200,7 @@ private final class NavigatorEngineFixture {
     private let db: String
     private let process = Process()
     private let log: FileHandle
+    private let stdout: FileHandle
 
     init() throws {
         let env = ProcessInfo.processInfo.environment
@@ -207,6 +211,7 @@ private final class NavigatorEngineFixture {
         let logPath = "\(root)/navigator-engine.log"
         FileManager.default.createFile(atPath: logPath, contents: nil)
         log = try FileHandle(forWritingTo: URL(fileURLWithPath: logPath))
+        let output = Pipe()
         process.executableURL = URL(fileURLWithPath: "\(runfiles)/_main/tools/boss/engine/core/engine_fixture_test")
         process.arguments = ["--socket-path", socket]
         var environment = env
@@ -214,14 +219,28 @@ private final class NavigatorEngineFixture {
             environment.removeValue(forKey: key)
         }
         process.environment = environment
-        process.standardOutput = log
+        process.standardOutput = output
         process.standardError = log
         try process.run()
+        stdout = output.fileHandleForReading
+        try output.fileHandleForWriting.close()
+        do {
+            try EngineFixtureReadiness.waitForListening(socket: socket, output: stdout)
+        } catch {
+            // init throws, so the caller never gets a fixture whose defer can
+            // stop the process. Tear down here before wrapping the error.
+            stop()
+            let logText = (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? "engine log unavailable"
+            throw NSError(domain: "NavigatorFixture", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "\(error.localizedDescription): \(logText)",
+            ])
+        }
     }
 
     func stop() {
         if process.isRunning { process.terminate() }
         process.waitUntilExit()
+        try? stdout.close()
         try? log.close()
     }
 
