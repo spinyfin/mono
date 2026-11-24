@@ -28,8 +28,9 @@
 //! driver runs (`ModelMenu::model_for_reasoning`) but no longer decides
 //! *which driver*. The one policy exception is the dedicated
 //! design/investigation tier: original designs and `reasoning = investigation`
-//! rows exclude Grok and are allocated only between Claude and Codex. A
-//! `DesignPostmortem` is excluded by its distinct kind and remains ordinary
+//! rows are allocated only among drivers that declare a dedicated
+//! design/investigation model (`claude`, `codex`, and `agy`, excluding `grok`).
+//! A `DesignPostmortem` is excluded by its distinct kind and remains ordinary
 //! traffic-split work.
 //!
 //! The `ExecutionKind` dimension is why `conflict_resolution` and
@@ -56,7 +57,7 @@
 //!
 //! - **A row with an explicit pin** — see below. The dedicated
 //!   design/investigation tier is also intentionally unpinned so it follows
-//!   the Claude/Codex traffic split.
+//!   the traffic split across tier-eligible drivers.
 //!
 //! Assignment is a deterministic hash of the work item's own id placed on
 //! the split's `[0, 100)` bucket line — not a coin flip per dispatch
@@ -85,7 +86,7 @@
 //! an allocated row is actually routed to its driver rather than the
 //! recorded decision being an inert audit trail.
 
-use boss_protocol::{DRIVER_SLUG_CLAUDE, DRIVER_SLUG_CODEX, DriverTrafficSplit};
+use boss_protocol::DriverTrafficSplit;
 use sha2::{Digest, Sha256};
 
 use super::*;
@@ -268,7 +269,7 @@ fn eligible_drivers_for(
         .eligible_drivers_for_kind(kind, Some(execution_kind), &DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER)
         .into_iter()
         .filter(|slug| registry.get(slug).is_some_and(|driver| driver.launch_implemented()))
-        .filter(|slug| !design_or_investigation_tier || *slug == DRIVER_SLUG_CLAUDE || *slug == DRIVER_SLUG_CODEX)
+        .filter(|slug| !design_or_investigation_tier || driver_has_design_investigation_model(slug))
         .filter(|slug| {
             model_override.is_none_or(|model| {
                 registry
@@ -436,7 +437,7 @@ pub fn driver_clears_dispatch_gate(driver_slug: &str, task_kind: &TaskKind, exec
 }
 
 /// Whether `driver_slug`'s [`boss_engine_driver::ModelMenu`] declares a dedicated
-/// design/investigation-tier model. `grok` does not; `claude` and `codex` do.
+/// design/investigation-tier model. `grok` does not; `claude`, `codex`, and `agy` do.
 /// An unregistered slug returns `false` (fail closed) — the same "unknown
 /// driver" case is caught elsewhere with a loud `UnknownDriver` error.
 ///
