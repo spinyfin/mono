@@ -5,7 +5,7 @@ extension ChatViewModel {
     /// expected request id drop any reply that belongs to an earlier query.
     /// Skipped while disconnected; the window re-requests on reconnect.
     func requestTokenUsage(_ query: TokenUsageQuery) {
-        guard isConnected || engine.simulateConnectedForTesting else {
+        guard isConnected else {
             return
         }
         let requestId = engine.sendGetTokenUsageRows(query)

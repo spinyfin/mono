@@ -46,9 +46,11 @@ struct TokenUsageTableNode: Identifiable, Hashable {
     let unpriceableCause: String?
     let inputConvention: InputConvention?
     let containsGross: Bool
+    let inclusiveContainsGross: Bool
     let coverage: RunCoverage?
     let caveats: [UsageCaveat]
     let dominantCaveat: String?
+    let inclusiveDominantCaveat: String?
     let usageUnavailable: String?
 
     let taskId: String?
@@ -208,9 +210,11 @@ enum TokenUsageTree {
             unpriceableCause: aggregateUnpriceableCause(of: executionNodes),
             inputConvention: convention,
             containsGross: executionNodes.contains(where: \.containsGross),
+            inclusiveContainsGross: containsGrossInput(children),
             coverage: nil,
             caveats: [],
             dominantCaveat: dominantCaveatCode(of: executionNodes),
+            inclusiveDominantCaveat: dominantCaveatCode(of: children),
             usageUnavailable: task.direct.usageUnavailable.first,
             taskId: task.taskId,
             productId: task.productId,
@@ -269,9 +273,11 @@ enum TokenUsageTree {
             unpriceableCause: aggregateUnpriceableCause(of: children),
             inputConvention: convention,
             containsGross: children.contains(where: \.containsGross),
+            inclusiveContainsGross: false,
             coverage: nil,
             caveats: execution.runs.flatMap(\.caveats),
             dominantCaveat: dominantCaveatCode(of: children),
+            inclusiveDominantCaveat: nil,
             usageUnavailable: execution.measurement.usageUnavailable.first,
             taskId: nil,
             productId: nil,
@@ -324,9 +330,11 @@ enum TokenUsageTree {
             unpriceableCause: run.unpriceableCause,
             inputConvention: run.inputConvention,
             containsGross: run.inputConvention == .gross,
+            inclusiveContainsGross: false,
             coverage: run.coverage,
             caveats: run.caveats,
             dominantCaveat: nil,
+            inclusiveDominantCaveat: nil,
             usageUnavailable: run.usageUnavailable,
             taskId: nil,
             productId: nil,
@@ -390,9 +398,11 @@ enum TokenUsageTree {
                 unpriceableCause: nil,
                 inputConvention: nil,
                 containsGross: children.contains(where: \.containsGross),
+                inclusiveContainsGross: false,
                 coverage: nil,
                 caveats: [],
                 dominantCaveat: nil,
+                inclusiveDominantCaveat: nil,
                 usageUnavailable: nil,
                 taskId: nil,
                 productId: nil,
@@ -443,9 +453,11 @@ enum TokenUsageTree {
                 unpriceableCause: nil,
                 inputConvention: nil,
                 containsGross: kindNodes.contains(where: \.containsGross),
+                inclusiveContainsGross: false,
                 coverage: nil,
                 caveats: [],
                 dominantCaveat: nil,
+                inclusiveDominantCaveat: nil,
                 usageUnavailable: nil,
                 taskId: nil,
                 productId: nil,
@@ -507,9 +519,11 @@ enum TokenUsageTree {
             unpriceableCause: aggregateUnpriceableCause(of: childList),
             inputConvention: inputConvention,
             containsGross: containsGrossInput(childList),
+            inclusiveContainsGross: false,
             coverage: nil,
             caveats: [],
             dominantCaveat: dominantCaveatCode(of: childList),
+            inclusiveDominantCaveat: nil,
             usageUnavailable: measurement.usageUnavailable.first,
             taskId: nil,
             productId: nil,

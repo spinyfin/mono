@@ -715,7 +715,12 @@ private struct TokenUsageInspector: View {
                     runInspector
                 case .group:
                     if let measurement = node.measurement {
-                        measurementBlock("Group", measurement)
+                        measurementBlock(
+                            "Group",
+                            measurement,
+                            containsGross: node.containsGross,
+                            dominantCaveat: node.dominantCaveat
+                        )
                     }
                 case .tasklessHeader, .tasklessKind:
                     Text("Executions with no task row (answer agent, review guide, automation triage). Totals live on each execution so this header does not add token counts.")
@@ -744,10 +749,21 @@ private struct TokenUsageInspector: View {
     @ViewBuilder
     private var taskInspector: some View {
         if let direct = node.measurement {
-            measurementBlock("Direct", direct)
+            measurementBlock(
+                "Direct",
+                direct,
+                containsGross: node.containsGross,
+                dominantCaveat: node.dominantCaveat
+            )
         }
         if let inclusive = node.inclusive {
-            measurementBlock("Inclusive (chain)", inclusive, emphasize: true)
+            measurementBlock(
+                "Inclusive (chain)",
+                inclusive,
+                containsGross: node.inclusiveContainsGross,
+                dominantCaveat: node.inclusiveDominantCaveat,
+                emphasize: true
+            )
         }
         if !node.bySpendClass.isEmpty {
             Text("Spend class")
@@ -788,7 +804,12 @@ private struct TokenUsageInspector: View {
             Link("Pull request", destination: parsed)
         }
         if let measurement = node.measurement {
-            measurementBlock("Tokens", measurement)
+            measurementBlock(
+                "Tokens",
+                measurement,
+                containsGross: node.containsGross,
+                dominantCaveat: node.dominantCaveat
+            )
         }
     }
 
@@ -857,7 +878,13 @@ private struct TokenUsageInspector: View {
         }
     }
 
-    private func measurementBlock(_ title: String, _ measurement: CostMeasurement, emphasize: Bool = false) -> some View {
+    private func measurementBlock(
+        _ title: String,
+        _ measurement: CostMeasurement,
+        containsGross: Bool,
+        dominantCaveat: String?,
+        emphasize: Bool = false
+    ) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(title)
                 .font(.caption.weight(.semibold))
@@ -865,8 +892,8 @@ private struct TokenUsageInspector: View {
             Text(TokenUsageFormatter.measurementTotal(
                 measurement,
                 spansCaptureBoundary: spansCaptureBoundary,
-                containsGross: node.containsGross,
-                dominantCaveat: node.dominantCaveat
+                containsGross: containsGross,
+                dominantCaveat: dominantCaveat
             ).display)
                 .font(emphasize ? .title3.weight(.semibold) : .body)
                 .monospacedDigit()

@@ -428,39 +428,195 @@ final class TokenUsageTreeBuilderTests: XCTestCase {
         XCTAssertFalse(state.receiveRows(reportA, requestId: "req-D"))
     }
 
-    func testMixedClaudeAndGrokAggregateRendersUsdWithoutPartialAndGrokWindowHasNoPricingGapNote() throws {
-        var grokTask = sampleGrokLikeTask(id: "t_grok", driver: "grok", name: "Grok work", total: 20)
-        grokTask.executions[0].runs[0].unpriceableCause = "subscription_unpriced"
-        var claudeTask = sampleGrokLikeTask(id: "t_claude", driver: "claude", name: "Claude work", total: 30)
-        claudeTask.executions[0].runs[0].estimatedUsd = 2.50
-        claudeTask.executions[0].measurement.estimatedUsd = 2.50
-        claudeTask.direct.estimatedUsd = 2.50
+    func testFooterNotesPreservesPricingGapsNoteSentByEngine() {
+        // Engine tests in engine/usage-report own the guarantee that
+        // subscription_unpriced runs neither set estimated_usd_partial nor emit
+        // pricing_gaps; the app footer must faithfully render whatever
+        // pricing_gaps note the engine sends while dropping capture_started
+        // when the capture-boundary banner is shown.
+        var report = sampleReport(tasks: [])
+        report.spansCaptureBoundary = true
+        report.pricingGaps = ["unknown-model"]
+        report.coverage.notes = [
+            UsageNote(code: "capture_started", detail: "epoch 1785144180"),
+            UsageNote(code: "pricing_gaps", detail: "unknown-model"),
+        ]
+        let notes = TokenUsageFormatter.footerNotes(for: report)
+        XCTAssertEqual(notes.map(\.code), ["pricing_gaps"])
+        XCTAssertEqual(notes.first?.detail, "unknown-model")
+    }
 
-        var mixedMeasurement = measurement(measured: 2, totalTokens: 50)
-        mixedMeasurement.estimatedUsd = 2.50
-        mixedMeasurement.estimatedUsdPartial = false
-        let mixedGroup = UsageGroup(
-            key: [UsageGroupKey(dimension: .project, value: "proj", label: "Proj")],
-            measurement: mixedMeasurement,
-            subgroups: [],
-            tasks: [claudeTask, grokTask],
-            taskless: []
+    func testInclusiveMetadataCapturesGrossRevisionOnNetInputRoot() throws {
+        let codexRevision = TaskUsageNode(
+            taskId: "task_codex_rev",
+            chainRootId: "task_net_root",
+            direct: measurement(measured: 1, totalTokens: 95_000),
+            isChainRoot: false,
+            kind: "revision",
+            name: "Codex revision",
+            productId: "prod",
+            runsOutsideWindow: 0,
+            status: "done",
+            bySpendClass: [],
+            executions: [sampleExecution(id: "exec_codex_rev", driver: "codex", total: 95_000)],
+            revisions: [],
+            completedAtEpochS: 20,
+            effortCurrent: "high",
+            inclusive: nil,
+            prUrl: nil,
+            projectId: "proj",
+            reasoningCurrent: "high",
+            shortId: 21
         )
-        let mixedNodes = TokenUsageTree.build(sampleReport(tasks: [], groups: [mixedGroup]))
-        let mixed = try XCTUnwrap(mixedNodes.first)
-        let usd = TokenUsageFormatter.usd(
-            estimated: mixed.estimatedUsd,
-            partial: mixed.estimatedUsdPartial,
-            unpriceableCause: mixed.unpriceableCause
+        let netRoot = TaskUsageNode(
+            taskId: "task_net_root",
+            chainRootId: "task_net_root",
+            direct: measurement(measured: 1, totalTokens: 40_000),
+            isChainRoot: true,
+            kind: "chore",
+            name: "Claude root with Codex revision",
+            productId: "prod",
+            runsOutsideWindow: 0,
+            status: "done",
+            bySpendClass: [],
+            executions: [sampleExecution(id: "exec_net_root", driver: "claude", total: 40_000)],
+            revisions: [codexRevision],
+            completedAtEpochS: 20,
+            effortCurrent: "medium",
+            inclusive: measurement(measured: 2, totalTokens: 135_000),
+            prUrl: nil,
+            projectId: "proj",
+            reasoningCurrent: "standard",
+            shortId: 20
         )
-        XCTAssertEqual(usd?.display, "est. $2.50")
-        XCTAssertFalse(usd?.display.contains("(partial)") ?? true)
 
-        // Grok-only window carries no pricing_gaps note in the footer.
-        let grokOnlyReport = sampleReport(tasks: [grokTask])
-        XCTAssertTrue(grokOnlyReport.pricingGaps.isEmpty)
-        XCTAssertFalse(
-            TokenUsageFormatter.footerNotes(for: grokOnlyReport).contains { $0.code == "pricing_gaps" }
+        let rootNode = try XCTUnwrap(TokenUsageTree.build(sampleReport(tasks: [netRoot])).first)
+        XCTAssertFalse(rootNode.containsGross)
+        XCTAssertTrue(rootNode.inclusiveContainsGross)
+        XCTAssertEqual(
+            TokenUsageFormatter.measurementTotal(
+                rootNode.measurement!,
+                containsGross: rootNode.containsGross,
+                dominantCaveat: rootNode.dominantCaveat
+            ).display,
+            "40,000"
+        )
+        XCTAssertEqual(
+            TokenUsageFormatter.measurementTotal(
+                rootNode.inclusive!,
+                containsGross: rootNode.inclusiveContainsGross,
+                dominantCaveat: rootNode.inclusiveDominantCaveat
+            ).display,
+            "135,000 gross"
+        )
+    }
+
+    func testInclusiveMetadataCapturesPreCaptureDominantCaveatOnEmptyRoot() throws {
+        var unmeasured = CostMeasurement.empty
+        unmeasured.runsTotal = 1
+        unmeasured.runsUnmeasured = 1
+        let preRun = RunUsageRow(
+            runId: "run-pre-rev",
+            coverage: .unmeasured,
+            createdAtEpochS: 10,
+            hostId: "local",
+            inputConvention: .unknown,
+            status: "completed",
+            caveats: [
+                UsageCaveat(code: "driver_not_recorded", detail: nil),
+                UsageCaveat(code: "pre_capture", detail: nil),
+            ],
+            models: [],
+            tokens: nil,
+            agentActiveMs: nil,
+            finishedAtEpochS: 11,
+            modelObserved: nil,
+            rounds: nil,
+            startedAtEpochS: 10,
+            totalTokens: nil,
+            usageUnavailable: nil,
+            estimatedUsd: nil,
+            unpriceableCause: nil
+        )
+        let preExec = ExecutionUsageNode(
+            executionId: "exec-pre-rev",
+            workItemId: "task-pre-rev",
+            createdAtEpochS: 10,
+            driverSource: .unknown,
+            kind: "revision_implementation",
+            measurement: unmeasured,
+            spendClass: .implementation,
+            status: "completed",
+            runs: [preRun],
+            driver: nil,
+            effortLaunched: nil,
+            finishedAtEpochS: 11,
+            hostId: "local",
+            modelLaunched: nil,
+            prUrl: nil,
+            startedAtEpochS: 10
+        )
+        let preRevision = TaskUsageNode(
+            taskId: "task-pre-rev",
+            chainRootId: "task-empty-root",
+            direct: unmeasured,
+            isChainRoot: false,
+            kind: "revision",
+            name: "Pre-capture revision",
+            productId: "prod",
+            runsOutsideWindow: 0,
+            status: "done",
+            bySpendClass: [],
+            executions: [preExec],
+            revisions: [],
+            completedAtEpochS: 11,
+            effortCurrent: nil,
+            inclusive: nil,
+            prUrl: nil,
+            projectId: "proj",
+            reasoningCurrent: nil,
+            shortId: 23
+        )
+        let emptyRoot = TaskUsageNode(
+            taskId: "task-empty-root",
+            chainRootId: "task-empty-root",
+            direct: CostMeasurement.empty,
+            isChainRoot: true,
+            kind: "chore",
+            name: "Empty root with pre-capture revision",
+            productId: "prod",
+            runsOutsideWindow: 1,
+            status: "done",
+            bySpendClass: [],
+            executions: [],
+            revisions: [preRevision],
+            completedAtEpochS: 10,
+            effortCurrent: nil,
+            inclusive: unmeasured,
+            prUrl: nil,
+            projectId: "proj",
+            reasoningCurrent: nil,
+            shortId: 22
+        )
+
+        let rootNode = try XCTUnwrap(TokenUsageTree.build(sampleReport(tasks: [emptyRoot])).first)
+        XCTAssertNil(rootNode.dominantCaveat)
+        XCTAssertEqual(rootNode.inclusiveDominantCaveat, "pre_capture")
+        XCTAssertEqual(
+            TokenUsageFormatter.measurementTotal(
+                rootNode.measurement!,
+                containsGross: rootNode.containsGross,
+                dominantCaveat: rootNode.dominantCaveat
+            ).display,
+            "— no runs"
+        )
+        XCTAssertEqual(
+            TokenUsageFormatter.measurementTotal(
+                rootNode.inclusive!,
+                containsGross: rootNode.inclusiveContainsGross,
+                dominantCaveat: rootNode.inclusiveDominantCaveat
+            ).display,
+            "— not instrumented"
         )
     }
 
