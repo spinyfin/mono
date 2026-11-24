@@ -1334,10 +1334,19 @@ fn state_bound_to(socket: Option<PathBuf>, temp: &Path) -> Arc<ServerState> {
 async fn non_production_engine_resolves_a_session_directory_beside_its_own_state() {
     let temp = tempfile::tempdir().unwrap();
     let socket = temp.path().join("boss-test-abc.sock");
+    let expected_dir = temp.path().join("boss-test-abc.boss-session");
+    assert!(
+        !expected_dir.exists(),
+        "fixture session directory should not exist before resolution"
+    );
     let state = state_bound_to(Some(socket.clone()), temp.path());
 
     let dir = state.coordinator_session_directory().unwrap();
-    assert_eq!(dir, temp.path().join("boss-test-abc.boss-session"));
+    assert_eq!(dir, expected_dir);
+    assert!(
+        dir.is_dir(),
+        "engine must create the fixture session directory so engine-only fixtures can start a coordinator"
+    );
     let production = boss_engine_runtime::coordinator_tmux::coordinator_working_directory().unwrap();
     assert_ne!(
         dir, production,

@@ -1291,11 +1291,21 @@ impl ServerState {
     }
 
     /// The prepared coordinator session directory: the test override, else the
-    /// production directory under Application Support.
+    /// fixture directory beside a non-production engine's state (created if
+    /// missing so an engine-only fixture can still start a coordinator), else
+    /// the production directory under Application Support.
     fn coordinator_session_directory(&self) -> anyhow::Result<PathBuf> {
         match (&self.coordinator_working_directory_override, &self.coordinator_fixture) {
             (Some(path), _) => Ok(path.clone()),
-            (None, Some(fixture)) => Ok(fixture.session_directory.clone()),
+            (None, Some(fixture)) => {
+                std::fs::create_dir_all(&fixture.session_directory).with_context(|| {
+                    format!(
+                        "create fixture coordinator session directory {}",
+                        fixture.session_directory.display()
+                    )
+                })?;
+                Ok(fixture.session_directory.clone())
+            }
             (None, None) => boss_engine_runtime::coordinator_tmux::coordinator_working_directory(),
         }
     }

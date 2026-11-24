@@ -599,6 +599,39 @@ mod tests {
     }
 
     #[test]
+    fn legacy_socket_gets_isolated_coordinator_session_directory() {
+        let paths = IsolationPaths::derive_from(LEGACY_SOCKET_PATH, &IsolationOverrides::default(), &production());
+        assert!(paths.is_test_fixture);
+        assert_eq!(
+            paths.coordinator_session_directory(),
+            Some(PathBuf::from("/tmp/boss-engine.boss-session"))
+        );
+    }
+
+    #[test]
+    fn private_boss_test_directory_gets_isolated_coordinator_session_directory() {
+        let boss_test_socket = "/Users/tester/Library/Application Support/Boss-test/engine.sock";
+        let paths = IsolationPaths::derive_from(boss_test_socket, &IsolationOverrides::default(), &production());
+        assert!(paths.is_test_fixture);
+        assert_eq!(
+            paths.coordinator_session_directory(),
+            Some(PathBuf::from(
+                "/Users/tester/Library/Application Support/Boss-test/engine.boss-session"
+            ))
+        );
+
+        let other_home_socket = "/Users/other/Library/Application Support/Boss/engine.sock";
+        let other_paths = IsolationPaths::derive_from(other_home_socket, &IsolationOverrides::default(), &production());
+        assert!(other_paths.is_test_fixture);
+        assert_eq!(
+            other_paths.coordinator_session_directory(),
+            Some(PathBuf::from(
+                "/Users/other/Library/Application Support/Boss/engine.boss-session"
+            ))
+        );
+    }
+
+    #[test]
     fn default_socket_is_not_a_fixture() {
         let socket = production_socket();
         let paths =
