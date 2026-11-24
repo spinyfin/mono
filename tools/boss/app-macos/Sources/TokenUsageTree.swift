@@ -21,7 +21,6 @@ struct TokenUsageTableNode: Identifiable, Hashable {
     let name: String
     let kindLabel: String
     let driver: String
-    let driverSlug: String?
     let driverSource: DriverSource?
     let model: String
     let modelIsSynthetic: Bool
@@ -47,7 +46,6 @@ struct TokenUsageTableNode: Identifiable, Hashable {
     let unpriceableCause: String?
     let inputConvention: InputConvention?
     let containsGross: Bool
-    let mixesGross: Bool
     let coverage: RunCoverage?
     let caveats: [UsageCaveat]
     let dominantCaveat: String?
@@ -97,22 +95,18 @@ enum TokenUsageTree {
     }
 
     static func sort(_ nodes: [TokenUsageTableNode], by comparators: [KeyPathComparator<TokenUsageTableNode>]) -> [TokenUsageTableNode] {
-        guard !comparators.isEmpty else {
-            return nodes.map { node in
-                var copy = node
-                if let children = node.children {
-                    copy.children = sort(children, by: comparators)
-                }
-                return copy
-            }
-        }
-        return nodes.map { node in
+        let mapped = nodes.map { node in
             var copy = node
             if let children = node.children {
                 copy.children = sort(children, by: comparators)
             }
             return copy
-        }.sorted(using: comparators)
+        }
+        return comparators.isEmpty ? mapped : mapped.sorted(using: comparators)
+    }
+
+    static func containsGrossInput(_ nodes: [TokenUsageTableNode]) -> Bool {
+        firstNode(in: nodes, where: { $0.inputConvention == .gross }) != nil
     }
 
     static func mixesInputConventions(_ nodes: [TokenUsageTableNode]) -> Bool {
@@ -178,11 +172,10 @@ enum TokenUsageTree {
 
     private static func taskNode(_ task: TaskUsageNode, path: String, isRevision: Bool) -> TokenUsageTableNode {
         let id = "\(path)/task:\(task.taskId)"
-        var children: [TokenUsageTableNode] = []
-        children.append(contentsOf: task.executions.map { executionNode($0, path: id) })
-        children.append(contentsOf: task.revisions.map { taskNode($0, path: id, isRevision: true) })
-        let convention = convention(of: children)
-        let mixes = mixesInputConventions(children)
+        let executionNodes = task.executions.map { executionNode($0, path: id) }
+        let revisionNodes = task.revisions.map { taskNode($0, path: id, isRevision: true) }
+        let children = executionNodes + revisionNodes
+        let convention = convention(of: executionNodes)
         return TokenUsageTableNode(
             id: id,
             kind: isRevision ? .revision : .task,
@@ -190,7 +183,6 @@ enum TokenUsageTree {
             name: taskTitle(task),
             kindLabel: task.kind,
             driver: uniqueDriver(task.executions),
-            driverSlug: uniqueSlug(task.executions.map(\.driver)),
             driverSource: nil,
             model: uniqueModel(task.executions),
             modelIsSynthetic: false,
@@ -213,13 +205,12 @@ enum TokenUsageTree {
             agentActiveMs: task.direct.runsMeasured == 0 ? nil : task.direct.agentActiveMs,
             estimatedUsd: task.direct.estimatedUsd,
             estimatedUsdPartial: task.direct.estimatedUsdPartial,
-            unpriceableCause: aggregateUnpriceableCause(of: children),
+            unpriceableCause: aggregateUnpriceableCause(of: executionNodes),
             inputConvention: convention,
-            containsGross: children.contains(where: \.containsGross),
-            mixesGross: mixes,
+            containsGross: executionNodes.contains(where: \.containsGross),
             coverage: nil,
             caveats: [],
-            dominantCaveat: dominantCaveatCode(of: children),
+            dominantCaveat: dominantCaveatCode(of: executionNodes),
             usageUnavailable: task.direct.usageUnavailable.first,
             taskId: task.taskId,
             productId: task.productId,
@@ -251,7 +242,6 @@ enum TokenUsageTree {
             name: execution.kind,
             kindLabel: execution.kind,
             driver: TokenUsageFormatter.driverLabel(execution.driver, source: execution.driverSource),
-            driverSlug: execution.driver,
             driverSource: execution.driverSource,
             model: execution.runs.compactMap(\.modelObserved).first
                 ?? execution.modelLaunched
@@ -279,7 +269,6 @@ enum TokenUsageTree {
             unpriceableCause: aggregateUnpriceableCause(of: children),
             inputConvention: convention,
             containsGross: children.contains(where: \.containsGross),
-            mixesGross: mixesInputConventions(children),
             coverage: nil,
             caveats: execution.runs.flatMap(\.caveats),
             dominantCaveat: dominantCaveatCode(of: children),
@@ -310,7 +299,6 @@ enum TokenUsageTree {
             name: shortRunId(run.runId),
             kindLabel: "run",
             driver: TokenUsageFormatter.driverLabel(execution.driver, source: execution.driverSource),
-            driverSlug: execution.driver,
             driverSource: execution.driverSource,
             model: run.modelObserved ?? execution.modelLaunched ?? "",
             modelIsSynthetic: run.modelObserved == "<synthetic>",
@@ -336,7 +324,6 @@ enum TokenUsageTree {
             unpriceableCause: run.unpriceableCause,
             inputConvention: run.inputConvention,
             containsGross: run.inputConvention == .gross,
-            mixesGross: false,
             coverage: run.coverage,
             caveats: run.caveats,
             dominantCaveat: nil,
@@ -378,7 +365,6 @@ enum TokenUsageTree {
                 name: kind,
                 kindLabel: kind,
                 driver: "",
-                driverSlug: nil,
                 driverSource: nil,
                 model: "",
                 modelIsSynthetic: false,
@@ -404,7 +390,6 @@ enum TokenUsageTree {
                 unpriceableCause: nil,
                 inputConvention: nil,
                 containsGross: children.contains(where: \.containsGross),
-                mixesGross: mixesInputConventions(children),
                 coverage: nil,
                 caveats: [],
                 dominantCaveat: nil,
@@ -433,7 +418,6 @@ enum TokenUsageTree {
                 name: tasklessHeaderName,
                 kindLabel: "overhead",
                 driver: "",
-                driverSlug: nil,
                 driverSource: nil,
                 model: "",
                 modelIsSynthetic: false,
@@ -459,7 +443,6 @@ enum TokenUsageTree {
                 unpriceableCause: nil,
                 inputConvention: nil,
                 containsGross: kindNodes.contains(where: \.containsGross),
-                mixesGross: mixesInputConventions(kindNodes),
                 coverage: nil,
                 caveats: [],
                 dominantCaveat: nil,
@@ -499,7 +482,6 @@ enum TokenUsageTree {
             name: name,
             kindLabel: kindLabel,
             driver: "",
-            driverSlug: nil,
             driverSource: nil,
             model: "",
             modelIsSynthetic: false,
@@ -524,8 +506,7 @@ enum TokenUsageTree {
             estimatedUsdPartial: measurement.estimatedUsdPartial,
             unpriceableCause: aggregateUnpriceableCause(of: childList),
             inputConvention: inputConvention,
-            containsGross: childList.contains(where: \.containsGross),
-            mixesGross: mixesInputConventions(childList),
+            containsGross: containsGrossInput(childList),
             coverage: nil,
             caveats: [],
             dominantCaveat: dominantCaveatCode(of: childList),
@@ -566,11 +547,6 @@ enum TokenUsageTree {
         if labels.count == 1 { return labels.first ?? "" }
         if labels.isEmpty { return "" }
         return "mixed"
-    }
-
-    private static func uniqueSlug(_ slugs: [String?]) -> String? {
-        let present = Set(slugs.compactMap { $0 })
-        return present.count == 1 ? present.first : nil
     }
 
     private static func uniqueModel(_ executions: [ExecutionUsageNode]) -> String {
@@ -614,16 +590,6 @@ enum TokenUsageTree {
             node.children?.forEach(walk)
         }
         nodes.forEach(walk)
-        guard !counts.isEmpty else { return nil }
-        let unmeasuredPriority = ["pre_capture", "usage_unavailable"]
-        let unmeasuredCounts = counts.filter { unmeasuredPriority.contains($0.key) }
-        let pool = unmeasuredCounts.isEmpty ? counts : unmeasuredCounts
-        return pool.max { lhs, rhs in
-            if lhs.value != rhs.value { return lhs.value < rhs.value }
-            let lp = unmeasuredPriority.firstIndex(of: lhs.key) ?? Int.max
-            let rp = unmeasuredPriority.firstIndex(of: rhs.key) ?? Int.max
-            if lp != rp { return lp > rp }
-            return lhs.key > rhs.key
-        }?.key
+        return TokenUsageFormatter.dominantCaveatCode(from: counts)
     }
 }

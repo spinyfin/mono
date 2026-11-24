@@ -3,7 +3,11 @@ import Foundation
 extension ChatViewModel {
     /// One round trip for the Token Usage window. A generation counter and
     /// expected request id drop any reply that belongs to an earlier query.
+    /// Skipped while disconnected; the window re-requests on reconnect.
     func requestTokenUsage(_ query: TokenUsageQuery) {
+        guard isConnected || engine.simulateConnectedForTesting else {
+            return
+        }
         let requestId = engine.sendGetTokenUsageRows(query)
         guard let generation = tokenUsage.beginRequest(requestId: requestId) else {
             return

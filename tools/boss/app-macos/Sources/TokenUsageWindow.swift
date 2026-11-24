@@ -99,14 +99,20 @@ struct TokenUsageWindow: View {
         .onAppear {
             isOpen = true
             hasAppeared = true
-            chatModel.requestTokenUsage(makeQuery())
+            if chatModel.isConnected {
+                chatModel.requestTokenUsage(makeQuery())
+            }
         }
         .onDisappear {
             isOpen = false
             debounceTask?.cancel()
         }
         .onReceive(pollTimer) { _ in
-            guard isOpen else { return }
+            guard isOpen, chatModel.isConnected else { return }
+            chatModel.requestTokenUsage(makeQuery())
+        }
+        .onChange(of: chatModel.isConnected) { _, connected in
+            guard connected, isOpen else { return }
             chatModel.requestTokenUsage(makeQuery())
         }
         .onChange(of: queryFingerprint) { _, _ in
@@ -155,7 +161,8 @@ struct TokenUsageWindow: View {
                     Image(systemName: "arrow.clockwise")
                 }
                 .buttonStyle(.borderless)
-                .help("Refresh token usage")
+                .disabled(!chatModel.isConnected)
+                .help(chatModel.isConnected ? "Refresh token usage" : "Waiting for engine connection")
             }
             HStack(spacing: 8) {
                 groupPicker("Group by", selection: $groupPrimary, excluding: groupSecondary)
@@ -539,20 +546,15 @@ struct TokenUsageWindow: View {
                 let overall = TokenUsageFormatter.measurementTotal(
                     report.overall,
                     spansCaptureBoundary: report.spansCaptureBoundary,
-                    containsGross: roots.contains(where: \.containsGross)
+                    containsGross: TokenUsageTree.containsGrossInput(roots),
+                    dominantCaveat: TokenUsageFormatter.dominantCaveatCode(from: report.coverage.byCaveat)
                 )
                 HStack(spacing: 12) {
                     Text("Overall (direct): \(overall.display)")
                         .font(.callout.monospacedDigit())
-                    Text(TokenUsageFormatter.coverageBadge(
-                        complete: report.coverage.runsComplete,
-                        partial: report.coverage.runsPartial,
-                        zero: report.coverage.runsZero,
-                        unmeasured: report.coverage.runsUnmeasured,
-                        total: report.coverage.runsTotal
-                    ))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    Text(TokenUsageFormatter.coverageSummary(report.coverage))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
                     Spacer()
                 }
                 if report.spansCaptureBoundary {
@@ -566,13 +568,17 @@ struct TokenUsageWindow: View {
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
-                ForEach(report.coverage.notes, id: \.code) { note in
+                ForEach(TokenUsageFormatter.footerNotes(for: report), id: \.code) { note in
                     Text(note.detail)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
             } else if chatModel.tokenUsage.loading {
                 Text("Loading token usage…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if !chatModel.isConnected {
+                Text("Waiting for engine connection…")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {

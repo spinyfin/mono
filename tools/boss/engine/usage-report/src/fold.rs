@@ -131,6 +131,7 @@ impl RunFold {
                 self.priced_runs += 1;
                 self.priced_usd += usd;
             }
+            UsdOutcome::Unpriceable(cause) if cause == crate::classify::cause::SUBSCRIPTION_UNPRICED => {}
             UsdOutcome::Unpriceable(_) => self.usd_partial = true,
         }
     }
@@ -226,6 +227,19 @@ mod tests {
         fold.add(&sample(all(1), UsdOutcome::Unpriceable("x")));
         let m = fold.finish();
         assert!(m.estimated_usd_partial);
+        assert_eq!(m.estimated_usd, Some(1.5));
+    }
+
+    #[test]
+    fn subscription_unpriced_does_not_mark_usd_partial() {
+        let mut fold = RunFold::default();
+        fold.add(&sample(all(1), UsdOutcome::Estimate(1.5)));
+        fold.add(&sample(
+            all(1),
+            UsdOutcome::Unpriceable(crate::classify::cause::SUBSCRIPTION_UNPRICED),
+        ));
+        let m = fold.finish();
+        assert!(!m.estimated_usd_partial);
         assert_eq!(m.estimated_usd, Some(1.5));
     }
 }

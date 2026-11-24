@@ -218,7 +218,7 @@ final class TokenUsageTreeBuilderTests: XCTestCase {
         XCTAssertNil(run.cacheCreationTokens)
         XCTAssertEqual(run.inputTokens, 2486)
         XCTAssertEqual(run.unpriceableCause, "subscription_unpriced")
-        XCTAssertEqual(run.driverSlug, "grok")
+        XCTAssertEqual(run.driver, "Grok")
         let drivers = report.dimensionValues.first { $0.dimension == .driver }?.values.map(\.value) ?? []
         XCTAssertTrue(drivers.contains("agy"))
     }
@@ -230,7 +230,7 @@ final class TokenUsageTreeBuilderTests: XCTestCase {
         XCTAssertTrue(TokenUsageTree.mixesInputConventions(nodes))
     }
 
-    func testCodexOnlyNodesSetContainsGrossWithoutMixingAndMixedNodesSetBoth() throws {
+    func testCodexOnlyNodesSetContainsGrossWithoutMixingAndMixedNodesMixConventions() throws {
         let codex = sampleCodexTask()
         let codexGroup = sampleGroup(dimension: .driver, value: "codex", label: "Codex", tasks: [codex])
         let groupedNodes = TokenUsageTree.build(sampleReport(tasks: [], groups: [codexGroup]))
@@ -240,13 +240,10 @@ final class TokenUsageTreeBuilderTests: XCTestCase {
         let run = try XCTUnwrap(execution.children?.first)
 
         XCTAssertTrue(run.containsGross)
-        XCTAssertFalse(run.mixesGross)
         XCTAssertTrue(execution.containsGross)
-        XCTAssertFalse(execution.mixesGross)
         XCTAssertTrue(task.containsGross)
-        XCTAssertFalse(task.mixesGross)
         XCTAssertTrue(group.containsGross)
-        XCTAssertFalse(group.mixesGross)
+        XCTAssertTrue(TokenUsageTree.containsGrossInput(groupedNodes))
         XCTAssertFalse(TokenUsageTree.mixesInputConventions(groupedNodes))
 
         let claude = sampleGrokLikeTask(id: "t_claude", driver: "claude", total: 10)
@@ -254,7 +251,7 @@ final class TokenUsageTreeBuilderTests: XCTestCase {
         let mixedNodes = TokenUsageTree.build(sampleReport(tasks: [], groups: [mixedGroup]))
         let mixed = try XCTUnwrap(mixedNodes.first)
         XCTAssertTrue(mixed.containsGross)
-        XCTAssertTrue(mixed.mixesGross)
+        XCTAssertTrue(TokenUsageTree.containsGrossInput(mixedNodes))
         XCTAssertTrue(TokenUsageTree.mixesInputConventions(mixedNodes))
     }
 
@@ -429,6 +426,214 @@ final class TokenUsageTreeBuilderTests: XCTestCase {
         _ = state.beginRequest(requestId: "req-D")
         state.invalidatePending()
         XCTAssertFalse(state.receiveRows(reportA, requestId: "req-D"))
+    }
+
+    func testMixedClaudeAndGrokAggregateRendersUsdWithoutPartialAndGrokWindowHasNoPricingGapNote() throws {
+        var grokTask = sampleGrokLikeTask(id: "t_grok", driver: "grok", name: "Grok work", total: 20)
+        grokTask.executions[0].runs[0].unpriceableCause = "subscription_unpriced"
+        var claudeTask = sampleGrokLikeTask(id: "t_claude", driver: "claude", name: "Claude work", total: 30)
+        claudeTask.executions[0].runs[0].estimatedUsd = 2.50
+        claudeTask.executions[0].measurement.estimatedUsd = 2.50
+        claudeTask.direct.estimatedUsd = 2.50
+
+        var mixedMeasurement = measurement(measured: 2, totalTokens: 50)
+        mixedMeasurement.estimatedUsd = 2.50
+        mixedMeasurement.estimatedUsdPartial = false
+        let mixedGroup = UsageGroup(
+            key: [UsageGroupKey(dimension: .project, value: "proj", label: "Proj")],
+            measurement: mixedMeasurement,
+            subgroups: [],
+            tasks: [claudeTask, grokTask],
+            taskless: []
+        )
+        let mixedNodes = TokenUsageTree.build(sampleReport(tasks: [], groups: [mixedGroup]))
+        let mixed = try XCTUnwrap(mixedNodes.first)
+        let usd = TokenUsageFormatter.usd(
+            estimated: mixed.estimatedUsd,
+            partial: mixed.estimatedUsdPartial,
+            unpriceableCause: mixed.unpriceableCause
+        )
+        XCTAssertEqual(usd?.display, "est. $2.50")
+        XCTAssertFalse(usd?.display.contains("(partial)") ?? true)
+
+        // Grok-only window carries no pricing_gaps note in the footer.
+        let grokOnlyReport = sampleReport(tasks: [grokTask])
+        XCTAssertTrue(grokOnlyReport.pricingGaps.isEmpty)
+        XCTAssertFalse(
+            TokenUsageFormatter.footerNotes(for: grokOnlyReport).contains { $0.code == "pricing_gaps" }
+        )
+    }
+
+    func testChainRootWithNoOwnRunsDoesNotInheritRevisionCaveatOrUnpriceableCause() throws {
+        var revExec = sampleExecution(id: "exec_rev", driver: "claude", total: 30)
+        revExec.runs[0].caveats = [UsageCaveat(code: "subagents_excluded", detail: nil)]
+        let claudeRevision = TaskUsageNode(
+            taskId: "task_rev",
+            chainRootId: "task_root",
+            direct: measurement(measured: 1, totalTokens: 30),
+            isChainRoot: false,
+            kind: "revision",
+            name: "Revision with Claude run",
+            productId: "prod",
+            runsOutsideWindow: 0,
+            status: "done",
+            bySpendClass: [],
+            executions: [revExec],
+            revisions: [],
+            completedAtEpochS: 20,
+            effortCurrent: "medium",
+            inclusive: nil,
+            prUrl: nil,
+            projectId: "proj",
+            reasoningCurrent: "standard",
+            shortId: 13
+        )
+        let rootWithNoRuns = TaskUsageNode(
+            taskId: "task_root",
+            chainRootId: "task_root",
+            direct: CostMeasurement.empty,
+            isChainRoot: true,
+            kind: "chore",
+            name: "Root ran last week",
+            productId: "prod",
+            runsOutsideWindow: 2,
+            status: "done",
+            bySpendClass: [],
+            executions: [],
+            revisions: [claudeRevision],
+            completedAtEpochS: 10,
+            effortCurrent: "large",
+            inclusive: measurement(measured: 1, totalTokens: 30),
+            prUrl: nil,
+            projectId: "proj",
+            reasoningCurrent: "standard",
+            shortId: 12
+        )
+        let nodes = TokenUsageTree.build(sampleReport(tasks: [rootWithNoRuns]))
+        let rootNode = try XCTUnwrap(nodes.first)
+        XCTAssertNil(rootNode.dominantCaveat)
+        XCTAssertNil(rootNode.unpriceableCause)
+        XCTAssertEqual(
+            TokenUsageFormatter.measurementTotal(rootNode.measurement!, dominantCaveat: rootNode.dominantCaveat).display,
+            "— no runs"
+        )
+        XCTAssertEqual(
+            TokenUsageFormatter.measurementClass(nil, measurement: rootNode.measurement!, dominantCaveat: rootNode.dominantCaveat).display,
+            "— no runs"
+        )
+
+        // Root with own Grok run and a priced Claude revision keeps its own
+        // subscription_unpriced cause for its direct USD cell.
+        var grokExec = sampleExecution(id: "exec_grok_root", driver: "grok", total: 15)
+        grokExec.runs[0].unpriceableCause = "subscription_unpriced"
+        let grokRootWithClaudeRev = TaskUsageNode(
+            taskId: "task_grok_root",
+            chainRootId: "task_grok_root",
+            direct: measurement(measured: 1, totalTokens: 15),
+            isChainRoot: true,
+            kind: "chore",
+            name: "Grok root with Claude revision",
+            productId: "prod",
+            runsOutsideWindow: 0,
+            status: "done",
+            bySpendClass: [],
+            executions: [grokExec],
+            revisions: [claudeRevision],
+            completedAtEpochS: 20,
+            effortCurrent: "medium",
+            inclusive: measurement(measured: 2, totalTokens: 45),
+            prUrl: nil,
+            projectId: "proj",
+            reasoningCurrent: "standard",
+            shortId: 14
+        )
+        let grokRootNode = try XCTUnwrap(TokenUsageTree.build(sampleReport(tasks: [grokRootWithClaudeRev])).first)
+        XCTAssertEqual(grokRootNode.unpriceableCause, "subscription_unpriced")
+        XCTAssertEqual(
+            TokenUsageFormatter.usd(
+                estimated: grokRootNode.estimatedUsd,
+                partial: grokRootNode.estimatedUsdPartial,
+                unpriceableCause: grokRootNode.unpriceableCause
+            )?.display,
+            "— unpriced (subscription)"
+        )
+    }
+
+    func testSyntheticModelIsKeptWithWarningFlagAndLaunchedModel() throws {
+        var exec = sampleExecution(id: "exec_synth", driver: "claude", total: 100)
+        exec.modelLaunched = "opus"
+        exec.runs = [
+            sampleRun(id: "run_synth", coverage: .measured, total: 100, convention: .net, model: "<synthetic>"),
+        ]
+        let task = TaskUsageNode(
+            taskId: "task_synth",
+            chainRootId: "task_synth",
+            direct: measurement(measured: 1, totalTokens: 100),
+            isChainRoot: true,
+            kind: "chore",
+            name: "Synthetic model task",
+            productId: "prod",
+            runsOutsideWindow: 0,
+            status: "done",
+            bySpendClass: [],
+            executions: [exec],
+            revisions: [],
+            completedAtEpochS: 20,
+            effortCurrent: "medium",
+            inclusive: nil,
+            prUrl: nil,
+            projectId: nil,
+            reasoningCurrent: "standard",
+            shortId: 99
+        )
+        let nodes = TokenUsageTree.build(sampleReport(tasks: [task]))
+        let execNode = try XCTUnwrap(nodes.first?.children?.first)
+        let runNode = try XCTUnwrap(execNode.children?.first)
+
+        XCTAssertEqual(runNode.model, "<synthetic>")
+        XCTAssertTrue(runNode.modelIsSynthetic)
+        XCTAssertEqual(runNode.launchedModel, "opus")
+
+        XCTAssertEqual(execNode.model, "<synthetic>")
+        XCTAssertTrue(execNode.modelIsSynthetic)
+        XCTAssertEqual(execNode.launchedModel, "opus")
+    }
+
+    @MainActor
+    func testDisconnectedTokenUsageRequestsAreNotQueuedAndReconnectSendsFreshRequest() async {
+        let query1 = TokenUsageQuery(
+            sinceEpochS: 100, untilEpochS: 200,
+            filters: [], groupBy: [], rollUpRevisions: true, estimateUsd: false
+        )
+        let query2 = TokenUsageQuery(
+            sinceEpochS: 160, untilEpochS: 260,
+            filters: [], groupBy: [], rollUpRevisions: true, estimateUsd: false
+        )
+
+        let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        var events: [EngineEvent] = []
+        client.onEvent = { events.append($0) }
+
+        XCTAssertNil(client.sendGetTokenUsageRows(query1))
+        XCTAssertNil(client.sendGetTokenUsageRows(query2))
+        XCTAssertEqual(client.queuedReadCountForTesting, 0, "token usage reads must not queue while disconnected")
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertTrue(events.isEmpty, "skipped disconnected token usage reads must not emit .notConnected")
+
+        let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        model.isConnected = false
+        model.requestTokenUsage(query1)
+        XCTAssertFalse(model.tokenUsage.loading)
+        XCTAssertNil(model.tokenUsage.pendingRequestId)
+        XCTAssertNil(model.tokenUsage.error)
+        XCTAssertEqual(model.engine.queuedReadCountForTesting, 0)
+
+        model.engine.simulateConnectedForTesting = true
+        model.isConnected = true
+        model.requestTokenUsage(query2)
+        XCTAssertTrue(model.tokenUsage.loading)
+        XCTAssertNotNil(model.tokenUsage.pendingRequestId)
+        XCTAssertNil(model.tokenUsage.error)
     }
 
     // MARK: - Fixtures
