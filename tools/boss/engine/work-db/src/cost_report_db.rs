@@ -154,14 +154,16 @@ fn map_usage_run_record(row: &Row) -> rusqlite::Result<UsageRunRecord> {
     })
 }
 
-/// Fill a NULL launch tuple from [`WorkDb::get_execution_driver_slug`], once
-/// per distinct execution. That is the same chain
-/// `driver_transcript::resolve_execution_driver_slug` uses; calling it here
-/// (after the snapshot is released) avoids a lookup per run and avoids
-/// holding the pooled connection while that chain re-enters `WorkDb`.
-/// An error on one execution (for example an unrecognised `kind` written by
-/// another engine build) is logged and leaves that run's driver unknown so
-/// one bad row never makes the whole window unreadable.
+/// Fill a NULL launch tuple from [`WorkDb::get_execution_driver_slugs_lenient`],
+/// once per distinct execution. That is the same chain
+/// `driver_transcript::resolve_execution_driver_slug` uses, batched into a
+/// handful of `IN (json_each(?))` queries instead of one
+/// [`WorkDb::get_execution_driver_slug`] round-trip per execution. Calling it
+/// here (after the snapshot is released) avoids holding the pooled connection
+/// while that chain re-enters `WorkDb`. An error on one execution (for example
+/// an unrecognised `kind` written by another engine build) is logged and
+/// leaves that run's driver unknown so one bad row never makes the whole
+/// window unreadable.
 fn fill_resolved_drivers(db: &WorkDb, runs: &mut [UsageRunRecord]) {
     let mut resolved: HashMap<String, Option<String>> = HashMap::new();
     fill_resolved_drivers_with_cache(
@@ -176,24 +178,40 @@ fn fill_resolved_drivers_with_cache<'a>(
     items: impl IntoIterator<Item = (&'a str, &'a mut RecordedDriver)>,
     resolved: &mut HashMap<String, Option<String>>,
 ) {
-    for (execution_id, driver) in items {
-        if driver.slug().is_some() {
-            continue;
-        }
-        let slug = resolved.entry(execution_id.to_owned()).or_insert_with(|| {
-            match db.get_execution_driver_slug(execution_id) {
-                Ok(slug) => slug.filter(|s| !s.is_empty()),
-                Err(err) => {
-                    tracing::warn!(
-                        execution_id = %execution_id,
-                        error = %format!("{err:#}"),
-                        "failed to resolve driver for usage report execution; leaving unknown"
-                    );
-                    None
+    let pending: Vec<(&'a str, &'a mut RecordedDriver)> = items
+        .into_iter()
+        .filter(|(_, driver)| driver.slug().is_none())
+        .collect();
+    if pending.is_empty() {
+        return;
+    }
+    let mut unresolved_ids: Vec<&str> = pending
+        .iter()
+        .map(|(execution_id, _)| *execution_id)
+        .filter(|id| !resolved.contains_key(*id))
+        .collect();
+    unresolved_ids.sort_unstable();
+    unresolved_ids.dedup();
+    if !unresolved_ids.is_empty() {
+        match db.get_execution_driver_slugs_lenient(&unresolved_ids) {
+            Ok(batch) => resolved.extend(batch),
+            Err(err) => {
+                tracing::warn!(
+                    error = %format!("{err:#}"),
+                    "failed to batch-resolve drivers for usage report; leaving unknown"
+                );
+                for id in unresolved_ids {
+                    resolved.entry(id.to_owned()).or_insert(None);
                 }
             }
-        });
-        *driver = match slug.as_deref() {
+        }
+    }
+    for (execution_id, driver) in pending {
+        *driver = match resolved
+            .get(execution_id)
+            .and_then(|slug| slug.as_deref())
+            .filter(|slug| !slug.is_empty())
+        {
             Some(slug) => RecordedDriver::Resolved(slug.to_owned()),
             None => RecordedDriver::Unknown,
         };
@@ -395,7 +413,7 @@ impl WorkDb {
     /// to nest its revisions under. Chain roots come from the same walk the
     /// rest of the engine uses. All of it is read in one snapshot. After the
     /// snapshot is released, executions whose launch tuple is NULL are
-    /// resolved once each via [`Self::get_execution_driver_slug`].
+    /// resolved in one batched lookup via [`Self::get_execution_driver_slugs_lenient`].
     pub fn usage_records_for_window(&self, since_epoch_s: i64, until_epoch_s: i64) -> Result<UsageWindowRecords> {
         let mut runs;
         let tasks;
@@ -460,7 +478,7 @@ impl WorkDb {
     ///   task.
     ///
     /// After the snapshot is released, NULL launch-tuple drivers are resolved
-    /// once per distinct execution across both runs and finished executions.
+    /// in one batched lookup across both runs and finished executions.
     pub fn usage_series_records_for_window(
         &self,
         since_epoch_s: i64,
@@ -503,35 +521,44 @@ impl WorkDb {
             // observed latest run, not the launch alias. These are not added
             // to bucket measurement; the builder keeps measurement on
             // `wr.created_at` in `[since, until)`.
+            //
+            // Skip executions created at or after `since`: a run cannot exist
+            // before its execution row, so the in-window run projection already
+            // has every run. Binding tens of thousands of in-window ids into
+            // `json_each` looking for an empty out-of-window set is what
+            // pushed 7d/30d series past the 150 ms budget.
             if !finished_executions.is_empty() {
                 let mut exec_ids: Vec<&str> = finished_executions
                     .iter()
+                    .filter(|exec| exec.execution_created_at_epoch_s < since_epoch_s)
                     .map(|exec| exec.execution_id.as_str())
                     .collect();
                 exec_ids.sort_unstable();
                 exec_ids.dedup();
-                let extra_exec_run_sql = format!(
-                    "SELECT {USAGE_RUN_COLUMNS}
-                     FROM work_runs wr
-                     JOIN work_executions we ON we.id = wr.execution_id
-                     WHERE we.id IN (SELECT value FROM json_each(?1))
-                       AND (CAST(wr.created_at AS INTEGER) < ?2 OR CAST(wr.created_at AS INTEGER) >= ?3)
-                     ORDER BY CAST(wr.created_at AS INTEGER) ASC, wr.id ASC"
-                );
-                let extra_exec_runs = tx
-                    .prepare(&extra_exec_run_sql)?
-                    .query_map(
-                        params![query_ensure::id_array(&exec_ids), since_epoch_s, until_epoch_s],
-                        map_usage_run_record,
-                    )?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                runs.extend(extra_exec_runs);
+                if !exec_ids.is_empty() {
+                    let extra_exec_run_sql = format!(
+                        "SELECT {USAGE_RUN_COLUMNS}
+                         FROM work_runs wr
+                         JOIN work_executions we ON we.id = wr.execution_id
+                         WHERE we.id IN (SELECT value FROM json_each(?1))
+                           AND (CAST(wr.created_at AS INTEGER) < ?2 OR CAST(wr.created_at AS INTEGER) >= ?3)
+                         ORDER BY CAST(wr.created_at AS INTEGER) ASC, wr.id ASC"
+                    );
+                    let extra_exec_runs = tx
+                        .prepare(&extra_exec_run_sql)?
+                        .query_map(
+                            params![query_ensure::id_array(&exec_ids), since_epoch_s, until_epoch_s],
+                            map_usage_run_record,
+                        )?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    runs.extend(extra_exec_runs);
+                }
             }
 
             // All chain-root tasks completed in [since, until) plus every
             // descendant revision in their chains. `UNION` deduplicates and
             // guards against cycles.
-            let chain_members: Vec<(String, String)> = tx
+            let chain_members: Vec<(String, String, i64)> = tx
                 .prepare(
                     "WITH RECURSIVE chain(task_id, root_id) AS (
                          SELECT t.id, t.id
@@ -546,47 +573,63 @@ impl WorkDb {
                          JOIN chain c ON r.parent_task_id = c.task_id
                          WHERE r.kind = 'revision'
                      )
-                     SELECT task_id, root_id FROM chain",
+                     SELECT chain.task_id, chain.root_id, CAST(t.created_at AS INTEGER)
+                     FROM chain
+                     JOIN tasks t ON t.id = chain.task_id",
                 )?
                 .query_map(params![since_epoch_s, until_epoch_s], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
 
             if !chain_members.is_empty() {
-                let mut chain_task_ids: Vec<&str> = chain_members.iter().map(|(id, _)| id.as_str()).collect();
+                // A task created at or after `since` cannot have a run created
+                // before it existed, so the in-window run projection already
+                // covers it. Keep the extra lookup for older chain members
+                // (a root completed this week whose own run is 40 days old).
+                let mut chain_task_ids: Vec<&str> = chain_members
+                    .iter()
+                    .filter(|(_, _, created_at)| *created_at < since_epoch_s)
+                    .map(|(id, _, _)| id.as_str())
+                    .collect();
                 chain_task_ids.sort_unstable();
                 chain_task_ids.dedup();
-                let extra_run_sql = format!(
-                    "SELECT {USAGE_RUN_COLUMNS}
-                     FROM work_runs wr
-                     JOIN work_executions we ON we.id = wr.execution_id
-                     WHERE we.work_item_id IN (SELECT value FROM json_each(?1))
-                       AND (CAST(wr.created_at AS INTEGER) < ?2 OR CAST(wr.created_at AS INTEGER) >= ?3)
-                     ORDER BY CAST(wr.created_at AS INTEGER) ASC, wr.id ASC"
-                );
-                let extra_runs = tx
-                    .prepare(&extra_run_sql)?
-                    .query_map(
-                        params![query_ensure::id_array(&chain_task_ids), since_epoch_s, until_epoch_s],
-                        map_usage_run_record,
-                    )?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                runs.extend(extra_runs);
+                if !chain_task_ids.is_empty() {
+                    let extra_run_sql = format!(
+                        "SELECT {USAGE_RUN_COLUMNS}
+                         FROM work_runs wr
+                         JOIN work_executions we ON we.id = wr.execution_id
+                         WHERE we.work_item_id IN (SELECT value FROM json_each(?1))
+                           AND (CAST(wr.created_at AS INTEGER) < ?2 OR CAST(wr.created_at AS INTEGER) >= ?3)
+                         ORDER BY CAST(wr.created_at AS INTEGER) ASC, wr.id ASC"
+                    );
+                    let extra_runs = tx
+                        .prepare(&extra_run_sql)?
+                        .query_map(
+                            params![query_ensure::id_array(&chain_task_ids), since_epoch_s, until_epoch_s],
+                            map_usage_run_record,
+                        )?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    runs.extend(extra_runs);
+                }
             }
 
             let mut work_item_ids: Vec<&str> = runs
                 .iter()
                 .map(|run| run.work_item_id.as_str())
                 .chain(finished_executions.iter().map(|exec| exec.work_item_id.as_str()))
-                .chain(chain_members.iter().map(|(id, _)| id.as_str()))
-                .chain(chain_members.iter().map(|(_, root)| root.as_str()))
+                .chain(chain_members.iter().map(|(id, _, _)| id.as_str()))
+                .chain(chain_members.iter().map(|(_, root, _)| root.as_str()))
                 .collect();
             work_item_ids.sort_unstable();
             work_item_ids.dedup();
 
             let mut roots = chain_helpers::chain_roots(&tx, &work_item_ids)?;
-            for (task_id, root_id) in &chain_members {
+            for (task_id, root_id, _) in &chain_members {
                 roots.entry(task_id.clone()).or_insert_with(|| root_id.clone());
             }
             let mut task_ids: Vec<&str> = work_item_ids;
@@ -1085,6 +1128,65 @@ mod tests {
     }
 
     #[test]
+    fn null_launch_tuples_resolve_in_one_batch_across_distinct_pins() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let conn = db.connect().unwrap();
+        insert_task(&conn, "t_codex", &product_id, "chore", None);
+        insert_task(&conn, "t_claude", &product_id, "chore", None);
+        insert_task(&conn, "t_default", &product_id, "chore", None);
+        conn.execute("UPDATE tasks SET driver = 'codex' WHERE id = 't_codex'", [])
+            .unwrap();
+        conn.execute("UPDATE tasks SET driver = 'claude' WHERE id = 't_claude'", [])
+            .unwrap();
+        insert_run_with_driver(
+            &conn,
+            "run_codex",
+            "exec_codex",
+            "t_codex",
+            "chore_implementation",
+            1_500,
+            None,
+        );
+        insert_run_with_driver(
+            &conn,
+            "run_claude",
+            "exec_claude",
+            "t_claude",
+            "chore_implementation",
+            1_510,
+            None,
+        );
+        insert_run_with_driver(
+            &conn,
+            "run_default",
+            "exec_default",
+            "t_default",
+            "chore_implementation",
+            1_520,
+            None,
+        );
+        drop(conn);
+
+        let records = db.usage_records_for_window(1_000, 2_000).unwrap();
+        assert_eq!(records.runs.len(), 3);
+        let driver_of = |id: &str| {
+            records
+                .runs
+                .iter()
+                .find(|run| run.run_id == id)
+                .map(|run| run.driver.clone())
+                .unwrap()
+        };
+        assert_eq!(driver_of("run_codex"), RecordedDriver::Resolved("codex".into()));
+        assert_eq!(driver_of("run_claude"), RecordedDriver::Resolved("claude".into()));
+        assert_eq!(
+            driver_of("run_default"),
+            RecordedDriver::Resolved(boss_engine_effort::ENGINE_DEFAULT_DRIVER.into())
+        );
+    }
+
+    #[test]
     fn a_null_launch_tuple_that_cannot_resolve_stays_unknown() {
         let (_dir, db) = open_db();
         let conn = db.connect().unwrap();
@@ -1412,6 +1514,20 @@ mod tests {
             [],
         )
         .unwrap();
+        insert_run_with_driver(
+            &conn,
+            "r_in_window",
+            "e_in_window",
+            "t_open",
+            "chore_implementation",
+            4_500,
+            Some("claude"),
+        );
+        conn.execute(
+            "UPDATE work_executions SET finished_at = '5000' WHERE id = 'e_in_window'",
+            [],
+        )
+        .unwrap();
         drop(conn);
 
         let records = db.usage_series_records_for_window(4_000, 6_000).unwrap();
@@ -1422,7 +1538,12 @@ mod tests {
                 .any(|r| r.run_id == "r_early" && r.run_model.as_deref() == Some("claude-sonnet-4")),
             "the execution's only run predates `since` and must still be loaded for grouping"
         );
-        assert_eq!(records.finished_executions.len(), 1);
+        let in_window_count = records.runs.iter().filter(|r| r.run_id == "r_in_window").count();
+        assert_eq!(
+            in_window_count, 1,
+            "an execution created in-window must not be re-fetched as a pre-window extra"
+        );
+        assert_eq!(records.finished_executions.len(), 2);
 
         let q = UsageSeriesQuery::builder()
             .since_epoch_s(4_000)
