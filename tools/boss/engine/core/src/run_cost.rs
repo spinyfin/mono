@@ -8,7 +8,7 @@
 //! intentional: a run that is later orphaned still retains the spend observed
 //! up to its last hook.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -350,37 +350,39 @@ impl TranscriptCostTail {
 
 #[derive(Debug, Default)]
 struct RunCostTail {
-    tails: HashMap<PathBuf, TranscriptCostTail>,
+    tails: BTreeMap<PathBuf, TranscriptCostTail>,
+    parent_path: Option<PathBuf>,
+    subagents_unreadable_reason: Option<String>,
     capture_provider_usage: Option<bool>,
 }
 
 impl RunCostTail {
-    async fn poll(
+    async fn poll_file(
         &mut self,
-        transcript_path: &Path,
+        path: &Path,
         containment_root: Option<&Path>,
         capture_provider_usage: bool,
         limit: u64,
     ) -> Result<bool, CaptureError> {
-        let replace = match self.tails.get(transcript_path) {
+        let replace = match self.tails.get(path) {
             Some(state)
                 if state.containment_root.is_some() && state.containment_root.as_deref() != containment_root =>
             {
                 return Err(CaptureError::Permanent(format!(
                     "refusing transcript containment downgrade or root change for {}",
-                    transcript_path.display()
+                    path.display()
                 )));
             }
             Some(state) => state.containment_root.as_deref() != containment_root,
             None => false,
         };
-        if replace || !self.tails.contains_key(transcript_path) {
-            let tail = TranscriptCostTail::new(transcript_path, containment_root)?;
-            self.tails.insert(transcript_path.to_owned(), tail);
+        if replace || !self.tails.contains_key(path) {
+            let tail = TranscriptCostTail::new(path, containment_root)?;
+            self.tails.insert(path.to_owned(), tail);
         }
         let state = self
             .tails
-            .get_mut(transcript_path)
+            .get_mut(path)
             .expect("transcript cost tail was just inserted");
         let values = state.tail.poll_through(limit).await?;
         let mut full_replacement = replace;
@@ -390,20 +392,121 @@ impl RunCostTail {
             full_replacement = true;
         }
         for value in values {
-            state
-                .accumulator
-                .ingest(transcript_path, &value, capture_provider_usage);
+            state.accumulator.ingest(path, &value, capture_provider_usage);
         }
         Ok(full_replacement)
     }
 
+    async fn poll(
+        &mut self,
+        transcript_path: &Path,
+        containment_root: Option<&Path>,
+        capture_provider_usage: bool,
+        limit: u64,
+    ) -> Result<bool, CaptureError> {
+        self.parent_path = Some(transcript_path.to_owned());
+        let mut full_replacement = self
+            .poll_file(transcript_path, containment_root, capture_provider_usage, limit)
+            .await?;
+
+        let mut unreadable_reason = None;
+        let subagent_paths = match enumerate_subagent_transcripts(transcript_path) {
+            Ok(paths) => paths,
+            Err(reason) => {
+                unreadable_reason = Some(reason);
+                Vec::new()
+            }
+        };
+        for subagent_path in subagent_paths {
+            match self
+                .poll_file(&subagent_path, containment_root, capture_provider_usage, u64::MAX)
+                .await
+            {
+                Ok(replaced) => full_replacement |= replaced,
+                Err(error) => {
+                    if unreadable_reason.is_none() {
+                        unreadable_reason = Some(format!(
+                            "Subagent transcript unreadable ({}): {error}",
+                            subagent_path.display()
+                        ));
+                    }
+                }
+            }
+        }
+        self.subagents_unreadable_reason = unreadable_reason;
+        Ok(full_replacement)
+    }
+
+    fn subagents_unreadable_reason(&self) -> Option<&str> {
+        self.subagents_unreadable_reason.as_deref()
+    }
+
     fn snapshot(&self) -> Option<RunCostSnapshot> {
         let mut combined = CostAccumulator::default();
-        for state in self.tails.values() {
+        // Fold subagent tails first and the parent tail last so the parent's
+        // observed model wins deterministically over any subagent model.
+        for (path, state) in &self.tails {
+            if self.parent_path.as_deref() == Some(path.as_path()) {
+                continue;
+            }
             combined.merge_from(&state.accumulator);
         }
-        combined.snapshot()
+        if let Some(parent_path) = &self.parent_path
+            && let Some(parent_state) = self.tails.get(parent_path)
+        {
+            combined.merge_from(&parent_state.accumulator);
+        }
+        let mut snapshot = combined.snapshot();
+        if let Some(reason) = &self.subagents_unreadable_reason {
+            let snap = snapshot.get_or_insert_with(RunCostSnapshot::default);
+            if snap.usage_unavailable.is_none() {
+                snap.usage_unavailable = Some(reason.clone());
+            }
+        }
+        snapshot
     }
+}
+
+fn subagents_dir_for_transcript(transcript_path: &Path) -> Option<PathBuf> {
+    let parent = transcript_path.parent()?;
+    let stem = transcript_path.file_stem()?;
+    if stem.is_empty() {
+        return None;
+    }
+    Some(parent.join(stem).join("subagents"))
+}
+
+fn enumerate_subagent_transcripts(transcript_path: &Path) -> Result<Vec<PathBuf>, String> {
+    let Some(dir) = subagents_dir_for_transcript(transcript_path) else {
+        return Ok(Vec::new());
+    };
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "Subagent transcript directory unreadable ({}): {error}",
+                dir.display()
+            ));
+        }
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("Subagent transcript directory unreadable ({}): {error}", dir.display()))?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("Subagent transcript directory unreadable ({}): {error}", dir.display()))?;
+        if !file_type.is_dir() {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
 }
 
 /// Process-lifetime incremental tails keyed by execution id.
@@ -469,6 +572,14 @@ impl RunCostCapture {
         let full_replacement = state
             .poll(transcript_path, containment_root, capture_provider_usage, limit)
             .await?;
+        if let Some(reason) = state.subagents_unreadable_reason() {
+            tracing::warn!(
+                execution_id,
+                transcript_path = %transcript_path.display(),
+                reason,
+                "Claude subagent transcript enumeration incomplete; recording partial usage as unavailable",
+            );
+        }
         let mut snapshot = match state.snapshot() {
             Some(snapshot) => snapshot,
             None if full_replacement => RunCostSnapshot::default(),
@@ -695,6 +806,167 @@ mod tests {
             "contained run-cost tail must reject path replacement: {error}",
         );
         assert_eq!(tail.snapshot().unwrap().input_tokens, Some(1));
+    }
+
+    #[tokio::test]
+    async fn claude_subagent_transcripts_are_folded_and_deduplicated_by_message_id() {
+        let dir = TempDir::new().unwrap();
+        let parent_path = dir.path().join("sess-1.jsonl");
+        let subagents_dir = dir.path().join("sess-1").join("subagents");
+        std::fs::create_dir_all(&subagents_dir).unwrap();
+
+        std::fs::write(
+            &parent_path,
+            concat!(
+                r#"{"type":"assistant","message":{"id":"msg-parent-1","model":"claude-opus-4-6","usage":{"input_tokens":100,"output_tokens":20,"cache_creation_input_tokens":50,"cache_read_input_tokens":200}}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"id":"msg-shared","model":"claude-opus-4-6","usage":{"input_tokens":30,"output_tokens":5,"cache_creation_input_tokens":10,"cache_read_input_tokens":40}}}"#,
+                "\n",
+                r#"{"type":"system","subtype":"turn_duration","uuid":"turn-p1","durationMs":1000}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        // Subagent 1 shares `msg-shared` with the parent and adds `msg-sub-1`.
+        std::fs::write(
+            subagents_dir.join("agent-a.jsonl"),
+            concat!(
+                r#"{"type":"assistant","message":{"id":"msg-shared","model":"claude-haiku-4-5","usage":{"input_tokens":30,"output_tokens":5,"cache_creation_input_tokens":10,"cache_read_input_tokens":40}}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"id":"msg-sub-1","model":"claude-haiku-4-5","usage":{"input_tokens":40,"output_tokens":10,"cache_creation_input_tokens":15,"cache_read_input_tokens":60}}}"#,
+                "\n",
+                r#"{"type":"system","subtype":"turn_duration","uuid":"turn-s1","durationMs":250}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        // Subagent 2 adds `msg-sub-2`.
+        std::fs::write(
+            subagents_dir.join("agent-b.jsonl"),
+            concat!(
+                r#"{"type":"assistant","message":{"id":"msg-sub-2","model":"claude-sonnet-4-6","usage":{"input_tokens":25,"output_tokens":8,"cache_creation_input_tokens":5,"cache_read_input_tokens":15}}}"#,
+                "\n",
+                r#"{"type":"system","subtype":"turn_duration","uuid":"turn-s2","durationMs":150}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        // Non-jsonl sidecar metadata files must be ignored.
+        std::fs::write(subagents_dir.join("agent-a.meta.json"), r#"{"agentType":"Explore"}"#).unwrap();
+
+        let mut tail = RunCostTail::default();
+        tail.poll(&parent_path, None, false, u64::MAX).await.unwrap();
+        assert_eq!(tail.subagents_unreadable_reason(), None);
+
+        let snapshot = tail.snapshot().unwrap();
+        // Deduplicated sum: msg-parent-1 + msg-shared + msg-sub-1 + msg-sub-2
+        assert_eq!(snapshot.input_tokens, Some(100 + 30 + 40 + 25));
+        assert_eq!(snapshot.output_tokens, Some(20 + 5 + 10 + 8));
+        assert_eq!(snapshot.cache_creation_tokens, Some(50 + 10 + 15 + 5));
+        assert_eq!(snapshot.cache_read_tokens, Some(200 + 40 + 60 + 15));
+        assert_eq!(snapshot.rounds, Some(4));
+        assert_eq!(snapshot.agent_active_ms, Some(1000 + 250 + 150));
+        assert_eq!(snapshot.model.as_deref(), Some("claude-opus-4-6"));
+        assert_eq!(snapshot.usage_unavailable, None);
+    }
+
+    #[tokio::test]
+    async fn missing_subagents_directory_preserves_parent_totals_without_error() {
+        let dir = TempDir::new().unwrap();
+        let parent_path = dir.path().join("sess-no-sub.jsonl");
+        std::fs::write(
+            &parent_path,
+            concat!(
+                r#"{"type":"assistant","message":{"id":"msg-1","model":"claude-opus-4-6","usage":{"input_tokens":12,"output_tokens":3}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let mut tail = RunCostTail::default();
+        tail.poll(&parent_path, None, false, u64::MAX).await.unwrap();
+        assert_eq!(tail.subagents_unreadable_reason(), None);
+
+        let snapshot = tail.snapshot().unwrap();
+        assert_eq!(snapshot.input_tokens, Some(12));
+        assert_eq!(snapshot.output_tokens, Some(3));
+        assert_eq!(snapshot.rounds, Some(1));
+        assert_eq!(snapshot.usage_unavailable, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_subagents_directory_marks_run_usage_incomplete() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, db) = crate::test_support::open_db();
+        let product = crate::test_support::create_product(&db);
+        let task = crate::test_support::create_test_chore(&db, &product, "unreadable subagents");
+        let execution = crate::test_support::create_ready_chore_execution(&db, &task.id);
+        db.create_run(
+            boss_protocol::CreateRunInput::builder()
+                .execution_id(&execution.id)
+                .agent_id("worker")
+                .status("completed")
+                .build(),
+        )
+        .unwrap();
+
+        let parent_path = dir.path().join("sess-unreadable.jsonl");
+        std::fs::write(
+            &parent_path,
+            concat!(
+                r#"{"type":"assistant","message":{"id":"msg-1","model":"claude-opus-4-6","usage":{"input_tokens":50,"output_tokens":9}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let subagents_dir = dir.path().join("sess-unreadable").join("subagents");
+        std::fs::create_dir_all(&subagents_dir).unwrap();
+        std::fs::write(
+            subagents_dir.join("agent-1.jsonl"),
+            concat!(
+                r#"{"type":"assistant","message":{"id":"msg-sub","model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":2}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&subagents_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let capture = RunCostCapture::new();
+        let persisted = capture
+            .capture_and_persist(&db, &execution.id, &parent_path, None)
+            .await
+            .unwrap();
+        assert!(persisted);
+
+        let records = db.cost_records_for_window(0, i64::MAX).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].input_tokens, Some(50));
+        assert_eq!(records[0].output_tokens, Some(9));
+        let reason = records[0]
+            .usage_unavailable
+            .as_deref()
+            .expect("unreadable subagents dir must set usage_unavailable");
+        assert!(
+            reason.contains("Subagent transcript directory unreadable"),
+            "unexpected usage_unavailable reason: {reason}"
+        );
+
+        // Restoring directory permissions on a subsequent poll folds the subagent
+        // transcript and clears the incomplete marker.
+        std::fs::set_permissions(&subagents_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        capture
+            .capture_and_persist(&db, &execution.id, &parent_path, None)
+            .await
+            .unwrap();
+        let records = db.cost_records_for_window(0, i64::MAX).unwrap();
+        assert_eq!(records[0].input_tokens, Some(60));
+        assert_eq!(records[0].output_tokens, Some(11));
+        assert_eq!(records[0].usage_unavailable, None);
     }
 }
 
