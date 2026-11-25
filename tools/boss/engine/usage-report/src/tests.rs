@@ -1046,8 +1046,49 @@ fn usd_is_excluded_by_driver_for_subscription_drivers_even_when_the_model_name_i
         report.overall.estimated_usd, None,
         "nothing priced is None, never $0.00"
     );
-    assert!(report.overall.estimated_usd_partial);
+    assert!(
+        !report.overall.estimated_usd_partial,
+        "subscription-billed drivers must not mark aggregates partial"
+    );
+    assert!(
+        report.pricing_gaps.is_empty(),
+        "subscription-billed drivers must not appear in pricing_gaps"
+    );
+    assert!(
+        !report.coverage.notes.iter().any(|n| n.code == note::PRICING_GAPS),
+        "subscription-billed drivers must not emit a pricing_gaps note"
+    );
     assert_eq!(report.coverage.runs_priceable, Some(0));
+}
+
+#[test]
+fn usd_mixed_priced_and_subscription_aggregate_is_not_partial_and_has_no_pricing_gap() {
+    let claude = with_driver(
+        with_model(
+            tokens(run("c", "ec", "t1", BASE_EPOCH_S), 1_000, 100, 0, 0),
+            "claude-opus",
+        ),
+        Some("claude"),
+    );
+    let grok = with_driver(
+        with_model(
+            tokens(run("g", "eg", "t1", BASE_EPOCH_S + 1), 1, 1, 1, 1),
+            "grok-4.5-build",
+        ),
+        Some("grok"),
+    );
+    let report = build_usage_rows_report(
+        &window(),
+        &records(vec![claude, grok], vec![task("t1", "t1", 2)]),
+        Some(&priced_only_claude),
+    );
+    assert_eq!(report.overall.estimated_usd, Some(1.5));
+    assert!(!report.overall.estimated_usd_partial);
+    assert_eq!(report.tasks[0].direct.estimated_usd, Some(1.5));
+    assert!(!report.tasks[0].direct.estimated_usd_partial);
+    assert!(report.pricing_gaps.is_empty());
+    assert!(!report.coverage.notes.iter().any(|n| n.code == note::PRICING_GAPS));
+    assert_eq!(report.coverage.runs_priceable, Some(1));
 }
 
 #[test]

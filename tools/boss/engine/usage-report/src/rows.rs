@@ -275,9 +275,17 @@ fn dimension_values(
 }
 
 /// Distinct models a requested USD estimate left out, among measured runs.
+/// Subscription-billed drivers (`subscription_unpriced`) are excluded by driver
+/// rather than a pricing gap, so they are omitted.
 fn pricing_gaps(runs: &[&RunFacts<'_>]) -> BTreeSet<String> {
     runs.iter()
-        .filter(|facts| facts.coverage != RunCoverage::Unmeasured && matches!(facts.usd, UsdOutcome::Unpriceable(_)))
+        .filter(|facts| {
+            facts.coverage != RunCoverage::Unmeasured
+                && matches!(
+                    facts.usd,
+                    UsdOutcome::Unpriceable(c) if c != crate::classify::cause::SUBSCRIPTION_UNPRICED
+                )
+        })
         .map(|facts| model_label(facts.rec))
         .collect()
 }
@@ -313,7 +321,7 @@ fn coverage(query: &UsageRowsQuery, runs: &[&RunFacts<'_>], gaps: &BTreeSet<Stri
         notes.push(UsageNote {
             code: note::PRICING_GAPS.to_owned(),
             detail: format!(
-                "the USD estimate leaves out runs it cannot price (unverified rates, subscription billing, gross input or unknown tokens); models: {}",
+                "the USD estimate leaves out runs it cannot price (unverified rates, gross input or unknown tokens); models: {}",
                 gaps.iter().cloned().collect::<Vec<_>>().join(", ")
             ),
         });

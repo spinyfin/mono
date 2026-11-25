@@ -225,6 +225,8 @@ extension EngineClient {
 
     /// Run-grain token usage for a time window. The engine returns the
     /// task → execution → run tree with every figure already computed.
+    /// Never queued while disconnected: the window re-requests with fresh
+    /// timestamps on reconnect instead of piling up stale window scans.
     @discardableResult
     func sendGetTokenUsageRows(_ query: TokenUsageQuery) -> String? {
         let filters: [[String: Any]] = query.filters.map { filter in
@@ -238,7 +240,7 @@ extension EngineClient {
             "group_by": query.groupBy.map(\.rawValue),
             "roll_up_revisions": query.rollUpRevisions,
             "estimate_usd": query.estimateUsd,
-        ], queueIfDisconnected: true)
+        ], queueIfDisconnected: false, reportIfDisconnected: false)
     }
 
     /// Signal the engine that the Boss app window just became active.

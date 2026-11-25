@@ -118,11 +118,6 @@ enum TokenUsageFormatter {
     /// `$0.00` and never a pricing-gap warning. Other unpriceable causes
     /// hide the figure. A priced run under half a cent is `<$0.01` so it
     /// cannot read as free.
-    ///
-    /// Limitation: for mixed aggregates containing both priced runs and
-    /// `subscription_unpriced` runs, the engine currently sets
-    /// `estimated_usd_partial = true`, so the formatter renders `(partial)`
-    /// until the engine excludes `subscription_unpriced` from `usd_partial`.
     static func usd(
         estimated: Double?,
         partial: Bool,
@@ -161,6 +156,9 @@ enum TokenUsageFormatter {
     }
 
     static func noMeasuredReason(_ measurement: CostMeasurement, dominantCaveat: String?) -> String {
+        if measurement.runsTotal == 0 {
+            return "no runs"
+        }
         if let dominantCaveat, !dominantCaveat.isEmpty {
             if dominantCaveat == "usage_unavailable",
                let first = measurement.usageUnavailable.first, !first.isEmpty
@@ -172,10 +170,62 @@ enum TokenUsageFormatter {
         if let first = measurement.usageUnavailable.first, !first.isEmpty {
             return first
         }
-        if measurement.runsTotal == 0 {
-            return "no runs"
-        }
         return "not recorded"
+    }
+
+    /// Footer coverage summary preserving the distinct counts the engine
+    /// already computed: complete, partial, unmeasured, zero (when present),
+    /// and priceable (when Estimated USD is enabled).
+    static func coverageSummary(_ coverage: UsageCoverage) -> String {
+        if coverage.runsTotal == 0 {
+            return "0 runs"
+        }
+        var parts = [
+            "\(coverage.runsTotal) runs",
+            "\(coverage.runsComplete) complete",
+            "\(coverage.runsPartial) partial",
+            "\(coverage.runsUnmeasured) unmeasured",
+        ]
+        if coverage.runsZero > 0 {
+            parts.append("\(coverage.runsZero) zero")
+        }
+        if let priceable = coverage.runsPriceable {
+            parts.append("\(priceable) priceable")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    /// Report-level notes shown in the footer. Omits `capture_started` when
+    /// the window already renders the formatted capture-boundary banner.
+    static func footerNotes(for report: TokenUsageRowsReport) -> [UsageNote] {
+        report.coverage.notes.filter { note in
+            !(report.spansCaptureBoundary && note.code == "capture_started")
+        }
+    }
+
+    /// Dominant caveat code from a caveat-count map, prioritizing unmeasured
+    /// causes (`pre_capture`, `usage_unavailable`) so an all-unmeasured total
+    /// names why its tokens are missing rather than a secondary caveat.
+    static func dominantCaveatCode(from counts: [String: Int]) -> String? {
+        guard !counts.isEmpty else { return nil }
+        let unmeasuredPriority = ["pre_capture", "usage_unavailable"]
+        let unmeasuredCounts = counts.filter { unmeasuredPriority.contains($0.key) }
+        let pool = unmeasuredCounts.isEmpty ? counts : unmeasuredCounts
+        return pool.max { lhs, rhs in
+            if lhs.value != rhs.value { return lhs.value < rhs.value }
+            let lp = unmeasuredPriority.firstIndex(of: lhs.key) ?? Int.max
+            let rp = unmeasuredPriority.firstIndex(of: rhs.key) ?? Int.max
+            if lp != rp { return lp > rp }
+            return lhs.key > rhs.key
+        }?.key
+    }
+
+    static func dominantCaveatCode(from caveats: [UsageCaveatCount]) -> String? {
+        var counts: [String: Int] = [:]
+        for item in caveats where item.runs > 0 {
+            counts[item.code, default: 0] += Int(item.runs)
+        }
+        return dominantCaveatCode(from: counts)
     }
 
     /// Coverage of an engine-owned measurement. Uses the counts the

@@ -377,4 +377,105 @@ final class TokenUsageFormatterTests: XCTestCase {
             "none (not recorded)"
         )
     }
+
+    func testNoMeasuredReasonReturnsNoRunsWhenTotalIsZeroBeforeCaveat() {
+        let empty = CostMeasurement.empty
+        XCTAssertEqual(
+            TokenUsageFormatter.noMeasuredReason(empty, dominantCaveat: "subagents_excluded"),
+            "no runs"
+        )
+        XCTAssertEqual(
+            TokenUsageFormatter.measurementTotal(empty, dominantCaveat: "subagents_excluded").display,
+            "— no runs"
+        )
+    }
+
+    func testCoverageSummaryPreservesDistinctCountsAndPriceableTriple() {
+        let mixed = UsageCoverage(
+            runsComplete: 5,
+            runsPartial: 2,
+            runsTotal: 9,
+            runsUnmeasured: 1,
+            runsZero: 1,
+            byCaveat: [],
+            notes: [],
+            runsPriceable: 4
+        )
+        XCTAssertEqual(
+            TokenUsageFormatter.coverageSummary(mixed),
+            "9 runs · 5 complete · 2 partial · 1 unmeasured · 1 zero · 4 priceable"
+        )
+
+        let noZeroNoUsd = UsageCoverage(
+            runsComplete: 3,
+            runsPartial: 1,
+            runsTotal: 5,
+            runsUnmeasured: 1,
+            runsZero: 0,
+            byCaveat: [],
+            notes: [],
+            runsPriceable: nil
+        )
+        XCTAssertEqual(
+            TokenUsageFormatter.coverageSummary(noZeroNoUsd),
+            "5 runs · 3 complete · 1 partial · 1 unmeasured"
+        )
+
+        let empty = UsageCoverage(
+            runsComplete: 0, runsPartial: 0, runsTotal: 0,
+            runsUnmeasured: 0, runsZero: 0, byCaveat: [], notes: [], runsPriceable: nil
+        )
+        XCTAssertEqual(TokenUsageFormatter.coverageSummary(empty), "0 runs")
+    }
+
+    func testFooterNotesOmitsCaptureStartedWhenBannerShownAndPreCaptureOverallUsesDominantCaveat() {
+        var preCaptureOverall = CostMeasurement.empty
+        preCaptureOverall.runsTotal = 2
+        preCaptureOverall.runsUnmeasured = 2
+        let coverage = UsageCoverage(
+            runsComplete: 0,
+            runsPartial: 0,
+            runsTotal: 2,
+            runsUnmeasured: 2,
+            runsZero: 0,
+            byCaveat: [
+                UsageCaveatCount(code: "driver_not_recorded", runs: 2),
+                UsageCaveatCount(code: "pre_capture", runs: 2),
+            ],
+            notes: [
+                UsageNote(code: "capture_started", detail: "epoch 1785144180"),
+                UsageNote(code: "retention_bounded", detail: "older than 14 days"),
+            ],
+            runsPriceable: nil
+        )
+        let report = TokenUsageRowsReport(
+            captureStartEpochS: 1_785_144_180,
+            coverage: coverage,
+            generatedAtEpochS: 1_790_000_000,
+            overall: preCaptureOverall,
+            runCap: 5_000,
+            sinceEpochS: 0,
+            spansCaptureBoundary: true,
+            truncated: false,
+            untilEpochS: 1_785_144_000,
+            dimensionValues: [],
+            groupBy: [],
+            groups: [],
+            pricingGaps: [],
+            taskless: [],
+            tasks: []
+        )
+
+        let notes = TokenUsageFormatter.footerNotes(for: report)
+        XCTAssertEqual(notes.map(\.code), ["retention_bounded"])
+
+        let dominant = TokenUsageFormatter.dominantCaveatCode(from: report.coverage.byCaveat)
+        XCTAssertEqual(dominant, "pre_capture")
+        let overall = TokenUsageFormatter.measurementTotal(
+            report.overall,
+            spansCaptureBoundary: report.spansCaptureBoundary,
+            dominantCaveat: dominant
+        )
+        XCTAssertEqual(overall.display, "— not instrumented")
+    }
 }
