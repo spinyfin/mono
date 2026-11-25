@@ -684,6 +684,7 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
         | R::ReorderProjectTasks { .. }
         | R::RequestCriticalPriority { .. }
         | R::ResolveCriticalPriorityRequest { .. }
+        | R::ResolveWorkerRecoveryAttention { .. }
         | R::UnlinkWorkItemExternalRef { .. } => ordered_unreplayable(WorkerAccess::Taxonomy, ProgressionAccess::Deny),
     }
 }
