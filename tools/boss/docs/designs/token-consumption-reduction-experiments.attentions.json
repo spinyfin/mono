@@ -1,0 +1,22 @@
+[
+  {
+    "question_type": "yes_no",
+    "prompt": "Assign experiment arms per PR family, so a work item and all of its revisions, reviews and guides share one arm (about 160 families per arm per week), as this design does, rather than per run (about six times as many units, but the saving from a skipped review and every per-PR quality figure could not be attributed to an arm)?",
+    "anchor": "b-split-by-execution-id"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Keep every experiment split fixed at half and half, with the one-click off switch as the only bound on risk (recommended: a 10/90 split takes about 2.8 times as long to read), rather than adding a configurable share per experiment?",
+    "anchor": "d-a-configurable-share-per-experiment"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Hold the exploration-subagent experiment back until Claude subagent tokens are counted, which the cost-attribution project owns, as this design does, rather than running it now with the treated arm's subagent tokens missing from the comparison?",
+    "anchor": "experiment-exploration-subagent-on-a-cheaper-model"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Keep the small price refresh (current Opus, Sonnet and Fable list prices, and cache writes priced by lifetime) as an entry of this project, rather than leaving every price change to the cost-attribution project's rate table?",
+    "anchor": "refresh-claude-list-price-weights-and-price-cache-writes-by-lifetime"
+  }
+]
