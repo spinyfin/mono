@@ -19,6 +19,7 @@ fn enable_pr_created_seam() -> (Arc<crate::feature_flags::FeatureFlagsStore>, Te
     flags.load().unwrap();
     flags.set("worker_proposals", true).unwrap();
     flags.set("pr_created_proposals_seam", true).unwrap();
+    crate::review_guide_capture::pin_review_guide_flags_off(&flags);
     (flags, flags_dir)
 }
 

@@ -1,8 +1,8 @@
-//! `GetReviewGuideSummary` / `GetReviewGuideContent` / `RetryReviewGuide` RPC
-//! handlers. Modeled on `app::projects::handle_resolve_project_design_doc`
-//! (summary/content query shape) and `app::proposals::handle_submit_proposal`
-//! (idempotent retry shape). See
-//! `tools/boss/docs/designs/automatic-pr-review-guides.md`.
+//! `GetReviewGuideSummary` / `GetReviewGuideContent` / `GetReviewGuideRun` /
+//! `RetryReviewGuide` RPC handlers. Modeled on
+//! `app::projects::handle_resolve_project_design_doc` (summary/content query
+//! shape) and `app::proposals::handle_submit_proposal` (idempotent retry
+//! shape). See `tools/boss/docs/designs/automatic-pr-review-guides.md`.
 
 use super::*;
 
@@ -190,6 +190,115 @@ pub(super) async fn handle_get_review_guide_summary(ctx: Dispatch, req: Frontend
     }
 }
 
+pub(super) async fn handle_get_review_guide_run(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        work_db,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::GetReviewGuideRun { execution_id } = req else {
+        unreachable!()
+    };
+    match load_review_guide_run(&work_db, &execution_id) {
+        Ok(run) => send_response(&sink, &request_id, FrontendEvent::ReviewGuideRun { run }),
+        Err(err) => send_work_error(&sink, &request_id, &err),
+    }
+}
+
+fn load_review_guide_run(
+    work_db: &boss_work_db::WorkDb,
+    execution_id: &str,
+) -> anyhow::Result<boss_protocol::ReviewGuideRun> {
+    match work_db.get_execution(execution_id) {
+        Ok(execution) => load_review_guide_run_from_execution(work_db, execution_id, execution),
+        Err(err) => match load_latest_review_guide_run_for_root(work_db, execution_id)? {
+            Some(run) => Ok(run),
+            None => Err(err),
+        },
+    }
+}
+
+fn load_latest_review_guide_run_for_root(
+    work_db: &boss_work_db::WorkDb,
+    root_task_id: &str,
+) -> anyhow::Result<Option<boss_protocol::ReviewGuideRun>> {
+    let Some(summary) = work_db.get_pr_review_guide_summary_for_root(root_task_id)? else {
+        return Ok(None);
+    };
+    let Some(bound_execution_id) = summary.execution_id else {
+        anyhow::bail!("no review-guide execution is bound for this PR yet");
+    };
+    let execution = work_db.get_execution(&bound_execution_id)?;
+    load_review_guide_run_from_execution(work_db, &bound_execution_id, execution).map(Some)
+}
+
+fn load_review_guide_run_from_execution(
+    work_db: &boss_work_db::WorkDb,
+    execution_id: &str,
+    execution: boss_protocol::WorkExecution,
+) -> anyhow::Result<boss_protocol::ReviewGuideRun> {
+    anyhow::ensure!(
+        execution.kind == boss_protocol::ExecutionKind::PrReviewGuide,
+        "execution {execution_id} is not a review-guide run"
+    );
+    let attempt = work_db
+        .pr_review_guide_attempt_for_execution(execution_id)?
+        .ok_or_else(|| anyhow::anyhow!("execution {execution_id} has no bound review-guide attempt"))?;
+    let capture = work_db
+        .get_pr_review_guide_comparison_by_id(&attempt.comparison_id)?
+        .ok_or_else(|| anyhow::anyhow!("source comparison {} is gone", attempt.comparison_id))?;
+    let version = work_db.get_pr_review_guide_version_for_attempt(&attempt.id)?;
+    Ok(wire_run(execution_id, attempt, capture, version))
+}
+
+fn wire_run(
+    execution_id: &str,
+    attempt: boss_work_db::PrReviewGuideAttempt,
+    capture: boss_work_db::PrReviewGuideSourceCapture,
+    version: Option<boss_work_db::PrReviewGuideVersion>,
+) -> boss_protocol::ReviewGuideRun {
+    let published_at = version.as_ref().map(|version| version.generated_at.clone());
+    let version_id = version.map(|version| version.id);
+    boss_protocol::ReviewGuideRun::builder()
+        .execution_id(execution_id)
+        .attempt_id(attempt.id)
+        .series_id(attempt.series_id)
+        .request_epoch(attempt.request_epoch)
+        .status(attempt.status)
+        .maybe_version_id(version_id)
+        .maybe_error(attempt.error)
+        .retries(attempt.retries)
+        .source(
+            boss_protocol::ReviewGuideRunSource::builder()
+                .comparison_id(capture.comparison_id)
+                .canonical_pr_url(capture.packet.canonical_pr_url)
+                .observed_base_sha(capture.packet.observed_base_sha)
+                .merge_base_sha(capture.packet.merge_base_sha)
+                .head_sha(capture.packet.head_sha)
+                .packet_hash(capture.packet_hash)
+                .build(),
+        )
+        .prompt_version(attempt.prompt_version)
+        .model(
+            boss_protocol::ReviewGuideRunModel::builder()
+                .maybe_driver(attempt.driver)
+                .maybe_model(attempt.model)
+                .maybe_effort(attempt.effort_value)
+                .build(),
+        )
+        .timings(
+            boss_protocol::ReviewGuideRunTimings::builder()
+                .source_captured_at(capture.captured_at)
+                .queued_at(attempt.created_at)
+                .maybe_started_at(attempt.started_at)
+                .maybe_finished_at(attempt.finished_at)
+                .maybe_published_at(published_at)
+                .build(),
+        )
+        .build()
+}
+
 pub(super) async fn handle_get_review_guide_content(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         work_db,
@@ -307,6 +416,7 @@ fn wire_attempt(attempt: boss_work_db::PrReviewGuideAttempt) -> boss_protocol::R
         .request_epoch(attempt.request_epoch)
         .status(attempt.status)
         .maybe_error(attempt.error)
+        .maybe_execution_id(attempt.execution_id)
         .maybe_provider_usage_json(attempt.provider_usage_json)
         .build()
 }

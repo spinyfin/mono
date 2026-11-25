@@ -163,6 +163,7 @@ impl Fixture {
         flags
             .set("conflict_ladder_mechanical_rebase", ladder.is_some())
             .unwrap();
+        crate::review_guide_capture::pin_review_guide_flags_off(&flags);
         let handler = Arc::new(
             WorkerCompletionHandler::new(
                 db.clone(),

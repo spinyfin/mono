@@ -131,6 +131,7 @@ fn handler_with_ladder_enabled(
         flags_dir.path().join("feature-flags.toml"),
     ));
     flags.set("conflict_ladder_mechanical_rebase", true).unwrap();
+    crate::review_guide_capture::pin_review_guide_flags_off(&flags);
     assert!(
         flags.is_enabled("conflict_ladder_mechanical_rebase"),
         "setup: the ladder flag must be on or the deferral path is unreachable",

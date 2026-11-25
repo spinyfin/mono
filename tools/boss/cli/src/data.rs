@@ -936,6 +936,77 @@ pub(crate) async fn run_by_pr(client: &mut BossClient, ctx: &RunContext, args: B
     }
 }
 
+/// Handler for `boss review-guide show <execution-id>`.
+pub(crate) async fn run_review_guide_command(command: ReviewGuideCommand, ctx: &RunContext) -> Result<(), CliError> {
+    match command {
+        ReviewGuideCommand::Show(args) => {
+            let mut client = connect_for_work(ctx).await?;
+            inspect_review_guide_run(&mut client, ctx, &args.execution_id).await
+        }
+    }
+}
+
+async fn inspect_review_guide_run(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    execution_id: &str,
+) -> Result<(), CliError> {
+    rpc_call!(
+        try client,
+        FrontendRequest::GetReviewGuideRun {
+            execution_id: execution_id.to_owned(),
+        },
+        "review-guide show",
+        FrontendEvent::ReviewGuideRun { run } => print_review_guide_run(ctx, &run),
+    )
+}
+
+fn print_review_guide_run(ctx: &RunContext, run: &ReviewGuideRun) -> Result<(), CliError> {
+    print_entity(ctx, run, || {
+        println!("Review-guide run: {}", run.execution_id);
+        println!(
+            "Attempt: {}  status={}  epoch={}  retries={}",
+            run.attempt_id, run.status, run.request_epoch, run.retries
+        );
+        println!("Series: {}", run.series_id);
+        match &run.version_id {
+            Some(version_id) => println!("Version: {version_id}"),
+            None => println!("Version: (none published)"),
+        }
+        if let Some(error) = &run.error {
+            println!("Error: {error}");
+        }
+        println!("PR URL: {}", run.source.canonical_pr_url);
+        println!("Comparison: {}", run.source.comparison_id);
+        println!("Observed base: {}", run.source.observed_base_sha);
+        println!("Merge base: {}", run.source.merge_base_sha);
+        println!("Head: {}", run.source.head_sha);
+        println!("Packet hash: {}", run.source.packet_hash);
+        println!("Prompt: {}", run.prompt_version);
+        println!(
+            "Model: driver={}  model={}  effort={}",
+            run.model.driver.as_deref().unwrap_or("-"),
+            run.model.model.as_deref().unwrap_or("-"),
+            run.model.effort.as_deref().unwrap_or("-"),
+        );
+        println!("Timings:");
+        println!("  source_captured_at: {}", run.timings.source_captured_at);
+        println!("  queued_at:          {}", run.timings.queued_at);
+        println!(
+            "  started_at:         {}",
+            run.timings.started_at.as_deref().unwrap_or("-")
+        );
+        println!(
+            "  finished_at:        {}",
+            run.timings.finished_at.as_deref().unwrap_or("-")
+        );
+        println!(
+            "  published_at:       {}",
+            run.timings.published_at.as_deref().unwrap_or("-")
+        );
+    })
+}
+
 pub(crate) async fn get_execution(client: &mut BossClient, id: &str) -> Result<WorkExecution, CliError> {
     rpc_call!(
         client,
@@ -957,7 +1028,8 @@ pub(crate) async fn get_execution(client: &mut BossClient, id: &str) -> Result<W
 /// / `create_automation_triage_execution`). Those are reported directly
 /// with a pointer to the right inspection verb rather than attempted
 /// against `GetWorkItem`, which would only produce a confusing "unknown
-/// work item" error.
+/// work item" error. A `pr_review_guide` execution is inspected in place
+/// via `GetReviewGuideRun` (same payload as `boss review-guide show`).
 pub(crate) async fn run_by_exec(client: &mut BossClient, ctx: &RunContext, args: ByExecArgs) -> Result<(), CliError> {
     let execution = get_execution(client, &args.execution_id).await?;
     match execution.kind {
@@ -976,11 +1048,7 @@ pub(crate) async fn run_by_exec(client: &mut BossClient, ctx: &RunContext, args:
             )));
         }
         ExecutionKind::PrReviewGuide => {
-            return Err(CliError::application(format!(
-                "execution {} is a review-guide run bound to source comparison {} (not a task/chore) — there is no \
-                 CLI inspection verb for it yet",
-                execution.id, execution.work_item_id
-            )));
+            return inspect_review_guide_run(client, ctx, &execution.id).await;
         }
         _ => {}
     }

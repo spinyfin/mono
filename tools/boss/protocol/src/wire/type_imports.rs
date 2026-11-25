@@ -74,6 +74,7 @@ pub(super) use crate::types::RequestExecutionInput;
 pub(super) use crate::types::ResolveProjectDesignDocOutput;
 pub(super) use crate::types::ResolvedComment;
 pub(super) use crate::types::ReviewGuideAttempt;
+pub(super) use crate::types::ReviewGuideRun;
 pub(super) use crate::types::ReviewGuideSummary;
 pub(super) use crate::types::ReviewGuideVersion;
 pub(super) use crate::types::ReviseDocInput;

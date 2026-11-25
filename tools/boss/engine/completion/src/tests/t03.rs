@@ -147,6 +147,7 @@ async fn recheck_for_pr_late_counts_the_fallback_hit() {
     flags.load().unwrap();
     flags.set("worker_proposals", true).unwrap();
     flags.set("pr_created_proposals_seam", true).unwrap();
+    crate::review_guide_capture::pin_review_guide_flags_off(&flags);
 
     let metrics = Arc::new(Registry::new());
     register_metrics(&metrics);

@@ -33,6 +33,21 @@ pub const REVIEW_GUIDE_SOURCE_CAPTURE_FLAG: &str = "review_guide_source_capture"
 /// has nothing to consume while capture alone is enabled.
 pub const REVIEW_GUIDE_GENERATION_FLAG: &str = "review_guide_generation";
 
+/// Pin both review-guide rollout flags off on an existing store. Fixtures
+/// that build a flags store for some other flag must call this so the
+/// production default-on values do not spawn GitHub collection. Uses
+/// in-memory overrides so an empty-path store stays hermetic without
+/// writing a TOML file.
+#[cfg(any(test, feature = "test-support"))]
+pub fn pin_review_guide_flags_off(store: &FeatureFlagsStore) {
+    store
+        .set_in_memory(REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, false)
+        .expect("pin review_guide_source_capture off");
+    store
+        .set_in_memory(REVIEW_GUIDE_GENERATION_FLAG, false)
+        .expect("pin review_guide_generation off");
+}
+
 type SourcePacketFuture = Pin<Box<dyn Future<Output = Result<SourcePacket>> + Send>>;
 pub type PacketCollectFn = Arc<
     dyn Fn(String, Option<PinnedComparison>, Option<String>, Option<PrComparisonMetadata>) -> SourcePacketFuture

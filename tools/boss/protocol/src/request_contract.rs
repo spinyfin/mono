@@ -464,6 +464,7 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
         | R::GetHost { .. }
         | R::GetOffsiteBackup
         | R::GetReviewGuideContent { .. }
+        | R::GetReviewGuideRun { .. }
         | R::GetReviewGuideSummary { .. }
         | R::GetSelectedProduct
         | R::GetSettings

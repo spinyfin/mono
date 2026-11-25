@@ -60,6 +60,7 @@ struct ReviewGuideAttempt: Codable, Equatable {
     /// `"cancelled"` / `"superseded"`.
     let status: String
     let error: String?
+    let executionId: String?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -68,6 +69,7 @@ struct ReviewGuideAttempt: Codable, Equatable {
         case requestEpoch = "request_epoch"
         case status
         case error
+        case executionId = "execution_id"
     }
 }
 
