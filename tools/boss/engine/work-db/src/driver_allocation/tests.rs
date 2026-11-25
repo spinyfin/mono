@@ -196,16 +196,19 @@ fn every_kind_is_allocated_to_a_driver_the_gate_accepts() {
     }
 }
 
-/// The dedicated design/investigation tier restricts allocation to Claude and
-/// Codex before the existing traffic split is applied. A postmortem retains
-/// ordinary allocation because its distinct task kind is the carve-out.
+/// The dedicated design/investigation tier restricts allocation to drivers
+/// with a tier model (Claude, Codex, and Antigravity) before the existing
+/// traffic split is applied. A postmortem retains ordinary allocation because
+/// its distinct task kind is the carve-out.
 #[test]
 fn design_and_investigation_never_allocate_to_grok_but_postmortems_remain_ordinary() {
     let (_dir, db) = open_db();
-    db.set_driver_traffic_split(DriverTrafficSplit::new(80, 10, 10, 0))
+    db.set_driver_traffic_split(DriverTrafficSplit::new(70, 10, 10, 10))
         .unwrap();
     let product = create_test_product(&db);
 
+    let mut saw_design_agy = false;
+    let mut saw_investigation_agy = false;
     for index in 0..200 {
         let design = create_test_chore(&db, &product.id, format!("design {index}"));
         set_task_kind(&db, &design.id, &TaskKind::Design);
@@ -218,20 +221,28 @@ fn design_and_investigation_never_allocate_to_grok_but_postmortems_remain_ordina
             },
         )
         .unwrap();
-        for chore in [&design, &investigation] {
+        for (chore, saw_agy) in [
+            (&design, &mut saw_design_agy),
+            (&investigation, &mut saw_investigation_agy),
+        ] {
             let execution = create_ready_chore_execution(&db, &chore.id);
             let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
             assert!(
-                decision
-                    .driver
-                    .as_deref()
-                    .is_some_and(|driver| driver == DRIVER_SLUG_CLAUDE || driver == DRIVER_SLUG_CODEX),
+                decision.driver.as_deref().is_some_and(|driver| {
+                    driver == DRIVER_SLUG_CLAUDE || driver == DRIVER_SLUG_CODEX || driver == DRIVER_SLUG_AGY
+                }),
                 "{} allocated {:?}",
                 chore.name,
                 decision.driver,
             );
+            *saw_agy |= decision.driver.as_deref() == Some(DRIVER_SLUG_AGY);
         }
     }
+    assert!(saw_design_agy, "design rows must be eligible for agy allocation");
+    assert!(
+        saw_investigation_agy,
+        "investigation rows must be eligible for agy allocation"
+    );
 
     let postmortem = create_test_chore(&db, &product.id, "postmortem ordinary allocation");
     set_task_kind(&db, &postmortem.id, &TaskKind::DesignPostmortem);
@@ -660,22 +671,78 @@ fn design_tier_fails_when_only_grok_is_funded() {
     let err = decide_execution_driver(&db.connect().unwrap(), &task.id, ExecutionKind::TaskImplementation).unwrap_err();
     let text = err.to_string();
     assert!(text.contains("0 share"), "{text}");
-    for eligible_driver in [DRIVER_SLUG_CODEX, DRIVER_SLUG_CLAUDE] {
+    for eligible_driver in [DRIVER_SLUG_CODEX, DRIVER_SLUG_CLAUDE, DRIVER_SLUG_AGY] {
         assert!(
             text.contains(&format!("{eligible_driver} excluded: 0% share")),
             "design-tier refusal must name eligible 0% driver {eligible_driver}: {text}",
         );
     }
-    for ineligible_driver in [DRIVER_SLUG_GROK, DRIVER_SLUG_AGY] {
-        assert!(
-            !text.contains(&format!("{ineligible_driver} excluded: 0% share")),
-            "design-tier refusal must not attach 0% exclusions for ineligible driver {ineligible_driver}: {text}",
-        );
-    }
+    assert!(
+        !text.contains(&format!("{DRIVER_SLUG_GROK} excluded: 0% share")),
+        "design-tier refusal must not attach 0% exclusions for ineligible driver {DRIVER_SLUG_GROK}: {text}",
+    );
     let exclusions =
         DriverTrafficSplit::new(0, 100, 0, 0).zero_share_exclusions_among(&[DRIVER_SLUG_CODEX, DRIVER_SLUG_CLAUDE]);
     assert_eq!(exclusions, vec!["codex excluded: 0% share".to_owned()]);
     assert!(!text.ends_with("; "), "{text}");
+}
+
+#[test]
+fn design_tier_allocates_to_agy_when_only_grok_and_agy_are_funded() {
+    let (_dir, db) = open_db();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(50, 0, 0, 50))
+        .unwrap();
+    let product = create_test_product(&db);
+    for index in 0..20 {
+        let task = create_test_chore(&db, &product.id, format!("design agy only {index}"));
+        set_task_kind(&db, &task.id, &TaskKind::Design);
+        let execution = create_ready_chore_execution(&db, &task.id);
+        let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
+        assert_eq!(decision.driver.as_deref(), Some(DRIVER_SLUG_AGY));
+        assert_eq!(decision.reason, REASON_ALLOCATION);
+    }
+}
+
+#[test]
+fn design_row_allocated_to_agy_resolves_to_carbon_with_effort_clamped_at_high() {
+    let (_dir, db) = open_db();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 0, 100))
+        .unwrap();
+    let product = create_test_product(&db);
+
+    for (effort, expected_model) in [
+        (EffortLevel::Trivial, "gemini-4-carbon-low"),
+        (EffortLevel::Small, "gemini-4-carbon-medium"),
+        (EffortLevel::Medium, "gemini-4-carbon-high"),
+        (EffortLevel::Large, "gemini-4-carbon-high"),
+        (EffortLevel::Max, "gemini-4-carbon-high"),
+    ] {
+        let design = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(&product.id)
+                    .name(format!("design {effort:?}"))
+                    .effort_level(effort)
+                    .build(),
+            )
+            .unwrap();
+        set_task_kind(&db, &design.id, &TaskKind::Design);
+        let execution = create_ready_chore_execution(&db, &design.id);
+        let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
+        assert_eq!(decision.driver.as_deref(), Some(DRIVER_SLUG_AGY));
+        assert_eq!(decision.reason, REASON_ALLOCATION);
+
+        let config = boss_engine_effort::resolve_spawn_config(
+            &boss_engine_effort::SpawnResolutionInput::builder()
+                .allocated_driver(decision.driver.as_deref().unwrap())
+                .kind(&TaskKind::Design)
+                .effort_level(effort)
+                .build(),
+        )
+        .unwrap();
+        assert_eq!(config.driver, DRIVER_SLUG_AGY);
+        assert_eq!(config.model, expected_model, "effort={effort:?}");
+    }
 }
 
 /// An empty eligible set is an error too, never the engine default.

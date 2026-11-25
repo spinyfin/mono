@@ -409,9 +409,10 @@ Antigravity refines the standard tier using the driver-owned
 runtime per-driver mapping configuration. Other drivers retain their selection
 policy.
 
-Automatic design/investigation driver allocation remains limited to Claude and
-Codex. An explicit Antigravity driver choice uses the Carbon mapping below;
-the model policy does not change driver-allocation eligibility.
+Automatic design/investigation driver allocation includes every driver that
+declares a dedicated design/investigation model (`claude`, `codex`, and `agy`;
+`grok` has no tier model and remains excluded). Both allocated and explicit
+Antigravity design/investigation runs use the Carbon mapping below.
 
 | Work                                                                                              | Antigravity family                                                    |
 | ------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
