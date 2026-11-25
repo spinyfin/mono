@@ -30,6 +30,10 @@ import UpdateCore
 ///
 /// --capture-reveal-state=markdown-list-rhythm captures the markdown document
 /// viewer with a wrapped-bullet list (`BossMarkdownListCapture`).
+///
+/// --capture-reveal-state=coordinator-chat-probe hosts the coordinator chat
+/// probe fixture and drives a real conversation through `boss-acp-probe`
+/// (`BossCoordinatorChatProbeCapture`, which lists its own flags).
 @MainActor
 enum BossRevealCapture {
     private static var window: NSWindow?
@@ -131,6 +135,10 @@ enum BossRevealCapture {
         }
         if state == "markdown-list-rhythm" {
             BossMarkdownListCapture.start(path: path)
+            return
+        }
+        if state == BossCoordinatorChatProbeCapture.stateName {
+            BossCoordinatorChatProbeCapture.start(path: path)
             return
         }
         let model = ChatViewModel(paths: BossEnginePaths.production())

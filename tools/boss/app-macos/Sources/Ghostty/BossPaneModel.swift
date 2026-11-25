@@ -133,6 +133,19 @@ final class BossPaneModel: ObservableObject {
         let bossSession = BossEnginePaths.isolatedCoordinatorSessionDirectory(
             socketPath: ProcessInfo.processInfo.environment["BOSS_SOCKET_PATH"]
         ) ?? appSupport.appendingPathComponent("Boss/boss-session")
+        renderSessionDirectory(at: bossSession, directDeveloperMode: readDirectDeveloperMode())
+        return bossSession.path
+    }
+
+    /// Writes the coordinator's instructions (`CLAUDE.md`) and tool-permission
+    /// settings (`.claude/settings.local.json`) into `bossSession`.
+    ///
+    /// The destination is a parameter so a caller that needs the same files
+    /// somewhere else, such as the coordinator chat probe fixture, gets what
+    /// this build would give the real coordinator, written by the same code.
+    /// Nothing here reads or writes outside `bossSession`.
+    nonisolated static func renderSessionDirectory(at bossSession: URL, directDeveloperMode: Bool) {
+        let fm = FileManager.default
         try? fm.createDirectory(at: bossSession, withIntermediateDirectories: true)
 
         let claudeDir = bossSession.appendingPathComponent(".claude")
@@ -141,7 +154,7 @@ final class BossPaneModel: ObservableObject {
         let claudeMd = bossSession.appendingPathComponent("CLAUDE.md")
         // Always rewrite so iterations on the prompt take effect on
         // the next Boss-session start without manually clearing files.
-        try? bossSystemPrompt(directDeveloperMode: readDirectDeveloperMode()).write(to: claudeMd, atomically: true, encoding: .utf8)
+        try? bossSystemPrompt(directDeveloperMode: directDeveloperMode).write(to: claudeMd, atomically: true, encoding: .utf8)
 
         // Tool-permission allowlist for the Boss session. Without these,
         // Claude Code prompts before the Boss can run its own CLIs
@@ -158,8 +171,6 @@ final class BossPaneModel: ObservableObject {
         // would silently drop them.
         let settingsPath = claudeDir.appendingPathComponent("settings.local.json")
         writeBossSettingsLocalJson(to: settingsPath)
-
-        return bossSession.path
     }
 }
 
