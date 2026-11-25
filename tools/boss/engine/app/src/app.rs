@@ -850,6 +850,12 @@ struct ServerState {
     #[cfg(test)]
     #[builder(default)]
     grok_teardown_settle_window_override: std::sync::Mutex<Option<Duration>>,
+    /// Test-only handshake so Grok ingest can be stalled after driver lookup.
+    /// `started` fires when the detached ingest task begins; ingest then waits
+    /// on `proceed` so the test can take an exclusive DB lock first.
+    #[cfg(test)]
+    #[builder(default)]
+    grok_ingest_gate: std::sync::Mutex<Option<(std::sync::mpsc::SyncSender<()>, std::sync::mpsc::Receiver<()>)>>,
     /// One prepared/active run-correlated JSONL file source per execution.
     /// Prepared before Ghostty launch, activated after live-slot
     /// registration, and cancelled through `release_worker_pane`.

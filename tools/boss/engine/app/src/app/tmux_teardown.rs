@@ -24,6 +24,8 @@ use boss_work_db::TmuxIdentity;
 mod grok;
 #[cfg(test)]
 pub(crate) use boss_engine_driver::grok::GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON;
+#[cfg(test)]
+pub(crate) use grok::GROK_TEARDOWN_INGEST_FAILED_REASON;
 
 /// `WorkerPaneReleaser` implementation backed by a `Weak<ServerState>`.
 /// Late-bound via `set_server_state` to break the ownership cycle:
@@ -224,15 +226,20 @@ impl ServerState {
                         current_command: None,
                     },
                 );
-                self.capture_grok_cost_if_present(execution_id, &identity.session_name)
+                let pending_usage_persist = self
+                    .capture_grok_cost_if_present(execution_id, &identity.session_name)
                     .await;
-                return match reap_worker_process_tree(tmux, &identity.spawn_token).await {
+                let outcome = match reap_worker_process_tree(tmux, &identity.spawn_token).await {
                     Ok(_) => self.finish_tmux_reap(execution_id, identity),
                     Err(err) => {
                         tracing::error!(execution_id, %err, "detached worker cleanup failed; retaining identity");
                         TmuxTeardownOutcome::Refused
                     }
                 };
+                if let Some(handle) = pending_usage_persist {
+                    let _ = tokio::time::timeout(std::time::Duration::from_millis(50), handle).await;
+                }
+                return outcome;
             }
             Err(err) => {
                 tracing::warn!(
@@ -285,8 +292,7 @@ impl ServerState {
 
         let pending_usage_persist = if observation.pane_dead == Some(true) {
             self.capture_grok_cost_if_present(execution_id, &identity.session_name)
-                .await;
-            None
+                .await
         } else {
             self.settle_grok_turn_before_reap(tmux, execution_id, &identity.session_name)
                 .await

@@ -67,7 +67,7 @@ use boss_protocol_spoke::{
     v1::{Command, CommandResult, ProposalDecision, ResultCode, command},
 };
 use boss_spoke_custody::{Applied as Custodied, Evidence, PendingCause, Source};
-pub use boss_spoke_custody::{Custody, Mark, TranscriptSource};
+pub use boss_spoke_custody::{Custody, CustodyRefused, Mark, TranscriptSource};
 pub use boss_spoke_stream::CommandOutcome;
 use boss_spoke_stream::{StreamManager, store::CommandAdmission};
 use boss_work_db::{

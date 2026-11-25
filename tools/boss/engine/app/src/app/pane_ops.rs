@@ -230,6 +230,25 @@ impl SendInputError {
     }
 }
 
+/// Pane `send-keys` adapter for [`boss_engine_driver::send_interrupt_gesture`].
+struct PaneInterruptSink<'a> {
+    state: &'a ServerState,
+    run_id: &'a str,
+    slot_id: u8,
+}
+
+#[async_trait::async_trait]
+impl boss_engine_driver::InterruptKeySink for PaneInterruptSink<'_> {
+    type Error = InterruptPaneError;
+
+    async fn send_interrupt_key(&mut self, key: &'static str) -> Result<(), Self::Error> {
+        self.state
+            .send_interrupt_key(self.run_id, self.slot_id, key)
+            .await
+            .map(|_| ())
+    }
+}
+
 impl ServerState {
     /// Resolve `run_id → slot_id` and ask the app to bring that
     /// worker pane to the front. Returns the resolved slot on success
@@ -523,30 +542,21 @@ impl ServerState {
         let Some(slot_id) = self.worker_registry.slot_for_run(run_id) else {
             return Err(InterruptPaneError::UnknownRun);
         };
-        let key = plan.map(|p| p.gesture.key).unwrap_or("Escape");
-        let presses = plan.map(|p| p.gesture.presses.max(1)).unwrap_or(1);
-        let press_interval = plan.map(|p| p.gesture.press_interval).unwrap_or(Duration::ZERO);
         let recovery_prep = boss_engine_completion::driver_transcript::driver_for_execution(&self.work_db, run_id)
             .and_then(|driver| {
                 interrupt_recovery_prep::prepare(&self.work_db, driver.as_ref(), run_id)
                     .map(|snapshot| (driver, snapshot))
             });
-        let mut result = Ok(slot_id);
-        for press in 0..presses {
-            if press > 0 && !press_interval.is_zero() {
-                tokio::time::sleep(press_interval).await;
-            }
-            result = self.send_interrupt_key(run_id, slot_id, key).await;
-            if result.is_err() {
-                // A failed press aborts the rest of the attempt: repeating a
-                // gesture the transport just refused cannot succeed, and the
-                // caller needs the transport error, not the last press's.
-                break;
-            }
-        }
-        if result.is_ok()
-            && let Some((driver, snapshot)) = recovery_prep
-        {
+        boss_engine_driver::send_interrupt_gesture(
+            plan,
+            &mut PaneInterruptSink {
+                state: self,
+                run_id,
+                slot_id,
+            },
+        )
+        .await?;
+        if let Some((driver, snapshot)) = recovery_prep {
             match self._self_weak.upgrade() {
                 Some(arc_self) => {
                     let run_id = run_id.to_owned();
@@ -563,7 +573,7 @@ impl ServerState {
                 None => tracing::debug!(run_id, "interrupt recovery: ServerState already dropped; skipping"),
             }
         }
-        result
+        Ok(slot_id)
     }
 
     /// One keypress into the run's pane via tmux `send-keys <key>`.

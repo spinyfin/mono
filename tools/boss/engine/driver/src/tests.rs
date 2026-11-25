@@ -929,6 +929,78 @@ fn worst_case_duration_handles_the_degenerate_plans() {
     assert_eq!(zero_attempts.worst_case_duration(), Duration::from_secs(5));
 }
 
+struct VecInterruptSink<'a>(&'a mut Vec<&'static str>);
+
+#[async_trait]
+impl InterruptKeySink for VecInterruptSink<'_> {
+    type Error = ();
+
+    async fn send_interrupt_key(&mut self, key: &'static str) -> Result<(), ()> {
+        self.0.push(key);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn send_interrupt_gesture_falls_back_to_one_escape() {
+    let mut keys = Vec::new();
+    send_interrupt_gesture(None, &mut VecInterruptSink(&mut keys))
+        .await
+        .unwrap();
+    assert_eq!(keys, ["Escape"]);
+}
+
+#[tokio::test]
+async fn send_interrupt_gesture_repeats_the_plan_presses() {
+    let plan = InterruptPlan {
+        gesture: InterruptGesture {
+            key: "C-c",
+            presses: 2,
+            press_interval: Duration::ZERO,
+        },
+        confirm_window: Duration::from_millis(1),
+        max_attempts: 1,
+        turn_end_evidence: TurnEndEvidence::TurnBoundarySignal,
+    };
+    let mut keys = Vec::new();
+    send_interrupt_gesture(Some(&plan), &mut VecInterruptSink(&mut keys))
+        .await
+        .unwrap();
+    assert_eq!(keys, ["C-c", "C-c"]);
+}
+
+struct FailingInterruptSink {
+    calls: usize,
+}
+
+#[async_trait]
+impl InterruptKeySink for FailingInterruptSink {
+    type Error = &'static str;
+
+    async fn send_interrupt_key(&mut self, _key: &'static str) -> Result<(), Self::Error> {
+        self.calls += 1;
+        Err("transport refused")
+    }
+}
+
+#[tokio::test]
+async fn send_interrupt_gesture_aborts_after_a_failed_press() {
+    let plan = InterruptPlan {
+        gesture: InterruptGesture {
+            key: "Escape",
+            presses: 3,
+            press_interval: Duration::ZERO,
+        },
+        confirm_window: Duration::from_millis(1),
+        max_attempts: 1,
+        turn_end_evidence: TurnEndEvidence::TurnBoundarySignal,
+    };
+    let mut sink = FailingInterruptSink { calls: 0 };
+    let err = send_interrupt_gesture(Some(&plan), &mut sink).await.unwrap_err();
+    assert_eq!(err, "transport refused");
+    assert_eq!(sink.calls, 1, "a refused press must not continue the remaining presses");
+}
+
 #[test]
 fn tmux_session_config_is_codex_only_and_session_scoped() {
     let codex_config = tmux_session_config_for("codex").expect("codex must carry a tmux session config");

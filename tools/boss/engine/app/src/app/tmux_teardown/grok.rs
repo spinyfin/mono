@@ -34,10 +34,24 @@ use super::*;
 /// [`RunCostCapture`] could not persist it.
 pub(crate) const GROK_TEARDOWN_INGEST_FAILED_REASON: &str = "turn_completed observed but usage capture failed";
 
+#[derive(Clone)]
 struct GrokTelemetryPaths {
     events_path: Option<PathBuf>,
     updates_path: Option<PathBuf>,
     containment_root: Option<Option<PathBuf>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrokIngestOutcome {
+    Persisted,
+    NoUsageRecord,
+    Failed,
+}
+
+struct GrokIngestWait {
+    expect_usage: bool,
+    turn_completed: usize,
+    already_complete: bool,
 }
 
 struct ResolvedGrokTeardown {
@@ -59,19 +73,36 @@ impl ServerState {
         GROK_TEARDOWN_SETTLE_WINDOW
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_grok_ingest_gate_for_test(
+        &self,
+        started: std::sync::mpsc::SyncSender<()>,
+        proceed: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.grok_ingest_gate.lock().unwrap() = Some((started, proceed));
+    }
+
+    #[cfg(test)]
+    fn take_grok_ingest_gate_for_test(
+        &self,
+    ) -> Option<(std::sync::mpsc::SyncSender<()>, std::sync::mpsc::Receiver<()>)> {
+        self.grok_ingest_gate.lock().unwrap().take()
+    }
+
     /// Best-effort one-shot cost capture for a Grok session whose process is
     /// already dead or missing when teardown runs, so any `turn_completed`
     /// flushed just before exit is still ingested. Bounded by the settle
     /// window; expiry is logged and does not delay kill/slot release.
-    pub(super) async fn capture_grok_cost_if_present(&self, execution_id: &str, session_name: &str) {
+    pub(super) async fn capture_grok_cost_if_present(
+        &self,
+        execution_id: &str,
+        session_name: &str,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         let settle_window = self.grok_teardown_settle_window();
         let deadline = tokio::time::Instant::now() + settle_window;
-        let Some(resolved) = self.resolve_grok_teardown_bounded(execution_id, deadline).await else {
-            return;
-        };
-        let _ = self
-            .finish_dead_or_missing_capture(execution_id, session_name, &resolved, deadline, settle_window)
-            .await;
+        let resolved = self.resolve_grok_teardown_bounded(execution_id, deadline).await?;
+        self.finish_dead_or_missing_capture(execution_id, session_name, &resolved, deadline)
+            .await
     }
 
     /// Ensure an open Grok ACP turn is given a chance to close (via the
@@ -113,8 +144,7 @@ impl ServerState {
             Some(Err(_)) | None => {
                 tracing::warn!(
                     execution_id,
-                    reason = GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON,
-                    "reap_tmux_worker: resolving Grok teardown context timed out; proceeding with reap",
+                    "reap_tmux_worker: resolving teardown context timed out; proceeding with reap",
                 );
                 None
             }
@@ -194,13 +224,16 @@ impl ServerState {
                 completed,
                 already_complete,
             } => {
-                self.finish_grok_settle_ingest(
+                self.finish_ingest(
                     execution_id,
                     session_name,
-                    &resolved.paths,
-                    completed,
+                    resolved.paths.clone(),
                     deadline,
-                    already_complete,
+                    GrokIngestWait {
+                        expect_usage: true,
+                        turn_completed: completed,
+                        already_complete,
+                    },
                 )
                 .await
             }
@@ -216,66 +249,84 @@ impl ServerState {
         session_name: &str,
         resolved: &ResolvedGrokTeardown,
         deadline: tokio::time::Instant,
-        settle_window: Duration,
     ) -> Option<tokio::task::JoinHandle<()>> {
-        match timeout_remaining(deadline, self.ingest_grok_updates(execution_id, &resolved.paths)).await {
-            Some(true) => None,
-            Some(false) => {
-                Some(self.spawn_persist_grok_usage_unavailable(execution_id, GROK_TEARDOWN_INGEST_FAILED_REASON))
-            }
-            None => {
-                tracing::warn!(
-                    execution_id,
-                    session = session_name,
-                    settle_window_secs = settle_window.as_secs_f64(),
-                    reason = GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON,
-                    "reap_tmux_worker: teardown bound expired during dead/missing Grok usage capture; \
-                     proceeding with reap",
-                );
-                Some(self.spawn_persist_grok_usage_unavailable(execution_id, GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON))
-            }
-        }
+        let mut progress = GrokTurnProgress::default();
+        let mut tails = GrokSettleTails::new(
+            resolved.paths.events_path.clone(),
+            resolved.paths.updates_path.clone(),
+            "reap_tmux_worker",
+        );
+        let _ = timeout_remaining(deadline, tails.poll(&mut progress)).await;
+        self.finish_ingest(
+            execution_id,
+            session_name,
+            resolved.paths.clone(),
+            deadline,
+            GrokIngestWait {
+                expect_usage: progress.updates.completed > 0,
+                turn_completed: progress.updates.completed,
+                already_complete: false,
+            },
+        )
+        .await
     }
 
-    async fn finish_grok_settle_ingest(
+    /// Spawn transcript-path write plus capture as one detached task, then
+    /// wait only for its handle under the remaining settle budget. Dropping
+    /// the wait on timeout leaves the task running so usage already on disk
+    /// is not lost; a later token write clears `usage_unavailable`.
+    async fn finish_ingest(
         &self,
         execution_id: &str,
         session_name: &str,
-        paths: &GrokTelemetryPaths,
-        turn_completed: usize,
+        paths: GrokTelemetryPaths,
         deadline: tokio::time::Instant,
-        already_complete: bool,
+        wait: GrokIngestWait,
     ) -> Option<tokio::task::JoinHandle<()>> {
-        match timeout_remaining(deadline, self.ingest_grok_updates(execution_id, paths)).await {
-            Some(true) => {
-                tracing::info!(
-                    execution_id,
-                    session = session_name,
-                    turn_completed,
-                    already_complete,
-                    "reap_tmux_worker: captured Grok turn_completed before reap",
-                );
+        let failure_reason = wait.expect_usage.then_some(GROK_TEARDOWN_INGEST_FAILED_REASON);
+        let ingest = self.spawn_ingest_grok_updates(execution_id, paths, failure_reason);
+        match timeout_remaining(deadline, ingest).await {
+            Some(Ok(GrokIngestOutcome::Persisted)) => {
+                if wait.expect_usage {
+                    tracing::info!(
+                        execution_id,
+                        session = session_name,
+                        turn_completed = wait.turn_completed,
+                        already_complete = wait.already_complete,
+                        "reap_tmux_worker: captured Grok turn_completed before reap",
+                    );
+                }
                 None
             }
-            Some(false) => {
+            Some(Ok(_)) if !wait.expect_usage => None,
+            Some(Ok(_)) => {
                 tracing::warn!(
                     execution_id,
                     session = session_name,
-                    turn_completed,
+                    turn_completed = wait.turn_completed,
                     reason = GROK_TEARDOWN_INGEST_FAILED_REASON,
                     "reap_tmux_worker: Grok turn_completed was present but usage capture failed",
                 );
-                Some(self.spawn_persist_grok_usage_unavailable(execution_id, GROK_TEARDOWN_INGEST_FAILED_REASON))
+                None
+            }
+            Some(Err(_)) => {
+                tracing::warn!(
+                    execution_id,
+                    session = session_name,
+                    "reap_tmux_worker: Grok usage capture task failed",
+                );
+                wait.expect_usage.then(|| {
+                    self.spawn_persist_grok_usage_unavailable(execution_id, GROK_TEARDOWN_INGEST_FAILED_REASON)
+                })
             }
             None => {
                 tracing::warn!(
                     execution_id,
                     session = session_name,
-                    turn_completed,
-                    reason = GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON,
-                    "reap_tmux_worker: teardown bound expired during Grok usage capture; proceeding with reap",
+                    turn_completed = wait.turn_completed,
+                    "reap_tmux_worker: Grok usage capture still running after teardown bound; proceeding with reap",
                 );
-                Some(self.spawn_persist_grok_usage_unavailable(execution_id, GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON))
+                None
             }
         }
     }
@@ -304,65 +355,102 @@ impl ServerState {
         let work_db = self.work_db.clone();
         let execution_id = execution_id.to_owned();
         let reason = reason.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let snapshot = RunCostSnapshot {
-                usage_unavailable: Some(reason),
-                ..Default::default()
-            };
-            if let Err(err) = work_db.set_run_cost_snapshot(&execution_id, snapshot) {
-                tracing::warn!(
-                    execution_id,
-                    error = %format!("{err:#}"),
-                    "reap_tmux_worker: failed recording Grok teardown usage_unavailable reason",
-                );
-            }
-        })
+        tokio::task::spawn_blocking(move || persist_grok_usage_unavailable(&work_db, &execution_id, reason))
     }
 
-    async fn ingest_grok_updates(&self, execution_id: &str, paths: &GrokTelemetryPaths) -> bool {
-        let Some(updates_path) = paths.updates_path.clone() else {
-            return false;
-        };
-        let Some(containment_root) = paths.containment_root.clone() else {
-            return false;
-        };
-        match tokio::fs::try_exists(&updates_path).await {
-            Ok(false) => return false,
-            Err(error) => {
-                tracing::warn!(
-                    execution_id,
-                    transcript_path = %updates_path.display(),
-                    %error,
-                    "reap_tmux_worker: Grok updates.jsonl exists check failed",
-                );
-                return false;
-            }
-            Ok(true) => {}
-        }
-        let path_str = updates_path.to_string_lossy().into_owned();
-        let work_db = self.work_db.clone();
-        let exec_id = execution_id.to_owned();
-        let _ =
-            tokio::task::spawn_blocking(move || work_db.set_run_transcript_path_if_unset(&exec_id, &path_str)).await;
+    fn spawn_ingest_grok_updates(
+        &self,
+        execution_id: &str,
+        paths: GrokTelemetryPaths,
+        failure_reason: Option<&'static str>,
+    ) -> tokio::task::JoinHandle<GrokIngestOutcome> {
         let capture = Arc::clone(&self.run_cost_capture);
         let work_db = self.work_db.clone();
-        let exec_id = execution_id.to_owned();
-        let persist = tokio::task::spawn(async move {
-            capture
-                .capture_and_persist(&work_db, &exec_id, &updates_path, containment_root.as_deref())
-                .await
-        });
-        match persist.await {
-            Ok(Ok(persisted)) => persisted,
-            Ok(Err(error)) => {
-                tracing::warn!(
-                    execution_id,
-                    %error,
-                    "reap_tmux_worker: failed capturing Grok run cost from updates.jsonl",
-                );
-                false
+        let execution_id = execution_id.to_owned();
+        #[cfg(test)]
+        let ingest_gate = self.take_grok_ingest_gate_for_test();
+        tokio::task::spawn(async move {
+            #[cfg(test)]
+            if let Some((started, proceed)) = ingest_gate {
+                let _ = started.send(());
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = proceed.recv();
+                })
+                .await;
             }
-            Err(_) => false,
+            let outcome = ingest_grok_updates(&capture, work_db.clone(), &execution_id, &paths).await;
+            if !matches!(outcome, GrokIngestOutcome::Persisted)
+                && let Some(reason) = failure_reason
+            {
+                let persist_db = work_db.clone();
+                let persist_id = execution_id.clone();
+                let persist_reason = reason.to_owned();
+                let _ = tokio::task::spawn_blocking(move || {
+                    persist_grok_usage_unavailable(&persist_db, &persist_id, persist_reason);
+                })
+                .await;
+            }
+            outcome
+        })
+    }
+}
+
+fn persist_grok_usage_unavailable(work_db: &boss_work_db::WorkDb, execution_id: &str, reason: String) {
+    let snapshot = RunCostSnapshot {
+        usage_unavailable: Some(reason),
+        ..Default::default()
+    };
+    if let Err(err) = work_db.set_run_cost_snapshot(execution_id, snapshot) {
+        tracing::warn!(
+            execution_id,
+            error = %format!("{err:#}"),
+            "reap_tmux_worker: failed recording Grok teardown usage_unavailable reason",
+        );
+    }
+}
+
+async fn ingest_grok_updates(
+    capture: &boss_engine_runtime::run_cost::RunCostCapture,
+    work_db: Arc<boss_work_db::WorkDb>,
+    execution_id: &str,
+    paths: &GrokTelemetryPaths,
+) -> GrokIngestOutcome {
+    let Some(updates_path) = paths.updates_path.clone() else {
+        return GrokIngestOutcome::NoUsageRecord;
+    };
+    let Some(containment_root) = paths.containment_root.clone() else {
+        return GrokIngestOutcome::NoUsageRecord;
+    };
+    match tokio::fs::try_exists(&updates_path).await {
+        Ok(false) => return GrokIngestOutcome::NoUsageRecord,
+        Err(error) => {
+            tracing::warn!(
+                execution_id,
+                transcript_path = %updates_path.display(),
+                %error,
+                "reap_tmux_worker: Grok updates.jsonl exists check failed",
+            );
+            return GrokIngestOutcome::Failed;
+        }
+        Ok(true) => {}
+    }
+    let path_str = updates_path.to_string_lossy().into_owned();
+    let db = Arc::clone(&work_db);
+    let exec_id = execution_id.to_owned();
+    let _ = tokio::task::spawn_blocking(move || db.set_run_transcript_path_if_unset(&exec_id, &path_str)).await;
+    match capture
+        .capture_and_persist(&work_db, execution_id, &updates_path, containment_root.as_deref())
+        .await
+    {
+        Ok(true) => GrokIngestOutcome::Persisted,
+        Ok(false) => GrokIngestOutcome::NoUsageRecord,
+        Err(error) => {
+            tracing::warn!(
+                execution_id,
+                %error,
+                "reap_tmux_worker: failed capturing Grok run cost from updates.jsonl",
+            );
+            GrokIngestOutcome::Failed
         }
     }
 }
