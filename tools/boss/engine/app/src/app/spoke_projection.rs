@@ -178,7 +178,13 @@ async fn ingest_spoke_transcript_cost(state: &ServerState, execution_id: &str, s
     }
     match state
         .run_cost_capture
-        .capture_and_persist(&state.work_db, execution_id, &source.path, Some(&source.root))
+        .capture_and_persist_from(
+            &state.work_db,
+            execution_id,
+            &source.path,
+            Some(&source.root),
+            boss_engine_runtime::run_cost::SubagentSource::HubCopy,
+        )
         .await
     {
         Ok(_) => Applied::Done,
