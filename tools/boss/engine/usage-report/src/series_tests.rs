@@ -521,7 +521,7 @@ fn coverage_emits_notes_for_every_boundary_and_pricing_gap() {
     let mut pre = run("r_pre", "e_pre", "t_pre", COMPLETED_AT_START - DAY);
     pre.driver = RecordedDriver::Unknown;
 
-    // Post-capture Grok run (recorded driver, subscription-unpriced -> pricing gap, no active_ms).
+    // Post-capture Grok run (recorded driver, subscription-unpriced, no active_ms).
     let mut grok = with_tokens(
         run("r_grok", "e_grok", "t_grok", DAY0 + 100),
         Some(500),
@@ -533,12 +533,28 @@ fn coverage_emits_notes_for_every_boundary_and_pricing_gap() {
     grok.driver = RecordedDriver::LaunchTuple("grok".into());
     grok.run_model = Some("grok-4.5-build".to_owned());
 
+    // Post-capture Claude run with an unpriced model -> pricing gap.
+    let mut unpriced = with_tokens(
+        run("r_unpriced", "e_unpriced", "t_unpriced", DAY0 + 200),
+        Some(100),
+        Some(0),
+        Some(0),
+        Some(50),
+        Some(1_000),
+    );
+    unpriced.driver = RecordedDriver::LaunchTuple("claude".into());
+    unpriced.run_model = Some("<synthetic>".to_owned());
+
     let recs = UsageSeriesRecords {
-        runs: vec![pre, grok],
+        runs: vec![pre, grok, unpriced],
         finished_executions: Vec::new(),
-        tasks: vec![task("t_pre", "t_pre", None), task("t_grok", "t_grok", None)],
+        tasks: vec![
+            task("t_pre", "t_pre", None),
+            task("t_grok", "t_grok", None),
+            task("t_unpriced", "t_unpriced", None),
+        ],
     };
-    let pricer = |_model: &str, _tokens: PricedTokens| Some(1.0);
+    let pricer = |model: &str, _tokens: PricedTokens| (model != "<synthetic>").then_some(1.0);
     let report = build_usage_series_report(&q, &recs, Some(&pricer));
 
     assert!(report.spans_capture_boundary);
@@ -593,7 +609,7 @@ fn coverage_emits_notes_for_every_boundary_and_pricing_gap() {
         dim_notes.iter().any(|n| n.epoch_s == Some(DAY0 + 100)),
         "grouped dimension boundary must be stamped: {dim_notes:?}"
     );
-    assert_eq!(report.pricing_gaps, vec!["grok-4.5-build"]);
+    assert_eq!(report.pricing_gaps, vec!["<synthetic>"]);
 }
 
 #[test]
