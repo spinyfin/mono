@@ -119,7 +119,9 @@ pub struct ExecutionCostRow {
 }
 
 /// Output shape for `boss cost task <id>` — cost for one work item,
-/// aggregated across every execution and run it has ever had.
+/// aggregated across every execution and run it has ever had, including
+/// the review guides generated for its PR (their `ExecutionCostRow::kind`
+/// is `pr_review_guide`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct TaskCostReport {
@@ -164,7 +166,11 @@ pub struct WindowCostReport {
 }
 
 /// One row of `boss cost top` — a single run, identified well enough
-/// to know what it was.
+/// to know what it was. `work_item_id`, `short_id` and `name` describe the
+/// task the run's spend belongs to; for a review guide that is the task that
+/// owns the PR. A run whose execution has no task (answer agent, automation
+/// triage) carries what its execution is bound to as `work_item_id`, no
+/// `short_id`, and the name `(no task)`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct CostTopRow {

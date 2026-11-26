@@ -4,12 +4,36 @@
 //! this file's only job is the flat row fetch.
 //!
 //! [`WorkDb::usage_records_for_window`] is the same fetch widened for the
-//! usage rows request: every execution is kept (a left join to `tasks`, so the
-//! kinds that have no task row are not silently dropped), plus the launch
-//! tuple, timestamps and chain roots that request groups by. NULL launch
-//! tuples are then filled once per distinct execution from the same chain
+//! usage rows request: the launch tuple, timestamps and chain roots that
+//! request groups by. NULL launch tuples are then filled once per distinct
+//! execution from the same chain
 //! `driver_transcript::resolve_execution_driver_slug` uses. The builders
 //! live in `boss_usage_report`; this file still only fetches.
+//!
+//! # Every run is counted, whatever its execution binds to
+//!
+//! Three execution kinds do not bind to a `tasks` row: `answer_agent` (a
+//! comment id), `automation_triage` (an automation id) and `pr_review_guide`
+//! (a `pr_review_guide_source_comparisons.id`). Their runs record tokens like
+//! any other, so no fetch here may inner-join `tasks`: that join is what once
+//! dropped them from `boss cost window` and `boss cost top`.
+//!
+//! A review guide is generated for one PR, and that PR belongs to a task, so
+//! its spend is attributed to that task: comparison → series →
+//! `pr_review_guide_source_series.root_task_id` (see [`GUIDE_OWNER_JOINS`];
+//! the same ownership relation `WorkDb::list_executions` uses). The other two
+//! kinds have no task and stay task-less. Queries that start from a task
+//! instead of a run use [`owned_work_item_ids_sql`] for the same relation in
+//! the other direction.
+//!
+//! The owner is looked up, not stored on the execution. Source retention
+//! (`review_guide_source_retention`) deletes comparison rows it no longer
+//! needs, and a task can be deleted; a guide run whose owner can no longer be
+//! resolved is still fetched and counted, as a run with no task.
+//!
+//! The Sol comparison below is the exception: it compares the two arms of
+//! implementation work on a PR family and keeps its own task-rooted join, so
+//! guide runs are not part of its token figures.
 
 use super::*;
 
@@ -18,10 +42,58 @@ use boss_usage_report::{
     RecordedDriver, UsageExecutionRecord, UsageRunRecord, UsageSeriesRecords, UsageTaskRecord, UsageWindowRecords,
 };
 
+/// Resolves a `pr_review_guide` execution to the series of the PR it
+/// explains. `gs.root_task_id` is then the task that owns that PR, and NULL
+/// for every other kind. Both joins are primary-key lookups, taken only for
+/// guide executions. Requires the `we` alias for `work_executions`.
+const GUIDE_OWNER_JOINS: &str = "
+    LEFT JOIN pr_review_guide_source_comparisons gc
+           ON we.kind = 'pr_review_guide' AND gc.id = we.work_item_id
+    LEFT JOIN pr_review_guide_source_series gs ON gs.id = gc.series_id";
+
+/// Every `work_executions.work_item_id` whose spend belongs to one of the
+/// tasks in the JSON id array bound to `task_ids_param` (for example `?1`):
+/// the task ids themselves, plus the comparison ids of every review guide
+/// series those tasks own. The reverse of [`GUIDE_OWNER_JOINS`]; both arms
+/// seek an index (`pr_review_guide_source_series_observation_idx` leads with
+/// `root_task_id`, the comparisons' unique key with `series_id`).
+fn owned_work_item_ids_sql(task_ids_param: &str) -> String {
+    format!(
+        "SELECT value FROM json_each({task_ids_param})
+         UNION ALL
+         SELECT owned_gc.id
+           FROM pr_review_guide_source_series owned_gs
+           JOIN pr_review_guide_source_comparisons owned_gc ON owned_gc.series_id = owned_gs.id
+          WHERE owned_gs.root_task_id IN (SELECT value FROM json_each({task_ids_param}))"
+    )
+}
+
+/// `FROM` clause of the `boss cost` fetches: every run with its execution,
+/// and the task its spend belongs to when there is one (`t` is NULL for a run
+/// with no task, which is kept).
+fn cost_record_source() -> String {
+    format!(
+        "work_runs wr
+         JOIN work_executions we ON we.id = wr.execution_id
+         {GUIDE_OWNER_JOINS}
+         LEFT JOIN tasks t ON t.id = COALESCE(gs.root_task_id, we.work_item_id)"
+    )
+}
+
+/// `FROM` clause of the usage fetches: every run with its execution and, for
+/// a review guide, the series that names its owning task.
+fn usage_run_source() -> String {
+    format!(
+        "work_runs wr
+         JOIN work_executions we ON we.id = wr.execution_id
+         {GUIDE_OWNER_JOINS}"
+    )
+}
+
 const COST_RECORD_COLUMNS: &str = "
     wr.id,
     wr.execution_id,
-    we.work_item_id,
+    COALESCE(t.id, we.work_item_id),
     t.name,
     we.kind,
     we.status,
@@ -122,7 +194,8 @@ const USAGE_RUN_COLUMNS: &str = "
     wr.first_call_context_tokens,
     wr.first_call_cache_write_tokens,
     wr.peak_context_tokens,
-    wr.compactions
+    wr.compactions,
+    gs.root_task_id
 ";
 
 fn map_usage_run_record(row: &Row) -> rusqlite::Result<UsageRunRecord> {
@@ -163,6 +236,7 @@ fn map_usage_run_record(row: &Row) -> rusqlite::Result<UsageRunRecord> {
         first_call_cache_write_tokens: row.get(29)?,
         peak_context_tokens: row.get(30)?,
         compactions: row.get(31)?,
+        owning_task_id: row.get(32)?,
     })
 }
 
@@ -246,7 +320,8 @@ const USAGE_EXECUTION_COLUMNS: &str = "
     we.host_id,
     we.driver,
     we.model,
-    we.effort_level
+    we.effort_level,
+    gs.root_task_id
 ";
 
 fn map_usage_execution_record(row: &Row) -> rusqlite::Result<UsageExecutionRecord> {
@@ -267,6 +342,7 @@ fn map_usage_execution_record(row: &Row) -> rusqlite::Result<UsageExecutionRecor
         driver,
         execution_model: row.get(10)?,
         execution_effort: row.get(11)?,
+        owning_task_id: row.get(12)?,
     })
 }
 
@@ -290,7 +366,9 @@ const USAGE_SERIES_TASK_COLUMNS: &str = "
 ";
 
 /// Task columns of [`UsageTaskRecord`] in field order of [`map_usage_task_record`],
-/// ending with the task's all-time run count.
+/// ending with the task's all-time run count. The count covers the same runs
+/// the window attributes to the task: its own executions' and those of the
+/// review guides generated for its PR.
 const USAGE_TASK_COLUMNS: &str = "
     t.id,
     t.name,
@@ -308,7 +386,13 @@ const USAGE_TASK_COLUMNS: &str = "
     (SELECT COUNT(*)
        FROM work_executions we
        JOIN work_runs wr ON wr.execution_id = we.id
-      WHERE we.work_item_id = t.id)
+      WHERE we.work_item_id IN (
+            SELECT t.id
+            UNION ALL
+            SELECT owned_gc.id
+              FROM pr_review_guide_source_series owned_gs
+              JOIN pr_review_guide_source_comparisons owned_gc ON owned_gc.series_id = owned_gs.id
+             WHERE owned_gs.root_task_id = t.id))
 ";
 
 fn map_usage_task_record(row: &Row, roots: &HashMap<String, String>) -> rusqlite::Result<UsageTaskRecord> {
@@ -375,7 +459,7 @@ fn cost_row_mapping_preserves_every_owned_field_and_null() {
 
     let absent = conn
         .query_row(
-            "SELECT 'run-a', 'exec-a', 'task-a', 'Work name', 'task_implementation',
+            "SELECT 'run-a', 'exec-a', 'task-a', NULL, 'task_implementation',
                     'completed', 'orphaned', 100, NULL, NULL, NULL, NULL,
                     NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL",
             [],
@@ -388,31 +472,32 @@ fn cost_row_mapping_preserves_every_owned_field_and_null() {
             .run_id("run-a")
             .execution_id("exec-a")
             .work_item_id("task-a")
-            .work_item_name("Work name")
             .execution_kind("task_implementation")
             .execution_status("completed")
             .run_status("orphaned")
             .created_at_epoch_s(100)
-            .build()
+            .build(),
+        "a run with no task keeps a NULL name"
     );
 }
 
 #[work_db_boundary::instrument]
 impl WorkDb {
-    /// Every `work_runs` row for `work_item_id`'s executions, oldest
-    /// first. Backs `boss cost task <id>`.
+    /// Every `work_runs` row whose spend belongs to the task `work_item_id`,
+    /// oldest first: the runs of its own executions and of the review guides
+    /// generated for its PR. Backs `boss cost task <id>`.
     pub fn cost_records_for_work_item(&self, work_item_id: &str) -> Result<Vec<CostRunRecord>> {
         let conn = self.connect()?;
+        let source = cost_record_source();
+        let owned = owned_work_item_ids_sql("?1");
         let sql = format!(
             "SELECT {COST_RECORD_COLUMNS}
-             FROM work_runs wr
-             JOIN work_executions we ON we.id = wr.execution_id
-             JOIN tasks t ON t.id = we.work_item_id
-             WHERE we.work_item_id = ?1
+             FROM {source}
+             WHERE we.work_item_id IN ({owned})
              ORDER BY wr.created_at ASC, wr.id ASC"
         );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![work_item_id], map_cost_run_record)?;
+        let rows = stmt.query_map([query_ensure::id_array(&[work_item_id])], map_cost_run_record)?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -422,9 +507,10 @@ impl WorkDb {
 
     /// Every `work_runs` row created in `[since_epoch_s, until_epoch_s)`
     /// with its execution, launch tuple and task context, for the usage rows
-    /// request. Executions whose work item has no `tasks` row (answer agent,
-    /// review guide, automation triage) are kept; the task list simply has no
-    /// entry for them. The task list carries each referenced task plus its
+    /// request. A review guide run carries the task that owns its PR as
+    /// `owning_task_id`. Executions with no task at all (answer agent,
+    /// automation triage) are kept; the task list simply has no entry for
+    /// them. The task list carries each referenced task plus its
     /// chain root, so a root with no run of its own in the window is available
     /// to nest its revisions under. Chain roots come from the same walk the
     /// rest of the engine uses. All of it is read in one snapshot. After the
@@ -436,10 +522,10 @@ impl WorkDb {
         {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+            let run_source = usage_run_source();
             let sql = format!(
                 "SELECT {USAGE_RUN_COLUMNS}
-                 FROM work_runs wr
-                 JOIN work_executions we ON we.id = wr.execution_id
+                 FROM {run_source}
                  WHERE CAST(wr.created_at AS INTEGER) >= ?1 AND CAST(wr.created_at AS INTEGER) < ?2
                  ORDER BY CAST(wr.created_at AS INTEGER) ASC, wr.id ASC"
             );
@@ -456,7 +542,7 @@ impl WorkDb {
             let mut work_item_ids: Vec<&str> = runs
                 .iter()
                 .filter(|run| run.execution_kind != boss_protocol::COORDINATOR_USAGE_KIND)
-                .map(|run| run.work_item_id.as_str())
+                .map(UsageRunRecord::task_key)
                 .collect();
             work_item_ids.sort_unstable();
             work_item_ids.dedup();
@@ -516,10 +602,10 @@ impl WorkDb {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
 
+            let run_source = usage_run_source();
             let run_sql = format!(
                 "SELECT {USAGE_RUN_COLUMNS}
-                 FROM work_runs wr
-                 JOIN work_executions we ON we.id = wr.execution_id
+                 FROM {run_source}
                  WHERE CAST(wr.created_at AS INTEGER) >= ?1 AND CAST(wr.created_at AS INTEGER) < ?2
                  ORDER BY CAST(wr.created_at AS INTEGER) ASC, wr.id ASC"
             );
@@ -536,6 +622,7 @@ impl WorkDb {
             let exec_sql = format!(
                 "SELECT {USAGE_EXECUTION_COLUMNS}
                  FROM work_executions we
+                 {GUIDE_OWNER_JOINS}
                  WHERE we.finished_at IS NOT NULL
                    AND CAST(we.finished_at AS INTEGER) >= ?1
                    AND CAST(we.finished_at AS INTEGER) < ?2
@@ -572,8 +659,7 @@ impl WorkDb {
                 if !exec_ids.is_empty() {
                     let extra_exec_run_sql = format!(
                         "SELECT {USAGE_RUN_COLUMNS}
-                         FROM work_runs wr
-                         JOIN work_executions we ON we.id = wr.execution_id
+                         FROM {run_source}
                          WHERE we.id IN (SELECT value FROM json_each(?1))
                            AND (CAST(wr.created_at AS INTEGER) < ?2 OR CAST(wr.created_at AS INTEGER) >= ?3)
                          ORDER BY CAST(wr.created_at AS INTEGER) ASC, wr.id ASC"
@@ -647,11 +733,11 @@ impl WorkDb {
                 chain_task_ids.sort_unstable();
                 chain_task_ids.dedup();
                 if !chain_task_ids.is_empty() {
+                    let owned = owned_work_item_ids_sql("?1");
                     let extra_run_sql = format!(
                         "SELECT {USAGE_RUN_COLUMNS}
-                         FROM work_runs wr
-                         JOIN work_executions we ON we.id = wr.execution_id
-                         WHERE we.work_item_id IN (SELECT value FROM json_each(?1))
+                         FROM {run_source}
+                         WHERE we.work_item_id IN ({owned})
                            AND (CAST(wr.created_at AS INTEGER) < ?2 OR CAST(wr.created_at AS INTEGER) >= ?3)
                          ORDER BY CAST(wr.created_at AS INTEGER) ASC, wr.id ASC"
                     );
@@ -684,8 +770,8 @@ impl WorkDb {
 
             let mut work_item_ids: Vec<&str> = runs
                 .iter()
-                .map(|run| run.work_item_id.as_str())
-                .chain(finished_executions.iter().map(|exec| exec.work_item_id.as_str()))
+                .map(UsageRunRecord::task_key)
+                .chain(finished_executions.iter().map(UsageExecutionRecord::task_key))
                 .chain(chain_members.iter().map(|(id, _, _)| id.as_str()))
                 .chain(chain_members.iter().map(|(_, root, _)| root.as_str()))
                 .collect();
@@ -737,17 +823,17 @@ impl WorkDb {
     }
 
     /// Every `work_runs` row and coordinator usage slice created in
-    /// `[since_epoch_s, until_epoch_s)`, oldest first. Backs both
-    /// `boss cost window` (aggregated further by the caller) and
-    /// `boss cost top` (ranked further by the caller).
+    /// `[since_epoch_s, until_epoch_s)`, oldest first, including the runs of
+    /// executions that have no task. Backs both `boss cost window`
+    /// (aggregated further by the caller) and `boss cost top` (ranked further
+    /// by the caller).
     pub fn cost_records_for_window(&self, since_epoch_s: i64, until_epoch_s: i64) -> Result<Vec<CostRunRecord>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+        let source = cost_record_source();
         let sql = format!(
             "SELECT {COST_RECORD_COLUMNS}
-             FROM work_runs wr
-             JOIN work_executions we ON we.id = wr.execution_id
-             JOIN tasks t ON t.id = we.work_item_id
+             FROM {source}
              WHERE CAST(wr.created_at AS INTEGER) >= ?1 AND CAST(wr.created_at AS INTEGER) < ?2
              ORDER BY wr.created_at ASC, wr.id ASC"
         );
@@ -968,7 +1054,8 @@ mod sol_report_db {
 }
 
 /// Runs created at or after `until_epoch_s` that belong to one of the given
-/// executions or work items. The restriction is in SQL (the id sets are the
+/// executions or tasks (a task's runs include those of the review guides
+/// generated for its PR). The restriction is in SQL (the id sets are the
 /// ones the caller already resolved), so cost is bounded by those items' own
 /// late runs, not by all history after `until`.
 fn late_usage_runs(
@@ -977,13 +1064,14 @@ fn late_usage_runs(
     execution_ids: &[&str],
     work_item_ids: &[&str],
 ) -> Result<Vec<UsageRunRecord>> {
+    let run_source = usage_run_source();
+    let owned = owned_work_item_ids_sql("?3");
     let sql = format!(
         "SELECT {USAGE_RUN_COLUMNS}
-         FROM work_runs wr
-         JOIN work_executions we ON we.id = wr.execution_id
+         FROM {run_source}
          WHERE CAST(wr.created_at AS INTEGER) >= ?1
            AND (wr.execution_id IN (SELECT value FROM json_each(?2))
-                OR we.work_item_id IN (SELECT value FROM json_each(?3)))
+                OR we.work_item_id IN ({owned}))
          ORDER BY CAST(wr.created_at AS INTEGER) ASC, wr.id ASC"
     );
     Ok(tx
@@ -998,6 +1086,10 @@ fn late_usage_runs(
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }
+
+#[cfg(test)]
+#[path = "cost_report_guide_tests.rs"]
+mod guide_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1043,7 +1135,7 @@ mod tests {
 
         let records = db.cost_records_for_work_item(&task.id).expect("query succeeds");
         assert_eq!(records.len(), 2);
-        assert_eq!(records[0].work_item_name, "Fix cursor flicker");
+        assert_eq!(records[0].work_item_name.as_deref(), Some("Fix cursor flicker"));
         assert_eq!(records[0].execution_kind, "chore_implementation");
         assert_eq!(records[0].input_tokens, Some(100));
         assert_eq!(records[1].input_tokens, None);
@@ -1364,10 +1456,11 @@ mod tests {
     fn the_window_predicate_seeks_the_created_at_index() {
         let (_dir, db) = open_db();
         let conn = db.connect().unwrap();
+        let run_source = usage_run_source();
         let plan: String = conn
             .prepare(&format!(
                 "EXPLAIN QUERY PLAN SELECT {USAGE_RUN_COLUMNS}
-                 FROM work_runs wr JOIN work_executions we ON we.id = wr.execution_id
+                 FROM {run_source}
                  WHERE CAST(wr.created_at AS INTEGER) >= 1 AND CAST(wr.created_at AS INTEGER) < 2"
             ))
             .unwrap()
@@ -1450,8 +1543,24 @@ mod tests {
         );
         assert_eq!(
             report.taskless.len(),
-            7,
-            "answer agent, review guide, automation triage, unresolvable progression, and 3 coordinator sessions"
+            6,
+            "answer agent, automation triage, unresolvable progression, and 3 coordinator sessions"
+        );
+        // The review guide is listed under the task that owns its PR.
+        let guide_owner = report
+            .tasks
+            .iter()
+            .find(|t| t.task_id == "task_seed_a_claude")
+            .expect("the guide's owning task is in the report");
+        let guide = guide_owner
+            .executions
+            .iter()
+            .find(|e| e.kind == "pr_review_guide")
+            .expect("the review guide execution is listed under its owning task");
+        assert_eq!(guide.work_item_id, "comparison_seed_1");
+        assert_eq!(
+            (guide.measurement.runs_measured, guide.measurement.input_tokens),
+            (1, Some(40_000))
         );
         let coord = report
             .coordinator_measurement

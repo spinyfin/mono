@@ -322,6 +322,10 @@ pub(super) async fn handle_get_token_usage_series(ctx: Dispatch, req: FrontendRe
 }
 
 #[cfg(test)]
+#[path = "cost_guide_tests.rs"]
+mod guide_tests;
+
+#[cfg(test)]
 mod tests {
     use super::super::tests::{make_session_sink, test_server_state};
     use super::*;

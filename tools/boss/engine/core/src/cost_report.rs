@@ -198,6 +198,9 @@ pub const COMPLETED_AT_MIGRATION_EPOCH_S: i64 = 1_782_805_232;
 pub use boss_engine_storage_values::{CostRunRecord, CostRunRecordBuilder};
 
 const NO_VALUE_LABEL: &str = "(none)";
+/// Name shown for a run whose execution has no task (answer agent,
+/// automation triage). Such a run is still ranked and counted.
+const NO_TASK_NAME: &str = "(no task)";
 const NO_MODEL_GAP_LABEL: &str = "(no model recorded)";
 
 /// Folds one record into `fold`. `gaps` collects the distinct unpriced model
@@ -497,7 +500,7 @@ pub fn build_top_cost_report(
                 .maybe_cache_read_tokens(record.cache_read_tokens)
                 .maybe_input_tokens(record.input_tokens)
                 .kind(record.execution_kind.clone())
-                .name(record.work_item_name.clone())
+                .name(record.work_item_name.as_deref().unwrap_or(NO_TASK_NAME))
                 .maybe_output_tokens(record.output_tokens)
                 .status(record.run_status.clone())
                 .total_tokens(total_tokens)
@@ -901,14 +904,14 @@ mod tests {
         let mut coord_measured = measured(record("coord_run_1", "coord_sess_a"), 1_000, 200, 300, 500);
         coord_measured.execution_kind = boss_protocol::COORDINATOR_USAGE_KIND.to_owned();
         coord_measured.work_item_id = boss_protocol::COORDINATOR_USAGE_KIND.to_owned();
-        coord_measured.work_item_name = "Coordinator session sess-a".to_owned();
+        coord_measured.work_item_name = Some("Coordinator session sess-a".to_owned());
         coord_measured.driver = Some("claude".to_owned());
         coord_measured.model = Some("claude-opus-4-6".to_owned());
 
         let mut coord_unknown = record("coord_run_2", "coord_sess_b");
         coord_unknown.execution_kind = boss_protocol::COORDINATOR_USAGE_KIND.to_owned();
         coord_unknown.work_item_id = boss_protocol::COORDINATOR_USAGE_KIND.to_owned();
-        coord_unknown.work_item_name = "Coordinator session sess-b".to_owned();
+        coord_unknown.work_item_name = Some("Coordinator session sess-b".to_owned());
         coord_unknown.driver = Some("claude".to_owned());
         coord_unknown.usage_unavailable = Some("Coordinator transcript unreadable".to_owned());
 
