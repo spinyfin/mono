@@ -108,6 +108,11 @@ pub(crate) mod abandon_cause {
         "reap_inert_review_batches",
         "review batch's cycle root is gone; member executions retired with the batch",
     );
+    pub(crate) const REVIEW_BATCH_PR_ENDED: AbandonCause<'static> = AbandonCause::engine(
+        "review_batch_pr_ended",
+        "fail_pre_merge_review_batches_for_ended_pr",
+        "review batch's PR merged or closed; member executions retired with the batch",
+    );
     pub(crate) const RUN_FINISHED_ABANDONED: AbandonCause<'static> = AbandonCause::engine(
         "run_finished_abandoned",
         "finish_execution_run",

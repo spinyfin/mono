@@ -66,7 +66,7 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
 /// replaced, retired as unnecessary or held by a human, so the item is not
 /// stopped. Everything else raises the notice when nothing replaced the
 /// execution.
-const BENIGN_ABANDON_CAUSES: [AbandonCause<'static>; 10] = [
+const BENIGN_ABANDON_CAUSES: [AbandonCause<'static>; 11] = [
     abandon_cause::CLOSED_ITEM_STRANDED,
     abandon_cause::REDUNDANT_DUPLICATE,
     abandon_cause::STALE_REVISION_RETIRED,
@@ -77,6 +77,7 @@ const BENIGN_ABANDON_CAUSES: [AbandonCause<'static>; 10] = [
     abandon_cause::DEFERRED,
     abandon_cause::REVIEW_RESERVATION_RELEASED,
     abandon_cause::REVIEW_BATCH_REAPED,
+    abandon_cause::REVIEW_BATCH_PR_ENDED,
 ];
 
 /// The unacknowledged ledger rows that raise a notice, for the items in

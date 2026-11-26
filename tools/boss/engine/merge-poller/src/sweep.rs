@@ -4,7 +4,11 @@ use super::post_merge_review::maybe_trigger_post_merge_review;
 use super::*;
 use boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED;
 
-/// Cancel live review-guide attempts for a PR that merged or closed. Bound
+/// Cancel pending reviews of a PR that merged or closed: live review-guide
+/// attempts, single-reviewer `pr_review` executions, and live pre-merge review
+/// batches.
+///
+/// Bound review-guide
 /// executions are cancelled (and force-released when a completion handler is
 /// wired) so an Astra-high generation does not keep burning tokens after the
 /// PR is gone. Unbound queued attempts are cancelled in the same pass.
@@ -15,7 +19,7 @@ pub(crate) async fn stop_live_review_guides(
     pr_url: &str,
     reason: &str,
 ) {
-    let execution_ids = match work_db.cancel_live_pr_review_guides_for_root(chain_root_id, pr_url, reason) {
+    let mut execution_ids = match work_db.cancel_live_pr_review_guides_for_root(chain_root_id, pr_url, reason) {
         Ok(ids) => ids,
         Err(err) => {
             tracing::warn!(
@@ -24,9 +28,36 @@ pub(crate) async fn stop_live_review_guides(
                 ?err,
                 "merge poller: failed to cancel live review-guide attempts",
             );
-            return;
+            Vec::new()
         }
     };
+    match work_db.cancel_single_pr_reviews_for_chain(chain_root_id, pr_url, reason) {
+        Ok(ids) => execution_ids.extend(ids),
+        Err(err) => tracing::warn!(
+            chain_root_id,
+            pr_url,
+            ?err,
+            "merge poller: failed to cancel pending single-reviewer PR reviews",
+        ),
+    }
+    // Batch members are retired (and their panes torn down by the terminal
+    // event) in the same transaction that fails the batch.
+    match work_db.fail_pre_merge_review_batches_for_ended_pr(chain_root_id, pr_url) {
+        Ok(batch_ids) if !batch_ids.is_empty() => tracing::info!(
+            chain_root_id,
+            pr_url,
+            reason,
+            batches = batch_ids.len(),
+            "merge poller: failed pre-merge review batches of an ended PR",
+        ),
+        Ok(_) => {}
+        Err(err) => tracing::warn!(
+            chain_root_id,
+            pr_url,
+            ?err,
+            "merge poller: failed to fail pre-merge review batches of an ended PR",
+        ),
+    }
     let Some(handler) = completion_handler else {
         return;
     };

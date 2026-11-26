@@ -3,8 +3,9 @@
 //!
 //! The poller's other candidate lists are keyed on the status of the row
 //! that owns the PR: `in_review`, and `blocked` for a reason the poller
-//! remediates. Two states are on none of them while nothing else observes
-//! their PR, so a merge or a close left them where they were for good:
+//! remediates. Two states are on none of them, and nothing else observes their
+//! PR, so without this module a merge or a close would leave them where they
+//! are:
 //!
 //! - A PR-owning row held `active` with no run that could still push to its
 //!   PR. This is the review hold: the implementation finished, the PR is
@@ -15,10 +16,10 @@
 //!   [`WorkDb::list_chores_held_active_with_pr`].
 //! - A revision resting `in_review` whose chain root can no longer carry it.
 //!   A revision is settled as a side effect of its root's own merged or
-//!   closed transition. A root that is already `done` or `archived` (moved
-//!   there by hand, or completed by another path) or deleted is not listed
-//!   for probing, so its PR's close was never observed and the transition
-//!   that settles the chain never ran.
+//!   closed transition. A root that is already `done` or `archived`, or
+//!   deleted, is on none of the status-keyed lists, so the root's own
+//!   transition, which is what settles a chain, never runs for that PR; this
+//!   module observes the merge or close in its place.
 //!   [`WorkDb::list_orphaned_in_review_revision_chains`] and
 //!   [`WorkDb::settle_orphaned_revisions_after_pr_close`].
 //!
