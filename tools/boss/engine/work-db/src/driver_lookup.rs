@@ -539,7 +539,9 @@ impl WorkDb {
 
 #[cfg(test)]
 mod tests {
-    use crate::test_support::{create_ready_chore_execution, create_test_chore, create_test_product, open_db};
+    use crate::test_support::{
+        create_ready_chore_execution, create_test_chore, create_test_product, create_test_product_named, open_db,
+    };
     use crate::{CreateCommentInput, WorkDb, WorkItemPatch};
 
     const DOC_REPO: &str = "git@github.com:spinyfin/mono.git";
@@ -1029,7 +1031,10 @@ mod tests {
         // durable allocation decision, a run that claimed a review-pool slot
         // (with an older failed sibling to exercise the run ordering), and
         // review-batch members.
-        let allocated_chore = create_test_chore(&db, &product.id, "allocated chore");
+        // Under a product with no default driver and a task with no pin, so
+        // the allocation decision is the only thing that can pick the driver.
+        let unpinned_product = create_test_product_named(&db, "Unpinned");
+        let allocated_chore = create_test_chore(&db, &unpinned_product.id, "allocated chore");
         let allocated = create_ready_chore_execution(&db, &allocated_chore.id);
         {
             let conn = db.connect().unwrap();
@@ -1047,9 +1052,22 @@ mod tests {
             )
             .unwrap();
         }
+        // Pinned to codex: the preferred run (an unfinished one on the
+        // review-1 pool slot, resolving the pool driver) is OLDER than a newer
+        // failed run on worker-1 (which falls through to the codex pin), so
+        // only the shared hook-run ordering yields the pool driver; a plain
+        // newest-first pick would yield codex.
         let claimed_chore = create_test_chore(&db, &product.id, "claimed chore");
+        db.update_work_item(
+            &claimed_chore.id,
+            WorkItemPatch {
+                driver: Some("codex".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let claimed = create_ready_chore_execution(&db, &claimed_chore.id);
-        for (status, agent) in [("failed", "worker-1"), ("active", "review-pending")] {
+        for (status, agent, created_at) in [("active", "review-pending", "100"), ("failed", "worker-1", "200")] {
             let run = db
                 .create_run(
                     boss_protocol::CreateRunInput::builder()
@@ -1062,9 +1080,29 @@ mod tests {
             if agent == "review-pending" {
                 db.set_run_agent_id(&run.id, "review-1").unwrap();
             }
+            db.connect()
+                .unwrap()
+                .execute(
+                    "UPDATE work_runs SET created_at = ?1 WHERE id = ?2",
+                    rusqlite::params![created_at, run.id],
+                )
+                .unwrap();
         }
         let cycle_root = crate::test_support::create_test_chore_manual(&db, &product.id, "review target");
         let leaves = fan_out_batch_leaves(&db, &cycle_root.id);
+        // A leaf that also claimed a review-pool slot: the member row must
+        // still win over the slot's pool policy.
+        let (leaf_execution, leaf_driver) = &leaves[1];
+        let leaf_run = db
+            .create_run(
+                boss_protocol::CreateRunInput::builder()
+                    .agent_id("review-pending")
+                    .execution_id(leaf_execution.id.as_str())
+                    .status("active")
+                    .build(),
+            )
+            .unwrap();
+        db.set_run_agent_id(&leaf_run.id, "review-1").unwrap();
 
         let mut ids = vec![
             pinned.id.as_str(),
@@ -1082,6 +1120,27 @@ mod tests {
                 batch.get(id).cloned().flatten(),
                 single,
                 "batch and single lookup must agree for {id}"
+            );
+        }
+        // Expected values, asserted directly on both paths as well as parity.
+        let expected = [
+            (pinned.id.as_str(), Some("copilot")),
+            (defaulted.id.as_str(), Some("codex")),
+            (allocated.id.as_str(), Some("grok")),
+            (claimed.id.as_str(), Some("claude")),
+            (leaf_execution.id.as_str(), Some(leaf_driver.as_str())),
+            (missing, None),
+        ];
+        for (id, want) in expected {
+            assert_eq!(
+                batch.get(id).cloned().flatten().as_deref(),
+                want,
+                "batch driver for {id}"
+            );
+            assert_eq!(
+                db.get_execution_driver_slug(id).unwrap().as_deref(),
+                want,
+                "single driver for {id}"
             );
         }
     }
