@@ -27,6 +27,17 @@ pub enum FrameError {
     UnterminatedAtEof,
 }
 
+impl FrameError {
+    /// The stable name journalled beside an unusable frame.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::InvalidUtf8 => "invalid_utf8",
+            Self::TooLong { .. } => "too_long",
+            Self::UnterminatedAtEof => "unterminated_at_eof",
+        }
+    }
+}
+
 impl std::fmt::Display for FrameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

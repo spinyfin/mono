@@ -558,24 +558,28 @@ async fn a_new_connection_takes_the_response_to_a_request_an_earlier_one_sent() 
             ts_ms: 0,
             dir: Direction::ToAgent,
             line: r#"{"jsonrpc":"2.0","id":6,"method":"session/new","params":{}}"#.into(),
+            invalid: None,
         },
         WireRecord {
             seq: 2,
             ts_ms: 0,
             dir: Direction::FromAgent,
             line: r#"{"jsonrpc":"2.0","id":6,"result":{"sessionId":"session-1"}}"#.into(),
+            invalid: None,
         },
         WireRecord {
             seq: 3,
             ts_ms: 0,
             dir: Direction::ToAgent,
             line: r#"{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{}}"#.into(),
+            invalid: None,
         },
         WireRecord {
             seq: 4,
             ts_ms: 0,
             dir: Direction::FromAgent,
             line: r#"{"jsonrpc":"2.0","id":"p-1","method":"session/request_permission","params":{}}"#.into(),
+            invalid: None,
         },
     ];
     let open = unanswered_requests(&earlier);

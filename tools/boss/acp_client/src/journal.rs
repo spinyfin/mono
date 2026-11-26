@@ -12,7 +12,13 @@
 //! - `dir` names the receiver's side of the stream, not the writer of the
 //!   journal, so the value means the same thing whoever holds the journal.
 //! - `line` is the line exactly as it was sent or received, never a
-//!   re-serialised copy, so request ids and field order survive.
+//!   re-serialised copy, so request ids and field order survive. The one
+//!   exception is a record carrying `invalid`: the received bytes were not a
+//!   usable line, so `line` is only a bounded, lossy preview of them and the
+//!   record is never read as a message.
+//! - `invalid` is absent for every ordinary record. When present it names why
+//!   the framer rejected the bytes: `invalid_utf8`, `too_long` or
+//!   `unterminated_at_eof`.
 
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, Write};
@@ -43,6 +49,9 @@ pub struct WireRecord {
     pub ts_ms: u64,
     pub dir: Direction,
     pub line: String,
+    /// Why the received bytes were unusable, when `line` is only a preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalid: Option<String>,
 }
 
 /// The single ordered writer of a journal.
@@ -89,6 +98,16 @@ impl Journal {
 
     /// Appends one line and returns the sequence number it was given.
     pub fn append(&self, dir: Direction, line: &str) -> io::Result<u64> {
+        self.append_record(dir, line, None)
+    }
+
+    /// Appends a preview of bytes that were not a usable line, marked so a
+    /// reader never mistakes it for a message that was received.
+    pub fn append_invalid(&self, dir: Direction, preview: &str, kind: &str) -> io::Result<u64> {
+        self.append_record(dir, preview, Some(kind.to_owned()))
+    }
+
+    fn append_record(&self, dir: Direction, line: &str, invalid: Option<String>) -> io::Result<u64> {
         let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let seq = state.next_seq;
         let record = WireRecord {
@@ -96,6 +115,7 @@ impl Journal {
             ts_ms: now_ms(),
             dir,
             line: line.to_owned(),
+            invalid,
         };
         let mut encoded = serde_json::to_vec(&record).map_err(io::Error::other)?;
         encoded.push(b'\n');
@@ -158,6 +178,9 @@ pub struct UnansweredRequest {
 pub fn unanswered_requests<'a>(records: impl IntoIterator<Item = &'a WireRecord>) -> Vec<UnansweredRequest> {
     let mut open: Vec<UnansweredRequest> = Vec::new();
     for record in records {
+        if record.invalid.is_some() {
+            continue;
+        }
         let Ok(Value::Object(message)) = serde_json::from_str::<Value>(&record.line) else {
             continue;
         };
@@ -208,6 +231,7 @@ mod tests {
             ts_ms: 0,
             dir,
             line: line.to_owned(),
+            invalid: None,
         }
     }
 
@@ -241,6 +265,35 @@ mod tests {
         let torn = &whole[..whole.len() - 4];
         assert_eq!(read_records(format!("{whole}\n{torn}").as_bytes()).unwrap().len(), 1);
         assert!(read_records(format!("{torn}\n{whole}\n").as_bytes()).is_err());
+    }
+
+    #[test]
+    fn an_invalid_frame_preview_is_marked_and_never_answers_a_request() {
+        let buffer = SharedBuffer::default();
+        let journal = Journal::to_writer(buffer.clone());
+        journal
+            .append(
+                Direction::ToAgent,
+                r#"{"jsonrpc":"2.0","id":1,"method":"session/prompt"}"#,
+            )
+            .unwrap();
+        // A lossy preview of a line with a bad byte inside a string parses as
+        // a response, but the connection never delivered it to the waiter.
+        journal
+            .append_invalid(
+                Direction::FromAgent,
+                r#"{"jsonrpc":"2.0","id":1,"result":"\u{fffd}"}"#,
+                "invalid_utf8",
+            )
+            .unwrap();
+        let text = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert!(text.lines().next().unwrap().find("invalid").is_none());
+        assert!(text.lines().nth(1).unwrap().contains(r#""invalid":"invalid_utf8""#));
+        let records = read_records(text.as_bytes()).unwrap();
+        assert_eq!(records[1].invalid.as_deref(), Some("invalid_utf8"));
+        let open = unanswered_requests(&records);
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].method, "session/prompt");
     }
 
     #[test]

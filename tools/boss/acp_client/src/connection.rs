@@ -520,9 +520,13 @@ fn handle_frame(shared: &Shared, incoming: &mpsc::UnboundedSender<Incoming>, fra
         Some(journal) => journal.append(Direction::FromAgent, line),
         None => Ok(0),
     };
+    let journal_invalid = |preview: &str, kind: &str| match &shared.journal {
+        Some(journal) => journal.append_invalid(Direction::FromAgent, preview, kind),
+        None => Ok(0),
+    };
     let event = match frame {
         Frame::Invalid { preview, error } => {
-            let seq = journal(&preview)?;
+            let seq = journal_invalid(&preview, error.kind())?;
             Incoming::Malformed {
                 preview,
                 reason: error.to_string(),
