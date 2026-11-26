@@ -263,6 +263,25 @@ fn seed_in_review(db: &WorkDb, product: &str) -> String {
     id
 }
 
+fn seed_reviewing_pr(db: &WorkDb, product: &str) -> String {
+    let id = chore(db, product, "reviewing PR");
+    let input = batch_input(&id);
+    set_blocking_state(db, &id, "active", None, Some(&input.pr_url), "100");
+    db.create_review_batch(
+        input,
+        &[ReviewBatchMemberCreateInput::builder()
+            .attempt(1)
+            .provider_effort("medium")
+            .requested_driver("claude")
+            .resolved_model("fixture")
+            .role(boss_protocol::ReviewBatchMemberRole::ClaudeReviewer)
+            .status(boss_protocol::ReviewBatchMemberStatus::Pending)
+            .build()],
+    )
+    .unwrap();
+    id
+}
+
 fn seed_blocked_conflict(db: &WorkDb, product: &str) -> String {
     let id = chore(db, product, "blocked on conflict");
     set_blocking_state(db, &id, "blocked", Some("merge_conflict"), Some(&fresh_pr()), "100");
@@ -488,6 +507,18 @@ const PRODUCERS: &[Producer] = &[
         seed: seed_in_review,
         nominated: |db| {
             ids(db.list_chores_pending_merge_check().unwrap(), |c| {
+                c.work_item_id.clone()
+            })
+        },
+    },
+    Producer {
+        name: "merge poller, review-held PRs (list_reviewing_chores_pending_merge_check)",
+        stance: Stance::KeepsParked {
+            why: "a parked PR may still merge; this listing only feeds terminal observation, never open-PR upkeep",
+        },
+        seed: seed_reviewing_pr,
+        nominated: |db| {
+            ids(db.list_reviewing_chores_pending_merge_check().unwrap(), |c| {
                 c.work_item_id.clone()
             })
         },

@@ -872,6 +872,18 @@ impl WorkDb {
         self.query_pending_merge_checks("t.status = 'in_review'")
     }
 
+    /// Review admission/failure can leave a delivered PR in Doing or Backlog.
+    /// Observe a confirmed merge there too, without enrolling open PRs in upkeep
+    /// or retiring the row on a closed-unmerged PR.
+    pub fn list_reviewing_chores_pending_merge_check(&self) -> Result<Vec<PendingMergeCheck>> {
+        self.query_pending_merge_checks(
+            "t.status IN ('todo', 'active') AND EXISTS (
+                SELECT 1 FROM pr_review_batches b
+                WHERE b.cycle_root_id = t.id AND b.pr_url = t.pr_url AND b.phase = 'pre_merge'
+            )",
+        )
+    }
+
     /// [`Self::list_chores_pending_merge_check`] minus the parked rows: the
     /// `in_review` PRs for which upkeep may run.
     ///

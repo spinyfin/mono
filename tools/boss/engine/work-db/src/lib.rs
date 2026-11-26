@@ -970,6 +970,8 @@ mod proposals;
 mod query_ensure;
 pub mod queue_ci_evidence;
 mod review_badge;
+mod review_batch_findings;
+pub use review_batch_findings::ReviewBatchMemberReport;
 mod review_batches;
 mod review_findings_followup;
 mod review_guide_context;

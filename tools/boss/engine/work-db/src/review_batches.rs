@@ -2761,6 +2761,12 @@ impl WorkDb {
              FROM pr_review_batches b
              JOIN tasks t ON t.id = b.cycle_root_id
              WHERE b.status NOT IN ('completed', 'failed')
+               -- A staged verdict still has an owner: the apply sweep. In
+               -- particular, a merge must not race it into a failed batch.
+               AND (t.deleted_at IS NOT NULL OR b.status != 'applying'
+                    OR NOT EXISTS (SELECT 1 FROM worker_proposals p
+                        WHERE p.id = b.final_verdict_proposal_id
+                          AND p.kind = 'review_verdict' AND p.state = 'proposed'))
                AND (
                  t.deleted_at IS NOT NULL
                  OR (b.phase != 'post_merge' AND t.status IN ('done', 'archived'))

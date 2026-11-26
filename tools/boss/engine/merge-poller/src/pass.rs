@@ -420,10 +420,25 @@ pub async fn run_one_pass_observed(
 
 /// Whether the snapshot reports `pr_url` merged or closed — a terminal fact
 /// the pass records before any open-PR upkeep.
-fn probed_terminal(results: &HashMap<String, std::result::Result<PrLifecycleProbe, String>>, pr_url: &str) -> bool {
+pub(super) fn probed_terminal(
+    results: &HashMap<String, std::result::Result<PrLifecycleProbe, String>>,
+    pr_url: &str,
+) -> bool {
     matches!(
         results.get(pr_url),
         Some(Ok(probe)) if !matches!(probe.state, PrLifecycleState::Open(_))
+    )
+}
+
+/// Whether the snapshot reports `pr_url` merged. Review-held Backlog/Doing
+/// rows complete only on this observation.
+pub(super) fn probed_merged(
+    results: &HashMap<String, std::result::Result<PrLifecycleProbe, String>>,
+    pr_url: &str,
+) -> bool {
+    matches!(
+        results.get(pr_url),
+        Some(Ok(probe)) if matches!(probe.state, PrLifecycleState::Merged)
     )
 }
 
@@ -494,6 +509,14 @@ pub async fn run_one_pass_tracked(
             Vec::new()
         }
     };
+    let reviewing = match work_db.list_reviewing_chores_pending_merge_check() {
+        Ok(items) => items,
+        Err(err) => {
+            tracing::warn!(?err, "merge poller: failed to list PRs awaiting review");
+            Vec::new()
+        }
+    };
+    let reviewing_ids: HashSet<&str> = reviewing.iter().map(|c| c.work_item_id.as_str()).collect();
     let blocked_ci = match work_db.list_chores_blocked_on_ci_failure() {
         Ok(items) => items,
         Err(err) => {
@@ -570,6 +593,7 @@ pub async fn run_one_pass_tracked(
         super::disarm_drain::drain_pending_merge_disarms(work_db, probe, publisher, host).await;
     }
     let total = in_review.len()
+        + reviewing.len()
         + blocked_conflict.len()
         + blocked_ci.len()
         + blocked_other.len()
@@ -584,6 +608,7 @@ pub async fn run_one_pass_tracked(
     let mut seen = std::collections::HashSet::new();
     let candidates: Vec<&PendingMergeCheck> = in_review
         .iter()
+        .chain(reviewing.iter())
         .chain(blocked_conflict.iter())
         .chain(blocked_ci.iter())
         .chain(blocked_other.iter())
@@ -641,6 +666,7 @@ pub async fn run_one_pass_tracked(
     let mut probe_url_seen = std::collections::HashSet::new();
     let probe_urls: Vec<String> = in_review
         .iter()
+        .chain(reviewing.iter())
         .chain(blocked_conflict.iter())
         .chain(blocked_ci.iter())
         .chain(blocked_other.iter())
@@ -681,6 +707,15 @@ pub async fn run_one_pass_tracked(
         .chain(stranded_blocked.iter())
         .map(|candidate| candidate.pr_url.as_str())
         .collect();
+    // Reviewing PRs are walked only for merge, but they still need a probe
+    // plan: `plan_tiers` only considers `always_full` and `in_review`.
+    let mut tier_in_review_seen = std::collections::HashSet::new();
+    let mut tier_in_review: Vec<PendingMergeCheck> = Vec::new();
+    for row in in_review.iter().chain(reviewing.iter()) {
+        if tier_in_review_seen.insert(row.pr_url.clone()) {
+            tier_in_review.push(row.clone());
+        }
+    }
     let crate::probe_tier::TieredProbe {
         results,
         unwalked,
@@ -694,7 +729,7 @@ pub async fn run_one_pass_tracked(
             state,
             inputs: crate::probe_tier::TierInputs {
                 always_full,
-                in_review: &in_review,
+                in_review: &tier_in_review,
                 parked: &in_review_parked,
                 merge_in_flight: merge_in_flight.as_ref(),
                 active_products: active_products.as_ref(),
@@ -715,7 +750,14 @@ pub async fn run_one_pass_tracked(
     let (terminal, open): (Vec<&PendingMergeCheck>, Vec<&PendingMergeCheck>) = candidates
         .into_iter()
         .filter(|candidate| !unwalked.contains(&candidate.pr_url))
-        .partition(|candidate| probed_terminal(&snapshot.results, &candidate.pr_url));
+        .partition(|candidate| {
+            if reviewing_ids.contains(candidate.work_item_id.as_str()) {
+                probed_merged(&snapshot.results, &candidate.pr_url)
+            } else {
+                probed_terminal(&snapshot.results, &candidate.pr_url)
+            }
+        });
+
     let terminal_walk: Vec<&PendingMergeCheck> = {
         let rotations = state.rotations();
         rotations
@@ -724,7 +766,12 @@ pub async fn run_one_pass_tracked(
     };
     let open_walk: Vec<&PendingMergeCheck> = {
         let rotations = state.rotations();
-        rotations.walk.order(open, |candidate| candidate.work_item_id.as_str())
+        rotations.walk.order(
+            open.into_iter()
+                .filter(|c| !reviewing_ids.contains(c.work_item_id.as_str()))
+                .collect(),
+            |candidate| candidate.work_item_id.as_str(),
+        )
     };
     let parked_scope: Vec<&PendingMergeCheck> = terminal_walk
         .iter()
@@ -756,6 +803,14 @@ pub async fn run_one_pass_tracked(
             break;
         }
         state.rotations().walk.stamp(&candidate.work_item_id);
+        // A snapshot refresh may have changed a merged observation to open.
+        // Review-held rows are here for confirmed merge observation only.
+        if reviewing_ids.contains(candidate.work_item_id.as_str())
+            && !probed_merged(&snapshot.results, &candidate.pr_url)
+        {
+            trace.finish_item();
+            continue;
+        }
         sweep_one(
             work_db,
             &snapshot.results,

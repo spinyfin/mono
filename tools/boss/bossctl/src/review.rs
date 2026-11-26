@@ -157,6 +157,14 @@ pub(crate) fn review_show(json: bool, state_root: Option<PathBuf>, work_item: St
         .filter(|batch| batch.final_verdict_proposal_id.is_some())
         .map(|batch| (batch, batch_verdict(&db, batch)))
         .collect();
+    let batch_members: Vec<_> = batches
+        .iter()
+        .map(|batch| db.review_batch_members(&batch.id))
+        .collect::<Result<_>>()?;
+    let batch_reports: Vec<_> = batches
+        .iter()
+        .map(|batch| db.review_batch_reports(&batch.id))
+        .collect::<Result<_>>()?;
 
     if json {
         println!(
@@ -169,6 +177,20 @@ pub(crate) fn review_show(json: bool, state_root: Option<PathBuf>, work_item: St
                 "latest_informative_verdict": latest_informative.map(verdict_json),
                 "reviewed_head_is_stale": reviewed_head_is_stale,
                 "history": history.iter().map(verdict_json_with_informative_flag).collect::<Vec<_>>(),
+                "batches": batches.iter().zip(&batch_members).zip(&batch_reports)
+                    .map(|((batch, members), reports)| serde_json::json!({
+                        "batch": batch_json(batch, members, &batch_verdict(&db, batch)),
+                        "reports": reports.iter().map(|read| match &read.report {
+                            Ok(report) => serde_json::json!({
+                                "member_id": read.member.id, "execution_id": read.member.execution_id,
+                                "role": read.member.role, "report": report,
+                            }),
+                            Err(error) => serde_json::json!({
+                                "member_id": read.member.id, "execution_id": read.member.execution_id,
+                                "role": read.member.role, "error": error,
+                            }),
+                        }).collect::<Vec<_>>(),
+                    })).collect::<Vec<_>>(),
                 "batch_verdicts": batch_verdicts.iter().map(|(batch, verdict)| serde_json::json!({
                     "batch_id": batch.id,
                     "target_sha": batch.target_sha,
@@ -194,8 +216,16 @@ pub(crate) fn review_show(json: bool, state_root: Option<PathBuf>, work_item: St
     println!();
 
     match latest_informative {
-        None if history.is_empty() => {
+        None if history.is_empty() && batches.is_empty() => {
             println!("never reviewed — no pr_review pass has completed for this work item");
+        }
+        None if history.is_empty() => {
+            let readable_report_count = batch_reports
+                .iter()
+                .flat_map(|reports| reports.iter())
+                .filter(|read| read.report.is_ok())
+                .count();
+            println!("no consolidated verdict — {readable_report_count} completed member report(s)");
         }
         None => {
             let mut outcomes: Vec<&str> = history.iter().map(|v| v.gate_outcome.as_str()).collect();
@@ -251,6 +281,25 @@ pub(crate) fn review_show(json: bool, state_root: Option<PathBuf>, work_item: St
     for (batch, verdict) in &batch_verdicts {
         println!("batch {} verdict (head {}):", batch.id, batch.target_sha);
         print_verdict(verdict);
+    }
+    for ((batch, members), reports) in batches.iter().zip(&batch_members).zip(&batch_reports) {
+        print_batch(batch, members, &Ok(None), None);
+        if batch.status == boss_protocol::ReviewBatchStatus::Failed {
+            println!("  failed quorum — no successful consolidated review");
+        }
+        for read in reports {
+            match &read.report {
+                Ok(report) => {
+                    println!("  completed member report [{}]:", read.member.role);
+                    // Keep all static evidence, coverage limitations, and proposed fixes
+                    // reachable even when no supervisor verdict was ever written.
+                    println!("{}", serde_json::to_string_pretty(report)?);
+                }
+                Err(error) => {
+                    println!("  report unreadable: {error}");
+                }
+            }
+        }
     }
 
     Ok(())
