@@ -68,6 +68,33 @@ pub struct OrphanedRevisionChain {
 /// holds the two together.
 const READ_ONLY_EXECUTION_KINDS_SQL: &str = "'pr_review', 'pr_review_guide', 'progression'";
 
+/// SQL predicate matching an unfinished execution of `work_item_expr` whose
+/// kind can still push to the PR branch.
+///
+/// Shared between [`WorkDb::list_chores_held_active_with_pr`] and the
+/// terminal transitions ([`WorkDb::observe_chore_pr_merged`] and
+/// [`WorkDb::mark_chore_pr_closed_unmerged`]) so list-time filtering and
+/// write-lock re-checks stay identical.
+fn unfinished_writer_exists_sql(work_item_expr: &str) -> String {
+    let unfinished = super::recurring_read_indexes::unfinished_execution_statuses_sql();
+    format!(
+        "EXISTS (
+            SELECT 1 FROM work_executions writer
+             WHERE writer.work_item_id = {work_item_expr}
+               AND writer.status IN ({unfinished})
+               AND writer.kind NOT IN ({READ_ONLY_EXECUTION_KINDS_SQL})
+        )"
+    )
+}
+
+/// Returns whether `work_item_id` currently has an unfinished execution that
+/// can push to its PR branch.
+pub(crate) fn has_unfinished_writer_in_tx(conn: &Connection, work_item_id: &str) -> Result<bool> {
+    let exists = unfinished_writer_exists_sql("?1");
+    conn.query_row(&format!("SELECT {exists}"), [work_item_id], |row| row.get(0))
+        .map_err(Into::into)
+}
+
 /// Resolve the review-admission marker of `chain_root_id` and of every
 /// revision in its chain. The marker says a review of the PR is still to be
 /// admitted; once the PR has merged or closed no review of it will be, so
@@ -95,17 +122,15 @@ impl WorkDb {
     /// again under the run they just started. Runs that only read the PR
     /// (reviewers, review guides, progression) do not hold the row out, so a
     /// review that is queued, running or held by dispatch focus never keeps
-    /// a merge from being recorded.
+    /// a merge from being recorded. Human-driven rows are also excluded: they
+    /// are never held `active` for an automated review and close only via the
+    /// human completion ritual.
     pub fn list_chores_held_active_with_pr(&self) -> Result<Vec<PendingMergeCheck>> {
-        let unfinished = super::recurring_read_indexes::unfinished_execution_statuses_sql();
+        let has_writer = unfinished_writer_exists_sql("t.id");
         self.query_pending_merge_checks(&format!(
             "t.status = 'active'
-               AND NOT EXISTS (
-                   SELECT 1 FROM work_executions writer
-                    WHERE writer.work_item_id = t.id
-                      AND writer.status IN ({unfinished})
-                      AND writer.kind NOT IN ({READ_ONLY_EXECUTION_KINDS_SQL})
-               )"
+               AND t.human_driven = 0
+               AND NOT {has_writer}"
         ))
     }
 
@@ -184,7 +209,12 @@ impl WorkDb {
             return Ok(Vec::new());
         }
         let root_pr_url = root.and_then(|root| root.pr_url).filter(|url| !url.is_empty());
-        let mut revision_ids = collect_chain_revision_ids(&tx, chain_root_id)?;
+        // Walk through tombstoned intermediate revisions too, matching
+        // `list_orphaned_in_review_revision_chains` (which uses
+        // `cycle_root_walk_cte` with no tombstone filter). The UPDATE below
+        // guards `deleted_at IS NULL AND status = 'in_review'` so only live
+        // in-review descendants are settled.
+        let mut revision_ids = collect_chain_revision_ids_including_deleted(&tx, chain_root_id)?;
         if root_is_revision {
             revision_ids.push(chain_root_id.to_owned());
         }
@@ -367,13 +397,20 @@ mod tests {
         let unbound = create_test_chore_manual(&db, product.id.clone(), "no PR yet");
         set_task(&db, &unbound.id, "active", None);
 
-        let reviewing = create_test_chore_manual(&db, product.id, "already in review");
+        let reviewing = create_test_chore_manual(&db, product.id.clone(), "already in review");
         set_task(
             &db,
             &reviewing.id,
             "in_review",
             Some("https://github.com/acme/widget/pull/9"),
         );
+
+        let human = create_test_chore_manual(&db, product.id, "human working in Doing");
+        set_task(&db, &human.id, "active", Some("https://github.com/acme/widget/pull/10"));
+        db.connect()
+            .unwrap()
+            .execute("UPDATE tasks SET human_driven = 1 WHERE id = ?1", [&human.id])
+            .unwrap();
 
         assert_eq!(held_ids(&db), vec![held.id]);
     }
@@ -455,9 +492,8 @@ mod tests {
         assert_eq!(listed, expected);
     }
 
-    /// The reported sequence: the PR is closed without merging while its
-    /// root is already archived, and the revisions it left in review end
-    /// with a recorded reason.
+    /// When a PR is closed without merging while its root is already archived,
+    /// the revisions it left in review end with a recorded reason.
     #[test]
     fn closed_pr_settles_in_review_revisions_of_an_archived_root() {
         let (_dir, db) = open_db();
@@ -560,5 +596,109 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(status(&db, &carried), "in_review");
+    }
+
+    /// A legacy nested chain whose intermediate revision was soft-deleted must
+    /// still settle live `in_review` descendants when its PR closes, without
+    /// modifying the tombstoned intermediate row.
+    #[test]
+    fn orphaned_settlement_descends_past_tombstoned_intermediate_revision() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let root = create_test_chore_manual(&db, product.id, "archived root");
+        set_task(&db, &root.id, "archived", Some(PR));
+        let intermediate = revision(&db, "task_rev_mid", &root.id, "in_review", None);
+        let nested = revision(&db, "task_rev_leaf", &intermediate, "in_review", None);
+        db.connect()
+            .unwrap()
+            .execute("UPDATE tasks SET deleted_at = '5' WHERE id = ?1", [&intermediate])
+            .unwrap();
+
+        let listed = db.list_orphaned_in_review_revision_chains().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].chain_root_id, root.id);
+        assert_eq!(listed[0].pr_url, PR);
+
+        let settled = db
+            .settle_orphaned_revisions_after_pr_close(&root.id, PR, PrClose::ClosedUnmerged)
+            .unwrap();
+        assert_eq!(settled, vec![nested.clone()]);
+        assert_eq!(status(&db, &nested), "done");
+        assert_eq!(
+            db.latest_status_audit_basis(&nested, "status").unwrap().as_deref(),
+            Some(ORPHANED_REVISION_PR_CLOSED_UNMERGED_BASIS),
+        );
+        // The tombstoned intermediate revision was traversed, not settled.
+        assert_eq!(status(&db, &intermediate), "in_review");
+        assert_ne!(
+            db.latest_status_audit_basis(&intermediate, "status")
+                .unwrap()
+                .as_deref(),
+            Some(ORPHANED_REVISION_PR_CLOSED_UNMERGED_BASIS),
+        );
+        assert!(db.list_orphaned_in_review_revision_chains().unwrap().is_empty());
+    }
+
+    /// Both terminal transitions re-check for an unfinished writer under their
+    /// write lock when the row is `active`, so a redo run started after listing
+    /// cannot have its row retired underneath it.
+    #[test]
+    fn terminal_transitions_refuse_active_rows_with_an_unfinished_writer() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+
+        let merged_row = create_test_chore_manual(&db, product.id.clone(), "active redo merge");
+        set_task(&db, &merged_row.id, "active", Some(PR));
+        db.file_admission_deferred_attention(&merged_row.id, PR).unwrap();
+        execution(
+            &db,
+            &merged_row.id,
+            ExecutionKind::ChoreImplementation,
+            ExecutionStatus::Ready,
+        );
+
+        let obs = db.observe_chore_pr_merged(&merged_row.id, PR).unwrap();
+        assert!(obs.completed_task.is_none());
+        assert!(!obs.changed);
+        assert!(obs.cleared_queue_state.is_none());
+        assert_eq!(status(&db, &merged_row.id), "active");
+        assert!(db.get_merge_evidence(&merged_row.id).unwrap().is_none());
+
+        let closed_row = create_test_chore_manual(&db, product.id.clone(), "active redo close");
+        let closed_pr = "https://github.com/acme/widget/pull/3751";
+        set_task(&db, &closed_row.id, "active", Some(closed_pr));
+        db.file_admission_deferred_attention(&closed_row.id, closed_pr).unwrap();
+        execution(
+            &db,
+            &closed_row.id,
+            ExecutionKind::ChoreImplementation,
+            ExecutionStatus::Running,
+        );
+
+        assert!(
+            db.mark_chore_pr_closed_unmerged(&closed_row.id, closed_pr)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(status(&db, &closed_row.id), "active");
+        assert_eq!(
+            db.list_open_attention_items_of_kind(PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND)
+                .unwrap()
+                .len(),
+            2,
+            "neither refused transition may resolve deferred-admission markers"
+        );
+
+        // Read-only executions do not block the transition.
+        let held_row = create_test_chore_manual(&db, product.id, "active with review");
+        let held_pr = "https://github.com/acme/widget/pull/3752";
+        set_task(&db, &held_row.id, "active", Some(held_pr));
+        execution(&db, &held_row.id, ExecutionKind::PrReview, ExecutionStatus::Ready);
+        assert!(
+            db.mark_chore_pr_closed_unmerged(&held_row.id, held_pr)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(status(&db, &held_row.id), "done");
     }
 }

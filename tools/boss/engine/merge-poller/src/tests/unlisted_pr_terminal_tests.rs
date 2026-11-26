@@ -198,10 +198,10 @@ async fn pass(db: &WorkDb, probe: &dyn MergeProbe, handler: &FanoutHandler) -> S
     run_one_pass(db, probe, &RecordingPublisher::default(), None, Some(handler), None).await
 }
 
-/// The reported sequence. A chore finished and opened its PR; dispatch focus
-/// is on another project, so its review was never admitted and the row stays
-/// `active` with a review guide queued and a follow-up proposal open. The PR
-/// is then merged on GitHub. The row must reach `done` on the merge alone.
+/// A chore finished and opened its PR; dispatch focus is on another project,
+/// so its review was never admitted and the row stays `active` with a review
+/// guide queued and a follow-up proposal open. The PR is then merged on
+/// GitHub. The row must reach `done` on the merge alone.
 #[tokio::test]
 async fn merged_pr_finalizes_a_chore_held_for_a_review_that_focus_deferred() {
     let (_dir, db) = open_db();
@@ -417,6 +417,108 @@ async fn a_held_chore_with_a_writer_in_flight_is_left_to_that_run() {
     assert_eq!(probe.asked_about(PR), 0);
 }
 
+/// A probe that runs a one-shot hook while the GitHub probe is in flight,
+/// after candidate listing has already completed and before the terminal
+/// transition runs.
+struct HookedProbe {
+    inner: Arc<StubProbe>,
+    asked: std::sync::atomic::AtomicUsize,
+    on_probe: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl HookedProbe {
+    fn new(pr_url: &str, state: PrLifecycleState, on_probe: impl FnOnce() + Send + 'static) -> Self {
+        let inner = StubProbe::new();
+        inner.set(pr_url, state);
+        Self {
+            inner,
+            asked: std::sync::atomic::AtomicUsize::new(0),
+            on_probe: std::sync::Mutex::new(Some(Box::new(on_probe))),
+        }
+    }
+
+    fn asked(&self) -> usize {
+        self.asked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl MergeProbe for HookedProbe {
+    async fn probe(&self, pr_url: &str) -> Result<PrLifecycleProbe> {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(hook) = self.on_probe.lock().unwrap().take() {
+            hook();
+        }
+        self.inner.probe(pr_url).await
+    }
+}
+
+/// If a writer execution is minted after the held row is listed and before the
+/// GitHub probe returns (e.g. a board drop to Doing followed by execution
+/// creation, or a redo started while the probe is in flight), neither the full
+/// pass nor `reconcile_batch` may retire the row underneath that run.
+#[tokio::test]
+async fn writer_minted_while_probe_is_in_flight_keeps_held_chore_active() {
+    for terminal_state in [PrLifecycleState::Merged, PrLifecycleState::ClosedUnmerged] {
+        for use_reconcile_batch in [false, true] {
+            let (_dir, db) = open_db();
+            let (_product_id, chore_id, _) = chore_held_for_review(&db, "raced-redo", PR);
+            let db_for_hook = db.clone();
+            let chore_for_hook = chore_id.clone();
+            let probe = HookedProbe::new(PR, terminal_state.clone(), move || {
+                db_for_hook
+                    .create_execution(
+                        CreateExecutionInput::builder()
+                            .work_item_id(chore_for_hook)
+                            .kind(ExecutionKind::ChoreImplementation)
+                            .status(ExecutionStatus::Ready)
+                            .repo_remote_url(REPO)
+                            .build(),
+                    )
+                    .unwrap();
+            });
+            let publisher = RecordingPublisher::default();
+
+            let outcome = if use_reconcile_batch {
+                let urls = [PR.to_owned()];
+                reconcile_batch(&db, &probe, &publisher, None, None, None, &urls)
+                    .await
+                    .0
+            } else {
+                run_one_pass(&db, &probe, &publisher, None, None, None).await
+            };
+
+            assert_eq!(
+                probe.asked(),
+                1,
+                "state={terminal_state:?} batch={use_reconcile_batch}: row must have been listed and probed"
+            );
+            assert_eq!(
+                outcome.merged, 0,
+                "state={terminal_state:?} batch={use_reconcile_batch}: {outcome:?}"
+            );
+            assert_eq!(
+                outcome.closed_unmerged, 0,
+                "state={terminal_state:?} batch={use_reconcile_batch}: {outcome:?}"
+            );
+            assert_eq!(
+                task(&db, &chore_id).status,
+                TaskStatus::Active,
+                "state={terminal_state:?} batch={use_reconcile_batch}: row must remain active"
+            );
+            assert!(
+                db.get_merge_evidence(&chore_id).unwrap().is_none(),
+                "state={terminal_state:?} batch={use_reconcile_batch}: no merge evidence on refused transition"
+            );
+            assert_eq!(
+                open_deferred_markers(&db),
+                1,
+                "state={terminal_state:?} batch={use_reconcile_batch}: deferred marker must remain untouched"
+            );
+        }
+    }
+}
+
 /// The per-PR reconcile reaches the same row the full pass does.
 #[tokio::test]
 async fn targeted_reconcile_finalizes_a_held_chore_whose_pr_merged() {
@@ -484,8 +586,9 @@ fn revision_in_review(db: &WorkDb, id: &str, root_id: &str, name: &str, created_
     id.to_owned()
 }
 
-/// The owner of `CLOSED_PR` with the four engine-minted revisions the report
-/// names resting in review, and the owner then removed by `fate`.
+/// The owner of `CLOSED_PR` with four engine-minted revisions (three review
+/// findings and a conflict resolution) resting in review, and the owner then
+/// removed by `fate`.
 fn orphaned_chain(db: &WorkDb, fate: RootFate) -> (String, String, Vec<String>) {
     let (product_id, root_id) = make_chore_in_review(db, &format!("owner-{fate:?}"), CLOSED_PR);
     let revisions = vec![
@@ -556,10 +659,10 @@ fn revision_statuses(db: &WorkDb, revisions: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The second reported sequence. Revisions are in review on a PR whose
-/// owning row is already archived, done or deleted, so no list names that PR.
-/// The PR is then closed without merging. Every revision must end, with the
-/// reason recorded, on the pass that sees the close.
+/// Revisions are in review on a PR whose owning row is already archived, done
+/// or deleted, so no list names that PR. The PR is then closed without
+/// merging. Every revision must end, with the reason recorded, on the pass
+/// that sees the close.
 #[tokio::test]
 async fn closed_pr_settles_in_review_revisions_whose_root_is_gone() {
     for fate in [RootFate::Archived, RootFate::DoneByHand, RootFate::Deleted] {
