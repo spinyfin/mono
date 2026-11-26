@@ -288,7 +288,32 @@ pub(super) async fn surface_ci_rebase_card_detail(
         publisher
             .publish_work_item_changed(product_id, work_item_id, publish_reason)
             .await;
+        return;
     }
+    // After the rebase push, CI polling can move the card to `in_review`
+    // while `gh pr merge` / Trunk submit is still pending. The CI-blocked
+    // detail update then no-ops; file a PR-bound attention item so the
+    // failure stays visible.
+    if let Err(err) = work_db.create_attention_item(boss_work_db::CreateAttentionItemInput {
+        work_item_id: Some(work_item_id.to_owned()),
+        kind: "ci_merge_rebase_failed".to_owned(),
+        title: "Merge after rebase could not be completed".to_owned(),
+        body_markdown: detail.to_owned(),
+        execution_id: None,
+        status: None,
+        resolved_at: None,
+    }) {
+        tracing::warn!(
+            %work_item_id,
+            %pr_url,
+            ?err,
+            "merge_when_ready: failed to file CI-merge rebase attention after card left ci_failure",
+        );
+        return;
+    }
+    publisher
+        .publish_work_item_changed(product_id, work_item_id, publish_reason)
+        .await;
 }
 
 /// Persist confirmation, call `gh pr merge --auto --squash`, record the
@@ -760,7 +785,20 @@ pub(super) async fn handle_trunk_queue_merge(
                         ) =>
                 {
                     record_after_rebase(&work_db, &work_item_id, &pr_url, after_rebase.as_ref());
-                    if !reply_already_sent {
+                    if reply_already_sent {
+                        if let Some(after) = after_rebase.as_ref() {
+                            let already_detail =
+                                format!("Rebased onto {}; already in the merge queue", after.base_branch);
+                            let _ = work_db.set_ci_failure_blocked_detail(&work_item_id, &pr_url, &already_detail);
+                            publisher
+                                .publish_work_item_changed(
+                                    &product_id,
+                                    &work_item_id,
+                                    "ci_merge_rebase_already_enqueued",
+                                )
+                                .await;
+                        }
+                    } else {
                         send_response(
                             &sink,
                             &request_id,

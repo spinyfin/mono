@@ -1146,6 +1146,19 @@ async fn serve_scoped(
         }
     }
 
+    match server_state.work_db.reconcile_stale_ci_merge_rebase_progress() {
+        Ok(cleared) if cleared > 0 => {
+            tracing::warn!(
+                count = cleared,
+                "cleared leftover CI-merge rebase progress detail at startup",
+            );
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::error!(?err, "CI-merge rebase progress recovery sweep failed; continuing");
+        }
+    }
+
     post_bind.mark("conflict_ladder_orphan_recovery");
 
     // Install boss-event to a stable location and heal existing worker

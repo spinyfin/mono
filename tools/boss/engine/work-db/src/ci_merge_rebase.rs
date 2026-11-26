@@ -209,6 +209,59 @@ impl WorkDb {
             params![work_item_id, pr_url, detail, now_string()],
         )? > 0)
     }
+
+    /// Stamp `blocked_detail` on any blocked task for this PR. Used after a
+    /// CI-merge rebase has already retargeted the card to `merge_conflict`
+    /// or `deletion_signoff`, where [`Self::set_ci_failure_blocked_detail`]
+    /// cannot apply.
+    pub fn set_blocked_detail(&self, work_item_id: &str, pr_url: &str, detail: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        Ok(conn.execute(
+            "UPDATE tasks
+                SET blocked_detail = ?3,
+                    updated_at     = ?4
+              WHERE id = ?1
+                AND pr_url = ?2
+                AND status = 'blocked'
+                AND deleted_at IS NULL",
+            params![work_item_id, pr_url, detail, now_string()],
+        )? > 0)
+    }
+
+    /// Engine-startup recovery for a Merge-click rebase interrupted mid-flight:
+    /// the early reply left `blocked_detail` as "Rebasing onto … before
+    /// merging..." and a pending `ci_merge_rebase` attempt row. Nothing in
+    /// process is still rebasing after a restart, so clear the stale progress
+    /// text and abandon those attempts so a later Merge click can retry.
+    pub fn reconcile_stale_ci_merge_rebase_progress(&self) -> Result<usize> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = now_string();
+        let cleared = tx.execute(
+            "UPDATE tasks
+                SET blocked_detail = NULL,
+                    updated_at     = ?1
+              WHERE status = 'blocked'
+                AND blocked_reason IN ('ci_failure', 'ci_failure_exhausted')
+                AND blocked_detail LIKE 'Rebasing onto % before merging...'
+                AND deleted_at IS NULL",
+            params![now],
+        )?;
+        tx.execute(
+            "UPDATE conflict_resolutions
+                SET status                    = 'abandoned',
+                    failure_reason            = 'engine_restart_orphaned_ci_merge_rebase',
+                    base_sha_at_trigger       = NULL,
+                    resolved_by_rung          = NULL,
+                    mechanical_rung_in_flight = NULL,
+                    finished_at               = COALESCE(finished_at, ?1)
+              WHERE event_source = ?2
+                AND status IN ('pending', 'running')",
+            params![now, CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE],
+        )?;
+        tx.commit()?;
+        Ok(cleared)
+    }
 }
 
 #[cfg(test)]
@@ -323,6 +376,60 @@ mod tests {
         assert_eq!(
             still_active.last_trunk_state.as_deref(),
             Some(crate::TRUNK_INTENT_WITHDRAW)
+        );
+    }
+
+    #[test]
+    fn reconcile_stale_ci_merge_rebase_progress_clears_leftover_rebasing_detail() {
+        let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+        let product = create_test_product(&db);
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Stale rebase progress");
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some(PR.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.mark_chore_blocked_ci_failure(&chore.id, PR, None).unwrap();
+        assert!(
+            db.set_ci_failure_blocked_detail(&chore.id, PR, "Rebasing onto main before merging...")
+                .unwrap()
+        );
+        let attempt = db
+            .insert_conflict_resolution_with_source(
+                ConflictResolutionInsertInput {
+                    product_id: product.id,
+                    work_item_id: chore.id.clone(),
+                    pr_url: PR.to_owned(),
+                    pr_number: 77,
+                    head_branch: "boss/feature".to_owned(),
+                    base_branch: "main".to_owned(),
+                    base_sha_at_trigger: Some("base".to_owned()),
+                    head_sha_before: Some("head".to_owned()),
+                },
+                CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE,
+            )
+            .unwrap()
+            .expect("ci_merge_rebase attempt inserted");
+        assert_eq!(attempt.status, "pending");
+
+        let cleared = db.reconcile_stale_ci_merge_rebase_progress().unwrap();
+        assert_eq!(cleared, 1);
+
+        let WorkItem::Chore(task) = db.get_work_item(&chore.id).unwrap() else {
+            panic!("expected chore");
+        };
+        assert_eq!(task.blocked_reason.as_deref(), Some("ci_failure"));
+        assert_eq!(task.blocked_detail, None);
+
+        let abandoned = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+        assert_eq!(abandoned.status, "abandoned");
+        assert_eq!(
+            abandoned.failure_reason.as_deref(),
+            Some("engine_restart_orphaned_ci_merge_rebase")
         );
     }
 }

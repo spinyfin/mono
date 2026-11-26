@@ -22,12 +22,18 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use super::super::review::handle_merge_when_ready;
 use super::super::*;
 
+struct FakeDirectMergeBehavior {
+    ignore_expected_head: bool,
+    fail_message: Option<String>,
+    gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+}
+
 struct FakeDirectMergeExecutor {
     calls: Mutex<Vec<String>>,
     pinned_heads: Mutex<Vec<Option<String>>>,
     disarms: Mutex<Vec<String>>,
     head_sha: String,
-    ignore_expected_head: bool,
+    behavior: FakeDirectMergeBehavior,
 }
 
 impl FakeDirectMergeExecutor {
@@ -37,15 +43,27 @@ impl FakeDirectMergeExecutor {
             pinned_heads: Mutex::new(Vec::new()),
             disarms: Mutex::new(Vec::new()),
             head_sha: head_sha.into(),
-            ignore_expected_head: false,
+            behavior: FakeDirectMergeBehavior {
+                ignore_expected_head: false,
+                fail_message: None,
+                gate: None,
+            },
         }
     }
 
     fn ignoring_expected_head(head_sha: impl Into<String>) -> Self {
-        Self {
-            ignore_expected_head: true,
-            ..Self::returning(head_sha)
-        }
+        let mut executor = Self::returning(head_sha);
+        executor.behavior.ignore_expected_head = true;
+        executor
+    }
+
+    fn failing_gated(message: impl Into<String>) -> (Arc<Self>, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut executor = Self::returning("unused-head");
+        executor.behavior.fail_message = Some(message.into());
+        executor.behavior.gate = Some((entered.clone(), release.clone()));
+        (Arc::new(executor), entered, release)
     }
 
     fn calls(&self) -> Vec<String> {
@@ -77,7 +95,14 @@ impl DirectMergeExecutor for FakeDirectMergeExecutor {
             .lock()
             .unwrap()
             .push(expected_head_sha.map(str::to_owned));
-        let head_sha = if self.ignore_expected_head {
+        if let Some((entered, release)) = &self.behavior.gate {
+            entered.notify_one();
+            release.notified().await;
+        }
+        if let Some(message) = &self.behavior.fail_message {
+            anyhow::bail!("{message}");
+        }
+        let head_sha = if self.behavior.ignore_expected_head {
             self.head_sha.clone()
         } else {
             expected_head_sha
@@ -1809,9 +1834,9 @@ impl boss_execution_contracts::ExecutionPublisher for CapturingPublisher {
     async fn publish_work_item_changed(&self, _product_id: &str, _work_item_id: &str, _reason: &str) {}
 }
 
-/// C1: A clean CI-merge rebase must NOT emit `ConflictResolutionSucceeded`,
-/// must NOT appear in conflict remediation lists or `open_remediation_state`,
-/// must NOT increment conflict-ladder telemetry counters, and must NOT count
+/// A clean CI-merge rebase must not emit `ConflictResolutionSucceeded`,
+/// must not appear in conflict remediation lists or `open_remediation_state`,
+/// must not increment conflict-ladder telemetry counters, and must not count
 /// toward the per-work-item conflict churn guard.
 #[tokio::test]
 async fn clean_ci_merge_rebase_does_not_emit_conflict_cleared_or_consume_churn_guard() {
@@ -1917,10 +1942,11 @@ async fn clean_ci_merge_rebase_does_not_emit_conflict_cleared_or_consume_churn_g
     );
 }
 
-/// C2: The MergeWhenReady reply (`rebasing_onto_base`) arrives immediately
-/// once the branch is confirmed behind base — BEFORE the slow rebase finishes —
+/// The MergeWhenReady reply (`rebasing_onto_base`) arrives immediately
+/// once the branch is confirmed behind base — before the slow rebase finishes —
 /// and publishes card-visible progress state (`blocked_detail`). A duplicate
-/// click while the rebase is still running is refused immediately.
+/// click while the rebase is still running is refused immediately as already
+/// in progress.
 #[tokio::test]
 async fn merge_click_replies_rebasing_onto_base_before_slow_rebase_completes() {
     let server = MockServer::start().await;
@@ -1978,7 +2004,7 @@ async fn merge_click_replies_rebasing_onto_base_before_slow_rebase_completes() {
         .unwrap()
         .expect("expected duplicate click refusal");
     assert!(
-        matches!(&dup.payload, FrontendEvent::WorkError { message } if message.contains("already active")),
+        matches!(&dup.payload, FrontendEvent::WorkError { message } if message.contains("already in progress")),
         "expected immediate refusal for in-flight rebase, got {:?}",
         dup.payload
     );
@@ -2001,10 +2027,9 @@ async fn merge_click_replies_rebasing_onto_base_before_slow_rebase_completes() {
     );
 }
 
-/// C5(1): Under-budget `ci_failure` variant of test (d): when CI on the
-/// rebased head is still failing and budget remains, a CI-fix revision is
-/// spawned (returning the parent to `in_review`), `merge_queue_detail` still
-/// carries `"rebased onto main; CI still failing"`, and auto-merge is disarmed.
+/// With CI-fix budget remaining, a red rebased head spawns a CI-fix revision
+/// (returning the parent to `in_review`), `merge_queue_detail` still carries
+/// `"rebased onto main; CI still failing"`, and auto-merge is disarmed.
 #[tokio::test]
 async fn rebased_head_still_red_with_budget_remaining_spawns_revision_and_keeps_reason() {
     let server = MockServer::start().await;
@@ -2092,7 +2117,7 @@ async fn rebased_head_still_red_with_budget_remaining_spawns_revision_and_keeps_
     assert_eq!(direct_executor.disarms(), vec![pr_url.to_owned()]);
 }
 
-/// C5(2): When the PR carries the `boss/no-auto-rebase` opt-out label, a red
+/// When the PR carries the `boss/no-auto-rebase` opt-out label, a red
 /// rebased head still consumes the `ci_merge_rebases` row, disarms auto-merge,
 /// stamps the reason, and keeps the card blocked without spawning a revision.
 #[tokio::test]
@@ -2179,10 +2204,10 @@ async fn rebased_head_still_red_with_opt_out_label_consumes_marker_disarms_and_s
     assert_eq!(direct_executor.disarms(), vec![pr_url.to_owned()]);
 }
 
-/// C5(3): Table-driven coverage for `DeferredForLiveWriter`,
-/// `HaltedForSignoff`, and `LockfileRegenerationFailed` outcomes on a
-/// CI-blocked Merge click, verifying the resulting card status,
-/// `blocked_reason`, and `blocked_detail`.
+/// Table-driven coverage for `DeferredForLiveWriter`, `HaltedForSignoff`,
+/// and `LockfileRegenerationFailed` outcomes on a CI-blocked Merge click,
+/// verifying the resulting card status, `blocked_reason`, and the
+/// explanation the user actually sees (`blocked_detail` or an attention item).
 #[tokio::test]
 async fn ci_merge_rebase_refusal_outcomes_leave_expected_card_state() {
     #[derive(Clone, Copy)]
@@ -2199,8 +2224,18 @@ async fn ci_merge_rebase_refusal_outcomes_leave_expected_card_state() {
             "ci_failure",
             Some("a worker is currently active on this PR's branch"),
         ),
-        (RefusalCase::HaltedForSignoff, 425u64, "deletion_signoff", None),
-        (RefusalCase::LockfileRegenerationFailed, 426u64, "merge_conflict", None),
+        (
+            RefusalCase::HaltedForSignoff,
+            425u64,
+            "deletion_signoff",
+            Some("src/deleted.rs"),
+        ),
+        (
+            RefusalCase::LockfileRegenerationFailed,
+            426u64,
+            "merge_conflict",
+            Some("lockfile_regeneration_failed"),
+        ),
     ];
 
     for (case, pr_num, expected_blocked_reason, expected_detail_substr) in cases {
@@ -2220,11 +2255,10 @@ async fn ci_merge_rebase_refusal_outcomes_leave_expected_card_state() {
             cube.clone(),
             probe.clone(),
         );
-        let (product_id, chore_id) =
+        let (_product_id, chore_id) =
             seed_ci_blocked_chore(&state.work_db, &format!("ci-refusal-{pr_num}"), &pr_url, false, false);
 
         if matches!(case, RefusalCase::DeferredForLiveWriter) {
-            let _ = &product_id;
             state
                 .work_db
                 .create_execution(
@@ -2260,6 +2294,11 @@ async fn ci_merge_rebase_refusal_outcomes_leave_expected_card_state() {
         let task = chore_of(&state.work_db, &chore_id);
         assert_eq!(task.status, TaskStatus::Blocked);
         assert_eq!(task.blocked_reason.as_deref(), Some(expected_blocked_reason));
+        assert!(
+            !task.blocked_detail.as_deref().unwrap_or("").contains("Rebasing onto"),
+            "stale rebase-in-progress detail must be replaced, got {:?}",
+            task.blocked_detail
+        );
         if let Some(substr) = expected_detail_substr {
             assert!(
                 task.blocked_detail.as_deref().unwrap_or("").contains(substr),
@@ -2268,5 +2307,127 @@ async fn ci_merge_rebase_refusal_outcomes_leave_expected_card_state() {
             );
         }
         assert!(direct_executor.calls().is_empty(), "refusal outcome must not arm merge");
+
+        match case {
+            RefusalCase::HaltedForSignoff => {
+                assert!(
+                    task.blocked_detail
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_ascii_lowercase()
+                        .contains("sign-off"),
+                    "deletion-signoff card must tell the operator to sign off, got {:?}",
+                    task.blocked_detail
+                );
+                assert!(
+                    state
+                        .work_db
+                        .list_conflict_resolutions(None, &[], Some(&chore_id), None)
+                        .unwrap()
+                        .is_empty(),
+                    "clean rung-1 halt must not appear as a visible conflict row"
+                );
+                assert!(
+                    state
+                        .work_db
+                        .open_remediation_state()
+                        .unwrap()
+                        .into_iter()
+                        .all(|row| row.kind != "conflict" || row.pr_url != pr_url),
+                    "clean rung-1 halt must not project as a conflict remediation row"
+                );
+                let genuine = state
+                    .work_db
+                    .insert_conflict_resolution(boss_work_db::ConflictResolutionInsertInput {
+                        product_id: _product_id.clone(),
+                        work_item_id: chore_id.clone(),
+                        pr_url: pr_url.clone(),
+                        pr_number: pr_num as i64,
+                        head_branch: "boss/feature".to_owned(),
+                        base_branch: "main".to_owned(),
+                        base_sha_at_trigger: Some("base-sha-genuine".to_owned()),
+                        head_sha_before: Some("head-genuine".to_owned()),
+                    })
+                    .unwrap()
+                    .expect("genuine conflict resolution row inserted");
+                assert_eq!(
+                    genuine.status, "pending",
+                    "clean HaltedForSignoff must not consume the conflict churn-guard budget"
+                );
+                assert_ne!(
+                    genuine.failure_reason.as_deref(),
+                    Some(boss_work_db::CHURN_GUARD_REASON)
+                );
+            }
+            RefusalCase::LockfileRegenerationFailed => {
+                let items = state.work_db.list_attention_items_for_work_item(&chore_id).unwrap();
+                assert!(
+                    items.iter().any(|item| {
+                        item.kind == boss_work_db::LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND
+                            && item.body_markdown.contains("Cargo.lock")
+                    }),
+                    "lockfile regeneration failure must stay visible as an attention item, got {items:?}"
+                );
+            }
+            RefusalCase::DeferredForLiveWriter => {}
+        }
     }
+}
+
+/// After the early rebase reply, CI can return the card to `in_review` before
+/// a failing arm runs. The failure must still be visible as a PR-bound
+/// attention item (`ci_merge_rebase_failed`).
+#[tokio::test]
+async fn late_arm_failure_after_ci_unblocks_files_attention_item() {
+    let server = MockServer::start().await;
+    let pr_url = "https://github.com/spinyfin/mono/pull/427";
+    let (direct_executor, arm_entered, arm_release) =
+        FakeDirectMergeExecutor::failing_gated("GitHub refused the merge request");
+    let (cube, rebase_entered, rebase_release) = RebaseCube::clean_pushed_gated();
+    let probe = ScriptedMergeProbe::new(failing_probe(pr_url, "head-old", "BEHIND"), true)
+        .with_after_rebase_head("head-rebased");
+    let (state, _temp) = test_server(
+        trunk_client_for(server.uri()),
+        direct_executor.clone(),
+        cube.clone(),
+        probe.clone(),
+    );
+    let (_product_id, chore_id) = seed_ci_blocked_chore(&state.work_db, "ci-late-arm-fail", pr_url, false, false);
+    let sink = make_session_sink();
+
+    handle_merge_when_ready(
+        dispatch_ctx(&state, &sink),
+        FrontendRequest::MergeWhenReady {
+            work_item_id: chore_id.clone(),
+            confirmed_revisions: vec![],
+        },
+    )
+    .await;
+    expect_rebasing_reply(&sink).await;
+    tokio::time::timeout(Duration::from_secs(5), rebase_entered.notified())
+        .await
+        .expect("rebase_workspace should have started");
+    rebase_release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), arm_entered.notified())
+        .await
+        .expect("direct merge arm should have started");
+
+    state
+        .work_db
+        .clear_chore_blocked_ci_failure(&chore_id, pr_url)
+        .unwrap()
+        .expect("CI block must still be clearable before the failing arm returns");
+    arm_release.notify_one();
+
+    wait_until("late arm failure surfaced as attention", || {
+        state
+            .work_db
+            .list_attention_items_for_work_item(&chore_id)
+            .unwrap()
+            .iter()
+            .any(|item| {
+                item.kind == "ci_merge_rebase_failed" && item.body_markdown.contains("GitHub refused the merge request")
+            })
+    })
+    .await;
 }

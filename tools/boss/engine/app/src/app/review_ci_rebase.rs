@@ -199,21 +199,13 @@ pub(super) async fn handle_ci_failure_merge_rebase(ctx: CiFailureMergeRebaseCont
             .filter(|s| !s.is_empty())
             .unwrap_or("main")
             .to_owned();
-        if work_db.has_live_conflict_revision_for_pr(&pr_url).unwrap_or(false)
-            || work_db
-                .active_conflict_resolution_for_work_item(&work_item_id)
-                .ok()
-                .flatten()
-                .is_some()
-        {
-            refuse_merge_when_ready(
-                &sink,
-                &request_id,
-                &work_item_id,
-                format!(
-                    "merge_when_ready: rebase onto {base_branch} failed: a conflict resolution is already active for this PR"
-                ),
-            );
+        if let Some(reason) = boss_engine_runtime::conflict_watch::ci_merge_rebase_busy_reason(
+            &work_db,
+            &work_item_id,
+            &pr_url,
+            &base_branch,
+        ) {
+            refuse_merge_when_ready(&sink, &request_id, &work_item_id, format!("merge_when_ready: {reason}"));
             return;
         }
         let candidate = boss_work_db::PendingMergeCheck {
@@ -391,7 +383,8 @@ pub(super) async fn handle_ci_failure_merge_rebase(ctx: CiFailureMergeRebaseCont
             }
             boss_engine_runtime::conflict_watch::CiMergeRebaseOutcome::HaltedForSignoff => {
                 // Card already moved to `blocked: deletion_signoff` by
-                // `rebase_for_ci_failure_merge`.
+                // `rebase_for_ci_failure_merge`, with an outcome-specific
+                // `blocked_detail` (flagged deletions + sign-off instruction).
                 tracing::info!(
                     %work_item_id,
                     %pr_url,
@@ -400,12 +393,32 @@ pub(super) async fn handle_ci_failure_merge_rebase(ctx: CiFailureMergeRebaseCont
             }
             boss_engine_runtime::conflict_watch::CiMergeRebaseOutcome::LockfileRegenerationFailed => {
                 // Card already moved to `blocked: merge_conflict` by
-                // `rebase_for_ci_failure_merge`.
+                // `rebase_for_ci_failure_merge`. Stamp the regeneration
+                // failure onto `blocked_detail` so the card does not keep
+                // the in-progress rebase text.
                 tracing::info!(
                     %work_item_id,
                     %pr_url,
                     "merge_when_ready: CI-merge rebase hit a lockfile conflict whose regeneration failed",
                 );
+                let detail = work_db
+                    .list_conflict_resolutions(None, &[], Some(&work_item_id), None)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .find_map(|row| {
+                        row.failure_reason
+                            .filter(|reason| reason.contains("lockfile_regeneration_failed"))
+                    })
+                    .unwrap_or_else(|| "lockfile regeneration failed".to_owned());
+                if work_db
+                    .set_blocked_detail(&work_item_id, &pr_url, &detail)
+                    .unwrap_or(false)
+                {
+                    publisher
+                        .publish_work_item_changed(&product_id, &work_item_id, "ci_merge_rebase_lockfile_failed")
+                        .await;
+                }
             }
             boss_engine_runtime::conflict_watch::CiMergeRebaseOutcome::DeferredForLiveWriter => {
                 surface_ci_rebase_card_detail(

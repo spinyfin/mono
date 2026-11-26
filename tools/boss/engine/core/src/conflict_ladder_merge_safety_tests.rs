@@ -110,7 +110,7 @@ async fn clean_sweeps_wait_for_tripwire_and_only_resume_approved_resolution_once
         assert_eq!(
             outcome,
             if rejected {
-                LadderOutcome::HaltedForSignoff
+                LadderOutcome::HaltedForSignoff { had_conflicts: false }
             } else {
                 LadderOutcome::Retired
             }

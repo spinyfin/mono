@@ -163,7 +163,13 @@ pub(crate) enum LadderOutcome {
     /// caller must NOT spawn a worker revision (there is no automatic
     /// remediation for a flagged deletion), but callers must not log or
     /// report this as an auto-resolution.
-    HaltedForSignoff,
+    ///
+    /// `had_conflicts` is true when a mechanical rung actually resolved
+    /// residual conflicted files (rung 0) before the tripwire fired. A
+    /// clean rung-1 rebase that never conflicted reports `false` so a
+    /// CI-merge rebase can stay tagged `ci_merge_rebase` instead of being
+    /// reclassified as a succeeded conflict.
+    HaltedForSignoff { had_conflicts: bool },
     /// No mechanical rung produced a resolution (rung 1 unavailable, the
     /// rebase errored, or residual conflicts remain). The caller falls
     /// through to the existing worker-spawn path. Any leased workspace has
@@ -582,7 +588,7 @@ pub(crate) async fn try_mechanical_rungs_with(
     // If that write failed, retain the guard until recovery can persist the
     // rejection. Other outcomes release the marker here; a failed clear is
     // recovered by reconcile_orphaned_conflict_ladder_attempts at engine startup.
-    if outcome != LadderOutcome::HaltedForSignoff
+    if !matches!(outcome, LadderOutcome::HaltedForSignoff { .. })
         && let Err(err) = work_db.clear_conflict_resolution_mechanical_rung(&attempt.id)
     {
         tracing::error!(
@@ -747,7 +753,7 @@ pub(crate) async fn run_rung1_in_lease_with(
                     &deletions,
                 )
                 .await;
-                return LadderOutcome::HaltedForSignoff;
+                return LadderOutcome::HaltedForSignoff { had_conflicts: false };
             }
             // Rung 1 rebased cleanly and pushed the updated branch — the PR is
             // resolved with no agent. Retire the attempt at rung 1.
@@ -1211,7 +1217,7 @@ pub(crate) async fn attempt_rung0_with(
             &deletions,
         )
         .await;
-        return LadderOutcome::HaltedForSignoff;
+        return LadderOutcome::HaltedForSignoff { had_conflicts: true };
     }
 
     retire_attempt_at_rung(

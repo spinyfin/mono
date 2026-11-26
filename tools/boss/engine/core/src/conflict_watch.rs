@@ -254,6 +254,34 @@ fn insert_ci_merge_rebase_attempt(
     Ok(attempt)
 }
 
+/// Refuse a second Merge-click rebase when this PR already has a live
+/// conflict revision or a non-terminal `conflict_resolutions` row.
+///
+/// A `ci_merge_rebase` row is the first click's own in-flight rebase, not a
+/// merge conflict, so the message says a rebase is already in progress
+/// rather than that conflict resolution is already active.
+pub fn ci_merge_rebase_busy_reason(
+    work_db: &WorkDb,
+    work_item_id: &str,
+    pr_url: &str,
+    base_branch: &str,
+) -> Option<String> {
+    if work_db.has_live_conflict_revision_for_pr(pr_url).unwrap_or(false) {
+        return Some(format!(
+            "rebase onto {base_branch} failed: a conflict resolution is already active for this PR"
+        ));
+    }
+    match work_db.active_conflict_resolution_for_work_item(work_item_id) {
+        Ok(Some(active)) if active.event_source == crate::work::CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE => Some(format!(
+            "a rebase onto {base_branch} is already in progress for this PR"
+        )),
+        Ok(Some(_)) => Some(format!(
+            "rebase onto {base_branch} failed: a conflict resolution is already active for this PR"
+        )),
+        _ => None,
+    }
+}
+
 /// Run the existing mechanical rebase rung ([`conflict_ladder::try_mechanical_rungs`])
 /// for a Merge click on a `blocked: ci_failure` / `blocked: ci_failure_exhausted`
 /// card whose PR branch is behind its base.
@@ -271,16 +299,17 @@ pub async fn rebase_for_ci_failure_merge(
     probe: &PrLifecycleProbe,
     blocked_reason: &str,
 ) -> CiMergeRebaseOutcome {
-    if work_db
-        .has_live_conflict_revision_for_pr(&candidate.pr_url)
-        .unwrap_or(false)
-        || work_db
-            .active_conflict_resolution_for_work_item(&candidate.work_item_id)
-            .ok()
-            .flatten()
-            .is_some()
-    {
-        return CiMergeRebaseOutcome::Failed("a conflict resolution is already active for this PR".to_owned());
+    if let Some(reason) = ci_merge_rebase_busy_reason(
+        work_db,
+        &candidate.work_item_id,
+        &candidate.pr_url,
+        probe
+            .base_ref_name
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("main"),
+    ) {
+        return CiMergeRebaseOutcome::Failed(reason);
     }
     let mut attempt = match insert_ci_merge_rebase_attempt(work_db, candidate, probe) {
         Ok(attempt) => attempt,
@@ -333,8 +362,15 @@ pub async fn rebase_for_ci_failure_merge(
             let _ = work_db.abandon_conflict_resolution_for_supersede(&attempt.id, "ci_merge_rebase_failed");
             CiMergeRebaseOutcome::Failed(reason.to_owned())
         }
-        conflict_ladder::LadderOutcome::HaltedForSignoff => {
-            let _ = work_db.reclassify_ci_merge_rebase_as_conflict(&attempt.id);
+        conflict_ladder::LadderOutcome::HaltedForSignoff { had_conflicts } => {
+            // A clean rung-1 rebase never conflicted: keep the row tagged
+            // `ci_merge_rebase` so it stays out of conflict lists, the
+            // 24h "conflict cleared" chip, and the per-item churn guard.
+            // Reclassify only when a mechanical rung actually resolved
+            // residual conflicted files.
+            if had_conflicts {
+                let _ = work_db.reclassify_ci_merge_rebase_as_conflict(&attempt.id);
+            }
             if take_over_foreign_ci_block(work_db, publisher, candidate, blocked_reason).await {
                 let _ = work_db.mark_chore_blocked_deletion_signoff(&candidate.work_item_id, &candidate.pr_url);
                 publisher
@@ -1271,7 +1307,7 @@ pub async fn on_conflict_detected_with(
                         );
                         return true;
                     }
-                    conflict_ladder::LadderOutcome::HaltedForSignoff => {
+                    conflict_ladder::LadderOutcome::HaltedForSignoff { .. } => {
                         // A mechanical rung pushed a resolution the
                         // deletion tripwire rejected. The task is already
                         // `blocked: deletion_signoff` pending operator

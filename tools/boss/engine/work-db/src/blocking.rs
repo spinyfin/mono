@@ -359,6 +359,7 @@ impl WorkDb {
             "engine",
             "UPDATE tasks
                 SET blocked_reason     = 'merge_conflict',
+                    blocked_detail     = NULL,
                     blocked_attempt_id = NULL,
                     last_status_actor  = 'engine',
                     updated_at         = ?3
@@ -2442,6 +2443,17 @@ fn halted_signoff_deletions(
         .unwrap_or_default()
 }
 
+fn deletion_signoff_blocked_detail(deletions: &[String]) -> String {
+    if deletions.is_empty() {
+        "Rebase halted for operator sign-off of a merged-parent deletion. Move the task back to Review to sign off, or restore the removed surface.".to_owned()
+    } else {
+        format!(
+            "Rebase halted for operator sign-off: merged-parent deletion of {}. Move the task back to Review to sign off, or restore the surface.",
+            deletions.join(", ")
+        )
+    }
+}
+
 pub(crate) fn mark_deletion_signoff_in_tx(
     conn: &Connection,
     work_item_id: &str,
@@ -2450,6 +2462,10 @@ pub(crate) fn mark_deletion_signoff_in_tx(
     attempt_id: Option<&str>,
 ) -> Result<Option<Task>> {
     let now = now_string();
+    let deletions = live_deletions
+        .map(|live| live.to_vec())
+        .unwrap_or_else(|| halted_signoff_deletions(conn, work_item_id, pr_url, attempt_id));
+    let detail = deletion_signoff_blocked_detail(&deletions);
     let rows = crate::task_status_audit::execute(
         conn,
         "mark_chore_blocked_deletion_signoff",
@@ -2457,6 +2473,7 @@ pub(crate) fn mark_deletion_signoff_in_tx(
         "UPDATE tasks
                 SET status             = 'blocked',
                     blocked_reason     = 'deletion_signoff',
+                    blocked_detail     = ?4,
                     blocked_attempt_id = NULL,
                     pr_url             = ?2,
                     last_status_actor  = 'engine',
@@ -2465,7 +2482,7 @@ pub(crate) fn mark_deletion_signoff_in_tx(
                 AND status = 'blocked'
                 AND blocked_reason = 'merge_conflict'
                 AND deleted_at IS NULL",
-        params![work_item_id, pr_url, now],
+        params![work_item_id, pr_url, now, detail],
     )?;
     crate::merge_conflict_merging::stop(
         conn,
@@ -2477,9 +2494,6 @@ pub(crate) fn mark_deletion_signoff_in_tx(
     }
     let kind = boss_engine_storage_values::attention_kinds::MERGED_PARENT_DELETION_SIGNOFF_ATTENTION_KIND;
     if crate::attention_filing::reraise_open_work_item_attention(conn, work_item_id, kind)?.is_none() {
-        let deletions = live_deletions
-            .map(|live| live.to_vec())
-            .unwrap_or_else(|| halted_signoff_deletions(conn, work_item_id, pr_url, attempt_id));
         crate::workitems::insert_attention_item_row(
             conn,
             &CreateAttentionItemInput {

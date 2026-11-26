@@ -1248,6 +1248,9 @@ fn retarget_flips_ci_failure_to_merge_conflict() {
     assert_eq!(attempt_id.as_deref(), Some(RETARGET_ATTEMPT_ID));
     assert_eq!(active_signal_reasons(&db, &chore_id), vec!["ci_failure"]);
 
+    db.set_ci_failure_blocked_detail(&chore_id, &pr_url, "Rebasing onto main before merging...")
+        .unwrap();
+
     let updated = db
         .retarget_blocked_ci_failure_to_merge_conflict(&chore_id, &pr_url)
         .unwrap()
@@ -1256,6 +1259,10 @@ fn retarget_flips_ci_failure_to_merge_conflict() {
     // The returned Task reflects the flip.
     assert_eq!(updated.status, TaskStatus::Blocked);
     assert_eq!(updated.blocked_reason.as_deref(), Some("merge_conflict"));
+    assert_eq!(
+        updated.blocked_detail, None,
+        "retarget must drop leftover rebase-in-progress detail"
+    );
     assert_eq!(updated.blocked_attempt_id, None, "blocked_attempt_id is cleared");
     assert_eq!(updated.last_status_actor, "engine");
 

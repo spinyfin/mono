@@ -329,7 +329,7 @@ async fn rung1_deletion_tripwire_hit_halts_for_signoff_instead_of_retiring() {
 
     let outcome = try_mechanical_rungs(&db, pub_.as_ref(), &cube, &candidate, &attempt).await;
 
-    assert_eq!(outcome, LadderOutcome::HaltedForSignoff);
+    assert_eq!(outcome, LadderOutcome::HaltedForSignoff { had_conflicts: false });
     // The attempt still gets stamped rung 1 / succeeded — it did push a
     // mechanical resolution; the safety gate is orthogonal telemetry.
     let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
@@ -1219,7 +1219,7 @@ async fn rung0_deletion_tripwire_hit_halts_for_signoff_instead_of_retiring() {
     )
     .await;
 
-    assert_eq!(outcome, LadderOutcome::HaltedForSignoff);
+    assert_eq!(outcome, LadderOutcome::HaltedForSignoff { had_conflicts: true });
     let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
     assert!(row.ladder_reason.as_deref().unwrap().contains("deletion tripwire"));
     assert_eq!(row.status, "succeeded");
@@ -1917,7 +1917,7 @@ async fn rung0_keep_both_resolution_is_still_halted_by_the_deletion_tripwire() {
 
     let outcome = try_mechanical_rungs(&db, pub_.as_ref(), &cube, &candidate, &attempt).await;
 
-    assert_eq!(outcome, LadderOutcome::HaltedForSignoff);
+    assert_eq!(outcome, LadderOutcome::HaltedForSignoff { had_conflicts: true });
     let (status, reason) = chore_state(&db, &chore_id);
     assert_eq!(status, "Blocked");
     assert_eq!(reason.as_deref(), Some("deletion_signoff"));

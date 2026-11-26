@@ -44,7 +44,11 @@ impl WorkDb {
             .optional()?
             .unwrap_or(false);
         append_ladder_outcome_in_tx(&conn, attempt_id, tier, outcome, reason, deletions)?;
-        if !is_ci_merge_rebase {
+        // A clean CI-merge rebase that retires is not a conflict-ladder
+        // decision. Residual-conflict / fell-through outcomes on the same
+        // row are real conflicts recorded *before* the row is reclassified
+        // to `review_watch`, so they still increment the counters.
+        if !is_ci_merge_rebase || outcome != "retired" {
             self.metrics_registry().counter_inc_by_dynamic(
                 &format!("conflict_ladder.{tier}.{outcome}"),
                 "Conflict ladder tier decisions since engine start.",
@@ -123,5 +127,63 @@ mod tests {
             )
             .unwrap();
         assert_eq!(saved, ("[]".into(), None));
+    }
+
+    #[test]
+    fn ci_merge_rebase_records_residual_conflict_counters_but_skips_retired() {
+        use crate::test_support::{create_test_chore_manual, create_test_product};
+
+        let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
+        let product = create_test_product(&db);
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Telemetry");
+        db.update_work_item(
+            &chore.id,
+            crate::WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some("https://github.com/example/repo/pull/9".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let attempt = db
+            .insert_conflict_resolution_with_source(
+                crate::ConflictResolutionInsertInput {
+                    product_id: product.id,
+                    work_item_id: chore.id,
+                    pr_url: "https://github.com/example/repo/pull/9".into(),
+                    pr_number: 9,
+                    head_branch: "boss/feature".into(),
+                    base_branch: "main".into(),
+                    base_sha_at_trigger: Some("base".into()),
+                    head_sha_before: Some("head".into()),
+                },
+                CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE,
+            )
+            .unwrap()
+            .expect("inserted");
+
+        db.record_conflict_ladder_outcome(&attempt.id, "engine_rebase", "residual_conflicts", "Cargo.lock")
+            .unwrap();
+        db.record_conflict_ladder_outcome(
+            &attempt.id,
+            "engine_rebase",
+            "retired",
+            "resolution pushed and deletion tripwire passed",
+        )
+        .unwrap();
+
+        let snapshots = db.metrics_registry().counter_snapshots();
+        assert!(
+            snapshots
+                .iter()
+                .any(|m| m.name == "conflict_ladder.engine_rebase.residual_conflicts" && m.value >= 1),
+            "genuine residual conflicts on a ci_merge_rebase row must increment the counter, got {snapshots:?}"
+        );
+        assert!(
+            snapshots
+                .iter()
+                .all(|m| m.name != "conflict_ladder.engine_rebase.retired"),
+            "retired outcomes on a ci_merge_rebase row must not increment the counter, got {snapshots:?}"
+        );
     }
 }
