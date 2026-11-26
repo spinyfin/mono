@@ -37,6 +37,11 @@ pub enum MergeAction {
     /// observed). Distinct from [`Self::TrunkEnqueued`]: this click did
     /// **not** call `submitPullRequest`.
     TrunkAlreadyEnqueued,
+    /// A Merge click on a CI-blocked card whose branch is behind base has
+    /// committed to running the mechanical rebase rung before arming the
+    /// merge. Sent early so the request reply does not time out during a slow
+    /// workspace lease/rebase/push; later outcomes are surfaced via card state.
+    RebasingOntoBase,
 }
 
 impl MergeAction {
@@ -47,6 +52,7 @@ impl MergeAction {
             Self::Requested => "merge_requested",
             Self::TrunkEnqueued => "trunk_enqueued",
             Self::TrunkAlreadyEnqueued => "trunk_already_enqueued",
+            Self::RebasingOntoBase => "rebasing_onto_base",
         }
     }
 }
@@ -1075,6 +1081,7 @@ mod tests {
     #[test]
     fn merge_action_trunk_enqueued_as_str() {
         assert_eq!(MergeAction::TrunkEnqueued.as_str(), "trunk_enqueued");
+        assert_eq!(MergeAction::RebasingOntoBase.as_str(), "rebasing_onto_base");
     }
 
     #[test]

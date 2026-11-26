@@ -86,9 +86,13 @@ impl WorkDb {
     pub fn open_remediation_state(&self) -> Result<Vec<EngineAttemptListEntry>> {
         let conn = self.connect()?;
         let mut out = Vec::new();
-        for (table, kind, extra_column) in [
-            ("conflict_resolutions", "conflict", "NULL"),
-            ("ci_remediations", "ci", "a.attempt_kind"),
+        let conflict_filter = format!(
+            "AND latest.event_source != '{}'",
+            crate::CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE
+        );
+        for (table, kind, extra_column, extra_where) in [
+            ("conflict_resolutions", "conflict", "NULL", conflict_filter.as_str()),
+            ("ci_remediations", "ci", "a.attempt_kind", ""),
         ] {
             let sql = format!(
                 "SELECT a.id, a.product_id, a.work_item_id, a.pr_url, a.status,
@@ -97,6 +101,7 @@ impl WorkDb {
                  FROM tasks t JOIN {table} a ON a.id = (
                      SELECT latest.id FROM {table} latest
                      WHERE latest.work_item_id = t.id AND latest.pr_url = t.pr_url
+                       {extra_where}
                      ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1)
                  WHERE t.deleted_at IS NULL AND t.status NOT IN ('done', 'archived')
                    AND t.pr_url = a.pr_url

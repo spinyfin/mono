@@ -687,11 +687,24 @@ impl TrunkQueueProbe {
             // a live-entry snapshot for a slot the conflict resolver now
             // owns.
             if is_superseded_by_conflict(member) {
-                cancel_intent(ctx, member, &repo_ref, &key.target_branch, outcome).await;
+                cancel_intent(
+                    ctx,
+                    member,
+                    &repo_ref,
+                    &key.target_branch,
+                    "conflict supersede",
+                    outcome,
+                )
+                .await;
                 continue;
             }
             if is_withdrawing(member) {
-                withdraw_intent(ctx, member, &repo_ref, &key.target_branch, outcome).await;
+                if cancel_intent(ctx, member, &repo_ref, &key.target_branch, "withdraw", outcome)
+                    .await
+                    .is_gone()
+                {
+                    retire_withdrawn_intent(ctx, member, outcome);
+                }
                 continue;
             }
             let observed = match by_pr_number.get(&(member.intent.pr_number as u64)) {
@@ -1372,19 +1385,37 @@ async fn resubmit_intent(
     }
 }
 
-/// Pull an intent superseded by a mid-queue conflict
-/// ([`is_superseded_by_conflict`]) out of the queue. Leaves the sentinel in
-/// place either way — `conflict_watch::on_resolved` is what advances it to
-/// [`TRUNK_INTENT_AWAITING_RESUBMIT`] once the conflict-fix revision lands,
-/// so this call is safe to repeat every due cycle until then (Trunk
-/// documents no rate limits — see the design's API-surface section).
+/// Outcome of calling Trunk's `cancelPullRequest` for a standing intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueCancel {
+    /// Trunk confirmed the live queue entry was cancelled.
+    Cancelled,
+    /// Trunk reported `NotFound` — the entry had already left the queue.
+    AlreadyGone,
+    /// Transport or API failure; the caller should retry on the next cycle.
+    Failed,
+}
+
+impl QueueCancel {
+    /// Whether the entry is confirmed absent from Trunk's queue.
+    fn is_gone(self) -> bool {
+        matches!(self, Self::Cancelled | Self::AlreadyGone)
+    }
+}
+
+/// Pull an intent out of Trunk's queue — used both for entries superseded by
+/// a mid-queue conflict ([`is_superseded_by_conflict`], where `conflict_watch`
+/// owns advancing the sentinel to [`TRUNK_INTENT_AWAITING_RESUBMIT`]) and for
+/// entries withdrawn after a red rebased head ([`is_withdrawing`], where the
+/// caller retires the intent once [`QueueCancel::is_gone`] holds).
 async fn cancel_intent(
     ctx: &TrunkSweepContext<'_>,
     member: &ActiveTrunkMergeIntent,
     repo: &TrunkRepoRef,
     target_branch: &str,
+    reason: &str,
     outcome: &mut TrunkSweepOutcome,
-) {
+) -> QueueCancel {
     let lookup = TrunkPrLookup::new(
         repo.clone(),
         TrunkPrRef::new(member.intent.pr_number as u64),
@@ -1396,74 +1427,32 @@ async fn cancel_intent(
             tracing::info!(
                 work_item_id = %member.intent.work_item_id,
                 pr_url = %member.intent.pr_url,
-                "trunk queue poller: cancelled a queue entry superseded by a mid-queue conflict",
+                reason,
+                "trunk queue poller: cancelled queue entry",
             );
+            QueueCancel::Cancelled
         }
         Err(TrunkError::NotFound(_)) => {
             // Already left the queue (Trunk failed it independently, or a
-            // human already cancelled it) — nothing left to cancel. Not
-            // an error: `conflict_watch`'s own resolution path is what
-            // clears the sentinel once the fix lands, regardless of
-            // whether this call ever finds a live entry to pull.
+            // human already cancelled it) — nothing left to cancel.
             tracing::debug!(
                 work_item_id = %member.intent.work_item_id,
                 pr_url = %member.intent.pr_url,
+                reason,
                 "trunk queue poller: cancelPullRequest found no live entry; already left the queue",
             );
+            QueueCancel::AlreadyGone
         }
         Err(err) => {
             outcome.probe_failures += 1;
             tracing::warn!(
                 work_item_id = %member.intent.work_item_id,
                 pr_url = %member.intent.pr_url,
+                reason,
                 error = %err,
-                "trunk queue poller: cancelPullRequest (conflict supersede) failed; retrying next cycle",
+                "trunk queue poller: cancelPullRequest failed; retrying next cycle",
             );
-        }
-    }
-}
-
-/// Pull a withdrawn intent out of the queue and retire it once Trunk
-/// confirms (or already has no live entry). Leaves the `boss:withdraw`
-/// sentinel in place on a transport error so the next due cycle retries.
-async fn withdraw_intent(
-    ctx: &TrunkSweepContext<'_>,
-    member: &ActiveTrunkMergeIntent,
-    repo: &TrunkRepoRef,
-    target_branch: &str,
-    outcome: &mut TrunkSweepOutcome,
-) {
-    let lookup = TrunkPrLookup::new(
-        repo.clone(),
-        TrunkPrRef::new(member.intent.pr_number as u64),
-        target_branch.to_owned(),
-    );
-    match ctx.api.cancel_pull_request(&lookup).await {
-        Ok(()) => {
-            outcome.queue_cancellations += 1;
-            tracing::info!(
-                work_item_id = %member.intent.work_item_id,
-                pr_url = %member.intent.pr_url,
-                "trunk queue poller: cancelled a queue entry withdrawn after a red rebased head",
-            );
-            retire_withdrawn_intent(ctx, member, outcome);
-        }
-        Err(TrunkError::NotFound(_)) => {
-            tracing::debug!(
-                work_item_id = %member.intent.work_item_id,
-                pr_url = %member.intent.pr_url,
-                "trunk queue poller: withdraw cancelPullRequest found no live entry; retiring intent",
-            );
-            retire_withdrawn_intent(ctx, member, outcome);
-        }
-        Err(err) => {
-            outcome.probe_failures += 1;
-            tracing::warn!(
-                work_item_id = %member.intent.work_item_id,
-                pr_url = %member.intent.pr_url,
-                error = %err,
-                "trunk queue poller: cancelPullRequest (withdraw) failed; retrying next cycle",
-            );
+            QueueCancel::Failed
         }
     }
 }

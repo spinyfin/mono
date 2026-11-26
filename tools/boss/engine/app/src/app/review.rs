@@ -263,6 +263,32 @@ pub(super) struct DirectMergeArmRequest {
     pub kick_reconciler_on_error: bool,
     pub after_rebase: Option<AfterRebaseRecord>,
     pub recv_instant: Option<std::time::Instant>,
+    /// True when an early `MergeWhenReadyAccepted { action: "rebasing_onto_base" }`
+    /// was already sent to the caller before the rebase started. When set, no
+    /// second reply is sent on `request_id`; failures are surfaced in card
+    /// state (`blocked_detail`) and successes through the normal Merging
+    /// transition.
+    #[builder(default)]
+    pub reply_already_sent: bool,
+}
+
+pub(super) async fn surface_ci_rebase_card_detail(
+    work_db: &WorkDb,
+    publisher: &dyn boss_execution_contracts::ExecutionPublisher,
+    product_id: &str,
+    work_item_id: &str,
+    pr_url: &str,
+    detail: &str,
+    publish_reason: &str,
+) {
+    if work_db
+        .set_ci_failure_blocked_detail(work_item_id, pr_url, detail)
+        .unwrap_or(false)
+    {
+        publisher
+            .publish_work_item_changed(product_id, work_item_id, publish_reason)
+            .await;
+    }
 }
 
 /// Persist confirmation, call `gh pr merge --auto --squash`, record the
@@ -287,6 +313,7 @@ pub(super) async fn arm_direct_github_merge(req: DirectMergeArmRequest) {
         kick_reconciler_on_error,
         after_rebase,
         recv_instant,
+        reply_already_sent,
     } = req;
     tracing::info!(
         work_item_id = %work_item_id,
@@ -298,7 +325,20 @@ pub(super) async fn arm_direct_github_merge(req: DirectMergeArmRequest) {
     let confirmation = match work_db.remember_confirmed_merge_revisions(&work_item_id, &pr_url, &confirmed_revisions) {
         Ok(confirmation) => confirmation,
         Err(err) => {
-            refuse_merge_when_ready(&sink, &request_id, &work_item_id, err.to_string());
+            if reply_already_sent {
+                surface_ci_rebase_card_detail(
+                    &work_db,
+                    publisher.as_ref(),
+                    &product_id,
+                    &work_item_id,
+                    &pr_url,
+                    &err.to_string(),
+                    "ci_merge_rebase_arm_failed",
+                )
+                .await;
+            } else {
+                refuse_merge_when_ready(&sink, &request_id, &work_item_id, err.to_string());
+            }
             return;
         }
     };
@@ -337,13 +377,23 @@ pub(super) async fn arm_direct_github_merge(req: DirectMergeArmRequest) {
                 }
                 event_bus.publish(Event::PrReconcileRequested { pr_url: pr_url.clone() });
                 let _ = work_db.forget_confirmed_merge_revisions(&confirmation);
-                refuse_merge_when_ready(
-                    &sink,
-                    &request_id,
-                    &work_item_id,
+                let stale_msg =
                     "merge_when_ready: rebased onto base, but GitHub still reports the pre-rebase head; try again"
-                        .to_owned(),
-                );
+                        .to_owned();
+                if reply_already_sent {
+                    surface_ci_rebase_card_detail(
+                        &work_db,
+                        publisher.as_ref(),
+                        &product_id,
+                        &work_item_id,
+                        &pr_url,
+                        &stale_msg,
+                        "ci_merge_rebase_arm_failed",
+                    )
+                    .await;
+                } else {
+                    refuse_merge_when_ready(&sink, &request_id, &work_item_id, stale_msg);
+                }
                 return;
             }
             tracing::info!(request_id = %request_id, elapsed_ms = external_started.elapsed().as_secs_f64() * 1000.0, "merge request external operation completed");
@@ -387,7 +437,20 @@ pub(super) async fn arm_direct_github_merge(req: DirectMergeArmRequest) {
                             "merge_when_ready accepted the GitHub request but could not record its merge intent: {err}"
                         )
                     };
-                    send_response(&sink, &request_id, FrontendEvent::WorkError { message });
+                    if reply_already_sent {
+                        surface_ci_rebase_card_detail(
+                            &work_db,
+                            publisher.as_ref(),
+                            &product_id,
+                            &work_item_id,
+                            &pr_url,
+                            &message,
+                            "ci_merge_rebase_arm_failed",
+                        )
+                        .await;
+                    } else {
+                        send_response(&sink, &request_id, FrontendEvent::WorkError { message });
+                    }
                     return;
                 }
             };
@@ -405,19 +468,25 @@ pub(super) async fn arm_direct_github_merge(req: DirectMergeArmRequest) {
                 after.rebased_head_sha = Some(success.head_sha.clone());
             }
             record_after_rebase(&work_db, &work_item_id, &pr_url, after_rebase.as_ref());
+            if reply_already_sent && let Some(after) = after_rebase.as_ref() {
+                let armed_detail = format!("Rebased onto {}; merge armed, waiting for CI", after.base_branch);
+                let _ = work_db.set_ci_failure_blocked_detail(&work_item_id, &pr_url, &armed_detail);
+            }
             let remembered = remember_merge_request(&work_db, &work_item_id, &pr_url, Some(&success.head_sha));
             tracing::info!(request_id = %request_id, elapsed_ms = record_started.elapsed().as_secs_f64() * 1000.0, "merge request durable write completed");
             // Acknowledge durable acceptance before publication takes the
             // shared decision-feed lock or wakes board readers.
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::MergeWhenReadyAccepted {
-                    work_item_id: work_item_id.clone(),
-                    pr_url: pr_url.clone(),
-                    action: merge_when_ready::MergeAction::Requested.as_str().to_owned(),
-                },
-            );
+            if !reply_already_sent {
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::MergeWhenReadyAccepted {
+                        work_item_id: work_item_id.clone(),
+                        pr_url: pr_url.clone(),
+                        action: merge_when_ready::MergeAction::Requested.as_str().to_owned(),
+                    },
+                );
+            }
             if let Some(recv_instant) = recv_instant {
                 tracing::info!(request_id = %request_id, elapsed_ms = recv_instant.elapsed().as_secs_f64() * 1000.0, "merge request acknowledgement enqueued");
             }
@@ -488,22 +557,36 @@ pub(super) async fn arm_direct_github_merge(req: DirectMergeArmRequest) {
             if kick_reconciler_on_error {
                 event_bus.publish(Event::PrReconcileRequested { pr_url: pr_url.clone() });
             }
-            let response = if conflict_released {
-                FrontendEvent::MergeWhenReadyAccepted {
-                    work_item_id: work_item_id.clone(),
-                    pr_url: pr_url.clone(),
-                    action: merge_when_ready::MergeAction::Requested.as_str().to_owned(),
+            let error_message = if after_rebase.is_some() {
+                rebase_arm_error(after_rebase.as_ref(), &format!("arming merge failed: {message}"))
+            } else {
+                format!("merge_when_ready failed: {message}")
+            };
+            if reply_already_sent {
+                if !conflict_released {
+                    surface_ci_rebase_card_detail(
+                        &work_db,
+                        publisher.as_ref(),
+                        &product_id,
+                        &work_item_id,
+                        &pr_url,
+                        &error_message,
+                        "ci_merge_rebase_arm_failed",
+                    )
+                    .await;
                 }
             } else {
-                FrontendEvent::WorkError {
-                    message: if after_rebase.is_some() {
-                        rebase_arm_error(after_rebase.as_ref(), &format!("arming merge failed: {message}"))
-                    } else {
-                        format!("merge_when_ready failed: {message}")
-                    },
-                }
-            };
-            send_response(&sink, &request_id, response);
+                let response = if conflict_released {
+                    FrontendEvent::MergeWhenReadyAccepted {
+                        work_item_id: work_item_id.clone(),
+                        pr_url: pr_url.clone(),
+                        action: merge_when_ready::MergeAction::Requested.as_str().to_owned(),
+                    }
+                } else {
+                    FrontendEvent::WorkError { message: error_message }
+                };
+                send_response(&sink, &request_id, response);
+            }
         }
     }
 }
@@ -579,6 +662,10 @@ pub(super) struct TrunkQueueMergeRequest {
     pub kick_pr_reconciler: bool,
     pub publish_reason: &'static str,
     pub after_rebase: Option<AfterRebaseRecord>,
+    /// True when an early `MergeWhenReadyAccepted { action: "rebasing_onto_base" }`
+    /// was already sent before the rebase started.
+    #[builder(default)]
+    pub reply_already_sent: bool,
 }
 
 /// The `trunk_queue` branch of [`handle_merge_when_ready`]: submit the PR
@@ -605,7 +692,25 @@ pub(super) async fn handle_trunk_queue_merge(
         kick_pr_reconciler,
         publish_reason,
         after_rebase,
+        reply_already_sent,
     } = req;
+    let publisher = server_state.publisher.clone();
+    let reply_or_surface_error = async |message: String| {
+        if reply_already_sent {
+            surface_ci_rebase_card_detail(
+                &work_db,
+                publisher.as_ref(),
+                &product_id,
+                &work_item_id,
+                &pr_url,
+                &message,
+                "ci_merge_rebase_arm_failed",
+            )
+            .await;
+        } else {
+            send_response(&sink, &request_id, FrontendEvent::WorkError { message });
+        }
+    };
     let coords = match boss_engine_merge_poller::trunk_merge::parse_trunk_pr_coordinates(&pr_url) {
         Ok(coords) => coords,
         Err(err) => {
@@ -616,13 +721,7 @@ pub(super) async fn handle_trunk_queue_merge(
                 outcome = "refused",
                 "merge_when_ready: PR URL is not a canonical GitHub PR URL",
             );
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: format!("merge_when_ready: {err}"),
-                },
-            );
+            reply_or_surface_error(format!("merge_when_ready: {err}")).await;
             return;
         }
     };
@@ -646,13 +745,10 @@ pub(super) async fn handle_trunk_queue_merge(
                         outcome = "refused",
                         "merge_when_ready: failed to load active trunk merge intent after duplicate insert",
                     );
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: format!("merge_when_ready: failed to load active trunk merge intent: {err}"),
-                        },
-                    );
+                    reply_or_surface_error(format!(
+                        "merge_when_ready: failed to load active trunk merge intent: {err}"
+                    ))
+                    .await;
                     return;
                 }
             };
@@ -664,15 +760,17 @@ pub(super) async fn handle_trunk_queue_merge(
                         ) =>
                 {
                     record_after_rebase(&work_db, &work_item_id, &pr_url, after_rebase.as_ref());
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::MergeWhenReadyAccepted {
-                            work_item_id,
-                            pr_url: pr_url.clone(),
-                            action: merge_when_ready::MergeAction::TrunkAlreadyEnqueued.as_str().to_owned(),
-                        },
-                    );
+                    if !reply_already_sent {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::MergeWhenReadyAccepted {
+                                work_item_id,
+                                pr_url: pr_url.clone(),
+                                action: merge_when_ready::MergeAction::TrunkAlreadyEnqueued.as_str().to_owned(),
+                            },
+                        );
+                    }
                     if kick_pr_reconciler {
                         server_state.event_bus.publish(Event::PrReconcileRequested { pr_url });
                     }
@@ -698,16 +796,11 @@ pub(super) async fn handle_trunk_queue_merge(
                         outcome = "refused",
                         "merge_when_ready: refusing to retire trunk intent while queue cancel is still pending",
                     );
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: rebase_arm_error(
-                                after_rebase.as_ref(),
-                                "a previous queue withdrawal is still pending; try again shortly",
-                            ),
-                        },
-                    );
+                    reply_or_surface_error(rebase_arm_error(
+                        after_rebase.as_ref(),
+                        "a previous queue withdrawal is still pending; try again shortly",
+                    ))
+                    .await;
                     return;
                 }
                 Some(active) if retire_stale_and_retry => {
@@ -723,16 +816,11 @@ pub(super) async fn handle_trunk_queue_merge(
                     match work_db.insert_trunk_merge_intent(insert_input) {
                         Ok(Some(intent)) => intent,
                         _ => {
-                            send_response(
-                                &sink,
-                                &request_id,
-                                FrontendEvent::WorkError {
-                                    message: rebase_arm_error(
-                                        after_rebase.as_ref(),
-                                        "could not record trunk merge intent",
-                                    ),
-                                },
-                            );
+                            reply_or_surface_error(rebase_arm_error(
+                                after_rebase.as_ref(),
+                                "could not record trunk merge intent",
+                            ))
+                            .await;
                             return;
                         }
                     }
@@ -762,19 +850,14 @@ pub(super) async fn handle_trunk_queue_merge(
                         outcome = "refused",
                         "merge_when_ready: intent insert was ignored but no active intent was found; not reporting success",
                     );
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: if after_rebase.is_some() {
-                                rebase_arm_error(after_rebase.as_ref(), "trunk merge intent insert was ignored")
-                            } else {
-                                "merge_when_ready: trunk merge intent insert was ignored but no active intent \
-                                 was found; retry the merge"
-                                    .to_owned()
-                            },
-                        },
-                    );
+                    let msg = if after_rebase.is_some() {
+                        rebase_arm_error(after_rebase.as_ref(), "trunk merge intent insert was ignored")
+                    } else {
+                        "merge_when_ready: trunk merge intent insert was ignored but no active intent \
+                         was found; retry the merge"
+                            .to_owned()
+                    };
+                    reply_or_surface_error(msg).await;
                     return;
                 }
             }
@@ -787,19 +870,12 @@ pub(super) async fn handle_trunk_queue_merge(
                 outcome = "refused",
                 "merge_when_ready: failed to record trunk merge intent",
             );
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: format!("merge_when_ready: failed to record trunk merge intent: {err}"),
-                },
-            );
+            reply_or_surface_error(format!("merge_when_ready: failed to record trunk merge intent: {err}")).await;
             return;
         }
     };
 
     let trunk_client = server_state.trunk_client.clone();
-    let publisher = server_state.publisher.clone();
     let event_bus = server_state.event_bus.clone();
     tracing::info!(
         %work_item_id,
@@ -821,17 +897,18 @@ pub(super) async fn handle_trunk_queue_merge(
         match trunk_client.submit_pull_request(&request).await {
             Ok(()) => {
                 // Optimistically move the card into the Merging UI ahead of
-                // the queue poller's first sweep. Deliberately does NOT kick
-                // `pr_reconciler_kick`: that wakes the GitHub merge poller to
-                // refresh GitHub-native auto-merge / merge-queue state,
-                // which never applies to a trunk_queue product, so it would
-                // do nothing useful here (and
+                // the queue poller's first sweep. The in-review path does not
+                // kick the GitHub merge poller (it only refreshes
+                // GitHub-native auto-merge / merge-queue state, which a
+                // `trunk_queue` product does not use, and
                 // `merge_poller::update_pr_poll_state`'s
-                // `preserve_merge_queue_state` gate is what keeps the
-                // poller's own scheduled sweeps off these two columns).
-                // The app is push-only, so the optimistic write needs its
-                // own `work_item_changed` publish to reach the Merging UI —
-                // nothing else emits one for this write.
+                // `preserve_merge_queue_state` gate keeps scheduled sweeps off
+                // these two columns); the post-CI-rebase path sets
+                // `kick_pr_reconciler` so the poller observes CI on the
+                // rebased head promptly. The app is push-only, so the
+                // optimistic write needs its own `work_item_changed` publish
+                // to reach the Merging UI — nothing else emits one for this
+                // write.
                 let detail = boss_engine_merge_poller::trunk_merge::optimistic_pending_detail_json();
                 let recorded = work_db.set_task_merge_queue_state(&work_item_id, Some("queued"), Some(&detail));
                 if let Err(err) = &recorded {
@@ -844,6 +921,13 @@ pub(super) async fn handle_trunk_queue_merge(
                 // Trunk reports no head for the submission, so the request is
                 // for the PR as the merge poller last saw it.
                 record_after_rebase(&work_db, &work_item_id, &pr_url, after_rebase.as_ref());
+                if reply_already_sent && let Some(after) = after_rebase.as_ref() {
+                    let submitted_detail = format!(
+                        "Rebased onto {}; submitted to Trunk queue, waiting for CI",
+                        after.base_branch
+                    );
+                    let _ = work_db.set_ci_failure_blocked_detail(&work_item_id, &pr_url, &submitted_detail);
+                }
                 let remembered = remember_merge_request(&work_db, &work_item_id, &pr_url, None);
                 tracing::info!(
                     %work_item_id,
@@ -852,15 +936,17 @@ pub(super) async fn handle_trunk_queue_merge(
                     outcome = "submitted",
                     "merge_when_ready: submitted PR to Trunk merge queue",
                 );
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::MergeWhenReadyAccepted {
-                        work_item_id: work_item_id.clone(),
-                        pr_url: pr_url.clone(),
-                        action: merge_when_ready::MergeAction::TrunkEnqueued.as_str().to_owned(),
-                    },
-                );
+                if !reply_already_sent {
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::MergeWhenReadyAccepted {
+                            work_item_id: work_item_id.clone(),
+                            pr_url: pr_url.clone(),
+                            action: merge_when_ready::MergeAction::TrunkEnqueued.as_str().to_owned(),
+                        },
+                    );
+                }
                 if kick_pr_reconciler {
                     event_bus.publish(Event::PrReconcileRequested { pr_url: pr_url.clone() });
                 }
@@ -926,20 +1012,28 @@ pub(super) async fn handle_trunk_queue_merge(
                 if kick_pr_reconciler {
                     event_bus.publish(Event::PrReconcileRequested { pr_url: pr_url.clone() });
                 }
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: if after_rebase.is_some() {
-                            rebase_arm_error(
-                                after_rebase.as_ref(),
-                                &format!("trunk queue submission failed for {pr_url}: {err}"),
-                            )
-                        } else {
-                            format!("merge_when_ready: trunk queue submission failed for {pr_url}: {err}")
-                        },
-                    },
-                );
+                let error_message = if after_rebase.is_some() {
+                    rebase_arm_error(
+                        after_rebase.as_ref(),
+                        &format!("trunk queue submission failed for {pr_url}: {err}"),
+                    )
+                } else {
+                    format!("merge_when_ready: trunk queue submission failed for {pr_url}: {err}")
+                };
+                if reply_already_sent {
+                    surface_ci_rebase_card_detail(
+                        &work_db,
+                        publisher.as_ref(),
+                        &product_id,
+                        &work_item_id,
+                        &pr_url,
+                        &error_message,
+                        "ci_merge_rebase_arm_failed",
+                    )
+                    .await;
+                } else {
+                    send_response(&sink, &request_id, FrontendEvent::WorkError { message: error_message });
+                }
             }
         }
     });

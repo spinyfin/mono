@@ -167,10 +167,26 @@ impl WorkDb {
         &self,
         input: ConflictResolutionInsertInput,
     ) -> Result<Option<ConflictResolution>> {
+        self.insert_conflict_resolution_with_source(input, "review_watch")
+    }
+
+    /// Insert a `conflict_resolutions` row with an explicit `event_source`.
+    ///
+    /// Rows tagged [`CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE`] represent a
+    /// behind-base rebase triggered by a Merge click on a CI-blocked card
+    /// rather than a detected merge conflict: they are excluded from the
+    /// conflict churn guard count (and do not trip it) unless promoted to
+    /// `review_watch` after hitting an actual conflict.
+    pub fn insert_conflict_resolution_with_source(
+        &self,
+        input: ConflictResolutionInsertInput,
+        event_source: &str,
+    ) -> Result<Option<ConflictResolution>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let id = next_id("crz");
         let now = now_string();
+        let is_ci_merge_rebase = event_source == CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE;
 
         // Count the trailing-1h attempts for this work item; if we've
         // already crossed the churn threshold, the new row is
@@ -179,25 +195,29 @@ impl WorkDb {
         // the bar.
         let now_secs: i64 = now.parse().unwrap_or(0);
         let cutoff_secs = now_secs - CHURN_GUARD_WINDOW_SECS;
-        // Excludes `event_source = 'speculative_predicted'` rows: those are
-        // telemetry-only observations from the Layer 4 speculative-rebase
-        // sweep, never a live resolution attempt, and must not eat
-        // into the churn budget that gates *real* conflict-resolution
-        // cycles. Without this exclusion a burst of speculative predictions
-        // for one work item could pre-abandon its next genuine attempt.
-        // Deferral records are excluded for the same reason: a `deferred`
-        // row, open or ended, records a conflict nobody tried to resolve.
-        let recent_count: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM conflict_resolutions
-              WHERE work_item_id = ?1
-                AND CAST(created_at AS INTEGER) >= ?2
-                AND event_source != 'speculative_predicted'
-                AND status != 'deferred'
-                AND deferral_end_reason IS NULL",
-            params![input.work_item_id, cutoff_secs],
-            |row| row.get(0),
-        )?;
-        let churn_tripped = recent_count >= CHURN_GUARD_THRESHOLD;
+        // Excludes `event_source = 'speculative_predicted'` rows (telemetry-only
+        // observations from the Layer 4 speculative-rebase sweep) and
+        // `event_source = 'ci_merge_rebase'` rows (behind-base rebases for
+        // Merge clicks on CI-blocked cards, not merge conflicts). Neither
+        // should eat into the churn budget that gates *real* conflict-resolution
+        // cycles. Deferral records are excluded for the same reason: a
+        // `deferred` row, open or ended, records a conflict nobody tried to
+        // resolve.
+        let churn_tripped = if is_ci_merge_rebase {
+            false
+        } else {
+            let recent_count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM conflict_resolutions
+                  WHERE work_item_id = ?1
+                    AND CAST(created_at AS INTEGER) >= ?2
+                    AND event_source NOT IN ('speculative_predicted', ?3)
+                    AND status != 'deferred'
+                    AND deferral_end_reason IS NULL",
+                params![input.work_item_id, cutoff_secs, CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE],
+                |row| row.get(0),
+            )?;
+            recent_count >= CHURN_GUARD_THRESHOLD
+        };
         let (status, failure_reason, finished_at): (&str, Option<&str>, Option<&str>) = if churn_tripped {
             ("abandoned", Some("churn_threshold_exceeded"), Some(now.as_str()))
         } else {
@@ -208,8 +228,8 @@ impl WorkDb {
             "INSERT OR IGNORE INTO conflict_resolutions
                 (id, product_id, work_item_id, pr_url, pr_number,
                  head_branch, base_branch, base_sha_at_trigger,
-                 head_sha_before, status, failure_reason, created_at, finished_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 head_sha_before, status, failure_reason, created_at, finished_at, event_source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 id,
                 input.product_id,
@@ -224,6 +244,7 @@ impl WorkDb {
                 failure_reason,
                 now,
                 finished_at,
+                event_source,
             ],
         )?;
         if rows == 0 {
@@ -238,16 +259,16 @@ impl WorkDb {
         // base sha is NULLed (see `abandon_conflict_resolution_for_supersede`)
         // so the stale row cannot collide with a future insert either.
         // Skipped when the churn guard pre-abandoned the new row (it supersedes
-        // nothing), and for rows with a `revision_task_id`: an in-flight
-        // revision must be closed alongside its attempt by the caller's
-        // supersede path, not orphaned here. `running` rows are left alone:
-        // they hold a lease on a real worker.
-        if !churn_tripped {
+        // nothing), for `ci_merge_rebase` rows, and for rows with a
+        // `revision_task_id`: an in-flight revision must be closed alongside
+        // its attempt by the caller's supersede path, not orphaned here.
+        // `running` rows are left alone: they hold a lease on a real worker.
+        if !churn_tripped && !is_ci_merge_rebase {
             retire_superseded_pending_conflict_attempts_in_tx(&tx, &input.work_item_id, &id, &now)?;
         }
         // Live attempts point the card at ongoing work. A churn stop is
         // stamped with its full explanation by surface_conflict_stop below.
-        if !churn_tripped {
+        if !churn_tripped && !is_ci_merge_rebase {
             tx.execute(
                 "UPDATE tasks
                     SET blocked_attempt_id = ?2,
@@ -1024,7 +1045,7 @@ impl WorkDb {
     ) -> Result<Vec<ConflictResolution>> {
         let conn = self.connect()?;
         ListFilterQuery::new(format!(
-            "SELECT {CONFLICT_RESOLUTION_COLUMNS} FROM conflict_resolutions WHERE 1=1"
+            "SELECT {CONFLICT_RESOLUTION_COLUMNS} FROM conflict_resolutions WHERE event_source != '{CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE}'"
         ))
         .filter_product_id(product_id)
         .filter_work_item_id(work_item_id)
@@ -1032,6 +1053,42 @@ impl WorkDb {
         .order_by_created_desc()
         .limit(limit)
         .collect(&conn, map_conflict_resolution)
+    }
+
+    /// Latest `conflict_resolutions` row for `work_item_id` tagged with
+    /// `event_source`, regardless of status. Used to free a colliding terminal
+    /// CI-merge rebase row on the same `(base, head)` key.
+    pub fn latest_conflict_resolution_for_source(
+        &self,
+        work_item_id: &str,
+        event_source: &str,
+    ) -> Result<Option<ConflictResolution>> {
+        let conn = self.connect()?;
+        let id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM conflict_resolutions
+                  WHERE work_item_id = ?1 AND event_source = ?2
+                  ORDER BY created_at DESC, id DESC LIMIT 1",
+                params![work_item_id, event_source],
+                |row| row.get(0),
+            )
+            .optional()?;
+        id.map(|id| query_conflict_resolution(&conn, &id))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    /// Reclassify a `ci_merge_rebase` row as `review_watch` when a Merge-click
+    /// rebase actually hits a conflict and hands off to the conflict ladder.
+    pub fn reclassify_ci_merge_rebase_as_conflict(&self, attempt_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let changed = conn.execute(
+            "UPDATE conflict_resolutions
+                SET event_source = 'review_watch'
+              WHERE id = ?1 AND event_source = ?2",
+            params![attempt_id, CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE],
+        )?;
+        Ok(changed > 0)
     }
 
     /// Aggregate `conflict_resolutions.conflict_diagnosis` for one
@@ -1739,9 +1796,14 @@ fn later_terminal_conflict_attempt_exists_on(conn: &Connection, attempt: &Confli
           WHERE work_item_id = ?1
             AND id != ?2
             AND status IN ('succeeded', 'failed', 'abandoned')
-            AND event_source != 'speculative_predicted'
+            AND event_source NOT IN ('speculative_predicted', ?4)
             AND (created_at > ?3 OR (created_at = ?3 AND id > ?2))",
-        params![attempt.work_item_id, attempt.id, attempt.created_at],
+        params![
+            attempt.work_item_id,
+            attempt.id,
+            attempt.created_at,
+            CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE
+        ],
         |row| row.get(0),
     )?;
     Ok(n > 0)
@@ -1775,9 +1837,15 @@ pub(crate) fn retire_superseded_pending_conflict_attempts_in_tx(
             AND status = 'pending'
             AND revision_task_id IS NULL
             AND mechanical_rung_in_flight IS NULL
-            AND event_source != 'speculative_predicted'
+            AND event_source NOT IN ('speculative_predicted', ?5)
             AND (created_at < ?4 OR (created_at = ?4 AND id < ?2))",
-        params![work_item_id, newer_attempt_id, now, created_at],
+        params![
+            work_item_id,
+            newer_attempt_id,
+            now,
+            created_at,
+            CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE
+        ],
     )?;
     if retired > 0 {
         tracing::info!(

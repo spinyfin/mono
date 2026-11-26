@@ -1248,21 +1248,32 @@ async fn retire_attempt_at_rung(
     rung: i64,
     conflicted_files: &[String],
 ) {
-    log_routing_verdict(
-        &candidate.work_item_id,
-        stored_pr_number(&candidate.pr_url).map(|n| n as u64),
-        conflicted_files,
-        "deterministic",
-        &format!("mechanical rung {rung} resolved every conflicted file; no worker spawned"),
-    );
+    let is_ci_merge_rebase = attempt.event_source == crate::work::CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE;
+    if is_ci_merge_rebase {
+        tracing::info!(
+            work_item_id = %candidate.work_item_id,
+            pr = stored_pr_number(&candidate.pr_url).map(|n| n as u64),
+            attempt_id = %attempt.id,
+            rung,
+            "conflict_ladder: CI-merge rebase completed cleanly at mechanical rung; skipping conflict telemetry and conflict-cleared event",
+        );
+    } else {
+        log_routing_verdict(
+            &candidate.work_item_id,
+            stored_pr_number(&candidate.pr_url).map(|n| n as u64),
+            conflicted_files,
+            "deterministic",
+            &format!("mechanical rung {rung} resolved every conflicted file; no worker spawned"),
+        );
 
-    record_tier(
-        work_db,
-        attempt,
-        if rung == 0 { "deterministic" } else { "engine_rebase" },
-        "retired",
-        "resolution pushed and deletion tripwire passed",
-    );
+        record_tier(
+            work_db,
+            attempt,
+            if rung == 0 { "deterministic" } else { "engine_rebase" },
+            "retired",
+            "resolution pushed and deletion tripwire passed",
+        );
+    }
     clear_lockfile_regeneration_failed_attention(work_db, &candidate.work_item_id);
 
     // The parent was flipped to `blocked: merge_conflict` upfront by
@@ -1319,7 +1330,7 @@ async fn retire_attempt_at_rung(
         ),
     }
 
-    if let Some(attempt) = marked {
+    if !is_ci_merge_rebase && let Some(attempt) = marked {
         publisher
             .publish_frontend_event_on_product(
                 &candidate.product_id,

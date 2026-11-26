@@ -35,12 +35,22 @@ impl WorkDb {
         deletions: &[String],
     ) -> Result<()> {
         let conn = self.connect()?;
+        let is_ci_merge_rebase: bool = conn
+            .query_row(
+                "SELECT event_source = ?2 FROM conflict_resolutions WHERE id = ?1",
+                params![attempt_id, CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
         append_ladder_outcome_in_tx(&conn, attempt_id, tier, outcome, reason, deletions)?;
-        self.metrics_registry().counter_inc_by_dynamic(
-            &format!("conflict_ladder.{tier}.{outcome}"),
-            "Conflict ladder tier decisions since engine start.",
-            1,
-        );
+        if !is_ci_merge_rebase {
+            self.metrics_registry().counter_inc_by_dynamic(
+                &format!("conflict_ladder.{tier}.{outcome}"),
+                "Conflict ladder tier decisions since engine start.",
+                1,
+            );
+        }
         Ok(())
     }
 }

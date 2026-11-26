@@ -153,10 +153,15 @@ pub(crate) fn latest_actionable_conflict_resolution_on(
     let id: Option<String> = conn
         .query_row(
             "SELECT id FROM conflict_resolutions
-              WHERE work_item_id = ?1 AND event_source != 'speculative_predicted'
+              WHERE work_item_id = ?1
+                AND event_source NOT IN ('speculative_predicted', ?3)
                 AND status != ?2 AND deferral_end_reason IS NULL
               ORDER BY created_at DESC, id DESC LIMIT 1",
-            params![work_item_id, crate::conflict_deferral::CONFLICT_STATUS_DEFERRED],
+            params![
+                work_item_id,
+                crate::conflict_deferral::CONFLICT_STATUS_DEFERRED,
+                crate::CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE,
+            ],
             |row| row.get(0),
         )
         .optional()?;
