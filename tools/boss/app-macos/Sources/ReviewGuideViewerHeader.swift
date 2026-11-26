@@ -82,15 +82,19 @@ struct ReviewGuideViewerHeader: View {
     var body: some View {
         if let task = chatModel.task(withID: rootTaskId) {
             VStack(alignment: .leading, spacing: 6) {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                HStack(alignment: .center, spacing: 8) {
                     Text("Review guide \u{2014} generated explanation")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer(minLength: 8)
                     if Self.showsMergeControl(task) {
-                        MergeWhenReadyControl(isRequesting: chatModel.mergingWhenReadyIDs.contains(task.id), onConfirm: {
-                            chatModel.mergeWhenReady(for: task, origin: inlineGuide == nil ? .reviewGuideViewer : .board)
-                        })
+                        MergeWhenReadyControl(
+                            isRequesting: chatModel.mergingWhenReadyIDs.contains(task.id),
+                            style: .regular,
+                            onConfirm: {
+                                chatModel.mergeWhenReady(for: task, origin: inlineGuide == nil ? .reviewGuideViewer : .board)
+                            }
+                        )
                         .disabled(actionsDisabled)
                     }
                 }
