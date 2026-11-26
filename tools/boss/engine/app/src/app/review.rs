@@ -1037,10 +1037,17 @@ pub(super) async fn handle_trunk_queue_merge(
 fn record_after_rebase(work_db: &WorkDb, work_item_id: &str, pr_url: &str, after_rebase: Option<&AfterRebaseRecord>) {
     // Every caller reaches here only once a merge request was accepted, which
     // supersedes an earlier failed CI-merge rebase report for this work item.
-    let _ = work_db.resolve_external_tracker_attention(
+    if let Err(err) = work_db.resolve_work_item_attention_kind(
         work_item_id,
         boss_engine_storage_values::attention_kinds::CI_MERGE_REBASE_FAILED_ATTENTION_KIND,
-    );
+    ) {
+        tracing::warn!(
+            %work_item_id,
+            %pr_url,
+            ?err,
+            "merge_when_ready: failed to resolve ci_merge_rebase_failed attention after accepted merge",
+        );
+    }
     let Some(after) = after_rebase else {
         return;
     };

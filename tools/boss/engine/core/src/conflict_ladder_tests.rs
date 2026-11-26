@@ -1018,6 +1018,121 @@ async fn cargo_lock_present_on_base_regenerates_and_retires_without_an_agent() {
 }
 
 #[tokio::test]
+async fn ci_merge_rebase_rung0_resolved_lockfile_reclassifies_as_conflict_and_counts_once() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let product = create_test_product_with_repo(&db, "test-ci-rung0", Some("https://github.com/spinyfin/mono.git"));
+    let chore = create_test_chore_manual(&db, product.id.clone(), "CI merge rebase with Cargo.lock conflict");
+    let pr_url = "https://github.com/spinyfin/mono/pull/42";
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("in_review".into()),
+            pr_url: Some(pr_url.into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.mark_chore_blocked_ci_failure(&chore.id, pr_url, None).unwrap();
+    let attempt = db
+        .insert_conflict_resolution_with_source(
+            ConflictResolutionInsertInput {
+                product_id: product.id.clone(),
+                work_item_id: chore.id.clone(),
+                pr_url: pr_url.to_owned(),
+                pr_number: 42,
+                head_branch: "boss/ci-lock".to_owned(),
+                base_branch: "main".to_owned(),
+                base_sha_at_trigger: Some("base-sha".to_owned()),
+                head_sha_before: Some("head-sha".to_owned()),
+            },
+            crate::work::CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE,
+        )
+        .unwrap()
+        .expect("ci_merge_rebase attempt inserted");
+    let candidate = PendingMergeCheck {
+        work_item_id: chore.id.clone(),
+        product_id: product.id.clone(),
+        pr_url: pr_url.to_owned(),
+    };
+    let publisher = RecordingPublisher::default();
+    let ws = tempdir().unwrap();
+    std::fs::write(
+        ws.path().join("Cargo.toml"),
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(ws.path().join("Cargo.lock"), "<<<<<<< conflicted\n").unwrap();
+    let cube = ScriptCube::with_workspace_path(Script::Conflicts(vec!["Cargo.lock".into()]), ws.path().to_path_buf());
+    let factory = |base: &str| {
+        let mut registry = ResolverRegistry::empty();
+        registry.register(Box::new(
+            boss_deterministic_resolvers::inject::cargo_lock(Arc::new(PresentBaseLock {
+                lock_path: "Cargo.lock",
+                tool: "cargo",
+                tool_args: &["update", "--workspace"],
+            }))
+            .with_base_revision(base.into()),
+        ));
+        registry
+    };
+
+    let outcome = try_mechanical_rungs_with(&db, &publisher, &cube, &candidate, &attempt, &factory).await;
+    assert_eq!(outcome, LadderOutcome::Retired);
+
+    let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(row.status, "succeeded");
+    assert_eq!(row.resolved_by_rung, Some(0));
+    assert_eq!(
+        row.event_source, "review_watch",
+        "rung-0 resolved CI-merge rebase must be promoted to a real conflict"
+    );
+    let visible = db.list_conflict_resolutions(None, &[], Some(&chore.id), None).unwrap();
+    assert!(
+        visible.iter().any(|r| r.id == attempt.id),
+        "reclassified rung-0 conflict must appear in conflict remediation history"
+    );
+
+    let decisions = row.ladder_outcomes.as_ref().unwrap();
+    assert_eq!(
+        decisions.len(),
+        2,
+        "expected rung-1 residual_conflicts + rung-0 retired"
+    );
+    assert_eq!(decisions[0].tier, "engine_rebase");
+    assert_eq!(decisions[0].outcome, "residual_conflicts");
+    assert_eq!(decisions[1].tier, "deterministic");
+    assert_eq!(decisions[1].outcome, "retired");
+
+    let counter_value = |name: &str| -> u64 {
+        db.metrics_registry()
+            .counter_snapshots()
+            .into_iter()
+            .find(|m| m.name == name)
+            .map(|m| m.value)
+            .unwrap_or(0)
+    };
+    assert_eq!(
+        counter_value("conflict_ladder.engine_rebase.residual_conflicts"),
+        1,
+        "withheld rung-1 outcome must be replayed exactly once"
+    );
+    assert_eq!(
+        counter_value("conflict_ladder.deterministic.retired"),
+        1,
+        "rung-0 retired outcome must be counted exactly once"
+    );
+
+    let typed = publisher.typed_events.lock().await;
+    assert!(
+        typed
+            .iter()
+            .any(|(_, e)| matches!(e, FrontendEvent::ConflictResolutionSucceeded { attempt_id, .. } if attempt_id == &attempt.id)),
+        "reclassified rung-0 resolution must publish ConflictResolutionSucceeded"
+    );
+}
+
+#[tokio::test]
 async fn mechanical_exits_persist_reasons_and_list_json_survives_reopen() {
     for script in [
         Script::CleanPushed,

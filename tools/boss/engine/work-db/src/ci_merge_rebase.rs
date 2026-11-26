@@ -259,40 +259,7 @@ impl WorkDb {
                 AND status IN ('pending', 'running')",
             params![now, CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE],
         )?;
-        // A deletion-signoff halt commits the attempt (`succeeded`, with a
-        // `halted_for_signoff` outcome) before the caller moves the
-        // CI-blocked card to `deletion_signoff`. A restart between the two
-        // leaves the card in its CI block with the sign-off requirement
-        // persisted only on the hidden attempt row; finish the transition.
-        let halted: Vec<(String, String)> = {
-            let mut stmt = tx.prepare(
-                "SELECT DISTINCT cr.work_item_id, cr.pr_url
-                   FROM conflict_resolutions cr
-                   JOIN tasks t ON t.id = cr.work_item_id AND t.pr_url = cr.pr_url
-                  WHERE cr.event_source = ?1
-                    AND cr.status = 'succeeded'
-                    AND t.status = 'blocked'
-                    AND t.blocked_reason IN ('ci_failure', 'ci_failure_exhausted')
-                    AND t.deleted_at IS NULL
-                    AND EXISTS (
-                        SELECT 1 FROM json_each(COALESCE(cr.ladder_outcomes, '[]'))
-                         WHERE json_extract(value, '$.outcome') = 'halted_for_signoff')",
-            )?;
-            stmt.query_map(params![CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })?
-            .collect::<rusqlite::Result<_>>()?
-        };
         tx.commit()?;
-        drop(conn);
-        for (work_item_id, pr_url) in halted {
-            if self
-                .retarget_blocked_ci_failure_to_merge_conflict(&work_item_id, &pr_url)?
-                .is_some()
-            {
-                self.mark_chore_blocked_deletion_signoff(&work_item_id, &pr_url)?;
-            }
-        }
         Ok(cleared)
     }
 }
@@ -467,10 +434,10 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_restores_deletion_signoff_after_restart_between_halt_and_takeover() {
+    fn ci_merge_rebase_clean_halt_transitions_to_deletion_signoff_atomically() {
         let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
         let product = create_test_product(&db);
-        let chore = create_test_chore_manual(&db, product.id.clone(), "Halted before takeover");
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Clean halt atomic");
         db.update_work_item(
             &chore.id,
             WorkItemPatch {
@@ -497,20 +464,264 @@ mod tests {
             )
             .unwrap()
             .expect("ci_merge_rebase attempt inserted");
-        // The halt commits, but the engine dies before the CI block is taken over.
-        db.halt_conflict_resolution_for_deletion_signoff(&attempt.id, 1, &["gone.rs".to_owned()])
+
+        // A clean rung-1 halt commits the attempt and transitions the CI-blocked
+        // card directly to deletion_signoff in one transaction.
+        let updated = db
+            .halt_conflict_resolution_for_deletion_signoff(&attempt.id, 1, &["gone.rs".to_owned()])
+            .unwrap()
+            .expect("task should transition to deletion_signoff atomically");
+        assert_eq!(updated.blocked_reason.as_deref(), Some("deletion_signoff"));
+        assert!(
+            updated
+                .blocked_detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("gone.rs")
+        );
+
+        let stored = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+        assert_eq!(stored.event_source, CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE);
+        assert_eq!(stored.status, "succeeded");
+        let open_ci_signals: i64 = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM task_blocked_signals
+                  WHERE work_item_id = ?1 AND reason = 'ci_failure' AND cleared_at IS NULL",
+                [&chore.id],
+                |row| row.get(0),
+            )
             .unwrap();
-        let WorkItem::Chore(before) = db.get_work_item(&chore.id).unwrap() else {
-            panic!("expected chore");
-        };
-        assert_eq!(before.blocked_reason.as_deref(), Some("ci_failure"));
+        assert_eq!(open_ci_signals, 0, "ci_failure signal must be cleared in the same tx");
+        assert!(
+            db.list_attention_items_for_work_item(&chore.id)
+                .unwrap()
+                .iter()
+                .any(|item| item.kind
+                    == boss_engine_storage_values::attention_kinds::MERGED_PARENT_DELETION_SIGNOFF_ATTENTION_KIND
+                    && item.status == "open"),
+            "deletion sign-off attention item must be open"
+        );
+        assert!(
+            db.metrics_registry()
+                .counter_snapshots()
+                .into_iter()
+                .all(|m| !m.name.starts_with("conflict_ladder.") || m.value == 0),
+            "clean CI-merge rebase halt must not touch conflict-ladder counters"
+        );
 
+        // Restart recovery leaves deletion_signoff intact.
         db.reconcile_stale_ci_merge_rebase_progress().unwrap();
-
         let WorkItem::Chore(after) = db.get_work_item(&chore.id).unwrap() else {
             panic!("expected chore");
         };
         assert_eq!(after.blocked_reason.as_deref(), Some("deletion_signoff"));
-        assert!(after.blocked_detail.as_deref().unwrap_or_default().contains("gone.rs"));
+    }
+
+    #[test]
+    fn signed_off_halt_then_ci_red_again_survives_restart_without_reblocking() {
+        let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+        let product = create_test_product(&db);
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Signed off then CI red");
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some(PR.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.mark_chore_blocked_ci_failure(&chore.id, PR, None).unwrap();
+        let attempt = db
+            .insert_conflict_resolution_with_source(
+                ConflictResolutionInsertInput {
+                    product_id: product.id,
+                    work_item_id: chore.id.clone(),
+                    pr_url: PR.to_owned(),
+                    pr_number: 77,
+                    head_branch: "boss/feature".to_owned(),
+                    base_branch: "main".to_owned(),
+                    base_sha_at_trigger: Some("base".to_owned()),
+                    head_sha_before: Some("head".to_owned()),
+                },
+                CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE,
+            )
+            .unwrap()
+            .expect("ci_merge_rebase attempt inserted");
+        db.halt_conflict_resolution_for_deletion_signoff(&attempt.id, 1, &["gone.rs".to_owned()])
+            .unwrap()
+            .expect("halted into deletion_signoff");
+
+        // Sign off by moving the card back to Review, then CI fails again.
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.mark_chore_blocked_ci_failure(&chore.id, PR, None).unwrap();
+
+        // Engine restart must not re-block the signed-off PR into deletion_signoff.
+        db.reconcile_stale_ci_merge_rebase_progress().unwrap();
+        let WorkItem::Chore(after) = db.get_work_item(&chore.id).unwrap() else {
+            panic!("expected chore");
+        };
+        assert_eq!(after.status, TaskStatus::Blocked);
+        assert_eq!(after.blocked_reason.as_deref(), Some("ci_failure"));
+    }
+
+    #[test]
+    fn older_halt_followed_by_newer_attempt_survives_restart_without_reblocking() {
+        let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+        let product = create_test_product(&db);
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Older halt newer attempt");
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some(PR.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.mark_chore_blocked_ci_failure(&chore.id, PR, None).unwrap();
+        let older = db
+            .insert_conflict_resolution_with_source(
+                ConflictResolutionInsertInput {
+                    product_id: product.id.clone(),
+                    work_item_id: chore.id.clone(),
+                    pr_url: PR.to_owned(),
+                    pr_number: 77,
+                    head_branch: "boss/feature".to_owned(),
+                    base_branch: "main".to_owned(),
+                    base_sha_at_trigger: Some("base-1".to_owned()),
+                    head_sha_before: Some("head-1".to_owned()),
+                },
+                CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE,
+            )
+            .unwrap()
+            .expect("older attempt inserted");
+        db.halt_conflict_resolution_for_deletion_signoff(&older.id, 1, &["gone.rs".to_owned()])
+            .unwrap();
+
+        // Sign off, CI fails again, and a newer clean rebase attempt runs.
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.mark_chore_blocked_ci_failure(&chore.id, PR, None).unwrap();
+        let newer = db
+            .insert_conflict_resolution_with_source(
+                ConflictResolutionInsertInput {
+                    product_id: product.id,
+                    work_item_id: chore.id.clone(),
+                    pr_url: PR.to_owned(),
+                    pr_number: 77,
+                    head_branch: "boss/feature".to_owned(),
+                    base_branch: "main".to_owned(),
+                    base_sha_at_trigger: Some("base-2".to_owned()),
+                    head_sha_before: Some("head-2".to_owned()),
+                },
+                CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE,
+            )
+            .unwrap()
+            .expect("newer attempt inserted");
+        db.mark_conflict_resolution_succeeded_at_rung(&newer.id, Some("head-3"), 1)
+            .unwrap();
+
+        db.reconcile_stale_ci_merge_rebase_progress().unwrap();
+        let WorkItem::Chore(after) = db.get_work_item(&chore.id).unwrap() else {
+            panic!("expected chore");
+        };
+        assert_eq!(after.status, TaskStatus::Blocked);
+        assert_eq!(after.blocked_reason.as_deref(), Some("ci_failure"));
+    }
+
+    #[test]
+    fn ci_merge_rebase_rung0_halt_reclassifies_and_transitions_atomically() {
+        let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+        let product = create_test_product(&db);
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Rung-0 halt atomic");
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some(PR.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.mark_chore_blocked_ci_failure(&chore.id, PR, None).unwrap();
+        let attempt = db
+            .insert_conflict_resolution_with_source(
+                ConflictResolutionInsertInput {
+                    product_id: product.id,
+                    work_item_id: chore.id.clone(),
+                    pr_url: PR.to_owned(),
+                    pr_number: 77,
+                    head_branch: "boss/feature".to_owned(),
+                    base_branch: "main".to_owned(),
+                    base_sha_at_trigger: Some("base".to_owned()),
+                    head_sha_before: Some("head".to_owned()),
+                },
+                CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE,
+            )
+            .unwrap()
+            .expect("ci_merge_rebase attempt inserted");
+        db.record_conflict_ladder_outcome(&attempt.id, "engine_rebase", "residual_conflicts", "Cargo.lock")
+            .unwrap();
+
+        // A rung-0 halt with conflicts reclassifies the attempt and moves the
+        // CI-blocked card to deletion_signoff in one transaction, so a crash
+        // before any async follow-up cannot leave a review_watch halt on a
+        // still-CI-blocked card.
+        let updated = db
+            .halt_conflict_resolution_for_deletion_signoff_with_reclassify(
+                &attempt.id,
+                0,
+                &["gone.rs".to_owned()],
+                true,
+            )
+            .unwrap()
+            .expect("task should transition to deletion_signoff atomically");
+        assert_eq!(updated.blocked_reason.as_deref(), Some("deletion_signoff"));
+        assert!(
+            updated
+                .blocked_detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("gone.rs")
+        );
+
+        let stored = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+        assert_eq!(stored.event_source, "review_watch");
+        assert_eq!(stored.status, "succeeded");
+        assert_eq!(stored.resolved_by_rung, Some(0));
+
+        let counter_value = |name: &str| -> u64 {
+            db.metrics_registry()
+                .counter_snapshots()
+                .into_iter()
+                .find(|m| m.name == name)
+                .map(|m| m.value)
+                .unwrap_or(0)
+        };
+        assert_eq!(counter_value("conflict_ladder.engine_rebase.residual_conflicts"), 1);
+        assert_eq!(counter_value("conflict_ladder.deterministic.halted_for_signoff"), 1);
+
+        // Restart recovery preserves deletion_signoff.
+        db.reconcile_stale_ci_merge_rebase_progress().unwrap();
+        let WorkItem::Chore(after) = db.get_work_item(&chore.id).unwrap() else {
+            panic!("expected chore");
+        };
+        assert_eq!(after.blocked_reason.as_deref(), Some("deletion_signoff"));
     }
 }

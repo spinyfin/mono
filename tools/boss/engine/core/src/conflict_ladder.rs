@@ -1255,7 +1255,22 @@ async fn retire_attempt_at_rung(
     conflicted_files: &[String],
 ) {
     let is_ci_merge_rebase = attempt.event_source == crate::work::CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE;
-    if is_ci_merge_rebase {
+    let is_clean_ci_merge_rebase = is_ci_merge_rebase && conflicted_files.is_empty();
+    if is_ci_merge_rebase && !conflicted_files.is_empty() {
+        // Rung 0 resolved real conflicted files during a CI-merge rebase:
+        // promote the row to a real conflict before recording the retired tier
+        // outcome and publishing `ConflictResolutionSucceeded`, so withheld
+        // prior outcomes replay once and the new retired outcome counts once.
+        if let Err(err) = work_db.reclassify_ci_merge_rebase_as_conflict(&attempt.id) {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                attempt_id = %attempt.id,
+                ?err,
+                "conflict_ladder: failed to reclassify rung-0 CI-merge rebase as conflict before retiring",
+            );
+        }
+    }
+    if is_clean_ci_merge_rebase {
         tracing::info!(
             work_item_id = %candidate.work_item_id,
             pr = stored_pr_number(&candidate.pr_url).map(|n| n as u64),
@@ -1336,7 +1351,7 @@ async fn retire_attempt_at_rung(
         ),
     }
 
-    if !is_ci_merge_rebase && let Some(attempt) = marked {
+    if !is_clean_ci_merge_rebase && let Some(attempt) = marked {
         publisher
             .publish_frontend_event_on_product(
                 &candidate.product_id,
@@ -1439,8 +1454,9 @@ async fn halt_attempt_for_deletion_signoff(
 ) {
     // A clean CI-merge rebase (no conflicted files) is not a conflict-routing
     // decision; only log the verdict when a conflict was actually resolved.
+    let had_conflicts = !conflicted_files.is_empty();
     let clean_ci_merge_rebase =
-        attempt.event_source == crate::work::CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE && conflicted_files.is_empty();
+        attempt.event_source == crate::work::CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE && !had_conflicts;
     if !clean_ci_merge_rebase {
         log_routing_verdict(
             &candidate.work_item_id,
@@ -1453,7 +1469,12 @@ async fn halt_attempt_for_deletion_signoff(
         );
     }
 
-    if let Err(err) = work_db.halt_conflict_resolution_for_deletion_signoff(&attempt.id, rung, deletions) {
+    if let Err(err) = work_db.halt_conflict_resolution_for_deletion_signoff_with_reclassify(
+        &attempt.id,
+        rung,
+        deletions,
+        had_conflicts,
+    ) {
         tracing::error!(attempt_id = %attempt.id, ?err, "could not persist atomic deletion-signoff halt");
         return;
     }

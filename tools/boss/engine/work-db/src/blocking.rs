@@ -479,11 +479,40 @@ impl WorkDb {
         rung: i64,
         deletions: &[String],
     ) -> Result<Option<Task>> {
+        self.halt_conflict_resolution_for_deletion_signoff_with_reclassify(attempt_id, rung, deletions, false)
+    }
+
+    /// Like [`Self::halt_conflict_resolution_for_deletion_signoff`], and when
+    /// `attempt_id` is a `ci_merge_rebase` attempt, atomically takes over a
+    /// `blocked: ci_failure` / `ci_failure_exhausted` card into
+    /// `blocked: deletion_signoff` (clearing CI-failure blocked signals) in the
+    /// same transaction. When `reclassify_ci_merge_rebase` is true (rung 0
+    /// resolved real conflicted files), also reclassifies the attempt to
+    /// `review_watch` in that same transaction and replays its withheld ladder
+    /// outcome counters once on commit.
+    pub fn halt_conflict_resolution_for_deletion_signoff_with_reclassify(
+        &self,
+        attempt_id: &str,
+        rung: i64,
+        deletions: &[String],
+        reclassify_ci_merge_rebase: bool,
+    ) -> Result<Option<Task>> {
         let attempt = self
             .get_conflict_resolution(attempt_id)?
             .with_context(|| format!("unknown conflict attempt: {attempt_id}"))?;
+        let is_ci_merge_rebase = attempt.event_source == crate::CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE;
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let reclassified = if is_ci_merge_rebase && reclassify_ci_merge_rebase {
+            tx.execute(
+                "UPDATE conflict_resolutions
+                    SET event_source = 'review_watch'
+                  WHERE id = ?1 AND event_source = ?2",
+                params![attempt_id, crate::CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE],
+            )? > 0
+        } else {
+            false
+        };
         let tier = if rung == 0 { "deterministic" } else { "engine_rebase" };
         let reason = format!("deletion tripwire: {}", deletions.join("; "));
         crate::conflict_ladder_telemetry::append_ladder_outcome_in_tx(
@@ -495,18 +524,23 @@ impl WorkDb {
             deletions,
         )?;
         crate::conflict_res::mark_conflict_resolution_succeeded_at_rung_in_tx(&tx, attempt_id, None, rung)?;
-        let updated = mark_deletion_signoff_in_tx(
+        let updated = mark_deletion_signoff_with_takeover_in_tx(
             &tx,
             &attempt.work_item_id,
             &attempt.pr_url,
             Some(deletions),
             Some(attempt_id),
+            is_ci_merge_rebase,
         )?;
         tx.commit()?;
-        // A clean CI-merge rebase is not a conflict-ladder decision; if it
-        // is later reclassified as a real conflict, the recorded outcome is
-        // replayed into the counters then.
-        if attempt.event_source != crate::CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE {
+        drop(conn);
+        // A clean CI-merge rebase is not a conflict-ladder decision; when
+        // rung 0 actually resolved conflicts (`reclassified`), replay every
+        // recorded outcome (including `halted_for_signoff`) into the counters
+        // once.
+        if reclassified {
+            self.replay_ladder_outcome_counters(attempt_id)?;
+        } else if !is_ci_merge_rebase {
             self.count_ladder_outcome(tier, "halted_for_signoff");
         }
         Ok(updated)
@@ -2462,16 +2496,50 @@ pub(crate) fn mark_deletion_signoff_in_tx(
     live_deletions: Option<&[String]>,
     attempt_id: Option<&str>,
 ) -> Result<Option<Task>> {
+    mark_deletion_signoff_with_takeover_in_tx(conn, work_item_id, pr_url, live_deletions, attempt_id, false)
+}
+
+fn mark_deletion_signoff_with_takeover_in_tx(
+    conn: &Connection,
+    work_item_id: &str,
+    pr_url: &str,
+    live_deletions: Option<&[String]>,
+    attempt_id: Option<&str>,
+    allow_ci_failure_takeover: bool,
+) -> Result<Option<Task>> {
     let now = now_string();
     let deletions = live_deletions
         .map(|live| live.to_vec())
         .unwrap_or_else(|| halted_signoff_deletions(conn, work_item_id, pr_url, attempt_id));
     let detail = deletion_signoff_blocked_detail(&deletions);
-    let rows = crate::task_status_audit::execute(
-        conn,
-        "mark_chore_blocked_deletion_signoff",
-        "engine",
-        "UPDATE tasks
+    let rows = if allow_ci_failure_takeover {
+        crate::task_status_audit::execute(
+            conn,
+            "mark_chore_blocked_deletion_signoff",
+            "engine",
+            "UPDATE tasks
+                SET status             = 'blocked',
+                    blocked_reason     = 'deletion_signoff',
+                    blocked_detail     = ?4,
+                    blocked_attempt_id = NULL,
+                    pr_url             = ?2,
+                    last_status_actor  = 'engine',
+                    updated_at         = ?3
+              WHERE id = ?1
+                AND status = 'blocked'
+                AND (
+                    blocked_reason = 'merge_conflict'
+                    OR (blocked_reason IN ('ci_failure', 'ci_failure_exhausted') AND pr_url = ?2)
+                )
+                AND deleted_at IS NULL",
+            params![work_item_id, pr_url, now, detail],
+        )?
+    } else {
+        crate::task_status_audit::execute(
+            conn,
+            "mark_chore_blocked_deletion_signoff",
+            "engine",
+            "UPDATE tasks
                 SET status             = 'blocked',
                     blocked_reason     = 'deletion_signoff',
                     blocked_detail     = ?4,
@@ -2483,8 +2551,9 @@ pub(crate) fn mark_deletion_signoff_in_tx(
                 AND status = 'blocked'
                 AND blocked_reason = 'merge_conflict'
                 AND deleted_at IS NULL",
-        params![work_item_id, pr_url, now, detail],
-    )?;
+            params![work_item_id, pr_url, now, detail],
+        )?
+    };
     crate::merge_conflict_merging::stop(
         conn,
         work_item_id,
@@ -2510,16 +2579,28 @@ pub(crate) fn mark_deletion_signoff_in_tx(
             },
         )?;
     }
-    // Leaving the merge_conflict state for deletion_signoff — clear the
-    // side-table signal, mirroring `clear_chore_blocked_merge_conflict`.
-    conn.execute(
-        "UPDATE task_blocked_signals
+    // Leaving the merge_conflict (or taken-over ci_failure) state for
+    // deletion_signoff — clear the side-table signal, mirroring
+    // `clear_chore_blocked_merge_conflict` / `retarget_blocked_ci_failure_to_merge_conflict`.
+    if allow_ci_failure_takeover {
+        conn.execute(
+            "UPDATE task_blocked_signals
+                SET cleared_at = ?2
+              WHERE work_item_id = ?1
+                AND reason IN ('merge_conflict', 'ci_failure', 'ci_failure_exhausted', 'ci_flaky_retriggered')
+                AND cleared_at IS NULL",
+            params![work_item_id, now],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE task_blocked_signals
                 SET cleared_at = ?2
               WHERE work_item_id = ?1
                 AND reason = 'merge_conflict'
                 AND cleared_at IS NULL",
-        params![work_item_id, now],
-    )?;
+            params![work_item_id, now],
+        )?;
+    }
     let updated = query_task(conn, work_item_id)?
         .with_context(|| format!("unknown task after deletion_signoff flip: {work_item_id}"))?;
     Ok(Some(updated))

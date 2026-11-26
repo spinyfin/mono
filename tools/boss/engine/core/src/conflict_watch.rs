@@ -366,25 +366,14 @@ pub async fn rebase_for_ci_failure_merge(
             let _ = work_db.abandon_conflict_resolution_for_supersede(&attempt.id, "ci_merge_rebase_failed");
             CiMergeRebaseOutcome::Failed(reason.to_owned())
         }
-        conflict_ladder::LadderOutcome::HaltedForSignoff { had_conflicts } => {
-            // A clean rung-1 rebase never conflicted: keep the row tagged
-            // `ci_merge_rebase` so it stays out of conflict lists, the
-            // 24h "conflict cleared" chip, and the per-item churn guard.
-            // Reclassify only when a mechanical rung actually resolved
-            // residual conflicted files.
-            if had_conflicts {
-                let _ = work_db.reclassify_ci_merge_rebase_as_conflict(&attempt.id);
-            }
-            if take_over_foreign_ci_block(work_db, publisher, candidate, blocked_reason).await {
-                let _ = work_db.mark_chore_blocked_deletion_signoff(&candidate.work_item_id, &candidate.pr_url);
-                publisher
-                    .publish_work_item_changed(
-                        &candidate.product_id,
-                        &candidate.work_item_id,
-                        "pr_review_deletion_signoff",
-                    )
-                    .await;
-            }
+        conflict_ladder::LadderOutcome::HaltedForSignoff { .. } => {
+            // The halt, optional conflict reclassification (when rung 0
+            // resolved residual conflicts), `ci_failure` -> `deletion_signoff`
+            // transition, CI-failure signal clear, and sign-off attention
+            // filing already committed in one transaction inside
+            // `halt_attempt_for_deletion_signoff`. Only the async cancellation
+            // of any live CI-remediation worker remains.
+            supersede_stale_ci_remediation(work_db, publisher, candidate).await;
             CiMergeRebaseOutcome::HaltedForSignoff
         }
         conflict_ladder::LadderOutcome::LockfileRegenerationFailed => {

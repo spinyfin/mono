@@ -32,8 +32,8 @@ struct FakeDirectMergeExecutor {
     calls: Mutex<Vec<String>>,
     pinned_heads: Mutex<Vec<Option<String>>>,
     disarms: Mutex<Vec<String>>,
-    head_sha: String,
-    behavior: FakeDirectMergeBehavior,
+    head_sha: Mutex<String>,
+    behavior: Mutex<FakeDirectMergeBehavior>,
 }
 
 impl FakeDirectMergeExecutor {
@@ -42,28 +42,38 @@ impl FakeDirectMergeExecutor {
             calls: Mutex::new(Vec::new()),
             pinned_heads: Mutex::new(Vec::new()),
             disarms: Mutex::new(Vec::new()),
-            head_sha: head_sha.into(),
-            behavior: FakeDirectMergeBehavior {
+            head_sha: Mutex::new(head_sha.into()),
+            behavior: Mutex::new(FakeDirectMergeBehavior {
                 ignore_expected_head: false,
                 fail_message: None,
                 gate: None,
-            },
+            }),
         }
     }
 
     fn ignoring_expected_head(head_sha: impl Into<String>) -> Self {
-        let mut executor = Self::returning(head_sha);
-        executor.behavior.ignore_expected_head = true;
+        let executor = Self::returning(head_sha);
+        executor.behavior.lock().unwrap().ignore_expected_head = true;
         executor
     }
 
     fn failing_gated(message: impl Into<String>) -> (Arc<Self>, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
-        let mut executor = Self::returning("unused-head");
-        executor.behavior.fail_message = Some(message.into());
-        executor.behavior.gate = Some((entered.clone(), release.clone()));
+        let executor = Self::returning("unused-head");
+        {
+            let mut behavior = executor.behavior.lock().unwrap();
+            behavior.fail_message = Some(message.into());
+            behavior.gate = Some((entered.clone(), release.clone()));
+        }
         (Arc::new(executor), entered, release)
+    }
+
+    fn succeed_with(&self, head_sha: impl Into<String>) {
+        *self.head_sha.lock().unwrap() = head_sha.into();
+        let mut behavior = self.behavior.lock().unwrap();
+        behavior.fail_message = None;
+        behavior.gate = None;
     }
 
     fn calls(&self) -> Vec<String> {
@@ -95,19 +105,23 @@ impl DirectMergeExecutor for FakeDirectMergeExecutor {
             .lock()
             .unwrap()
             .push(expected_head_sha.map(str::to_owned));
-        if let Some((entered, release)) = &self.behavior.gate {
+        let gate = self.behavior.lock().unwrap().gate.clone();
+        if let Some((entered, release)) = gate {
             entered.notify_one();
             release.notified().await;
         }
-        if let Some(message) = &self.behavior.fail_message {
+        let (fail_message, ignore_expected_head) = {
+            let behavior = self.behavior.lock().unwrap();
+            (behavior.fail_message.clone(), behavior.ignore_expected_head)
+        };
+        if let Some(message) = fail_message {
             anyhow::bail!("{message}");
         }
-        let head_sha = if self.behavior.ignore_expected_head {
-            self.head_sha.clone()
+        let fallback_head = self.head_sha.lock().unwrap().clone();
+        let head_sha = if ignore_expected_head {
+            fallback_head
         } else {
-            expected_head_sha
-                .map(str::to_owned)
-                .unwrap_or_else(|| self.head_sha.clone())
+            expected_head_sha.map(str::to_owned).unwrap_or(fallback_head)
         };
         Ok(DirectMergeSuccess { head_sha })
     }
@@ -247,6 +261,7 @@ struct ScriptedMergeProbe {
     /// Head SHA returned after the first `probe()` (the behind-base check).
     /// Subsequent probes used to wait for GitHub to show the rebased head.
     after_rebase_head: Mutex<Option<String>>,
+    behind_gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 impl ScriptedMergeProbe {
@@ -256,7 +271,15 @@ impl ScriptedMergeProbe {
             behind: Mutex::new(behind),
             probe_calls: AtomicUsize::new(0),
             after_rebase_head: Mutex::new(None),
+            behind_gate: Mutex::new(None),
         })
+    }
+
+    fn with_behind_gate(self: &Arc<Self>) -> (Arc<Self>, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.behind_gate.lock().unwrap() = Some((entered.clone(), release.clone()));
+        (self.clone(), entered, release)
     }
 
     fn with_after_rebase_head(self: &Arc<Self>, head: impl Into<String>) -> Arc<Self> {
@@ -289,6 +312,11 @@ impl MergeProbe for ScriptedMergeProbe {
     }
 
     async fn is_pr_behind_base(&self, _pr_url: &str, _probe: &PrLifecycleProbe) -> anyhow::Result<bool> {
+        let gate = self.behind_gate.lock().unwrap().take();
+        if let Some((entered, release)) = gate {
+            entered.notify_one();
+            release.notified().await;
+        }
         Ok(*self.behind.lock().unwrap())
     }
 }
@@ -2450,43 +2478,117 @@ async fn late_arm_failure_after_ci_unblocks_files_attention_item() {
             .unwrap()
             .iter()
             .any(|item| {
-                item.kind == "ci_merge_rebase_failed" && item.body_markdown.contains("GitHub refused the merge request")
+                item.kind == "ci_merge_rebase_failed"
+                    && item.status == "open"
+                    && item.resolved_at.is_none()
+                    && item.body_markdown.contains("GitHub refused the merge request")
             })
+    })
+    .await;
+
+    // A later accepted Merge request on the now-unblocked, already-rebased card
+    // must lower the open `ci_merge_rebase_failed` attention item.
+    probe.set(failing_probe(pr_url, "head-rebased", "CLEAN"), false);
+    direct_executor.succeed_with("head-rebased");
+    let retry_sink = make_session_sink();
+    handle_merge_when_ready(
+        dispatch_ctx(&state, &retry_sink),
+        FrontendRequest::MergeWhenReady {
+            work_item_id: chore_id.clone(),
+            confirmed_revisions: vec![],
+        },
+    )
+    .await;
+
+    wait_until("later accepted Merge lowers ci_merge_rebase_failed attention", || {
+        let items = state.work_db.list_attention_items_for_work_item(&chore_id).unwrap();
+        let failed: Vec<_> = items
+            .iter()
+            .filter(|item| item.kind == "ci_merge_rebase_failed")
+            .collect();
+        !failed.is_empty()
+            && failed
+                .iter()
+                .all(|item| item.status == "resolved" && item.resolved_at.is_some())
     })
     .await;
 }
 
 /// The early "Rebasing onto…" progress write runs after awaited probes. If CI
-/// polling already moved the card off `ci_failure` by then, the dropped
-/// progress text must not become a failure attention item.
+/// polling already moved the card off `ci_failure` while the behind-base check
+/// is paused, the dropped progress text must never file a
+/// `ci_merge_rebase_failed` attention item — neither transiently right after
+/// the progress write nor after the rebase and merge arm succeed.
 #[tokio::test]
 async fn progress_write_after_ci_unblocks_files_no_attention_item() {
     let server = MockServer::start().await;
     let pr_url = "https://github.com/spinyfin/mono/pull/428";
     let direct_executor = Arc::new(FakeDirectMergeExecutor::returning("head-rebased"));
-    let probe = ScriptedMergeProbe::new(failing_probe(pr_url, "head-old", "BEHIND"), true);
+    let (cube, rebase_entered, rebase_release) = RebaseCube::clean_pushed_gated();
+    let (probe, behind_entered, behind_release) =
+        ScriptedMergeProbe::new(failing_probe(pr_url, "head-old", "BEHIND"), true)
+            .with_after_rebase_head("head-rebased")
+            .with_behind_gate();
     let (state, _temp) = test_server(
         trunk_client_for(server.uri()),
-        direct_executor,
-        RebaseCube::clean_pushed(),
-        probe,
+        direct_executor.clone(),
+        cube.clone(),
+        probe.clone(),
     );
-    let (product_id, chore_id) = seed_ci_blocked_chore(&state.work_db, "ci-progress-unblocked", pr_url, false, false);
+    let (_product_id, chore_id) = seed_ci_blocked_chore(&state.work_db, "ci-progress-unblocked", pr_url, false, false);
+    let sink = make_session_sink();
+
+    handle_merge_when_ready(
+        dispatch_ctx(&state, &sink),
+        FrontendRequest::MergeWhenReady {
+            work_item_id: chore_id.clone(),
+            confirmed_revisions: vec![],
+        },
+    )
+    .await;
+
+    // Pause in `is_pr_behind_base`, before `publish_ci_rebase_progress` runs.
+    tokio::time::timeout(Duration::from_secs(5), behind_entered.notified())
+        .await
+        .expect("is_pr_behind_base should have started");
+
+    // CI clears the block while the behind-base check is paused.
     state
         .work_db
         .clear_chore_blocked_ci_failure(&chore_id, pr_url)
         .unwrap()
         .expect("CI block clears before the progress write");
+    behind_release.notify_one();
 
-    super::review_ci_rebase::publish_ci_rebase_progress(
-        &state.work_db,
-        state.publisher.as_ref(),
-        &product_id,
-        &chore_id,
-        pr_url,
-        "Rebasing onto main before merging...",
-        "ci_merge_rebase_started",
-    )
+    // Wait until the handler has written progress, sent the early reply, and
+    // entered the gated rebase (before completion / success-time lowering).
+    expect_rebasing_reply(&sink).await;
+    tokio::time::timeout(Duration::from_secs(5), rebase_entered.notified())
+        .await
+        .expect("rebase_workspace should have started after progress write");
+
+    assert!(
+        state
+            .work_db
+            .list_attention_items_for_work_item(&chore_id)
+            .unwrap()
+            .iter()
+            .all(|item| item.kind != "ci_merge_rebase_failed"),
+        "a dropped progress update must not transiently file a ci_merge_rebase_failed attention item"
+    );
+
+    // Release the rebase and let the full rebase + merge arm complete.
+    rebase_release.notify_one();
+    wait_until("rebase and merge arm complete", || {
+        state
+            .work_db
+            .get_ci_merge_rebase(&chore_id, pr_url)
+            .unwrap()
+            .and_then(|record| record.rebased_head_sha)
+            .as_deref()
+            == Some("head-rebased")
+            && !direct_executor.calls().is_empty()
+    })
     .await;
 
     assert!(
@@ -2496,6 +2598,6 @@ async fn progress_write_after_ci_unblocks_files_no_attention_item() {
             .unwrap()
             .iter()
             .all(|item| item.kind != "ci_merge_rebase_failed"),
-        "a dropped progress update must not file a failure attention item"
+        "no ci_merge_rebase_failed attention item may exist after a successful merge"
     );
 }
