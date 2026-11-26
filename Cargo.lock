@@ -449,6 +449,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "bon",
+ "boss-agent-host",
  "boss-log-files",
  "boss-transcript-markdown",
  "clap",
@@ -458,6 +459,18 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "workspace-procs",
+]
+
+[[package]]
+name = "boss-agent-host"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

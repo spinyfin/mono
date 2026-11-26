@@ -521,8 +521,8 @@ macos_application(
     # cube is bundled so the engine can find it even when the macOS GUI launchd
     # PATH excludes the user's shell PATH (see AgentConfig::load_for_engine in config.rs and
     # boss_engine_worker_bin::resolve_cube_cli_for_engine).
-    # Boss-owned tools (boss, cube, bossctl, boss-event, repobin) are always run
-    # from this bundle by absolute path: the engine resolves them through
+    # Boss-owned tools (boss, cube, bossctl, boss-event, boss-agent-host,
+    # repobin) are always run from this bundle by absolute path: the engine resolves them through
     # //tools/boss/engine/worker-bin and workers get them via per-workspace
     # launchers, never via a PATH search that a ~/bin repobin shim can win.
     # Third-party tools (jj, gh, claude, etc.) still resolve from PATH.
@@ -531,6 +531,7 @@ macos_application(
         "//tools/boss/cli:boss": "Resources/bin",
         "//tools/boss/bossctl:bossctl": "Resources/bin",
         "//tools/boss/event-shim:boss-event": "Resources/bin",
+        "//tools/boss/agent-host:boss-agent-host": "Resources/bin",
         "//tools/cube:cube": "Resources/bin",
         "//tools/repobin:repobin": "Resources/bin",
         "//tools/boss/app-macos/Sources/Resources/TrekIcons:trek_icons": "Resources/TrekIcons",

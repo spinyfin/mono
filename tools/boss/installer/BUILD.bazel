@@ -19,6 +19,7 @@ package(default_visibility = ["//visibility:private"])
 filegroup(
     name = "bundled_binaries",
     srcs = [
+        "//tools/boss/agent-host:boss-agent-host",
         "//tools/boss/bossctl",
         "//tools/boss/cli:boss",
         "//tools/boss/engine/core:engine",

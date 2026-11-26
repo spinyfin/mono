@@ -1,0 +1,35 @@
+[package]
+name = "boss-agent-host"
+version.workspace = true
+edition.workspace = true
+workspace = "../../.."
+
+[[bin]]
+name = "boss-agent-host"
+path = "src/main.rs"
+
+# Test helper: a child that speaks a recorded journal over stdio. Launched by
+# path from tests, never bundled with the app.
+[[bin]]
+name = "boss-agent-host-scripted-child"
+path = "tests/support/scripted_child.rs"
+test = false
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+libc = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = [
+  "io-util",
+  "macros",
+  "net",
+  "process",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time",
+] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

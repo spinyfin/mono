@@ -197,7 +197,7 @@ if [[ -d "$BIN_DIR" ]]; then
 
   # These are plain Rust CLIs (plus the relaunch helper's C exit-observer) with no
   # special entitlements.
-  for bin in boss bossctl boss-event repobin exit-observer; do
+  for bin in boss bossctl boss-event boss-agent-host repobin exit-observer; do
     [[ -f "${BIN_DIR}/${bin}" ]] && \
       run codesign --force --options runtime \
         -s "$APP_IDENTITY" "${BIN_DIR}/${bin}"

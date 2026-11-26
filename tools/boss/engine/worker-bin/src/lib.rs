@@ -67,6 +67,9 @@ const BOSS_LAUNCHER_NAME: &str = "boss";
 /// Basename of the launcher that pins `cube` to the engine-owned binary.
 const CUBE_LAUNCHER_NAME: &str = "cube";
 
+/// Basename of the coordinator's durable agent host.
+const BOSS_AGENT_HOST_BASENAME: &str = "boss-agent-host";
+
 /// Basename of the repobin multiplexer. A candidate that resolves to
 /// this is a build-from-source shim, not a built binary — see
 /// [`is_build_from_source_shim`].
@@ -77,6 +80,9 @@ const BOSS_CLI_RUNFILES_REL: &str = "tools/boss/cli/boss";
 
 /// Workspace-relative path of the `boss-event` shim under runfiles / bazel-bin.
 const BOSS_EVENT_RUNFILES_REL: &str = "tools/boss/event-shim/boss-event";
+
+/// Workspace-relative path of the `boss-agent-host` binary under runfiles / bazel-bin.
+const BOSS_AGENT_HOST_RUNFILES_REL: &str = "tools/boss/agent-host/boss-agent-host";
 
 /// Directory name, relative to the worker settings dir, that holds the
 /// generated launcher(s). Each workspace gets its own subdirectory under
@@ -111,6 +117,10 @@ pub const BOSS_CLI_BIN_ENV: &str = "BOSS_CLI_BIN";
 /// Env var that overrides `cube` CLI resolution outright. Same contract
 /// as [`BOSS_CLI_BIN_ENV`].
 pub const CUBE_CLI_BIN_ENV: &str = "CUBE_CLI_BIN";
+
+/// Env var that overrides `boss-agent-host` resolution outright. Same
+/// contract as [`BOSS_CLI_BIN_ENV`].
+pub const BOSS_AGENT_HOST_BIN_ENV: &str = "BOSS_AGENT_HOST_BIN";
 
 /// Env var naming the installed bundle's bin directory
 /// (`Boss.app/Contents/Resources/bin`). Set by the macOS app.
@@ -307,6 +317,57 @@ pub fn resolve_cube_cli_for_engine(engine_path: &Path) -> Option<PathBuf> {
     let env_override = std::env::var_os(CUBE_CLI_BIN_ENV).map(PathBuf::from);
     let boss_bin_dir = std::env::var_os(BOSS_BIN_DIR_ENV).map(PathBuf::from);
     resolve_cube_cli(
+        engine_path,
+        workspace_dir.as_deref(),
+        env_override.as_deref(),
+        boss_bin_dir.as_deref(),
+    )
+}
+
+/// Resolve the absolute path of the `boss-agent-host` binary that belongs to
+/// the running engine: the program a coordinator's tmux pane runs to keep its
+/// agent alive across engine restarts.
+///
+/// Same candidate order and shim rejection as [`resolve_boss_cli`], with the
+/// `boss-agent-host` basename and runfiles path, so there is no `PATH` search
+/// and no stable-bin-dir candidate (nothing installs it there).
+///
+/// Returns `None` when no bundled host exists; callers must fail rather than
+/// substitute a `PATH` lookup. A pane that cannot start its host has to say
+/// so, because the host is what makes the session outlive the engine.
+pub fn resolve_boss_agent_host(
+    engine_path: &Path,
+    workspace_dir: Option<&Path>,
+    env_override: Option<&Path>,
+    boss_bin_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    resolve_engine_binary(
+        BOSS_AGENT_HOST_BASENAME,
+        BOSS_AGENT_HOST_RUNFILES_REL,
+        ResolvePaths {
+            engine_path,
+            workspace_dir,
+            env_override,
+            boss_bin_dir,
+            stable_bin_dir: None,
+        },
+        true,
+    )
+}
+
+/// [`resolve_boss_agent_host`] fed from the running engine's own process: its
+/// executable path, `BUILD_WORKSPACE_DIRECTORY`, `BOSS_AGENT_HOST_BIN` and
+/// `BOSS_BIN_DIR`.
+pub fn resolve_boss_agent_host_from_process() -> Option<PathBuf> {
+    resolve_boss_agent_host_for_engine(&std::env::current_exe().unwrap_or_default())
+}
+
+/// Resolve the host using the engine path and the shared process environment.
+pub fn resolve_boss_agent_host_for_engine(engine_path: &Path) -> Option<PathBuf> {
+    let workspace_dir = std::env::var_os(BUILD_WORKSPACE_DIRECTORY_ENV).map(PathBuf::from);
+    let env_override = std::env::var_os(BOSS_AGENT_HOST_BIN_ENV).map(PathBuf::from);
+    let boss_bin_dir = std::env::var_os(BOSS_BIN_DIR_ENV).map(PathBuf::from);
+    resolve_boss_agent_host(
         engine_path,
         workspace_dir.as_deref(),
         env_override.as_deref(),
@@ -857,6 +918,95 @@ mod tests {
         assert_eq!(
             resolve_boss_event_binary(&tmp.path().join("engine"), None, None, Some(bundle.as_path()), None,),
             Some(bundle.join("boss-event")),
+        );
+    }
+
+    // ── resolve_boss_agent_host ─────────────────────────────────────────────
+
+    #[test]
+    fn agent_host_resolves_from_the_installed_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("bundle");
+        touch_exe(&bundle.join("boss-agent-host"));
+        touch_exe(&bundle.join("boss"));
+
+        assert_eq!(
+            resolve_boss_agent_host(&tmp.path().join("engine"), None, None, Some(bundle.as_path())),
+            Some(bundle.join("boss-agent-host")),
+        );
+    }
+
+    #[test]
+    fn agent_host_resolves_from_runfiles_then_bazel_bin_then_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = tmp.path().join("bin/engine");
+        touch_exe(&engine);
+        let workspace = tmp.path().join("workspace");
+        let built = workspace.join("bazel-bin/tools/boss/agent-host/boss-agent-host");
+        let sibling = tmp.path().join("bin/boss-agent-host");
+        touch_exe(&built);
+        touch_exe(&sibling);
+        assert_eq!(
+            resolve_boss_agent_host(&engine, Some(workspace.as_path()), None, None),
+            Some(built.clone())
+        );
+
+        let runfiles = tmp
+            .path()
+            .join("bin/engine.runfiles/_main/tools/boss/agent-host/boss-agent-host");
+        touch_exe(&runfiles);
+        assert_eq!(
+            resolve_boss_agent_host(&engine, Some(workspace.as_path()), None, None),
+            Some(runfiles)
+        );
+
+        std::fs::remove_file(&built).unwrap();
+        std::fs::remove_file(
+            tmp.path()
+                .join("bin/engine.runfiles/_main/tools/boss/agent-host/boss-agent-host"),
+        )
+        .unwrap();
+        assert_eq!(resolve_boss_agent_host(&engine, None, None, None), Some(sibling));
+    }
+
+    #[test]
+    fn agent_host_env_override_wins_even_when_the_file_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("bundle");
+        touch_exe(&bundle.join("boss-agent-host"));
+        let override_path = tmp.path().join("elsewhere/host");
+
+        assert_eq!(
+            resolve_boss_agent_host(
+                &tmp.path().join("engine"),
+                None,
+                Some(override_path.as_path()),
+                Some(bundle.as_path()),
+            ),
+            Some(override_path),
+        );
+    }
+
+    #[test]
+    fn agent_host_is_none_rather_than_a_path_search() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_boss_agent_host(&tmp.path().join("engine"), None, None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn agent_host_ignores_a_stable_bin_leftover_and_a_repobin_shim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shimmed = tmp.path().join("shimmed");
+        std::fs::create_dir_all(&shimmed).unwrap();
+        touch_exe(&tmp.path().join("repobin"));
+        std::os::unix::fs::symlink(tmp.path().join("repobin"), shimmed.join("boss-agent-host")).unwrap();
+
+        assert_eq!(
+            resolve_boss_agent_host(&tmp.path().join("engine"), None, None, Some(shimmed.as_path())),
+            None
         );
     }
 
