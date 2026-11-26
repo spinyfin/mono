@@ -2,6 +2,12 @@
 //! Clearing policy lives in [`super::attention_lifecycle`]; filing stays with producers.
 //! References to producer functions and policy types below refer to engine core.
 
+/// Filed when a Merge click's rebase-then-merge sequence fails after the card
+/// has already left its CI block, so no card detail can carry the failure.
+/// Lowered when a later merge request is accepted (see
+/// `attention_lifecycle::ATTENTION_LIFECYCLES`).
+pub const CI_MERGE_REBASE_FAILED_ATTENTION_KIND: &str = "ci_merge_rebase_failed";
+
 pub const ABANDONED_EXECUTION_BOOKMARK_ATTENTION_KIND: &str = "abandoned_execution_bookmark";
 
 /// Attention-item kind filed when this sweep completes an execution. Its

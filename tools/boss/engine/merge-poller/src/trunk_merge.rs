@@ -36,9 +36,11 @@ pub use crate::work::{
 };
 
 /// Whether an active intent's `last_trunk_state` marks it as needing a
-/// Boss-driven fix before it can be resubmitted: evicted (an active
-/// `ci_watch::on_trunk_queue_eviction_detected` episode owns it) or
-/// superseded by a mid-queue conflict (`conflict_watch` owns it).
+/// Boss-driven transition before it can be considered live or resubmitted:
+/// evicted (an active `ci_watch::on_trunk_queue_eviction_detected` episode
+/// owns it), superseded by a mid-queue conflict (`conflict_watch` owns it),
+/// or withdrawn after a red rebased head ([`TRUNK_INTENT_WITHDRAW`], waiting
+/// for the poller to cancel and retire it).
 fn needs_remediation(last_trunk_state: Option<&str>) -> bool {
     matches!(
         last_trunk_state,

@@ -130,6 +130,12 @@ pub const CHURN_GUARD_WINDOW_SECS: i64 = 60 * 60;
 pub const CHURN_GUARD_THRESHOLD: i64 = 3;
 /// `failure_reason` stamped on the pre-abandoned row.
 pub const CHURN_GUARD_REASON: &str = "churn_threshold_exceeded";
+/// `conflict_resolutions.event_source` stamped on mechanical-rebase rows
+/// created by a Merge click on a CI-blocked card whose branch is behind base.
+/// Excluded from conflict churn-guard budgets, conflict-ladder outcome
+/// telemetry, and conflict remediation lists unless the rebase actually hits
+/// a conflict and is promoted to `review_watch`.
+pub const CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE: &str = "ci_merge_rebase";
 
 /// Sliding window for the orphan-active redispatch churn guard: the
 /// 4th orphan-redispatch for a given work item inside one hour is
@@ -905,6 +911,7 @@ mod feedback_target;
 mod github_api_usage_db;
 mod github_merge_intents;
 mod merge_conflict_merging;
+pub use merge_conflict_merging::human_reason as human_conflict_stop_reason;
 mod merge_intent;
 mod operator_answer_outcome;
 mod operator_disposition;

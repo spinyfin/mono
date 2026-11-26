@@ -163,7 +163,13 @@ pub(crate) enum LadderOutcome {
     /// caller must NOT spawn a worker revision (there is no automatic
     /// remediation for a flagged deletion), but callers must not log or
     /// report this as an auto-resolution.
-    HaltedForSignoff,
+    ///
+    /// `had_conflicts` is true when a mechanical rung actually resolved
+    /// residual conflicted files (rung 0) before the tripwire fired. A
+    /// clean rung-1 rebase that never conflicted reports `false` so a
+    /// CI-merge rebase can stay tagged `ci_merge_rebase` instead of being
+    /// reclassified as a succeeded conflict.
+    HaltedForSignoff { had_conflicts: bool },
     /// No mechanical rung produced a resolution (rung 1 unavailable, the
     /// rebase errored, or residual conflicts remain). The caller falls
     /// through to the existing worker-spawn path. Any leased workspace has
@@ -582,7 +588,7 @@ pub(crate) async fn try_mechanical_rungs_with(
     // If that write failed, retain the guard until recovery can persist the
     // rejection. Other outcomes release the marker here; a failed clear is
     // recovered by reconcile_orphaned_conflict_ladder_attempts at engine startup.
-    if outcome != LadderOutcome::HaltedForSignoff
+    if !matches!(outcome, LadderOutcome::HaltedForSignoff { .. })
         && let Err(err) = work_db.clear_conflict_resolution_mechanical_rung(&attempt.id)
     {
         tracing::error!(
@@ -747,7 +753,7 @@ pub(crate) async fn run_rung1_in_lease_with(
                     &deletions,
                 )
                 .await;
-                return LadderOutcome::HaltedForSignoff;
+                return LadderOutcome::HaltedForSignoff { had_conflicts: false };
             }
             // Rung 1 rebased cleanly and pushed the updated branch — the PR is
             // resolved with no agent. Retire the attempt at rung 1.
@@ -1211,7 +1217,7 @@ pub(crate) async fn attempt_rung0_with(
             &deletions,
         )
         .await;
-        return LadderOutcome::HaltedForSignoff;
+        return LadderOutcome::HaltedForSignoff { had_conflicts: true };
     }
 
     retire_attempt_at_rung(
@@ -1248,21 +1254,47 @@ async fn retire_attempt_at_rung(
     rung: i64,
     conflicted_files: &[String],
 ) {
-    log_routing_verdict(
-        &candidate.work_item_id,
-        stored_pr_number(&candidate.pr_url).map(|n| n as u64),
-        conflicted_files,
-        "deterministic",
-        &format!("mechanical rung {rung} resolved every conflicted file; no worker spawned"),
-    );
+    let is_ci_merge_rebase = attempt.event_source == crate::work::CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE;
+    let is_clean_ci_merge_rebase = is_ci_merge_rebase && conflicted_files.is_empty();
+    if is_ci_merge_rebase && !conflicted_files.is_empty() {
+        // Rung 0 resolved real conflicted files during a CI-merge rebase:
+        // promote the row to a real conflict before recording the retired tier
+        // outcome and publishing `ConflictResolutionSucceeded`, so withheld
+        // prior outcomes replay once and the new retired outcome counts once.
+        if let Err(err) = work_db.reclassify_ci_merge_rebase_as_conflict(&attempt.id) {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                attempt_id = %attempt.id,
+                ?err,
+                "conflict_ladder: failed to reclassify rung-0 CI-merge rebase as conflict before retiring",
+            );
+        }
+    }
+    if is_clean_ci_merge_rebase {
+        tracing::info!(
+            work_item_id = %candidate.work_item_id,
+            pr = stored_pr_number(&candidate.pr_url).map(|n| n as u64),
+            attempt_id = %attempt.id,
+            rung,
+            "conflict_ladder: CI-merge rebase completed cleanly at mechanical rung; skipping conflict telemetry and conflict-cleared event",
+        );
+    } else {
+        log_routing_verdict(
+            &candidate.work_item_id,
+            stored_pr_number(&candidate.pr_url).map(|n| n as u64),
+            conflicted_files,
+            "deterministic",
+            &format!("mechanical rung {rung} resolved every conflicted file; no worker spawned"),
+        );
 
-    record_tier(
-        work_db,
-        attempt,
-        if rung == 0 { "deterministic" } else { "engine_rebase" },
-        "retired",
-        "resolution pushed and deletion tripwire passed",
-    );
+        record_tier(
+            work_db,
+            attempt,
+            if rung == 0 { "deterministic" } else { "engine_rebase" },
+            "retired",
+            "resolution pushed and deletion tripwire passed",
+        );
+    }
     clear_lockfile_regeneration_failed_attention(work_db, &candidate.work_item_id);
 
     // The parent was flipped to `blocked: merge_conflict` upfront by
@@ -1319,7 +1351,7 @@ async fn retire_attempt_at_rung(
         ),
     }
 
-    if let Some(attempt) = marked {
+    if !is_clean_ci_merge_rebase && let Some(attempt) = marked {
         publisher
             .publish_frontend_event_on_product(
                 &candidate.product_id,
@@ -1420,17 +1452,29 @@ async fn halt_attempt_for_deletion_signoff(
     conflicted_files: &[String],
     deletions: &[String],
 ) {
-    log_routing_verdict(
-        &candidate.work_item_id,
-        stored_pr_number(&candidate.pr_url).map(|n| n as u64),
-        conflicted_files,
-        "deterministic",
-        &format!(
-            "mechanical rung {rung} resolved every conflicted file but the deletion tripwire halted it pending sign-off"
-        ),
-    );
+    // A clean CI-merge rebase (no conflicted files) is not a conflict-routing
+    // decision; only log the verdict when a conflict was actually resolved.
+    let had_conflicts = !conflicted_files.is_empty();
+    let clean_ci_merge_rebase =
+        attempt.event_source == crate::work::CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE && !had_conflicts;
+    if !clean_ci_merge_rebase {
+        log_routing_verdict(
+            &candidate.work_item_id,
+            stored_pr_number(&candidate.pr_url).map(|n| n as u64),
+            conflicted_files,
+            "deterministic",
+            &format!(
+                "mechanical rung {rung} resolved every conflicted file but the deletion tripwire halted it pending sign-off"
+            ),
+        );
+    }
 
-    if let Err(err) = work_db.halt_conflict_resolution_for_deletion_signoff(&attempt.id, rung, deletions) {
+    if let Err(err) = work_db.halt_conflict_resolution_for_deletion_signoff_with_reclassify(
+        &attempt.id,
+        rung,
+        deletions,
+        had_conflicts,
+    ) {
         tracing::error!(attempt_id = %attempt.id, ?err, "could not persist atomic deletion-signoff halt");
         return;
     }

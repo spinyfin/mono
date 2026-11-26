@@ -983,6 +983,7 @@ extension ChatViewModel {
         switch action {
         case "trunk_enqueued": return "Submitted to Trunk merge queue"
         case "trunk_already_enqueued": return "Already in Trunk merge queue"
+        case "rebasing_onto_base": return "Rebasing onto base before merging"
         default: return "Merge requested"
         }
     }

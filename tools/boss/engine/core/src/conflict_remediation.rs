@@ -347,7 +347,7 @@ impl ConflictRemediationJob for LadderRemediationJob {
                 );
                 RemediationDisposition::Settled
             }
-            LadderOutcome::HaltedForSignoff => {
+            LadderOutcome::HaltedForSignoff { .. } => {
                 tracing::warn!(
                     work_item_id = %candidate.work_item_id,
                     pr_url = %candidate.pr_url,

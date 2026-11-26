@@ -35,12 +35,57 @@ impl WorkDb {
         deletions: &[String],
     ) -> Result<()> {
         let conn = self.connect()?;
+        let is_ci_merge_rebase: bool = conn
+            .query_row(
+                "SELECT event_source = ?2 FROM conflict_resolutions WHERE id = ?1",
+                params![attempt_id, CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
         append_ladder_outcome_in_tx(&conn, attempt_id, tier, outcome, reason, deletions)?;
+        // Outcomes on a CI-merge rebase row are not conflict-ladder decisions
+        // until the row proves it hit a real conflict; those outcomes are
+        // counted by `replay_ladder_outcome_counters` when the row is
+        // reclassified to `review_watch`.
+        if !is_ci_merge_rebase {
+            self.count_ladder_outcome(tier, outcome);
+        }
+        Ok(())
+    }
+}
+
+impl WorkDb {
+    pub(crate) fn count_ladder_outcome(&self, tier: &str, outcome: &str) {
         self.metrics_registry().counter_inc_by_dynamic(
             &format!("conflict_ladder.{tier}.{outcome}"),
             "Conflict ladder tier decisions since engine start.",
             1,
         );
+    }
+
+    /// Count every outcome already recorded on an attempt. Used when a
+    /// `ci_merge_rebase` row is reclassified as a real conflict, since its
+    /// earlier outcomes were withheld from the counters.
+    pub(crate) fn replay_ladder_outcome_counters(&self, attempt_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let recorded: Option<String> = conn
+            .query_row(
+                "SELECT ladder_outcomes FROM conflict_resolutions WHERE id = ?1",
+                [attempt_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(recorded) = recorded else {
+            return Ok(());
+        };
+        let events: Vec<serde_json::Value> = serde_json::from_str(&recorded).unwrap_or_default();
+        for event in events {
+            if let (Some(tier), Some(outcome)) = (event["tier"].as_str(), event["outcome"].as_str()) {
+                self.count_ladder_outcome(tier, outcome);
+            }
+        }
         Ok(())
     }
 }
@@ -113,5 +158,68 @@ mod tests {
             )
             .unwrap();
         assert_eq!(saved, ("[]".into(), None));
+    }
+
+    #[test]
+    fn ci_merge_rebase_counters_are_withheld_until_reclassified_as_conflict() {
+        use crate::test_support::{create_test_chore_manual, create_test_product};
+
+        let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
+        let product = create_test_product(&db);
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Telemetry");
+        db.update_work_item(
+            &chore.id,
+            crate::WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some("https://github.com/example/repo/pull/9".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let attempt = db
+            .insert_conflict_resolution_with_source(
+                crate::ConflictResolutionInsertInput {
+                    product_id: product.id,
+                    work_item_id: chore.id,
+                    pr_url: "https://github.com/example/repo/pull/9".into(),
+                    pr_number: 9,
+                    head_branch: "boss/feature".into(),
+                    base_branch: "main".into(),
+                    base_sha_at_trigger: Some("base".into()),
+                    head_sha_before: Some("head".into()),
+                },
+                CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE,
+            )
+            .unwrap()
+            .expect("inserted");
+
+        for outcome in ["residual_conflicts", "fell_through", "unavailable", "skip", "retired"] {
+            db.record_conflict_ladder_outcome(&attempt.id, "engine_rebase", outcome, "reason")
+                .unwrap();
+        }
+        db.halt_conflict_resolution_for_deletion_signoff(&attempt.id, 1, &["gone.rs".into()])
+            .unwrap();
+
+        let ladder_counters = |db: &WorkDb| -> Vec<String> {
+            db.metrics_registry()
+                .counter_snapshots()
+                .into_iter()
+                .filter(|m| m.name.starts_with("conflict_ladder.") && m.value >= 1)
+                .map(|m| m.name)
+                .collect()
+        };
+        assert!(
+            ladder_counters(&db).is_empty(),
+            "a clean ci_merge_rebase row must not touch conflict-ladder counters, got {:?}",
+            ladder_counters(&db)
+        );
+
+        // Once the rebase proves to be a real conflict, the withheld outcomes count.
+        assert!(db.reclassify_ci_merge_rebase_as_conflict(&attempt.id).unwrap());
+        let counted = ladder_counters(&db);
+        for outcome in ["residual_conflicts", "fell_through", "halted_for_signoff"] {
+            let name = format!("conflict_ladder.engine_rebase.{outcome}");
+            assert!(counted.contains(&name), "{name} missing after reclassify: {counted:?}");
+        }
     }
 }

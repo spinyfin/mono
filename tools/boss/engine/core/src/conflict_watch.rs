@@ -185,6 +185,10 @@ pub enum CiMergeRebaseOutcome {
     /// Operational failure before or without hitting a conflict (repo
     /// resolution, `goto`, rebase command error, or unpushed clean rebase).
     Failed(String),
+    /// Another rebase or conflict resolution already owns this PR (a
+    /// concurrent Merge click). Nothing was started and the card is left
+    /// as the other attempt set it; the string is a complete message.
+    Busy(String),
 }
 
 /// Insert a fresh `conflict_resolutions` attempt row for a Merge-click CI
@@ -205,10 +209,28 @@ fn insert_ci_merge_rebase_attempt(
         base_sha_at_trigger: probe.base_ref_oid.clone(),
         head_sha_before: probe.head_ref_oid.clone(),
     };
-    let attempt = match work_db.insert_conflict_resolution(make_input()) {
+    let insert = || {
+        work_db.insert_conflict_resolution_with_source(make_input(), crate::work::CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE)
+    };
+    let attempt = match insert() {
         Ok(Some(row)) => row,
         Ok(None) => {
-            if let Ok(Some(prev)) = work_db.latest_actionable_conflict_resolution(&candidate.work_item_id) {
+            for prev in [
+                work_db
+                    .latest_conflict_resolution_for_source(
+                        &candidate.work_item_id,
+                        crate::work::CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE,
+                    )
+                    .ok()
+                    .flatten(),
+                work_db
+                    .latest_actionable_conflict_resolution(&candidate.work_item_id)
+                    .ok()
+                    .flatten(),
+            ]
+            .into_iter()
+            .flatten()
+            {
                 match prev.status.as_str() {
                     "succeeded" => {
                         let _ =
@@ -220,7 +242,7 @@ fn insert_ci_merge_rebase_attempt(
                     _ => {}
                 }
             }
-            match work_db.insert_conflict_resolution(make_input()) {
+            match insert() {
                 Ok(Some(row)) => row,
                 Ok(None) => {
                     return Err("a conflict or rebase attempt already exists for this PR head".to_owned());
@@ -234,6 +256,34 @@ fn insert_ci_merge_rebase_attempt(
         return Err("rebase stopped by repeated-attempt churn guard".to_owned());
     }
     Ok(attempt)
+}
+
+/// Refuse a second Merge-click rebase when this PR already has a live
+/// conflict revision or a non-terminal `conflict_resolutions` row.
+///
+/// A `ci_merge_rebase` row is the first click's own in-flight rebase, not a
+/// merge conflict, so the message says a rebase is already in progress
+/// rather than that conflict resolution is already active.
+pub fn ci_merge_rebase_busy_reason(
+    work_db: &WorkDb,
+    work_item_id: &str,
+    pr_url: &str,
+    base_branch: &str,
+) -> Option<String> {
+    if work_db.has_live_conflict_revision_for_pr(pr_url).unwrap_or(false) {
+        return Some(format!(
+            "rebase onto {base_branch} failed: a conflict resolution is already active for this PR"
+        ));
+    }
+    match work_db.active_conflict_resolution_for_work_item(work_item_id) {
+        Ok(Some(active)) if active.event_source == crate::work::CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE => Some(format!(
+            "a rebase onto {base_branch} is already in progress for this PR"
+        )),
+        Ok(Some(_)) => Some(format!(
+            "rebase onto {base_branch} failed: a conflict resolution is already active for this PR"
+        )),
+        _ => None,
+    }
 }
 
 /// Run the existing mechanical rebase rung ([`conflict_ladder::try_mechanical_rungs`])
@@ -253,18 +303,19 @@ pub async fn rebase_for_ci_failure_merge(
     probe: &PrLifecycleProbe,
     blocked_reason: &str,
 ) -> CiMergeRebaseOutcome {
-    if work_db
-        .has_live_conflict_revision_for_pr(&candidate.pr_url)
-        .unwrap_or(false)
-        || work_db
-            .active_conflict_resolution_for_work_item(&candidate.work_item_id)
-            .ok()
-            .flatten()
-            .is_some()
-    {
-        return CiMergeRebaseOutcome::Failed("a conflict resolution is already active for this PR".to_owned());
+    if let Some(reason) = ci_merge_rebase_busy_reason(
+        work_db,
+        &candidate.work_item_id,
+        &candidate.pr_url,
+        probe
+            .base_ref_name
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("main"),
+    ) {
+        return CiMergeRebaseOutcome::Busy(reason);
     }
-    let attempt = match insert_ci_merge_rebase_attempt(work_db, candidate, probe) {
+    let mut attempt = match insert_ci_merge_rebase_attempt(work_db, candidate, probe) {
         Ok(attempt) => attempt,
         Err(reason) => return CiMergeRebaseOutcome::Failed(reason),
     };
@@ -275,8 +326,11 @@ pub async fn rebase_for_ci_failure_merge(
             ..
         } => {
             // The rebase itself conflicted and rung 0 could not resolve every
-            // file: take over the CI-failure block and hand off to the
-            // existing conflict ladder (rung 2/3).
+            // file: promote the row to a real conflict resolution, take over
+            // the CI-failure block, and hand off to the existing conflict
+            // ladder (rung 2/3).
+            let _ = work_db.reclassify_ci_merge_rebase_as_conflict(&attempt.id);
+            attempt.event_source = "review_watch".to_owned();
             take_over_foreign_ci_block(work_db, publisher, candidate, blocked_reason).await;
             if let Err(err) = work_db.record_blocked_conflict_attempt(&candidate.work_item_id, &attempt.id) {
                 tracing::warn!(
@@ -312,20 +366,18 @@ pub async fn rebase_for_ci_failure_merge(
             let _ = work_db.abandon_conflict_resolution_for_supersede(&attempt.id, "ci_merge_rebase_failed");
             CiMergeRebaseOutcome::Failed(reason.to_owned())
         }
-        conflict_ladder::LadderOutcome::HaltedForSignoff => {
-            if take_over_foreign_ci_block(work_db, publisher, candidate, blocked_reason).await {
-                let _ = work_db.mark_chore_blocked_deletion_signoff(&candidate.work_item_id, &candidate.pr_url);
-                publisher
-                    .publish_work_item_changed(
-                        &candidate.product_id,
-                        &candidate.work_item_id,
-                        "pr_review_deletion_signoff",
-                    )
-                    .await;
-            }
+        conflict_ladder::LadderOutcome::HaltedForSignoff { .. } => {
+            // The halt, optional conflict reclassification (when rung 0
+            // resolved residual conflicts), `ci_failure` -> `deletion_signoff`
+            // transition, CI-failure signal clear, and sign-off attention
+            // filing already committed in one transaction inside
+            // `halt_attempt_for_deletion_signoff`. Only the async cancellation
+            // of any live CI-remediation worker remains.
+            supersede_stale_ci_remediation(work_db, publisher, candidate).await;
             CiMergeRebaseOutcome::HaltedForSignoff
         }
         conflict_ladder::LadderOutcome::LockfileRegenerationFailed => {
+            let _ = work_db.reclassify_ci_merge_rebase_as_conflict(&attempt.id);
             take_over_foreign_ci_block(work_db, publisher, candidate, blocked_reason).await;
             let _ = work_db.record_blocked_conflict_attempt(&candidate.work_item_id, &attempt.id);
             CiMergeRebaseOutcome::LockfileRegenerationFailed
@@ -1248,7 +1300,7 @@ pub async fn on_conflict_detected_with(
                         );
                         return true;
                     }
-                    conflict_ladder::LadderOutcome::HaltedForSignoff => {
+                    conflict_ladder::LadderOutcome::HaltedForSignoff { .. } => {
                         // A mechanical rung pushed a resolution the
                         // deletion tripwire rejected. The task is already
                         // `blocked: deletion_signoff` pending operator

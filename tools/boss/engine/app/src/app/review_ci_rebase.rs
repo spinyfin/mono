@@ -16,6 +16,74 @@ use super::review::{
 };
 use super::*;
 
+/// Publish in-progress rebase text on a CI-blocked card. Progress is not a
+/// failure: if CI polling already moved the card off `ci_failure`, the update
+/// is dropped and no attention item is filed.
+pub(super) async fn publish_ci_rebase_progress(
+    work_db: &WorkDb,
+    publisher: &dyn boss_execution_contracts::ExecutionPublisher,
+    product_id: &str,
+    work_item_id: &str,
+    pr_url: &str,
+    detail: &str,
+    publish_reason: &str,
+) {
+    if work_db
+        .set_ci_failure_blocked_detail(work_item_id, pr_url, detail)
+        .unwrap_or(false)
+    {
+        publisher
+            .publish_work_item_changed(product_id, work_item_id, publish_reason)
+            .await;
+    }
+}
+
+/// Surface a CI-merge rebase failure on the card, or, when the card has left
+/// `ci_failure`, as a PR-bound attention item.
+pub(super) async fn surface_ci_rebase_card_detail(
+    work_db: &WorkDb,
+    publisher: &dyn boss_execution_contracts::ExecutionPublisher,
+    product_id: &str,
+    work_item_id: &str,
+    pr_url: &str,
+    detail: &str,
+    publish_reason: &str,
+) {
+    if work_db
+        .set_ci_failure_blocked_detail(work_item_id, pr_url, detail)
+        .unwrap_or(false)
+    {
+        publisher
+            .publish_work_item_changed(product_id, work_item_id, publish_reason)
+            .await;
+        return;
+    }
+    // After the rebase push, CI polling can move the card to `in_review`
+    // while `gh pr merge` / Trunk submit is still pending. The CI-blocked
+    // detail update then no-ops; file a PR-bound attention item so the
+    // failure stays visible.
+    if let Err(err) = work_db.create_attention_item(boss_work_db::CreateAttentionItemInput {
+        work_item_id: Some(work_item_id.to_owned()),
+        kind: boss_engine_storage_values::attention_kinds::CI_MERGE_REBASE_FAILED_ATTENTION_KIND.to_owned(),
+        title: "Merge after rebase could not be completed".to_owned(),
+        body_markdown: detail.to_owned(),
+        execution_id: None,
+        status: None,
+        resolved_at: None,
+    }) {
+        tracing::warn!(
+            %work_item_id,
+            %pr_url,
+            ?err,
+            "merge_when_ready: failed to file CI-merge rebase attention after card left ci_failure",
+        );
+        return;
+    }
+    publisher
+        .publish_work_item_changed(product_id, work_item_id, publish_reason)
+        .await;
+}
+
 const REBASED_HEAD_ATTEMPTS: usize = 20;
 #[cfg(not(test))]
 const REBASED_HEAD_DELAY: Duration = Duration::from_millis(250);
@@ -199,6 +267,15 @@ pub(super) async fn handle_ci_failure_merge_rebase(ctx: CiFailureMergeRebaseCont
             .filter(|s| !s.is_empty())
             .unwrap_or("main")
             .to_owned();
+        if let Some(reason) = boss_engine_runtime::conflict_watch::ci_merge_rebase_busy_reason(
+            &work_db,
+            &work_item_id,
+            &pr_url,
+            &base_branch,
+        ) {
+            refuse_merge_when_ready(&sink, &request_id, &work_item_id, format!("merge_when_ready: {reason}"));
+            return;
+        }
         let candidate = boss_work_db::PendingMergeCheck {
             work_item_id: work_item_id.clone(),
             product_id: product_id.clone(),
@@ -211,6 +288,32 @@ pub(super) async fn handle_ci_failure_merge_rebase(ctx: CiFailureMergeRebaseCont
             %blocked_reason,
             %base_branch,
             "merge_when_ready: CI-blocked PR is behind base; running mechanical rebase rung",
+        );
+
+        // Publish card-visible progress and reply early before the slow
+        // lease + rebase + push + head-wait + arm sequence so the app's 60s
+        // merge-request timer never expires on a healthy rebase. Later
+        // outcomes are surfaced through card state (blocked_detail / Merging
+        // transition / conflict handoff).
+        let progress_detail = format!("Rebasing onto {base_branch} before merging...");
+        publish_ci_rebase_progress(
+            &work_db,
+            publisher.as_ref(),
+            &product_id,
+            &work_item_id,
+            &pr_url,
+            &progress_detail,
+            "ci_merge_rebase_started",
+        )
+        .await;
+        send_response(
+            &sink,
+            &request_id,
+            FrontendEvent::MergeWhenReadyAccepted {
+                work_item_id: work_item_id.clone(),
+                pr_url: pr_url.clone(),
+                action: merge_when_ready::MergeAction::RebasingOntoBase.as_str().to_owned(),
+            },
         );
 
         let outcome = boss_engine_runtime::conflict_watch::rebase_for_ci_failure_merge(
@@ -259,7 +362,16 @@ pub(super) async fn handle_ci_failure_merge_rebase(ctx: CiFailureMergeRebaseCont
                     match wait_for_rebased_head(merge_probe.as_ref(), &pr_url, probe.head_ref_oid.as_deref()).await {
                         Ok(sha) => sha,
                         Err(message) => {
-                            refuse_merge_when_ready(&sink, &request_id, &work_item_id, message);
+                            surface_ci_rebase_card_detail(
+                                &work_db,
+                                publisher.as_ref(),
+                                &product_id,
+                                &work_item_id,
+                                &pr_url,
+                                &message,
+                                "ci_merge_rebase_head_wait_failed",
+                            )
+                            .await;
                             return;
                         }
                     };
@@ -282,6 +394,7 @@ pub(super) async fn handle_ci_failure_merge_rebase(ctx: CiFailureMergeRebaseCont
                         .mechanism(mechanism)
                         .confirmed_revisions(confirmed_revisions)
                         .publisher(publisher)
+                        .reply_already_sent(true)
                         .build(),
                     after_rebase,
                 )
@@ -313,83 +426,131 @@ pub(super) async fn handle_ci_failure_merge_rebase(ctx: CiFailureMergeRebaseCont
                         if let Err(message) =
                             ensure_trunk_intent_superseded_by_conflict(&work_db, &work_item_id, &pr_url, target_branch)
                         {
-                            refuse_merge_when_ready(
-                                &sink,
-                                &request_id,
-                                &work_item_id,
-                                format!(
-                                    "{message}; click Merge again after the conflict is resolved to submit to the Trunk queue"
-                                ),
+                            let full = format!(
+                                "{message}; click Merge again after the conflict is resolved to submit to the Trunk queue"
                             );
+                            tracing::warn!(%work_item_id, %pr_url, error = %full, "merge_when_ready: failed to record trunk conflict continuation");
+                            let _ = work_db.create_attention_item(boss_work_db::CreateAttentionItemInput {
+                                work_item_id: Some(work_item_id.clone()),
+                                kind:
+                                    boss_engine_storage_values::attention_kinds::CI_MERGE_REBASE_FAILED_ATTENTION_KIND
+                                        .to_owned(),
+                                title: "Merge queue continuation could not be recorded".to_owned(),
+                                body_markdown: full,
+                                execution_id: None,
+                                status: None,
+                                resolved_at: None,
+                            });
                             return;
                         }
                     }
                 }
                 remember_merge_request(&work_db, &work_item_id, &pr_url, None);
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::MergeWhenReadyAccepted {
-                        work_item_id: work_item_id.clone(),
-                        pr_url: pr_url.clone(),
-                        action: merge_when_ready::MergeAction::Requested.as_str().to_owned(),
-                    },
-                );
                 publisher
                     .publish_work_item_changed(&product_id, &work_item_id, "merge_conflict_resolution_requested")
                     .await;
                 server_state.event_bus.publish(Event::PrReconcileRequested { pr_url });
             }
             boss_engine_runtime::conflict_watch::CiMergeRebaseOutcome::HaltedForSignoff => {
-                refuse_merge_when_ready(
-                    &sink,
-                    &request_id,
-                    &work_item_id,
-                    "merge_when_ready: rebase halted for deletion sign-off; review the flagged deletions before merging"
-                        .to_owned(),
+                // Card already moved to `blocked: deletion_signoff` by
+                // `rebase_for_ci_failure_merge`, with an outcome-specific
+                // `blocked_detail` (flagged deletions + sign-off instruction).
+                tracing::info!(
+                    %work_item_id,
+                    %pr_url,
+                    "merge_when_ready: CI-merge rebase halted for deletion sign-off",
                 );
             }
             boss_engine_runtime::conflict_watch::CiMergeRebaseOutcome::LockfileRegenerationFailed => {
-                refuse_merge_when_ready(
-                    &sink,
-                    &request_id,
-                    &work_item_id,
-                    "merge_when_ready: rebase hit a lockfile conflict whose regeneration failed; resolve it before merging"
-                        .to_owned(),
+                // Card already moved to `blocked: merge_conflict` by
+                // `rebase_for_ci_failure_merge`. Stamp the regeneration
+                // failure onto `blocked_detail` so the card does not keep
+                // the in-progress rebase text.
+                tracing::info!(
+                    %work_item_id,
+                    %pr_url,
+                    "merge_when_ready: CI-merge rebase hit a lockfile conflict whose regeneration failed",
                 );
+                let detail = work_db
+                    .list_conflict_resolutions(None, &[], Some(&work_item_id), None)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .find_map(|row| {
+                        row.failure_reason
+                            .filter(|reason| reason.contains("lockfile_regeneration_failed"))
+                    })
+                    .map(|reason| {
+                        // Human wording first, then the specific path and
+                        // reason the machine code carried.
+                        let human = boss_work_db::human_conflict_stop_reason(&reason);
+                        match reason.split_once(':').map(|(_, rest)| rest.trim()) {
+                            Some(specifics) if !specifics.is_empty() => format!("{human}: {specifics}"),
+                            _ => human,
+                        }
+                    })
+                    .unwrap_or_else(|| "couldn't regenerate the lockfile".to_owned());
+                if work_db
+                    .set_blocked_detail(&work_item_id, &pr_url, &detail)
+                    .unwrap_or(false)
+                {
+                    publisher
+                        .publish_work_item_changed(&product_id, &work_item_id, "ci_merge_rebase_lockfile_failed")
+                        .await;
+                }
             }
             boss_engine_runtime::conflict_watch::CiMergeRebaseOutcome::DeferredForLiveWriter => {
-                refuse_merge_when_ready(
-                    &sink,
-                    &request_id,
+                surface_ci_rebase_card_detail(
+                    &work_db,
+                    publisher.as_ref(),
+                    &product_id,
                     &work_item_id,
-                    "merge_when_ready: a worker is currently active on this PR's branch; wait for it to finish before rebasing to merge"
-                        .to_owned(),
-                );
+                    &pr_url,
+                    "merge_when_ready: a worker is currently active on this PR's branch; wait for it to finish before rebasing to merge",
+                    "ci_merge_rebase_failed",
+                )
+                .await;
             }
             boss_engine_runtime::conflict_watch::CiMergeRebaseOutcome::MechanicalRungsUnavailable => {
-                refuse_merge_when_ready(
-                    &sink,
-                    &request_id,
+                surface_ci_rebase_card_detail(
+                    &work_db,
+                    publisher.as_ref(),
+                    &product_id,
                     &work_item_id,
-                    "merge_when_ready: could not lease a workspace to rebase the PR; try again".to_owned(),
-                );
+                    &pr_url,
+                    "merge_when_ready: could not lease a workspace to rebase the PR; try again",
+                    "ci_merge_rebase_failed",
+                )
+                .await;
             }
             boss_engine_runtime::conflict_watch::CiMergeRebaseOutcome::WorkspacePreparationFailed => {
-                refuse_merge_when_ready(
-                    &sink,
-                    &request_id,
+                surface_ci_rebase_card_detail(
+                    &work_db,
+                    publisher.as_ref(),
+                    &product_id,
                     &work_item_id,
-                    "merge_when_ready: workspace preparation failed while rebasing the PR".to_owned(),
-                );
+                    &pr_url,
+                    "merge_when_ready: workspace preparation failed while rebasing the PR",
+                    "ci_merge_rebase_failed",
+                )
+                .await;
+            }
+            boss_engine_runtime::conflict_watch::CiMergeRebaseOutcome::Busy(reason) => {
+                // A concurrent click lost the race: the winner owns the
+                // card's detail, so leave it untouched.
+                tracing::info!(%work_item_id, %pr_url, %reason, "merge_when_ready: CI-merge rebase skipped; another attempt is active");
             }
             boss_engine_runtime::conflict_watch::CiMergeRebaseOutcome::Failed(reason) => {
-                refuse_merge_when_ready(
-                    &sink,
-                    &request_id,
+                surface_ci_rebase_card_detail(
+                    &work_db,
+                    publisher.as_ref(),
+                    &product_id,
                     &work_item_id,
-                    format!("merge_when_ready: rebase onto {base_branch} failed: {reason}"),
-                );
+                    &pr_url,
+                    &format!("merge_when_ready: rebase onto {base_branch} failed: {reason}"),
+                    "ci_merge_rebase_failed",
+                )
+                .await;
             }
         }
     });
@@ -451,6 +612,8 @@ struct ArmAfterCiRebaseArgs {
     mechanism: boss_engine_runtime::merge_mechanism::MergeMechanism,
     confirmed_revisions: Vec<boss_protocol::OpenMergeRevision>,
     publisher: Arc<dyn boss_execution_contracts::ExecutionPublisher>,
+    #[builder(default)]
+    reply_already_sent: bool,
 }
 
 async fn arm_after_ci_rebase(args: ArmAfterCiRebaseArgs, after_rebase: AfterRebaseRecord) {
@@ -467,6 +630,7 @@ async fn arm_after_ci_rebase(args: ArmAfterCiRebaseArgs, after_rebase: AfterReba
         mechanism,
         confirmed_revisions,
         publisher,
+        reply_already_sent,
     } = args;
     match mechanism {
         boss_engine_runtime::merge_mechanism::MergeMechanism::Direct => {
@@ -489,6 +653,7 @@ async fn arm_after_ci_rebase(args: ArmAfterCiRebaseArgs, after_rebase: AfterReba
                     .release_deferred_conflict_on_refusal(false)
                     .kick_reconciler_on_error(true)
                     .after_rebase(after_rebase)
+                    .reply_already_sent(reply_already_sent)
                     .build(),
             )
             .await;
@@ -508,6 +673,7 @@ async fn arm_after_ci_rebase(args: ArmAfterCiRebaseArgs, after_rebase: AfterReba
                     .kick_pr_reconciler(true)
                     .publish_reason("ci_merge_rebase_trunk_submitted")
                     .after_rebase(after_rebase)
+                    .reply_already_sent(reply_already_sent)
                     .build(),
             )
             .await;

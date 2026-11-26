@@ -332,8 +332,10 @@ enum EngineEvent {
     /// initiated the merge process for the PR. `action` is
     /// `"merge_requested"` (GitHub accepted the request while its derived
     /// state converges), `"trunk_enqueued"` (submitted to a `trunk_queue`-mechanism
-    /// product's Trunk merge queue), or `"trunk_already_enqueued"` (already
-    /// live in that queue; this click did not re-submit). The PR-reconciler
+    /// product's Trunk merge queue), `"trunk_already_enqueued"` (already
+    /// live in that queue; this click did not re-submit), or
+    /// `"rebasing_onto_base"` (CI-blocked branch is behind base and the engine
+    /// is rebasing before arming). The PR-reconciler
     /// is kicked on the engine side so the kanban state refreshes promptly.
     case mergeWhenReadyAccepted(workItemID: String, prURL: String, action: String)
     /// GitHub OAuth auth-state push (OAuth device-flow design §4).

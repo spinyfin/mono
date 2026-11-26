@@ -281,11 +281,17 @@ impl WorkDb {
     }
 
     /// Mark all open attention items of `kind` for `work_item_id` as resolved.
+    /// A no-op when none are open.
+    pub fn resolve_work_item_attention_kind(&self, work_item_id: &str, kind: &str) -> Result<usize> {
+        let conn = self.connect()?;
+        resolve_attention_kind_in_tx(&conn, work_item_id, kind)
+    }
+
+    /// Mark all open attention items of `kind` for `work_item_id` as resolved.
     /// A no-op when none are open. Used by the external-tracker reconciler to
     /// clear stale failure items once a product recovers.
     pub fn resolve_external_tracker_attention(&self, work_item_id: &str, kind: &str) -> Result<()> {
-        let conn = self.connect()?;
-        resolve_attention_kind_in_tx(&conn, work_item_id, kind)?;
+        self.resolve_work_item_attention_kind(work_item_id, kind)?;
         Ok(())
     }
 

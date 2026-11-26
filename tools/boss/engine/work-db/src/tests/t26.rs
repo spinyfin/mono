@@ -741,6 +741,16 @@ fn mark_chore_blocked_deletion_signoff_flips_a_merge_conflict_chore() {
         Some("deletion_signoff"),
         "the halt reason is the deletion signoff"
     );
+    assert!(
+        updated
+            .blocked_detail
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .contains("sign-off"),
+        "deletion_signoff must replace leftover rebase progress with a sign-off explanation, got {:?}",
+        updated.blocked_detail
+    );
     assert_eq!(updated.pr_url.as_deref(), Some(pr_url), "the PR url is stamped");
     assert_eq!(
         updated.blocked_attempt_id, None,
