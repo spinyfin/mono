@@ -7,16 +7,21 @@
 //! JSON-RPC) is handed to the caller as an [`Incoming`] value in arrival
 //! order.
 //!
-//! Two properties are deliberate, because a client that outlives one process
+//! Three properties are deliberate, because a client that outlives one process
 //! needs them:
 //!
 //! - The id of a request is known before the request is on the wire
 //!   ([`PendingResponse::id`]), so the caller can record which id carried
 //!   what before the response can possibly arrive.
-//! - [`Connection::expect_response`] registers an id whose request an
-//!   earlier connection published on the same stream. The response is then
-//!   delivered here instead of being discarded as unknown, and nothing is
-//!   sent a second time.
+//! - [`PreparedConnection::expect_response`] registers an id whose request an
+//!   earlier connection published on the same stream. The registration
+//!   happens before anything is read, so a response that is already buffered
+//!   in the stream is delivered here instead of being discarded as unknown,
+//!   and nothing is sent a second time. An id is never registered twice.
+//! - The arrival of a response is also an event on the incoming stream
+//!   ([`Incoming::ResponseArrived`]), in the order the lines were read. A
+//!   caller that reports completions next to notifications takes them from
+//!   that one ordered stream, not from the task that awaits the response.
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -73,9 +78,18 @@ pub enum Incoming {
         params: Value,
         seq: u64,
     },
+    /// The response to a request this connection is waiting for. Its result
+    /// has already been handed to the matching [`PendingResponse`], so awaiting
+    /// [`PendingResponse::response`] on receipt of this event completes at
+    /// once. Only the arrival is reported here, in line order with everything
+    /// else; the result itself travels through the [`PendingResponse`].
+    ResponseArrived {
+        id: RequestId,
+        seq: u64,
+    },
     /// A response whose id nobody is waiting for: a request sent by an
     /// earlier connection that was not registered with
-    /// [`Connection::expect_response`], a duplicate, or an agent error.
+    /// [`PreparedConnection::expect_response`], a duplicate, or an agent error.
     UnmatchedResponse {
         id: RequestId,
         result: Result<Value, RpcError>,
@@ -87,7 +101,9 @@ pub enum Incoming {
         reason: String,
         seq: u64,
     },
-    /// Nothing more will arrive. Every pending request has been failed.
+    /// Nothing more will arrive. Every request still pending has been failed
+    /// before this is sent, so awaiting its [`PendingResponse`] completes at
+    /// once with [`RequestError::ClosedBeforeResponse`].
     Closed(CloseReason),
 }
 
@@ -98,6 +114,8 @@ pub enum ConnectionError {
     Closed(CloseReason),
     #[error("encoding `{method}`: {reason}")]
     Encode { method: String, reason: String },
+    #[error("a request with id {0} is already waiting for its response")]
+    DuplicateRequestId(RequestId),
     #[error("journalling an outgoing line: {0}")]
     Journal(std::io::Error),
     #[error("writing to the agent: {0}")]
@@ -210,7 +228,8 @@ pub struct ConnectionOptions {
     /// The id of the first request this connection sends. A connection that
     /// attaches to a stream an earlier connection used must start above every
     /// id that connection sent, or a late response would be taken for the
-    /// answer to a new request.
+    /// answer to a new request. An id that is still waiting for its response
+    /// is skipped regardless.
     pub first_request_id: i64,
 }
 
@@ -226,12 +245,52 @@ pub struct Connection {
     shared: Arc<Shared>,
 }
 
+/// A connection that has not started reading.
+///
+/// A client that attaches to a stream an earlier connection used must tell the
+/// connection which requests that earlier connection left unanswered before
+/// the first byte is read: a response that is already buffered in the stream
+/// is otherwise read and reported as [`Incoming::UnmatchedResponse`] before
+/// the caller could register it, and the waiter registered afterwards never
+/// resolves. Registering here, then [`start`](Self::start)ing, closes that gap.
+pub struct PreparedConnection<R> {
+    reader: R,
+    shared: Arc<Shared>,
+}
+
+impl<R> PreparedConnection<R>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+{
+    /// Waits for the response to a request that an earlier connection sent on
+    /// this stream. Sends nothing.
+    ///
+    /// Fails with [`ConnectionError::DuplicateRequestId`] if `id` is already
+    /// registered: two waiters cannot share one response.
+    pub fn expect_response<T: JsonRpcResponse>(
+        &self,
+        id: RequestId,
+        method: &str,
+    ) -> Result<PendingResponse<T>, ConnectionError> {
+        Shared::register(&self.shared, id, method)
+    }
+
+    /// Starts reading on a new task and returns the handle plus the stream of
+    /// everything that is not the result of a pending request.
+    pub fn start(self) -> (Connection, mpsc::UnboundedReceiver<Incoming>) {
+        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        tokio::spawn(read_loop(self.reader, self.shared.clone(), incoming_tx));
+        (Connection { shared: self.shared }, incoming_rx)
+    }
+}
+
 impl Connection {
     /// Starts reading `reader` on a new task and returns the handle plus the
-    /// stream of everything that is not a response to a pending request.
+    /// stream of everything that is not the result of a pending request.
     ///
     /// Nothing is sent: the caller decides whether this stream needs an
-    /// `initialize` or already had one.
+    /// `initialize` or already had one. A caller that has requests to
+    /// recover uses [`Connection::prepare`] instead.
     pub fn open<R, W>(
         reader: R,
         writer: W,
@@ -242,15 +301,28 @@ impl Connection {
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
+        Self::prepare(reader, writer, journal, options).start()
+    }
+
+    /// Builds a connection without reading from `reader` yet, so that the
+    /// requests an earlier connection left unanswered can be registered first.
+    pub fn prepare<R, W>(
+        reader: R,
+        writer: W,
+        journal: Option<Arc<Journal>>,
+        options: ConnectionOptions,
+    ) -> PreparedConnection<R>
+    where
+        R: AsyncRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
         let shared = Arc::new(Shared {
             writer: tokio::sync::Mutex::new(Some(Box::new(writer))),
             table: Mutex::new(Table::default()),
             journal,
             next_id: AtomicI64::new(options.first_request_id),
         });
-        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
-        tokio::spawn(read_loop(reader, shared.clone(), incoming_tx));
-        (Self { shared }, incoming_rx)
+        PreparedConnection { reader, shared }
     }
 
     /// Sends a request. The returned handle already knows the request's id.
@@ -259,10 +331,17 @@ impl Connection {
         request: &Req,
     ) -> Result<PendingResponse<Req::Response>, ConnectionError> {
         let (method, params) = untyped(request)?;
-        let id = RequestId::Number(self.shared.next_id.fetch_add(1, Ordering::Relaxed));
         // Registered before the line is written: the response can arrive
-        // before the write call returns.
-        let pending = self.register(id.clone(), &method)?;
+        // before the write call returns. An id that is already waiting for a
+        // response is never reused: replacing its entry would fail that waiter.
+        let pending = loop {
+            let id = RequestId::Number(self.shared.next_id.fetch_add(1, Ordering::Relaxed));
+            match Shared::register(&self.shared, id, &method) {
+                Err(ConnectionError::DuplicateRequestId(_)) => continue,
+                registered => break registered?,
+            }
+        };
+        let id = pending.id().clone();
         let line = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
         if let Err(error) = self.shared.write_line(&line).await {
             self.shared.table().pending.remove(&id);
@@ -274,16 +353,6 @@ impl Connection {
     /// Sends a request and waits for its decoded response.
     pub async fn call<Req: JsonRpcRequest>(&self, request: &Req) -> Result<Req::Response, RequestError> {
         self.send_request(request).await?.response().await
-    }
-
-    /// Waits for the response to a request that an earlier connection sent on
-    /// this stream. Sends nothing.
-    pub fn expect_response<T: JsonRpcResponse>(
-        &self,
-        id: RequestId,
-        method: &str,
-    ) -> Result<PendingResponse<T>, ConnectionError> {
-        self.register(id, method)
     }
 
     pub async fn send_notification<N: JsonRpcNotification>(&self, notification: &N) -> Result<(), ConnectionError> {
@@ -335,22 +404,6 @@ impl Connection {
         };
         writer.shutdown().await
     }
-
-    fn register<T: JsonRpcResponse>(&self, id: RequestId, method: &str) -> Result<PendingResponse<T>, ConnectionError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let mut table = self.shared.table();
-        if let Some(reason) = &table.closed {
-            return Err(ConnectionError::Closed(reason.clone()));
-        }
-        table.pending.insert(id.clone(), PendingEntry { reply: reply_tx });
-        Ok(PendingResponse {
-            id,
-            method: method.to_owned(),
-            reply: reply_rx,
-            shared_closed: self.shared.clone(),
-            response: PhantomData,
-        })
-    }
 }
 
 fn untyped<M: crate::JsonRpcMessage>(message: &M) -> Result<(String, Value), ConnectionError> {
@@ -364,6 +417,30 @@ fn untyped<M: crate::JsonRpcMessage>(message: &M) -> Result<(String, Value), Con
 }
 
 impl Shared {
+    /// Registers `id` as waiting for a response.
+    fn register<T: JsonRpcResponse>(
+        shared: &Arc<Self>,
+        id: RequestId,
+        method: &str,
+    ) -> Result<PendingResponse<T>, ConnectionError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let mut table = shared.table();
+        if let Some(reason) = &table.closed {
+            return Err(ConnectionError::Closed(reason.clone()));
+        }
+        match table.pending.entry(id.clone()) {
+            std::collections::hash_map::Entry::Occupied(_) => return Err(ConnectionError::DuplicateRequestId(id)),
+            std::collections::hash_map::Entry::Vacant(slot) => slot.insert(PendingEntry { reply: reply_tx }),
+        };
+        Ok(PendingResponse {
+            id,
+            method: method.to_owned(),
+            reply: reply_rx,
+            shared_closed: shared.clone(),
+            response: PhantomData,
+        })
+    }
+
     fn table(&self) -> std::sync::MutexGuard<'_, Table> {
         self.table.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -460,10 +537,12 @@ fn handle_frame(shared: &Shared, incoming: &mpsc::UnboundedSender<Incoming>, fra
                     let entry = shared.table().pending.remove(&id);
                     match entry {
                         // The waiter may have gone away; the response is
-                        // still consumed, exactly once.
+                        // still consumed, exactly once. The result is handed
+                        // over before the arrival is reported, so a caller
+                        // that awaits on seeing the event never waits.
                         Some(entry) => {
                             let _ = entry.reply.send(result);
-                            return Ok(());
+                            Incoming::ResponseArrived { id, seq }
                         }
                         None => Incoming::UnmatchedResponse { id, result, seq },
                     }

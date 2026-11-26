@@ -12,7 +12,9 @@
 //! `terminal` client capability, so the agent runs every tool itself.
 //!
 //! It also never routes the agent to a production Boss engine: the agent's
-//! environment is rebuilt from scratch (see [`agent_environment`]).
+//! environment is rebuilt from scratch (see [`agent_environment`]), and every
+//! path and variable a run was given is checked once, before the run creates a
+//! file or starts a process (see [`prepare_run`]).
 
 #[path = "probe/events.rs"]
 mod events;
@@ -30,7 +32,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use boss_acp_client::common_schema::ProtocolVersion;
-use boss_acp_client::connection::{Connection, ConnectionOptions, Incoming, RequestError};
+use boss_acp_client::connection::{Connection, ConnectionOptions, Incoming, PendingResponse};
 use boss_acp_client::journal::Journal;
 use boss_acp_client::schema::{
     CancelNotification, ClientCapabilities, ContentBlock, ImageContent, Implementation, InitializeRequest,
@@ -44,7 +46,6 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
-use tokio::task::JoinSet;
 use tokio::time::Instant;
 use workspace_procs::{LiveProcess, Signal, SystemWorkspaceProcessTable, WorkspaceProcessTable};
 
@@ -231,18 +232,42 @@ struct PendingPermission {
     options: Vec<PermissionOption>,
 }
 
-enum Finished {
+/// A request sent to the agent whose response has not been reported yet.
+///
+/// A request completes when the connection reports its response on the same
+/// ordered stream as the agent's notifications ([`Incoming::ResponseArrived`]),
+/// never from a task that merely awaits it: a turn's end is then reported
+/// after every update of that turn and before every update of the next.
+enum InFlight {
     Prompt {
         turn: u64,
-        id: RequestId,
-        result: Result<PromptResponse, RequestError>,
+        pending: PendingResponse<PromptResponse>,
     },
     Request {
         method: String,
-        id: RequestId,
-        result: Result<Value, RequestError>,
+        pending: PendingResponse<Value>,
     },
 }
+
+impl InFlight {
+    fn id(&self) -> &RequestId {
+        match self {
+            Self::Prompt { pending, .. } => pending.id(),
+            Self::Request { pending, .. } => pending.id(),
+        }
+    }
+}
+
+/// Whether the probe goes on after an incoming message.
+#[derive(Debug, PartialEq, Eq)]
+enum Flow {
+    Continue,
+    /// The agent's stream ended; nothing more will arrive.
+    Closed,
+}
+
+/// How long the agent has to exit after its input was closed.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
@@ -256,7 +281,7 @@ struct Probe {
     #[builder(default)]
     pending_permissions: Vec<PendingPermission>,
     #[builder(default)]
-    in_flight: JoinSet<Finished>,
+    in_flight: Vec<InFlight>,
     #[builder(default)]
     prompts_in_flight: usize,
     #[builder(default)]
@@ -265,6 +290,9 @@ struct Probe {
     gate: Gate,
     #[builder(default = Instant::now())]
     last_arrival: Instant,
+    /// Where events go: stdout, except in tests.
+    #[builder(default = Box::new(emit))]
+    sink: Box<dyn Fn(Value) + Send>,
 }
 
 #[tokio::main]
@@ -277,6 +305,9 @@ async fn main() -> Result<()> {
 }
 
 async fn converse(args: ConverseArgs) -> Result<()> {
+    // Everything that can be refused is refused before a file is created or a
+    // process is started.
+    let environment = prepare_run(&args.session)?;
     let journal = Arc::new(
         Journal::create(&args.session.journal).with_context(|| format!("creating {:?}", args.session.journal))?,
     );
@@ -286,7 +317,7 @@ async fn converse(args: ConverseArgs) -> Result<()> {
         stdin,
         stdout,
         environment,
-    } = spawn_agent(&args.session)?;
+    } = spawn_agent(&args.session, environment)?;
     let (connection, mut incoming) = Connection::open(stdout, stdin, Some(journal), ConnectionOptions::default());
 
     let initialized = connection
@@ -342,47 +373,60 @@ async fn converse(args: ConverseArgs) -> Result<()> {
         .build();
 
     let mut commands = spawn_command_reader(args.script.as_deref()).await?;
+    drive(&mut probe, &mut incoming, &mut commands, SHUTDOWN_GRACE).await?;
+
+    let _ = child.start_kill();
+    let status = child.wait().await.context("waiting for the agent")?;
+    emit(json!({"event": "exit", "code": status.code(), "status": status.to_string()}));
+    Ok(())
+}
+
+/// Runs commands and reports what the agent sends until the agent's stream
+/// ends, or until `shutdown_grace` after a `shutdown` command has closed the
+/// agent's input and the agent still has not closed its output.
+async fn drive(
+    probe: &mut Probe,
+    incoming: &mut mpsc::UnboundedReceiver<Incoming>,
+    commands: &mut mpsc::UnboundedReceiver<Result<Command, String>>,
+    shutdown_grace: Duration,
+) -> Result<()> {
     let mut commands_open = true;
+    // Kept apart from the command gate: whatever the gate is doing, and
+    // whatever the agent keeps sending, the agent is not waited for past this.
+    let mut shutdown_deadline: Option<Instant> = None;
     loop {
         probe.settle_gate();
         let gate_open = matches!(probe.gate, Gate::Open);
         let wake = probe.gate_wake();
         tokio::select! {
             biased;
+            () = tokio::time::sleep_until(shutdown_deadline.unwrap_or(wake)), if shutdown_deadline.is_some() => {
+                // The agent did not exit on end of input.
+                probe.emit_event(json!({"event": "shutdown_timed_out", "grace_ms": shutdown_grace.as_millis() as u64}));
+                break;
+            }
             arrived = incoming.recv() => match arrived {
-                Some(Incoming::Closed(reason)) => {
-                    emit(json!({"event": "closed", "reason": reason.to_string()}));
-                    break;
+                Some(arrived) => {
+                    if probe.handle_incoming(arrived).await? == Flow::Closed {
+                        break;
+                    }
                 }
-                Some(arrived) => probe.handle_incoming(arrived).await?,
                 None => break,
             },
-            Some(finished) = probe.in_flight.join_next(), if !probe.in_flight.is_empty() => {
-                probe.handle_finished(finished.context("a request task panicked")?);
-            }
             command = commands.recv(), if gate_open && commands_open => match command {
                 Some(Ok(Command::Shutdown)) | None => {
                     commands_open = false;
                     // End of input for the agent. The loop keeps running until
                     // the agent closes its side, so nothing it still sends is lost.
                     let _ = probe.connection.shutdown_writer().await;
-                    probe.gate = Gate::Sleep { until: Instant::now() + Duration::from_secs(10) };
+                    shutdown_deadline = Some(Instant::now() + shutdown_grace);
                 }
                 Some(Ok(command)) => probe.run(command).await?,
-                Some(Err(error)) => emit(json!({"event": "command_error", "error": error})),
+                Some(Err(error)) => probe.emit_event(json!({"event": "command_error", "error": error})),
             },
-            () = tokio::time::sleep_until(wake), if !gate_open => {
-                if !commands_open && matches!(probe.gate, Gate::Sleep { until } if Instant::now() >= until) {
-                    // The agent did not exit on end of input.
-                    break;
-                }
-            }
+            () = tokio::time::sleep_until(wake), if !gate_open => {}
         }
     }
-
-    let _ = child.start_kill();
-    let status = child.wait().await.context("waiting for the agent")?;
-    emit(json!({"event": "exit", "code": status.code(), "status": status.to_string()}));
     Ok(())
 }
 
@@ -395,10 +439,9 @@ struct SpawnedAgent {
     environment: AgentEnvironment,
 }
 
-/// Starts the agent in the session directory with a rebuilt environment.
-fn spawn_agent(args: &SessionArgs) -> Result<SpawnedAgent> {
-    refuse_production_paths(args)?;
-    let environment = agent_environment(args, std::env::vars())?;
+/// Starts the agent in the session directory with the environment that
+/// [`prepare_run`] built.
+fn spawn_agent(args: &SessionArgs, environment: AgentEnvironment) -> Result<SpawnedAgent> {
     let mut command = tokio::process::Command::new(&args.agent[0]);
     command
         .args(&args.agent[1..])
@@ -472,19 +515,41 @@ fn config_assignments(args: &SessionArgs) -> Result<Vec<(&str, &str)>> {
         .collect()
 }
 
+/// Checks everything a run was given and builds the agent's environment,
+/// before the run creates a file or starts a process.
+///
+/// Both modes call this first. A refusal that came after the journal was
+/// created would already have truncated a file it was meant to protect, so
+/// nothing that writes may run before this returns. Options that are only
+/// read later (`--config`, `--settings-json`) are parsed here as well, so a
+/// typo fails before any output exists rather than half-way through a run.
+fn prepare_run(args: &SessionArgs) -> Result<AgentEnvironment> {
+    refuse_production_paths(args)?;
+    config_assignments(args)?;
+    claude_code_options(args)?;
+    agent_environment(args, std::env::vars())
+}
+
 /// The Boss session directory and engine socket of the installed app must
-/// never be handed to a probe run.
+/// never be handed to a probe run, as a place to read, write or route to.
 fn refuse_production_paths(args: &SessionArgs) -> Result<()> {
-    const PRODUCTION_STATE: &str = "Library/Application Support/Boss";
-    let checks = [
+    let mut checks = vec![
         ("--cwd", Some(args.cwd.as_path())),
         ("--boss-socket", args.boss_socket.as_deref()),
+        // The journal and the agent's stderr are opened for writing and
+        // truncated.
         ("--journal", Some(args.journal.as_path())),
+        ("--agent-stderr", args.agent_stderr.as_deref()),
     ];
+    checks.extend(
+        args.path_prefixes
+            .iter()
+            .map(|prefix| ("--path-prefix", Some(prefix.as_path()))),
+    );
     for (flag, path) in checks {
         let Some(path) = path else { continue };
         let text = path.to_string_lossy();
-        if text.contains(PRODUCTION_STATE) || text == "/tmp/boss-engine.sock" {
+        if is_production_path(&text) {
             bail!("{flag} {text} is a production Boss path; the probe only runs against an isolated instance");
         }
     }
@@ -492,6 +557,11 @@ fn refuse_production_paths(args: &SessionArgs) -> Result<()> {
         bail!("--cwd {:?} is not a directory", args.cwd);
     }
     Ok(())
+}
+
+fn is_production_path(text: &str) -> bool {
+    const PRODUCTION_STATE: &str = "Library/Application Support/Boss";
+    text.contains(PRODUCTION_STATE) || text == "/tmp/boss-engine.sock"
 }
 
 struct AgentEnvironment {
@@ -516,6 +586,11 @@ struct AgentEnvironment {
 /// `ANTHROPIC_API_KEY` is removed the way the coordinator's own launch
 /// removes it, so the session authenticates with the Claude login. Other
 /// provider overrides are left alone and reported by name.
+///
+/// `--env` cannot undo any of that: it may not set a variable that names the
+/// parent session, routes to an engine, or carries the API key (only
+/// [`ALLOWED_BOSS_ENV`] is let through), nor carry a production path. The
+/// report is read back from the variables the agent will actually get.
 fn agent_environment(
     args: &SessionArgs,
     inherited: impl Iterator<Item = (String, String)>,
@@ -530,10 +605,7 @@ fn agent_environment(
             api_key_was_set = true;
             continue;
         }
-        let names_the_parent_session = name.starts_with("BOSS_")
-            || name.starts_with("CLAUDE_CODE_")
-            || matches!(name.as_str(), "CLAUDECODE" | "CLAUDE_PID" | "TMUX" | "TMUX_PANE");
-        if names_the_parent_session {
+        if names_the_parent_session(&name) {
             removed.insert(name);
             continue;
         }
@@ -577,21 +649,63 @@ fn agent_environment(
         let (name, value) = assignment
             .split_once('=')
             .ok_or_else(|| anyhow!("--env {assignment:?} is not KEY=VALUE"))?;
+        if let Some(why) = reserved_env_reason(name) {
+            bail!("--env {name}=...: {why}");
+        }
+        if is_production_path(value) {
+            bail!("--env {name}={value} is a production Boss path; the probe only runs against an isolated instance");
+        }
         extra.push(name.to_owned());
         variables.retain(|(existing, _)| existing != name);
         variables.push((name.to_owned(), value.to_owned()));
     }
+    let final_value = |name: &str| {
+        variables
+            .iter()
+            .find(|(existing, _)| existing == name)
+            .map(|(_, value)| value.as_str())
+    };
     let report = json!({
         "anthropic_api_key_was_set": api_key_was_set,
-        "anthropic_api_key_passed_on": false,
+        "anthropic_api_key_passed_on": final_value("ANTHROPIC_API_KEY").is_some(),
         "provider_override_variables": provider_overrides,
         "removed_variables": removed,
-        "claude_executable": args.claude_executable,
-        "boss_socket_is_isolated_engine": args.boss_socket.is_some(),
+        "claude_executable": final_value("CLAUDE_CODE_EXECUTABLE"),
+        "boss_socket_is_isolated_engine": args
+            .boss_socket
+            .as_ref()
+            .is_some_and(|socket| final_value("BOSS_SOCKET_PATH") == Some(&*socket.to_string_lossy())),
         "path_prefixes": prefixes,
         "extra_variables": extra,
     });
     Ok(AgentEnvironment { variables, report })
+}
+
+/// `BOSS_` variables that `--env` may set: they configure the agent's tools
+/// without identifying a session or routing to an engine.
+const ALLOWED_BOSS_ENV: &[&str] = &["BOSS_BIN"];
+
+/// Variables that identify the Boss worker or Claude Code session that started
+/// the probe, or route to its engine. None is inherited.
+fn names_the_parent_session(name: &str) -> bool {
+    name.starts_with("BOSS_")
+        || name.starts_with("CLAUDE_CODE_")
+        || matches!(name, "CLAUDECODE" | "CLAUDE_PID" | "TMUX" | "TMUX_PANE")
+}
+
+/// Why `--env` may not set `name`, if it may not.
+fn reserved_env_reason(name: &str) -> Option<&'static str> {
+    match name {
+        "ANTHROPIC_API_KEY" => {
+            Some("the probe never passes an API key on; the session authenticates with the Claude login")
+        }
+        "BOSS_SOCKET_PATH" => Some("the engine socket is set by --boss-socket"),
+        "CLAUDE_CODE_EXECUTABLE" => Some("the Claude Code binary is set by --claude-executable"),
+        _ if names_the_parent_session(name) && !ALLOWED_BOSS_ENV.contains(&name) => {
+            Some("it names the parent session or routes to an engine, so the agent may not be given it")
+        }
+        _ => None,
+    }
 }
 
 /// The Claude Code options that the coordinator's terminal launch passes as
@@ -659,10 +773,14 @@ impl Probe {
         };
         if met || timed_out {
             if op != "sleep" {
-                emit(json!({"event": "gate", "op": op, "met": met, "timed_out": !met && timed_out}));
+                self.emit_event(json!({"event": "gate", "op": op, "met": met, "timed_out": !met && timed_out}));
             }
             self.gate = Gate::Open;
         }
+    }
+
+    fn emit_event(&self, event: Value) {
+        (self.sink)(event);
     }
 
     /// When the main loop must look at the gate again.
@@ -680,12 +798,12 @@ impl Probe {
         if let Gate::Event { name, .. } = &self.gate
             && event.get("event").and_then(Value::as_str) == Some(name.as_str())
         {
-            emit(event);
-            emit(json!({"event": "gate", "op": "await_event", "met": true, "timed_out": false}));
+            self.emit_event(event);
+            self.emit_event(json!({"event": "gate", "op": "await_event", "met": true, "timed_out": false}));
             self.gate = Gate::Open;
             return;
         }
-        emit(event);
+        self.emit_event(event);
     }
 
     async fn run(&mut self, command: Command) -> Result<()> {
@@ -753,15 +871,8 @@ impl Probe {
                 substitute_placeholders(&mut params, self.session_id.0.as_ref(), &self.cwd);
                 let request = UntypedMessage::new(&method, params).map_err(|error| anyhow!("{error}"))?;
                 let pending = self.connection.send_request(&request).await?;
-                let id = pending.id().clone();
-                self.report(json!({"event": "request_sent", "method": method, "request_id": id}));
-                self.in_flight.spawn(async move {
-                    Finished::Request {
-                        method,
-                        id,
-                        result: pending.response().await,
-                    }
-                });
+                self.report(json!({"event": "request_sent", "method": method, "request_id": pending.id()}));
+                self.in_flight.push(InFlight::Request { method, pending });
             }
             Command::Processes => {
                 let processes = self.descendants()?;
@@ -842,31 +953,28 @@ impl Probe {
             .connection
             .send_request(&PromptRequest::new(self.session_id.clone(), blocks))
             .await?;
-        let id = pending.id().clone();
         self.turns += 1;
         self.prompts_in_flight += 1;
         let turn = self.turns;
         self.report(json!({
             "event": "turn_started",
             "turn": turn,
-            "request_id": id,
+            "request_id": pending.id(),
             "text": text,
             "images": images.len(),
             "prompts_in_flight": self.prompts_in_flight,
         }));
-        self.in_flight.spawn(async move {
-            Finished::Prompt {
-                turn,
-                id,
-                result: pending.response().await,
-            }
-        });
+        self.in_flight.push(InFlight::Prompt { turn, pending });
         Ok(())
     }
 
-    fn handle_finished(&mut self, finished: Finished) {
+    /// Reports the end of a request. Its result is already in hand when the
+    /// connection has reported the response, or has closed, so this never waits.
+    async fn complete(&mut self, finished: InFlight) {
         match finished {
-            Finished::Prompt { turn, id, result } => {
+            InFlight::Prompt { turn, pending } => {
+                let id = pending.id().clone();
+                let result = pending.response().await;
                 self.prompts_in_flight -= 1;
                 let event = match result {
                     Ok(response) => json!({
@@ -886,8 +994,9 @@ impl Probe {
                 };
                 self.report(event);
             }
-            Finished::Request { method, id, result } => {
-                let event = match result {
+            InFlight::Request { method, pending } => {
+                let id = pending.id().clone();
+                let event = match pending.response().await {
                     Ok(result) => json!({"event": "response", "method": method, "request_id": id, "result": result}),
                     Err(error) => {
                         json!({"event": "response", "method": method, "request_id": id, "error": error.to_string()})
@@ -898,7 +1007,7 @@ impl Probe {
         }
     }
 
-    async fn handle_incoming(&mut self, incoming: Incoming) -> Result<()> {
+    async fn handle_incoming(&mut self, incoming: Incoming) -> Result<Flow> {
         self.last_arrival = Instant::now();
         match incoming {
             Incoming::Notification { method, params, seq } if method == "session/update" => {
@@ -946,7 +1055,7 @@ impl Probe {
                         self.report(
                             json!({"event": "agent_request", "method": method, "error": error.to_string(), "seq": seq}),
                         );
-                        return Ok(());
+                        return Ok(Flow::Continue);
                     }
                 };
                 let event = events::permission_request(&id, &request, &params, seq);
@@ -958,7 +1067,7 @@ impl Probe {
                 let wanted = match self.policy {
                     PermissionPolicy::Ask => {
                         self.pending_permissions.push(pending);
-                        return Ok(());
+                        return Ok(Flow::Continue);
                     }
                     PermissionPolicy::Allow => Some(PermissionOptionKind::AllowOnce),
                     PermissionPolicy::Reject => Some(PermissionOptionKind::RejectOnce),
@@ -980,6 +1089,12 @@ impl Probe {
                     "seq": seq,
                 }));
             }
+            Incoming::ResponseArrived { id, .. } => {
+                if let Some(position) = self.in_flight.iter().position(|request| request.id() == &id) {
+                    let finished = self.in_flight.remove(position);
+                    self.complete(finished).await;
+                }
+            }
             Incoming::UnmatchedResponse { id, result, seq } => {
                 self.report(json!({
                     "event": "unmatched_response",
@@ -991,9 +1106,20 @@ impl Probe {
             Incoming::Malformed { preview, reason, seq } => {
                 self.report(json!({"event": "malformed", "reason": reason, "preview": preview, "seq": seq}));
             }
-            Incoming::Closed(_) => unreachable!("handled by the main loop"),
+            Incoming::Closed(reason) => {
+                // The connection failed every request still waiting before it
+                // reported the close, so each one is reported as failed here,
+                // after everything the agent sent before it went away. The
+                // close itself comes last: a front end treats it as the end of
+                // the conversation.
+                for finished in std::mem::take(&mut self.in_flight) {
+                    self.complete(finished).await;
+                }
+                self.emit_event(json!({"event": "closed", "reason": reason.to_string()}));
+                return Ok(Flow::Closed);
+            }
         }
-        Ok(())
+        Ok(Flow::Continue)
     }
 
     /// Sends the permission response: the chosen option, or `cancelled`.
@@ -1200,26 +1326,459 @@ mod tests {
         assert!(agent_environment(&converse_args(&["--env", "NOT_AN_ASSIGNMENT"]), inherited(&[])).is_err());
     }
 
+    const PRODUCTION_DIRECTORY: &str = "/Users/someone/Library/Application Support/Boss/boss-session";
+
     #[test]
-    fn production_paths_are_refused() {
-        for flag in ["--boss-socket", "--cwd"] {
-            let mut argv = vec!["boss-acp-probe", "converse", "--journal", "/tmp/j.jsonl"];
-            let production = "/Users/someone/Library/Application Support/Boss/boss-session";
-            if flag == "--cwd" {
-                argv.extend_from_slice(&["--cwd", production]);
-            } else {
-                argv.extend_from_slice(&["--cwd", "/tmp", flag, production]);
+    fn production_paths_are_refused_wherever_the_run_would_read_write_or_route_to_them() {
+        // One flag is given `value`; `--cwd` and `--journal` default to a safe place.
+        let refused = |flag: &str, value: &str| {
+            let defaults = [("--cwd", "/tmp"), ("--journal", "/tmp/j.jsonl")];
+            let mut all = vec!["boss-acp-probe", "converse"];
+            for (name, default) in defaults {
+                all.extend([name, if name == flag { value } else { default }]);
             }
-            argv.extend_from_slice(&["--", "agent"]);
+            if !defaults.iter().any(|(name, _)| *name == flag) {
+                all.extend([flag, value]);
+            }
+            all.extend(["--", "agent"]);
+            let Mode::Converse(args) = Cli::try_parse_from(all).unwrap().command else {
+                panic!("parsed the wrong subcommand");
+            };
+            refuse_production_paths(&args.session).map_err(|error| error.to_string())
+        };
+        for flag in ["--boss-socket", "--cwd", "--journal", "--agent-stderr", "--path-prefix"] {
+            let error = refused(flag, PRODUCTION_DIRECTORY).unwrap_err();
+            assert!(
+                error.contains("production Boss path") && error.contains(flag),
+                "{flag}: {error}"
+            );
+        }
+        assert!(refused("--boss-socket", "/tmp/boss-engine.sock").is_err());
+        assert!(refused("--boss-socket", "/tmp/x/engine.sock").is_ok());
+        assert!(refused("--agent-stderr", "/tmp/x/agent.log").is_ok());
+    }
+
+    #[test]
+    fn env_cannot_undo_the_isolation_or_carry_a_production_path() {
+        let isolated = ["--boss-socket", "/tmp/isolated/engine.sock"];
+        for assignment in [
+            "BOSS_SOCKET_PATH=/tmp/another/engine.sock",
+            "BOSS_EVENTS_SOCKET=/tmp/another/events.sock",
+            "BOSS_SPAWN_TOKEN=secret",
+            "ANTHROPIC_API_KEY=sk-secret",
+            "CLAUDE_CODE_EXECUTABLE=/usr/local/bin/claude",
+            "CLAUDE_CODE_MESSAGING_SOCKET=/tmp/cc-socks/1.sock",
+            "CLAUDECODE=1",
+            "CLAUDE_PID=1",
+            "TMUX=/private/tmp/tmux-501/default,1,0",
+            "TMUX_PANE=%7",
+        ] {
+            let mut flags = isolated.to_vec();
+            flags.extend(["--env", assignment]);
+            let error = agent_environment(&converse_args(&flags), inherited(&[]))
+                .err()
+                .unwrap_or_else(|| panic!("--env {assignment} was accepted"))
+                .to_string();
+            assert!(error.contains("--env"), "{assignment}: {error}");
+            assert!(
+                !error.contains("secret"),
+                "the refusal does not echo the value: {error}"
+            );
+        }
+        // Not a variable that identifies a session or routes to an engine.
+        let mut flags = isolated.to_vec();
+        flags.extend(["--env", "BOSS_BIN=/built/bin/boss", "--env", "RUST_LOG=debug"]);
+        assert!(agent_environment(&converse_args(&flags), inherited(&[])).is_ok());
+
+        // A value that points into the installed app's state is refused under any name.
+        let mut flags = isolated.to_vec();
+        let production = format!("STATE_DIRECTORY={PRODUCTION_DIRECTORY}");
+        flags.extend(["--env", &production]);
+        let error = agent_environment(&converse_args(&flags), inherited(&[]))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("production Boss path"), "{error}");
+    }
+
+    #[test]
+    fn the_report_is_read_from_the_variables_the_agent_gets() {
+        let isolated = converse_args(&[
+            "--boss-socket",
+            "/tmp/isolated/engine.sock",
+            "--env",
+            "BOSS_BIN=/b/boss",
+        ]);
+        let environment = agent_environment(
+            &isolated,
+            inherited(&[("ANTHROPIC_API_KEY", "sk-secret"), ("BOSS_SOCKET_PATH", "/prod.sock")]),
+        )
+        .unwrap();
+        assert_eq!(environment.report["anthropic_api_key_was_set"], json!(true));
+        assert_eq!(environment.report["anthropic_api_key_passed_on"], json!(false));
+        assert_eq!(environment.report["boss_socket_is_isolated_engine"], json!(true));
+        assert_eq!(environment.report["extra_variables"], json!(["BOSS_BIN"]));
+        assert_eq!(value_of(&environment, "ANTHROPIC_API_KEY"), None);
+
+        let without =
+            agent_environment(&converse_args(&["--claude-executable", "/bin/claude"]), inherited(&[])).unwrap();
+        assert_eq!(without.report["boss_socket_is_isolated_engine"], json!(false));
+        assert_eq!(without.report["claude_executable"], json!("/bin/claude"));
+    }
+
+    // ── A refused run creates and truncates nothing ──────────────────────────
+
+    /// A fresh scratch directory and, inside it, one whose path is the
+    /// installed app's state directory. Both exist on disk.
+    pub(crate) fn scratch_with_production_directory(name: &str) -> (PathBuf, PathBuf) {
+        let scratch = std::env::temp_dir().join(format!("boss-acp-probe-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let production = scratch.join("Library/Application Support/Boss/session");
+        std::fs::create_dir_all(&production).unwrap();
+        (scratch, production)
+    }
+
+    /// A file that must survive a refused run, with the text it holds.
+    pub(crate) fn sentinel(directory: &Path, name: &str) -> PathBuf {
+        let path = directory.join(name);
+        std::fs::write(&path, "sentinel").unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn a_refused_converse_run_leaves_every_file_it_was_pointed_at_untouched() {
+        let (scratch, production) = scratch_with_production_directory("converse");
+        let journal = sentinel(&production, "journal.jsonl");
+        let stderr = sentinel(&production, "agent.log");
+        let elsewhere_journal = scratch.join("journal.jsonl");
+        let elsewhere_stderr = scratch.join("agent.log");
+        let scratch_text = scratch.to_string_lossy().into_owned();
+        for (journal_flag, stderr_flag) in [
+            (&journal, &elsewhere_stderr),
+            (&elsewhere_journal, &stderr),
+            (&journal, &stderr),
+        ] {
+            let argv = [
+                "boss-acp-probe",
+                "converse",
+                "--cwd",
+                &scratch_text,
+                "--journal",
+                &journal_flag.to_string_lossy(),
+                "--agent-stderr",
+                &stderr_flag.to_string_lossy(),
+                "--",
+                "/nonexistent/agent",
+            ];
             let Mode::Converse(args) = Cli::try_parse_from(argv).unwrap().command else {
                 panic!("parsed the wrong subcommand");
             };
-            let error = refuse_production_paths(&args.session).unwrap_err().to_string();
-            assert!(error.contains("production Boss path"), "{flag}: {error}");
+            let error = converse(*args).await.unwrap_err().to_string();
+            assert!(error.contains("production Boss path"), "{error}");
         }
-        let legacy = converse_args(&["--boss-socket", "/tmp/boss-engine.sock"]);
-        assert!(refuse_production_paths(&legacy).is_err());
-        assert!(refuse_production_paths(&converse_args(&["--boss-socket", "/tmp/x/engine.sock"])).is_ok());
+        assert_eq!(std::fs::read_to_string(&journal).unwrap(), "sentinel");
+        assert_eq!(std::fs::read_to_string(&stderr).unwrap(), "sentinel");
+        assert!(!elsewhere_journal.exists(), "a refused run created no journal");
+        assert!(!elsewhere_stderr.exists(), "a refused run created no stderr file");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[tokio::test]
+    async fn a_run_with_a_malformed_option_creates_no_journal() {
+        let (scratch, _) = scratch_with_production_directory("malformed");
+        let journal = scratch.join("journal.jsonl");
+        let argv = [
+            "boss-acp-probe",
+            "converse",
+            "--cwd",
+            &scratch.to_string_lossy(),
+            "--journal",
+            &journal.to_string_lossy(),
+            "--config",
+            "not-an-assignment",
+            "--",
+            "/nonexistent/agent",
+        ];
+        let Mode::Converse(args) = Cli::try_parse_from(argv).unwrap().command else {
+            panic!("parsed the wrong subcommand");
+        };
+        assert!(converse(*args).await.is_err());
+        assert!(!journal.exists());
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    // ── Order of what the probe reports ──────────────────────────────────────
+
+    /// A probe on an in-memory stream, with the agent's side in the test's hands.
+    struct Harness {
+        probe: Probe,
+        incoming: mpsc::UnboundedReceiver<Incoming>,
+        reader: BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+        writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        events: Arc<std::sync::Mutex<Vec<Value>>>,
+    }
+
+    async fn soon<T>(what: &str, future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(20), future)
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let (client_io, peer_io) = tokio::io::duplex(1 << 20);
+            let (client_reader, client_writer) = tokio::io::split(client_io);
+            let (peer_reader, writer) = tokio::io::split(peer_io);
+            let (connection, incoming) =
+                Connection::open(client_reader, client_writer, None, ConnectionOptions::default());
+            let events: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+            let recorder = events.clone();
+            let probe = Probe::builder()
+                .connection(connection)
+                .session_id(SessionId::new("session-1"))
+                .cwd("/tmp")
+                .agent_pid(0)
+                .policy(PermissionPolicy::Ask)
+                .sink(Box::new(move |event| recorder.lock().unwrap().push(event)))
+                .build();
+            Self {
+                probe,
+                incoming,
+                reader: BufReader::new(peer_reader),
+                writer,
+                events,
+            }
+        }
+
+        /// Sends a prompt and returns the id the agent saw it with.
+        async fn prompt(&mut self, text: &str) -> Value {
+            self.probe
+                .run(Command::Prompt {
+                    text: text.into(),
+                    images: Vec::new(),
+                })
+                .await
+                .unwrap();
+            let mut line = String::new();
+            soon("the prompt on the wire", self.reader.read_line(&mut line))
+                .await
+                .unwrap();
+            serde_json::from_str::<Value>(&line).unwrap()["id"].clone()
+        }
+
+        /// The agent writes all of `lines` in one go, so one read carries them all.
+        async fn agent_says(&mut self, lines: &[Value]) {
+            let bytes: String = lines.iter().map(|line| format!("{line}\n")).collect();
+            tokio::io::AsyncWriteExt::write_all(&mut self.writer, bytes.as_bytes())
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::flush(&mut self.writer).await.unwrap();
+        }
+
+        /// Handles the next `count` things the connection reports.
+        async fn pump(&mut self, count: usize) {
+            for _ in 0..count {
+                let arrived = soon("an incoming message", self.incoming.recv()).await.unwrap();
+                assert_eq!(self.probe.handle_incoming(arrived).await.unwrap(), Flow::Continue);
+            }
+        }
+
+        async fn pump_until_closed(&mut self) {
+            loop {
+                let arrived = soon("an incoming message", self.incoming.recv()).await.unwrap();
+                if self.probe.handle_incoming(arrived).await.unwrap() == Flow::Closed {
+                    return;
+                }
+            }
+        }
+
+        /// What was reported, one short string per event.
+        fn reported(&self) -> Vec<String> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|event| {
+                    let name = event["event"].as_str().unwrap();
+                    let detail = event
+                        .get("turn")
+                        .map(Value::to_string)
+                        .or_else(|| event.get("text").and_then(Value::as_str).map(str::to_owned))
+                        .unwrap_or_default();
+                    format!("{name} {detail}").trim_end().to_owned()
+                })
+                .collect()
+        }
+
+        fn event(&self, name: &str) -> Vec<Value> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event["event"] == name)
+                .cloned()
+                .collect()
+        }
+    }
+
+    fn agent_text(text: &str) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "session-1",
+                "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}},
+            },
+        })
+    }
+
+    fn end_of_turn(id: &Value) -> Value {
+        json!({"jsonrpc": "2.0", "id": id, "result": {"stopReason": "end_turn"}})
+    }
+
+    #[tokio::test]
+    async fn a_turn_ends_between_the_updates_that_surround_it_even_when_one_read_carries_them_all() {
+        let mut harness = Harness::new();
+        let first = harness.prompt("A").await;
+        let second = harness.prompt("B").await;
+        harness
+            .agent_says(&[
+                agent_text("A-last"),
+                end_of_turn(&first),
+                agent_text("B-first"),
+                end_of_turn(&second),
+            ])
+            .await;
+        harness.pump(4).await;
+
+        assert_eq!(
+            harness.reported(),
+            [
+                "turn_started 1",
+                "turn_started 2",
+                "message_chunk A-last",
+                "turn_ended 1",
+                "message_chunk B-first",
+                "turn_ended 2",
+            ]
+        );
+        let ended = harness.event("turn_ended");
+        assert_eq!(
+            ended
+                .iter()
+                .map(|event| event["prompts_in_flight"].clone())
+                .collect::<Vec<_>>(),
+            [json!(1), json!(0)],
+            "the count of turns in flight is right as each one ends"
+        );
+        assert_eq!(harness.event("message_chunk")[1]["prompts_in_flight"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_ended_just_before_the_agent_closed_is_reported_as_ended() {
+        let mut harness = Harness::new();
+        let first = harness.prompt("A").await;
+        harness.agent_says(&[agent_text("A-last"), end_of_turn(&first)]).await;
+        tokio::io::AsyncWriteExt::shutdown(&mut harness.writer).await.unwrap();
+        harness.pump_until_closed().await;
+
+        assert_eq!(
+            harness.reported(),
+            ["turn_started 1", "message_chunk A-last", "turn_ended 1", "closed"]
+        );
+        assert!(harness.event("turn_failed").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_turn_the_agent_never_answered_is_reported_as_failed_before_the_close() {
+        let mut harness = Harness::new();
+        harness.prompt("A").await;
+        harness.agent_says(&[agent_text("A-partial")]).await;
+        tokio::io::AsyncWriteExt::shutdown(&mut harness.writer).await.unwrap();
+        harness.pump_until_closed().await;
+
+        assert_eq!(
+            harness.reported(),
+            ["turn_started 1", "message_chunk A-partial", "turn_failed 1", "closed"]
+        );
+        let failed = &harness.event("turn_failed")[0];
+        assert!(
+            failed["error"].as_str().unwrap().contains("closed before the response"),
+            "{failed}"
+        );
+        assert_eq!(failed["prompts_in_flight"], 0);
+    }
+
+    // ── Shutdown ─────────────────────────────────────────────────────────────
+
+    /// The agent never closes its output and keeps talking: with the
+    /// deadline passing while a line is being handled, the run still ends.
+    #[tokio::test]
+    async fn shutdown_ends_the_run_at_its_deadline_however_busy_the_agent_is() {
+        let Harness {
+            mut probe,
+            mut incoming,
+            reader,
+            mut writer,
+            events,
+        } = Harness::new();
+        let (commands_tx, mut commands) = mpsc::unbounded_channel();
+        commands_tx.send(Ok(Command::Shutdown)).unwrap();
+        let talker = tokio::spawn(async move {
+            let _input = reader;
+            while tokio::io::AsyncWriteExt::write_all(&mut writer, b"{\"jsonrpc\":\"2.0\",\"method\":\"probe/tick\"}\n")
+                .await
+                .is_ok()
+            {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        });
+
+        soon(
+            "the run to end",
+            drive(&mut probe, &mut incoming, &mut commands, Duration::from_millis(150)),
+        )
+        .await
+        .unwrap();
+
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|event| event["event"] == "shutdown_timed_out"));
+        assert!(
+            events.len() > 1,
+            "the agent was still being heard when the deadline passed"
+        );
+        talker.abort();
+    }
+
+    #[tokio::test]
+    async fn shutdown_ends_the_run_as_soon_as_the_agent_closes_its_output() {
+        let Harness {
+            mut probe,
+            mut incoming,
+            mut reader,
+            writer,
+            events,
+        } = Harness::new();
+        let (commands_tx, mut commands) = mpsc::unbounded_channel();
+        commands_tx.send(Ok(Command::Shutdown)).unwrap();
+        // An agent that exits when its input ends.
+        let agent = tokio::spawn(async move {
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line).await;
+            drop(writer);
+        });
+
+        soon(
+            "the run to end",
+            drive(&mut probe, &mut incoming, &mut commands, Duration::from_secs(300)),
+        )
+        .await
+        .unwrap();
+
+        agent.await.unwrap();
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|event| event["event"] == "closed"));
+        assert!(!events.iter().any(|event| event["event"] == "shutdown_timed_out"));
     }
 
     #[test]

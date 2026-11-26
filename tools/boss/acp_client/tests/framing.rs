@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use agent_client_protocol::{Agent, Client, Handled, Lines, v1};
 use boss_acp_client::connection::{
-    CloseReason, Connection, ConnectionError, ConnectionOptions, Incoming, RequestError,
+    CloseReason, Connection, ConnectionError, ConnectionOptions, Incoming, PreparedConnection, RequestError,
 };
 use boss_acp_client::journal::{Direction, Journal, WireRecord, read_records, unanswered_requests};
 use boss_acp_client::schema::{
@@ -62,18 +62,28 @@ impl Peer {
     }
 }
 
-fn connect_with(
+/// A connection that is not reading yet, and the agent's side of its stream.
+fn prepare(
     journal: Option<Arc<Journal>>,
     options: ConnectionOptions,
-) -> (Connection, UnboundedReceiver<Incoming>, Peer) {
+) -> (PreparedConnection<ReadHalf<DuplexStream>>, Peer) {
     let (client_io, peer_io) = tokio::io::duplex(1 << 20);
     let (client_reader, client_writer) = tokio::io::split(client_io);
     let (peer_reader, peer_writer) = tokio::io::split(peer_io);
-    let (connection, incoming) = Connection::open(client_reader, client_writer, journal, options);
+    let prepared = Connection::prepare(client_reader, client_writer, journal, options);
     let peer = Peer {
         reader: BufReader::new(peer_reader),
         writer: peer_writer,
     };
+    (prepared, peer)
+}
+
+fn connect_with(
+    journal: Option<Arc<Journal>>,
+    options: ConnectionOptions,
+) -> (Connection, UnboundedReceiver<Incoming>, Peer) {
+    let (prepared, peer) = prepare(journal, options);
+    let (connection, incoming) = prepared.start();
     (connection, incoming, peer)
 }
 
@@ -87,6 +97,34 @@ fn prompt(text: &str) -> PromptRequest {
 
 fn end_turn(id: &Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": {"stopReason": "end_turn"}})
+}
+
+fn text_update(text: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": "session-1",
+            "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}},
+        },
+    })
+}
+
+/// The text of a `session/update` that `text_update` made.
+fn update_text(incoming: Option<Incoming>) -> String {
+    match incoming {
+        Some(Incoming::Notification { method, params, .. }) if method == "session/update" => {
+            params["update"]["content"]["text"].as_str().unwrap().to_owned()
+        }
+        other => panic!("expected a session update, got {other:?}"),
+    }
+}
+
+fn arrived_id(incoming: Option<Incoming>) -> RequestId {
+    match incoming {
+        Some(Incoming::ResponseArrived { id, .. }) => id,
+        other => panic!("expected the arrival of a response, got {other:?}"),
+    }
 }
 
 #[derive(Clone, Default)]
@@ -551,10 +589,11 @@ async fn a_new_connection_takes_the_response_to_a_request_an_earlier_one_sent() 
         (&RequestId::Number(7), "session/prompt")
     );
 
-    let (connection, mut incoming, mut peer) = connect_with(None, ConnectionOptions { first_request_id: 8 });
-    let old_prompt = connection
+    let (prepared, mut peer) = prepare(None, ConnectionOptions { first_request_id: 8 });
+    let old_prompt = prepared
         .expect_response::<PromptResponse>(ours[0].id.clone(), &ours[0].method)
         .unwrap();
+    let (connection, mut incoming) = prepared.start();
     assert_eq!(connection.pending_ids(), [RequestId::Number(7)]);
 
     // The permission request the earlier process never answered is answered
@@ -591,9 +630,164 @@ async fn a_new_connection_takes_the_response_to_a_request_an_earlier_one_sent() 
             .stop_reason,
         StopReason::EndTurn
     );
+    // Both responses were consumed by their waiters; each is still reported
+    // once as an arrival, and neither was reported as an unmatched response.
+    assert_eq!(
+        arrived_id(soon("an arrival", incoming.recv()).await),
+        RequestId::Number(7)
+    );
+    assert_eq!(
+        arrived_id(soon("an arrival", incoming.recv()).await),
+        RequestId::Number(8)
+    );
+    assert!(incoming.try_recv().is_err(), "nothing was left over");
+}
+
+/// The response to the earlier process's prompt is already in the stream when
+/// the new connection is built. Registration happens before the first read,
+/// so the waiter gets it however the runtime schedules the reader.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_response_already_buffered_when_the_connection_starts_still_reaches_its_waiter() {
+    let (prepared, mut peer) = prepare(None, ConnectionOptions { first_request_id: 8 });
+    peer.send(json!({"jsonrpc": "2.0", "id": 7, "result": {"stopReason": "cancelled"}}))
+        .await;
+    let old_prompt = prepared
+        .expect_response::<PromptResponse>(RequestId::Number(7), "session/prompt")
+        .unwrap();
+    let (connection, mut incoming) = prepared.start();
+
+    assert_eq!(
+        soon("the buffered response", old_prompt.response())
+            .await
+            .unwrap()
+            .stop_reason,
+        StopReason::Cancelled
+    );
+    assert_eq!(
+        arrived_id(soon("its arrival", incoming.recv()).await),
+        RequestId::Number(7)
+    );
+    assert!(connection.pending_ids().is_empty());
+    assert!(incoming.try_recv().is_err(), "it was not reported as unmatched");
+}
+
+#[tokio::test]
+async fn an_id_that_is_already_waiting_is_refused_and_the_first_waiter_is_untouched() {
+    let (prepared, mut peer) = prepare(None, ConnectionOptions::default());
+    let first = prepared
+        .expect_response::<PromptResponse>(RequestId::Number(1), "session/prompt")
+        .unwrap();
+    let duplicate = prepared.expect_response::<PromptResponse>(RequestId::Number(1), "session/prompt");
     assert!(
-        incoming.try_recv().is_err(),
-        "both responses were consumed, nothing was left over"
+        matches!(
+            duplicate.err(),
+            Some(ConnectionError::DuplicateRequestId(RequestId::Number(1)))
+        ),
+        "the second registration of an id is an error, not a replacement"
+    );
+    let (connection, _incoming) = prepared.start();
+    assert_eq!(connection.pending_ids(), [RequestId::Number(1)]);
+
+    peer.send(end_turn(&json!(1))).await;
+    assert_eq!(
+        soon("the first waiter", first.response()).await.unwrap().stop_reason,
+        StopReason::EndTurn,
+        "the response reaches the waiter that registered first, decoded as its type"
+    );
+}
+
+#[tokio::test]
+async fn a_new_request_never_takes_an_id_that_is_waiting_for_a_response() {
+    // The connection would allocate 1 next, and 1 is a recovered request.
+    let (prepared, mut peer) = prepare(None, ConnectionOptions::default());
+    let recovered = prepared
+        .expect_response::<PromptResponse>(RequestId::Number(1), "session/prompt")
+        .unwrap();
+    let (connection, _incoming) = prepared.start();
+
+    let fresh = connection.send_request(&prompt("next")).await.unwrap();
+    assert_eq!(fresh.id(), &RequestId::Number(2), "id 1 is skipped");
+    assert_eq!(peer.read().await["id"], 2);
+
+    peer.send(json!({"jsonrpc": "2.0", "id": 1, "result": {"stopReason": "cancelled"}}))
+        .await;
+    peer.send(end_turn(&json!(2))).await;
+    assert_eq!(
+        soon("the recovered request", recovered.response())
+            .await
+            .unwrap()
+            .stop_reason,
+        StopReason::Cancelled
+    );
+    assert_eq!(
+        soon("the new request", fresh.response()).await.unwrap().stop_reason,
+        StopReason::EndTurn
+    );
+}
+
+// ── Order ────────────────────────────────────────────────────────────────────
+
+/// One read carries prompt A's last update, A's response, prompt B's first
+/// update and B's response. The arrival of each response is on the incoming
+/// stream between the updates it separates, so a caller that reports from that
+/// stream cannot see B's update before A's end.
+#[tokio::test]
+async fn a_response_is_reported_in_line_order_with_the_updates_around_it() {
+    let (connection, mut incoming, mut peer) = connect();
+    let first = connection.send_request(&prompt("A")).await.unwrap();
+    let second = connection.send_request(&prompt("B")).await.unwrap();
+    let (first_id, second_id) = (peer.read().await["id"].clone(), peer.read().await["id"].clone());
+
+    let lines = [
+        text_update("A-last"),
+        end_turn(&first_id),
+        text_update("B-first"),
+        end_turn(&second_id),
+    ]
+    .map(|line| format!("{line}\n"))
+    .concat();
+    peer.write(lines.as_bytes()).await;
+
+    assert_eq!(update_text(soon("A's update", incoming.recv()).await), "A-last");
+    assert_eq!(
+        arrived_id(soon("A's arrival", incoming.recv()).await),
+        first.id().clone(),
+        "A ends before B's update is reported"
+    );
+    assert_eq!(update_text(soon("B's update", incoming.recv()).await), "B-first");
+    assert_eq!(
+        arrived_id(soon("B's arrival", incoming.recv()).await),
+        second.id().clone()
+    );
+    // The result was in the waiter's hands before the arrival was reported.
+    assert_eq!(first.response().await.unwrap().stop_reason, StopReason::EndTurn);
+    assert_eq!(second.response().await.unwrap().stop_reason, StopReason::EndTurn);
+}
+
+/// A response that is the last thing the agent says is reported, then the
+/// close; the close does not turn the answered request into a failed one.
+#[tokio::test]
+async fn a_response_followed_by_end_of_stream_is_reported_before_the_close() {
+    let (connection, mut incoming, mut peer) = connect();
+    let pending = connection.send_request(&prompt("A")).await.unwrap();
+    let id = peer.read().await["id"].clone();
+    peer.write(format!("{}\n", end_turn(&id)).as_bytes()).await;
+    drop(peer);
+
+    assert_eq!(
+        arrived_id(soon("the arrival", incoming.recv()).await),
+        pending.id().clone()
+    );
+    assert_eq!(
+        soon("the close", incoming.recv()).await,
+        Some(Incoming::Closed(CloseReason::Eof))
+    );
+    assert_eq!(
+        soon("the answered request", pending.response())
+            .await
+            .unwrap()
+            .stop_reason,
+        StopReason::EndTurn
     );
 }
 

@@ -7,7 +7,7 @@ import SwiftUI
 ///
 /// Hosts `CoordinatorChatProbeView` in a never-presented window, launches
 /// `boss-acp-probe` by path, and drives one real conversation from a script
-/// of operator actions, capturing the window at the points the script names.
+/// of composer actions, capturing the window at the points the script names.
 /// The session directory is rendered here by the same code that renders the
 /// real coordinator's, into a directory the caller chooses.
 ///
@@ -98,7 +98,7 @@ struct CoordinatorChatProbeCaptureOptions: Equatable {
     }
 }
 
-/// One scripted operator action, or a point to wait for or capture at.
+/// One scripted UI action, or a point to wait for or capture at.
 ///
 /// A script is a JSON array of objects, each with a `do` key:
 ///

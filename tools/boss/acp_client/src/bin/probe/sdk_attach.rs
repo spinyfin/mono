@@ -31,7 +31,9 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::events::emit;
-use crate::{SessionArgs, SpawnedAgent, config_assignments, initialize_request, new_session_request, spawn_agent};
+use crate::{
+    SessionArgs, SpawnedAgent, config_assignments, initialize_request, new_session_request, prepare_run, spawn_agent,
+};
 
 #[derive(Args)]
 pub struct SdkAttachArgs {
@@ -51,6 +53,9 @@ pub struct SdkAttachArgs {
 type FromAgent = UnboundedReceiver<std::io::Result<String>>;
 
 pub async fn run(args: SdkAttachArgs) -> Result<()> {
+    // Everything that can be refused is refused before a file is created or a
+    // process is started.
+    let environment = prepare_run(&args.session)?;
     let journal_path = args.session.journal.clone();
     let journal = Arc::new(Journal::create(&journal_path).with_context(|| format!("creating {journal_path:?}"))?);
     let SpawnedAgent {
@@ -59,7 +64,7 @@ pub async fn run(args: SdkAttachArgs) -> Result<()> {
         stdout,
         environment,
         ..
-    } = spawn_agent(&args.session)?;
+    } = spawn_agent(&args.session, environment)?;
 
     // One writer and one reader own the child's pipes for the whole run, so
     // both phases share a single journal in wire order.
@@ -388,6 +393,45 @@ mod tests {
         assert_eq!(report["earlier_response_seen_by_sdk_handler"], false);
         assert_eq!(report["responses_on_wire_after_handover"], 2);
         assert_eq!(report["responses_seen_by_sdk_handler"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_refused_run_leaves_every_file_it_was_pointed_at_untouched() {
+        let (scratch, production) = crate::tests::scratch_with_production_directory("sdk-attach");
+        let journal = crate::tests::sentinel(&production, "journal.jsonl");
+        let stderr = crate::tests::sentinel(&production, "agent.log");
+        let elsewhere_journal = scratch.join("journal.jsonl");
+        let elsewhere_stderr = scratch.join("agent.log");
+        let scratch_text = scratch.to_string_lossy().into_owned();
+        for (journal_flag, stderr_flag) in [
+            (&journal, &elsewhere_stderr),
+            (&elsewhere_journal, &stderr),
+            (&journal, &stderr),
+        ] {
+            let argv = [
+                "boss-acp-probe".to_owned(),
+                "sdk-attach".to_owned(),
+                "--cwd".to_owned(),
+                scratch_text.clone(),
+                "--journal".to_owned(),
+                journal_flag.to_string_lossy().into_owned(),
+                "--agent-stderr".to_owned(),
+                stderr_flag.to_string_lossy().into_owned(),
+                "--".to_owned(),
+                "/nonexistent/agent".to_owned(),
+            ];
+            let crate::Mode::SdkAttach(args) = <crate::Cli as clap::Parser>::try_parse_from(argv).unwrap().command
+            else {
+                panic!("parsed the wrong subcommand");
+            };
+            let error = run(*args).await.unwrap_err().to_string();
+            assert!(error.contains("production Boss path"), "{error}");
+        }
+        assert_eq!(std::fs::read_to_string(&journal).unwrap(), "sentinel");
+        assert_eq!(std::fs::read_to_string(&stderr).unwrap(), "sentinel");
+        assert!(!elsewhere_journal.exists(), "a refused run created no journal");
+        assert!(!elsewhere_stderr.exists(), "a refused run created no stderr file");
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     #[test]

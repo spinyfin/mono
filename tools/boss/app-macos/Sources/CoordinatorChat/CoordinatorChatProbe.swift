@@ -204,7 +204,7 @@ struct CoordinatorChatProbeItem: Identifiable, Equatable {
 
 // MARK: - Model
 
-/// Reduces probe events to conversation rows and turns the operator's actions
+/// Reduces probe events to conversation rows and turns composer actions
 /// into probe commands. Pure state: it owns no process, so tests drive it with
 /// events and read the command lines it emits.
 @MainActor
@@ -266,7 +266,7 @@ final class CoordinatorChatProbeModel: ObservableObject {
         self.sendCommand = sendCommand
     }
 
-    // MARK: Operator actions
+    // MARK: Composer actions
 
     var canSend: Bool {
         guard status != .starting, !isEnded else { return false }
@@ -467,7 +467,7 @@ final class CoordinatorChatProbeModel: ObservableObject {
                 append(.thought(text: text))
             }
         case .user:
-            // The agent echoing the operator's own text; the prompt row already shows it.
+            // The echoed prompt text is already shown in its row.
             break
         }
     }
