@@ -21,6 +21,11 @@ struct TokenUsageOverTimeInitial: Equatable, Sendable {
     var hover: TokenUsageHover?
 }
 
+private struct UsageChartSeriesItem: Equatable, Sendable {
+    let key: String
+    let label: String
+}
+
 private enum UsageChartPalette {
     static let categorical: [Color] = [
         Color(red: 0.00, green: 0.45, blue: 0.70),
@@ -40,11 +45,11 @@ private enum UsageChartPalette {
     static let shade = Color.secondary.opacity(0.16)
     static let flag = Color.orange
 
-    static func range(for domain: [String], ordered groups: [String]) -> [Color] {
-        domain.map { name in
-            if let index = groups.firstIndex(of: name) { return color(at: index) }
-            if let index = UsageTokenClass.allCases.firstIndex(where: { $0.rawValue == name }) { return color(at: index) }
-            if let index = UsageWorkMetric.allCases.firstIndex(where: { $0.title == name }) { return color(at: index) }
+    static func range(for domain: [String], ordered groupKeys: [String]) -> [Color] {
+        domain.map { key in
+            if let index = groupKeys.firstIndex(of: key) { return color(at: index) }
+            if let index = UsageTokenClass.allCases.firstIndex(where: { $0.rawValue == key }) { return color(at: index) }
+            if let index = UsageWorkMetric.allCases.firstIndex(where: { $0.title == key }) { return color(at: index) }
             return Color.gray
         }
     }
@@ -216,7 +221,7 @@ struct TokenUsageOverTimeView: View {
             if segments.isEmpty {
                 emptyCard("No bucket has a value for this normalizer. A missing value is a gap, not zero.")
             } else {
-                let names = uniqueSeries(segments.map(\.series))
+                let seriesItems = uniqueSeries(segments.map { UsageChartSeriesItem(key: $0.seriesKey, label: $0.series) })
                 Chart {
                     shadeMarks(shades)
                     ForEach(segments) { segment in
@@ -226,11 +231,11 @@ struct TokenUsageOverTimeView: View {
                                 y: .value(normalizer.unitLabel, point.y),
                                 series: .value("Segment", segment.id)
                             )
-                            .foregroundStyle(by: .value("Group", segment.series))
+                            .foregroundStyle(by: .value("Group", segment.seriesKey))
                             .interpolationMethod(.linear)
                             .lineStyle(StrokeStyle(lineWidth: 2))
                             PointMark(x: .value("Bucket", point.x), y: .value(normalizer.unitLabel, point.y))
-                                .foregroundStyle(by: .value("Group", segment.series))
+                                .foregroundStyle(by: .value("Group", segment.seriesKey))
                                 .symbolSize(28)
                         }
                     }
@@ -238,7 +243,7 @@ struct TokenUsageOverTimeView: View {
                 }
                 .modifier(UsageChartStyle(
                     mapper: mapper,
-                    names: names,
+                    series: seriesItems,
                     card: .normalized,
                     hover: $hover
                 ))
@@ -311,7 +316,7 @@ struct TokenUsageOverTimeView: View {
         if bars.isEmpty {
             emptyCard(flags.isEmpty ? emptyMessage : "\(emptyMessage) \(flags.count) bucket\(flags.count == 1 ? "" : "s") flagged.")
         } else {
-            let names = uniqueSeries(bars.map(\.series))
+            let seriesItems = uniqueSeries(bars.map { UsageChartSeriesItem(key: $0.seriesKey, label: $0.series) })
             Chart {
                 shadeMarks(shades)
                 ForEach(bars) { bar in
@@ -319,8 +324,8 @@ struct TokenUsageOverTimeView: View {
                         x: .value("Bucket", bar.x, unit: UsageSeriesGeometry.unit(mapper.report.bucketWidth)),
                         y: .value("Value", bar.value)
                     )
-                    .foregroundStyle(by: .value("Series", bar.series))
-                    .position(by: .value("Series", sideBySide ? bar.series : ""))
+                    .foregroundStyle(by: .value("Series", bar.seriesKey))
+                    .position(by: .value("Series", sideBySide ? bar.seriesKey : ""))
                 }
                 ForEach(flags) { flag in
                     PointMark(x: .value("Bucket", flag.at), y: .value("Unknown", 0.0))
@@ -332,7 +337,7 @@ struct TokenUsageOverTimeView: View {
             }
             .modifier(UsageChartStyle(
                 mapper: mapper,
-                names: names,
+                series: seriesItems,
                 card: card,
                 hover: $hover,
                 percentAxis: percentAxis,
@@ -368,15 +373,15 @@ struct TokenUsageOverTimeView: View {
                     overflowResolution: .init(x: .fit(to: .chart), y: .fit(to: .chart))
                 ) {
                     if hover.card == card {
-                        UsageReadoutView(readout: readout(hover.bucketIndex), groups: mapper.groupLabels)
+                        UsageReadoutView(readout: readout(hover.bucketIndex), groupKeys: mapper.report.groups)
                     }
                 }
         }
     }
 
-    private func uniqueSeries(_ names: [String]) -> [String] {
+    private func uniqueSeries(_ items: [UsageChartSeriesItem]) -> [UsageChartSeriesItem] {
         var seen = Set<String>()
-        return names.filter { seen.insert($0).inserted }
+        return items.filter { seen.insert($0.key).inserted }
     }
 
     private func emptyCard(_ message: String) -> some View {
@@ -480,7 +485,7 @@ private struct UsageChartCard<Accessory: View, Content: View>: View {
 /// Axes, colour scale, domain and hover selection shared by every card.
 private struct UsageChartStyle: ViewModifier {
     let mapper: UsageSeriesMapper
-    let names: [String]
+    let series: [UsageChartSeriesItem]
     let card: TokenUsageChartCard
     @Binding var hover: TokenUsageHover?
     var percentAxis = false
@@ -488,10 +493,12 @@ private struct UsageChartStyle: ViewModifier {
 
     func body(content: Content) -> some View {
         let domain = mapper.domain
+        let keys = series.map(\.key)
+        let colors = UsageChartPalette.range(for: keys, ordered: mapper.report.groups)
         let base = content
             .chartForegroundStyleScale(
-                domain: names,
-                range: UsageChartPalette.range(for: names, ordered: mapper.groupLabels)
+                domain: keys,
+                range: colors
             )
             .chartXScale(domain: domain ?? Date.distantPast...Date.distantFuture)
             .chartXAxis {
@@ -511,7 +518,9 @@ private struct UsageChartStyle: ViewModifier {
                     }
                 }
             }
-            .chartLegend(position: .bottom, alignment: .leading, spacing: 6)
+            .chartLegend(position: .bottom, alignment: .leading, spacing: 6) {
+                UsageChartLegendView(series: series, colors: colors)
+            }
             .chartXSelection(value: Binding<Date?>(
                 get: { hover.flatMap { $0.bucketIndex < mapper.plotSpans.count ? mapper.plotSpans[$0.bucketIndex].mid : nil } },
                 set: { date in
@@ -550,9 +559,30 @@ private struct UsageChartStyle: ViewModifier {
     }
 }
 
+private struct UsageChartLegendView: View {
+    let series: [UsageChartSeriesItem]
+    let colors: [Color]
+
+    var body: some View {
+        FlowLayout(horizontalSpacing: 10, verticalSpacing: 4) {
+            ForEach(Array(series.enumerated()), id: \.element.key) { index, item in
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(index < colors.count ? colors[index] : Color.gray)
+                        .frame(width: 7, height: 7)
+                    Text(item.label)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+        }
+    }
+}
+
 private struct UsageReadoutView: View {
     let readout: UsageHoverReadout
-    let groups: [String]
+    let groupKeys: [String]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -560,9 +590,9 @@ private struct UsageReadoutView: View {
                 .font(.caption.weight(.semibold))
             ForEach(Array(readout.rows.enumerated()), id: \.offset) { _, row in
                 HStack(spacing: 6) {
-                    if let series = row.series {
+                    if let seriesKey = row.seriesKey {
                         Circle()
-                            .fill(UsageChartPalette.range(for: [series], ordered: groups)[0])
+                            .fill(UsageChartPalette.range(for: [seriesKey], ordered: groupKeys)[0])
                             .frame(width: 7, height: 7)
                     }
                     Text(row.label)

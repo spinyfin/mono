@@ -78,6 +78,10 @@ struct TokenUsageWindow: View {
     /// (such as the revision roll-up) neither re-requests it nor drops its
     /// in-flight reply.
     @State private var lastSeriesFingerprint = ""
+    /// Set whenever an in-flight series request is invalidated, so toggling an
+    /// input and back within the debounce window still re-issues the request
+    /// instead of leaving the spinner stuck.
+    @State private var seriesInvalidated = false
 
     private let captureScene: TokenUsageCaptureScene?
     private let pollTimer = Timer.publish(every: 60, on: .main, in: .common).autoconnect()
@@ -252,7 +256,19 @@ struct TokenUsageWindow: View {
                 .help(chatModel.isConnected ? "Refresh token usage" : "Waiting for engine connection")
             }
             HStack(spacing: 8) {
-                groupPicker("Group by", selection: $groupPrimary, excluding: groupSecondary)
+                groupPicker(
+                    "Group by",
+                    selection: Binding(
+                        get: { groupPrimary },
+                        set: { newValue in
+                            groupPrimary = newValue
+                            if let newValue, newValue == groupSecondary {
+                                groupSecondary = nil
+                            }
+                        }
+                    ),
+                    excluding: tab == .breakdown ? groupSecondary : nil
+                )
                 if tab == .breakdown {
                     groupPicker("Then by", selection: $groupSecondary, excluding: groupPrimary)
                         .disabled(groupPrimary == nil)
@@ -735,8 +751,9 @@ struct TokenUsageWindow: View {
 
     private func debounceRefresh() {
         chatModel.invalidatePendingTokenUsage()
-        let seriesChanged = tab == .overTime && seriesFingerprint != lastSeriesFingerprint
-        if seriesChanged {
+        let needsSeries = tab == .overTime && (seriesInvalidated || seriesFingerprint != lastSeriesFingerprint)
+        if needsSeries {
+            seriesInvalidated = true
             chatModel.invalidatePendingTokenUsageSeries()
         }
         debounceTask?.cancel()
@@ -745,7 +762,9 @@ struct TokenUsageWindow: View {
             guard !Task.isCancelled else { return }
             guard chatModel.isConnected else { return }
             chatModel.requestTokenUsage(makeQuery())
-            if seriesChanged { requestSeries() }
+            if tab == .overTime && (seriesInvalidated || seriesFingerprint != lastSeriesFingerprint) {
+                requestSeries()
+            }
         }
     }
 
@@ -759,6 +778,7 @@ struct TokenUsageWindow: View {
 
     private func requestSeries() {
         guard chatModel.isConnected else { return }
+        seriesInvalidated = false
         lastSeriesFingerprint = seriesFingerprint
         chatModel.requestTokenUsageSeries(makeSeriesQuery())
     }
