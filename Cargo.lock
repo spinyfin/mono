@@ -461,6 +461,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-agent-host"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "boss-backoff"
 version = "0.1.0"
 dependencies = [

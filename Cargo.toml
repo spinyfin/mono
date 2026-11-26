@@ -11,6 +11,7 @@ members = [
   "tools/boss/claude_client",
   "tools/boss/codex_auth",
   "tools/boss/acp_client",
+  "tools/boss/agent-host",
   "tools/boss/backoff",
   "tools/boss/cli",
   "tools/boss/comment_anchor",
