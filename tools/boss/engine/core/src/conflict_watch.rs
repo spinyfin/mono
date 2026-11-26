@@ -185,6 +185,10 @@ pub enum CiMergeRebaseOutcome {
     /// Operational failure before or without hitting a conflict (repo
     /// resolution, `goto`, rebase command error, or unpushed clean rebase).
     Failed(String),
+    /// Another rebase or conflict resolution already owns this PR (a
+    /// concurrent Merge click). Nothing was started and the card is left
+    /// as the other attempt set it; the string is a complete message.
+    Busy(String),
 }
 
 /// Insert a fresh `conflict_resolutions` attempt row for a Merge-click CI
@@ -309,7 +313,7 @@ pub async fn rebase_for_ci_failure_merge(
             .filter(|s| !s.is_empty())
             .unwrap_or("main"),
     ) {
-        return CiMergeRebaseOutcome::Failed(reason);
+        return CiMergeRebaseOutcome::Busy(reason);
     }
     let mut attempt = match insert_ci_merge_rebase_attempt(work_db, candidate, probe) {
         Ok(attempt) => attempt,

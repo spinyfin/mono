@@ -259,7 +259,40 @@ impl WorkDb {
                 AND status IN ('pending', 'running')",
             params![now, CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE],
         )?;
+        // A deletion-signoff halt commits the attempt (`succeeded`, with a
+        // `halted_for_signoff` outcome) before the caller moves the
+        // CI-blocked card to `deletion_signoff`. A restart between the two
+        // leaves the card in its CI block with the sign-off requirement
+        // persisted only on the hidden attempt row; finish the transition.
+        let halted: Vec<(String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT cr.work_item_id, cr.pr_url
+                   FROM conflict_resolutions cr
+                   JOIN tasks t ON t.id = cr.work_item_id AND t.pr_url = cr.pr_url
+                  WHERE cr.event_source = ?1
+                    AND cr.status = 'succeeded'
+                    AND t.status = 'blocked'
+                    AND t.blocked_reason IN ('ci_failure', 'ci_failure_exhausted')
+                    AND t.deleted_at IS NULL
+                    AND EXISTS (
+                        SELECT 1 FROM json_each(COALESCE(cr.ladder_outcomes, '[]'))
+                         WHERE json_extract(value, '$.outcome') = 'halted_for_signoff')",
+            )?;
+            stmt.query_map(params![CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        };
         tx.commit()?;
+        drop(conn);
+        for (work_item_id, pr_url) in halted {
+            if self
+                .retarget_blocked_ci_failure_to_merge_conflict(&work_item_id, &pr_url)?
+                .is_some()
+            {
+                self.mark_chore_blocked_deletion_signoff(&work_item_id, &pr_url)?;
+            }
+        }
         Ok(cleared)
     }
 }
@@ -431,5 +464,53 @@ mod tests {
             abandoned.failure_reason.as_deref(),
             Some("engine_restart_orphaned_ci_merge_rebase")
         );
+    }
+
+    #[test]
+    fn reconcile_restores_deletion_signoff_after_restart_between_halt_and_takeover() {
+        let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+        let product = create_test_product(&db);
+        let chore = create_test_chore_manual(&db, product.id.clone(), "Halted before takeover");
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some(PR.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.mark_chore_blocked_ci_failure(&chore.id, PR, None).unwrap();
+        let attempt = db
+            .insert_conflict_resolution_with_source(
+                ConflictResolutionInsertInput {
+                    product_id: product.id,
+                    work_item_id: chore.id.clone(),
+                    pr_url: PR.to_owned(),
+                    pr_number: 77,
+                    head_branch: "boss/feature".to_owned(),
+                    base_branch: "main".to_owned(),
+                    base_sha_at_trigger: Some("base".to_owned()),
+                    head_sha_before: Some("head".to_owned()),
+                },
+                CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE,
+            )
+            .unwrap()
+            .expect("ci_merge_rebase attempt inserted");
+        // The halt commits, but the engine dies before the CI block is taken over.
+        db.halt_conflict_resolution_for_deletion_signoff(&attempt.id, 1, &["gone.rs".to_owned()])
+            .unwrap();
+        let WorkItem::Chore(before) = db.get_work_item(&chore.id).unwrap() else {
+            panic!("expected chore");
+        };
+        assert_eq!(before.blocked_reason.as_deref(), Some("ci_failure"));
+
+        db.reconcile_stale_ci_merge_rebase_progress().unwrap();
+
+        let WorkItem::Chore(after) = db.get_work_item(&chore.id).unwrap() else {
+            panic!("expected chore");
+        };
+        assert_eq!(after.blocked_reason.as_deref(), Some("deletion_signoff"));
+        assert!(after.blocked_detail.as_deref().unwrap_or_default().contains("gone.rs"));
     }
 }

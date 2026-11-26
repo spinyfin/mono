@@ -159,6 +159,11 @@ const fn entry(kind: &'static str, cleared_by: ClearedBy, rationale: &'static st
 /// `every_registered_kind_is_declared_once` below pins the table itself.
 pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     entry(
+        CI_MERGE_REBASE_FAILED_ATTENTION_KIND,
+        ClearedBy::ProducerReconciles,
+        "The Merge handler resolves it once a later merge request (GitHub auto-merge or Trunk submit) is accepted for the work item; the rebase failure it reports is then superseded.",
+    ),
+    entry(
         CONFLICT_REMEDIATION_STOPPED_ATTENTION_KIND,
         ClearedBy::ProducerReconciles,
         "Conflict remediation clears the signal after workspace preparation succeeds, a retry resumes, or the PR becomes clean.",

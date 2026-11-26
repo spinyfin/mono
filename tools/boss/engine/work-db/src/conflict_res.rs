@@ -1088,6 +1088,10 @@ impl WorkDb {
               WHERE id = ?1 AND event_source = ?2",
             params![attempt_id, CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE],
         )?;
+        drop(conn);
+        if changed > 0 {
+            self.replay_ladder_outcome_counters(attempt_id)?;
+        }
         Ok(changed > 0)
     }
 

@@ -9,7 +9,7 @@ pub(crate) const SUPERSEDED_STALE_HEAD: &str = "superseded_stale_head";
 
 /// Short human wording for the machine reason codes callers pass to [`stop`].
 /// Text that is already prose is shown as written.
-fn human_reason(reason: &str) -> String {
+pub fn human_reason(reason: &str) -> String {
     let code = reason.split(':').next().unwrap_or(reason).trim();
     let is_code = !code.is_empty()
         && code

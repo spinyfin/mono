@@ -1437,15 +1437,21 @@ async fn halt_attempt_for_deletion_signoff(
     conflicted_files: &[String],
     deletions: &[String],
 ) {
-    log_routing_verdict(
-        &candidate.work_item_id,
-        stored_pr_number(&candidate.pr_url).map(|n| n as u64),
-        conflicted_files,
-        "deterministic",
-        &format!(
-            "mechanical rung {rung} resolved every conflicted file but the deletion tripwire halted it pending sign-off"
-        ),
-    );
+    // A clean CI-merge rebase (no conflicted files) is not a conflict-routing
+    // decision; only log the verdict when a conflict was actually resolved.
+    let clean_ci_merge_rebase =
+        attempt.event_source == crate::work::CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE && conflicted_files.is_empty();
+    if !clean_ci_merge_rebase {
+        log_routing_verdict(
+            &candidate.work_item_id,
+            stored_pr_number(&candidate.pr_url).map(|n| n as u64),
+            conflicted_files,
+            "deterministic",
+            &format!(
+                "mechanical rung {rung} resolved every conflicted file but the deletion tripwire halted it pending sign-off"
+            ),
+        );
+    }
 
     if let Err(err) = work_db.halt_conflict_resolution_for_deletion_signoff(&attempt.id, rung, deletions) {
         tracing::error!(attempt_id = %attempt.id, ?err, "could not persist atomic deletion-signoff halt");

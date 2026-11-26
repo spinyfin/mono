@@ -44,16 +44,47 @@ impl WorkDb {
             .optional()?
             .unwrap_or(false);
         append_ladder_outcome_in_tx(&conn, attempt_id, tier, outcome, reason, deletions)?;
-        // A clean CI-merge rebase that retires is not a conflict-ladder
-        // decision. Residual-conflict / fell-through outcomes on the same
-        // row are real conflicts recorded *before* the row is reclassified
-        // to `review_watch`, so they still increment the counters.
-        if !is_ci_merge_rebase || outcome != "retired" {
-            self.metrics_registry().counter_inc_by_dynamic(
-                &format!("conflict_ladder.{tier}.{outcome}"),
-                "Conflict ladder tier decisions since engine start.",
-                1,
-            );
+        // Outcomes on a CI-merge rebase row are not conflict-ladder decisions
+        // until the row proves it hit a real conflict; those outcomes are
+        // counted by `replay_ladder_outcome_counters` when the row is
+        // reclassified to `review_watch`.
+        if !is_ci_merge_rebase {
+            self.count_ladder_outcome(tier, outcome);
+        }
+        Ok(())
+    }
+}
+
+impl WorkDb {
+    pub(crate) fn count_ladder_outcome(&self, tier: &str, outcome: &str) {
+        self.metrics_registry().counter_inc_by_dynamic(
+            &format!("conflict_ladder.{tier}.{outcome}"),
+            "Conflict ladder tier decisions since engine start.",
+            1,
+        );
+    }
+
+    /// Count every outcome already recorded on an attempt. Used when a
+    /// `ci_merge_rebase` row is reclassified as a real conflict, since its
+    /// earlier outcomes were withheld from the counters.
+    pub(crate) fn replay_ladder_outcome_counters(&self, attempt_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let recorded: Option<String> = conn
+            .query_row(
+                "SELECT ladder_outcomes FROM conflict_resolutions WHERE id = ?1",
+                [attempt_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(recorded) = recorded else {
+            return Ok(());
+        };
+        let events: Vec<serde_json::Value> = serde_json::from_str(&recorded).unwrap_or_default();
+        for event in events {
+            if let (Some(tier), Some(outcome)) = (event["tier"].as_str(), event["outcome"].as_str()) {
+                self.count_ladder_outcome(tier, outcome);
+            }
         }
         Ok(())
     }
@@ -130,7 +161,7 @@ mod tests {
     }
 
     #[test]
-    fn ci_merge_rebase_records_residual_conflict_counters_but_skips_retired() {
+    fn ci_merge_rebase_counters_are_withheld_until_reclassified_as_conflict() {
         use crate::test_support::{create_test_chore_manual, create_test_product};
 
         let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
@@ -162,28 +193,33 @@ mod tests {
             .unwrap()
             .expect("inserted");
 
-        db.record_conflict_ladder_outcome(&attempt.id, "engine_rebase", "residual_conflicts", "Cargo.lock")
+        for outcome in ["residual_conflicts", "fell_through", "unavailable", "skip", "retired"] {
+            db.record_conflict_ladder_outcome(&attempt.id, "engine_rebase", outcome, "reason")
+                .unwrap();
+        }
+        db.halt_conflict_resolution_for_deletion_signoff(&attempt.id, 1, &["gone.rs".into()])
             .unwrap();
-        db.record_conflict_ladder_outcome(
-            &attempt.id,
-            "engine_rebase",
-            "retired",
-            "resolution pushed and deletion tripwire passed",
-        )
-        .unwrap();
 
-        let snapshots = db.metrics_registry().counter_snapshots();
+        let ladder_counters = |db: &WorkDb| -> Vec<String> {
+            db.metrics_registry()
+                .counter_snapshots()
+                .into_iter()
+                .filter(|m| m.name.starts_with("conflict_ladder.") && m.value >= 1)
+                .map(|m| m.name)
+                .collect()
+        };
         assert!(
-            snapshots
-                .iter()
-                .any(|m| m.name == "conflict_ladder.engine_rebase.residual_conflicts" && m.value >= 1),
-            "genuine residual conflicts on a ci_merge_rebase row must increment the counter, got {snapshots:?}"
+            ladder_counters(&db).is_empty(),
+            "a clean ci_merge_rebase row must not touch conflict-ladder counters, got {:?}",
+            ladder_counters(&db)
         );
-        assert!(
-            snapshots
-                .iter()
-                .all(|m| m.name != "conflict_ladder.engine_rebase.retired"),
-            "retired outcomes on a ci_merge_rebase row must not increment the counter, got {snapshots:?}"
-        );
+
+        // Once the rebase proves to be a real conflict, the withheld outcomes count.
+        assert!(db.reclassify_ci_merge_rebase_as_conflict(&attempt.id).unwrap());
+        let counted = ladder_counters(&db);
+        for outcome in ["residual_conflicts", "fell_through", "halted_for_signoff"] {
+            let name = format!("conflict_ladder.engine_rebase.{outcome}");
+            assert!(counted.contains(&name), "{name} missing after reclassify: {counted:?}");
+        }
     }
 }

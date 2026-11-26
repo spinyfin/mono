@@ -911,6 +911,7 @@ mod feedback_target;
 mod github_api_usage_db;
 mod github_merge_intents;
 mod merge_conflict_merging;
+pub use merge_conflict_merging::human_reason as human_conflict_stop_reason;
 mod merge_intent;
 mod operator_answer_outcome;
 mod operator_disposition;

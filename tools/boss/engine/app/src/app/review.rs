@@ -5,6 +5,7 @@
 //! behavioural change. See [`super::Dispatch`] for the per-request
 //! context every handler receives.
 
+use super::review_ci_rebase::surface_ci_rebase_card_detail;
 use super::*;
 
 pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest) {
@@ -270,50 +271,6 @@ pub(super) struct DirectMergeArmRequest {
     /// transition.
     #[builder(default)]
     pub reply_already_sent: bool,
-}
-
-pub(super) async fn surface_ci_rebase_card_detail(
-    work_db: &WorkDb,
-    publisher: &dyn boss_execution_contracts::ExecutionPublisher,
-    product_id: &str,
-    work_item_id: &str,
-    pr_url: &str,
-    detail: &str,
-    publish_reason: &str,
-) {
-    if work_db
-        .set_ci_failure_blocked_detail(work_item_id, pr_url, detail)
-        .unwrap_or(false)
-    {
-        publisher
-            .publish_work_item_changed(product_id, work_item_id, publish_reason)
-            .await;
-        return;
-    }
-    // After the rebase push, CI polling can move the card to `in_review`
-    // while `gh pr merge` / Trunk submit is still pending. The CI-blocked
-    // detail update then no-ops; file a PR-bound attention item so the
-    // failure stays visible.
-    if let Err(err) = work_db.create_attention_item(boss_work_db::CreateAttentionItemInput {
-        work_item_id: Some(work_item_id.to_owned()),
-        kind: "ci_merge_rebase_failed".to_owned(),
-        title: "Merge after rebase could not be completed".to_owned(),
-        body_markdown: detail.to_owned(),
-        execution_id: None,
-        status: None,
-        resolved_at: None,
-    }) {
-        tracing::warn!(
-            %work_item_id,
-            %pr_url,
-            ?err,
-            "merge_when_ready: failed to file CI-merge rebase attention after card left ci_failure",
-        );
-        return;
-    }
-    publisher
-        .publish_work_item_changed(product_id, work_item_id, publish_reason)
-        .await;
 }
 
 /// Persist confirmation, call `gh pr merge --auto --squash`, record the
@@ -1078,6 +1035,12 @@ pub(super) async fn handle_trunk_queue_merge(
 }
 
 fn record_after_rebase(work_db: &WorkDb, work_item_id: &str, pr_url: &str, after_rebase: Option<&AfterRebaseRecord>) {
+    // Every caller reaches here only once a merge request was accepted, which
+    // supersedes an earlier failed CI-merge rebase report for this work item.
+    let _ = work_db.resolve_external_tracker_attention(
+        work_item_id,
+        boss_engine_storage_values::attention_kinds::CI_MERGE_REBASE_FAILED_ATTENTION_KIND,
+    );
     let Some(after) = after_rebase else {
         return;
     };

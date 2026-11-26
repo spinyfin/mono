@@ -2234,7 +2234,7 @@ async fn ci_merge_rebase_refusal_outcomes_leave_expected_card_state() {
             RefusalCase::LockfileRegenerationFailed,
             426u64,
             "merge_conflict",
-            Some("lockfile_regeneration_failed"),
+            Some("couldn't regenerate the lockfile"),
         ),
     ];
 
@@ -2336,6 +2336,30 @@ async fn ci_merge_rebase_refusal_outcomes_leave_expected_card_state() {
                         .all(|row| row.kind != "conflict" || row.pr_url != pr_url),
                     "clean rung-1 halt must not project as a conflict remediation row"
                 );
+                // Seed one fewer genuine conflict than the guard trips on: if
+                // the clean halted row were wrongly counted, the next genuine
+                // attempt would reach the threshold and be abandoned.
+                for i in 0..(boss_work_db::CHURN_GUARD_THRESHOLD - 1) {
+                    let prior = state
+                        .work_db
+                        .insert_conflict_resolution(boss_work_db::ConflictResolutionInsertInput {
+                            product_id: _product_id.clone(),
+                            work_item_id: chore_id.clone(),
+                            pr_url: pr_url.clone(),
+                            pr_number: pr_num as i64,
+                            head_branch: "boss/feature".to_owned(),
+                            base_branch: "main".to_owned(),
+                            base_sha_at_trigger: Some(format!("base-sha-prior-{i}")),
+                            head_sha_before: Some(format!("head-prior-{i}")),
+                        })
+                        .unwrap()
+                        .expect("prior genuine conflict resolution row inserted");
+                    assert_eq!(prior.status, "pending", "prior genuine row {i} must not trip the guard");
+                    state
+                        .work_db
+                        .mark_conflict_resolution_failed(&prior.id, "seeded prior genuine conflict")
+                        .unwrap();
+                }
                 let genuine = state
                     .work_db
                     .insert_conflict_resolution(boss_work_db::ConflictResolutionInsertInput {
@@ -2430,4 +2454,48 @@ async fn late_arm_failure_after_ci_unblocks_files_attention_item() {
             })
     })
     .await;
+}
+
+/// The early "Rebasing onto…" progress write runs after awaited probes. If CI
+/// polling already moved the card off `ci_failure` by then, the dropped
+/// progress text must not become a failure attention item.
+#[tokio::test]
+async fn progress_write_after_ci_unblocks_files_no_attention_item() {
+    let server = MockServer::start().await;
+    let pr_url = "https://github.com/spinyfin/mono/pull/428";
+    let direct_executor = Arc::new(FakeDirectMergeExecutor::returning("head-rebased"));
+    let probe = ScriptedMergeProbe::new(failing_probe(pr_url, "head-old", "BEHIND"), true);
+    let (state, _temp) = test_server(
+        trunk_client_for(server.uri()),
+        direct_executor,
+        RebaseCube::clean_pushed(),
+        probe,
+    );
+    let (product_id, chore_id) = seed_ci_blocked_chore(&state.work_db, "ci-progress-unblocked", pr_url, false, false);
+    state
+        .work_db
+        .clear_chore_blocked_ci_failure(&chore_id, pr_url)
+        .unwrap()
+        .expect("CI block clears before the progress write");
+
+    super::review_ci_rebase::publish_ci_rebase_progress(
+        &state.work_db,
+        state.publisher.as_ref(),
+        &product_id,
+        &chore_id,
+        pr_url,
+        "Rebasing onto main before merging...",
+        "ci_merge_rebase_started",
+    )
+    .await;
+
+    assert!(
+        state
+            .work_db
+            .list_attention_items_for_work_item(&chore_id)
+            .unwrap()
+            .iter()
+            .all(|item| item.kind != "ci_merge_rebase_failed"),
+        "a dropped progress update must not file a failure attention item"
+    );
 }

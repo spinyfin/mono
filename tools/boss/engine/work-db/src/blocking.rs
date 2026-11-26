@@ -503,11 +503,12 @@ impl WorkDb {
             Some(attempt_id),
         )?;
         tx.commit()?;
-        self.metrics_registry().counter_inc_by_dynamic(
-            &format!("conflict_ladder.{tier}.halted_for_signoff"),
-            "Conflict ladder tier decisions since engine start.",
-            1,
-        );
+        // A clean CI-merge rebase is not a conflict-ladder decision; if it
+        // is later reclassified as a real conflict, the recorded outcome is
+        // replayed into the counters then.
+        if attempt.event_source != crate::CONFLICT_EVENT_SOURCE_CI_MERGE_REBASE {
+            self.count_ladder_outcome(tier, "halted_for_signoff");
+        }
         Ok(updated)
     }
 
