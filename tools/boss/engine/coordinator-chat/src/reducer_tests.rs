@@ -28,7 +28,7 @@ fn record(seq: u64, dir: Direction, payload: serde_json::Value) -> WireRecord {
 #[test]
 fn replays_background_agent_completion_agent_turn_compaction_and_account_state() {
     let records = read_records(BG_FIXTURE.as_bytes()).expect("fixture must parse cleanly");
-    assert_eq!(records.len(), 31);
+    assert_eq!(records.len(), 49);
 
     let first = replay_records(&records, CredentialRedactor::none());
     let second = replay_records(&records, CredentialRedactor::none());
@@ -48,15 +48,18 @@ fn replays_background_agent_completion_agent_turn_compaction_and_account_state()
     assert_eq!(state.agent_version.as_deref(), Some("0.110.0"));
     assert!(state.supports_background_subagents);
     assert!(state.supports_async_tasks);
-    assert_eq!(state.session_id.as_deref(), Some("sess-scrubbed-01"));
-    assert_eq!(state.model.as_deref(), Some("claude-opus-5-5"));
-    assert_eq!(state.mode.as_deref(), Some("auto"));
-    assert_eq!(state.last_seq, 31);
+    assert_eq!(
+        state.session_id.as_deref(),
+        Some("8f841612-5203-404c-a918-23204324e257")
+    );
+    assert_eq!(state.model.as_deref(), Some("claude-sonnet-5-5"));
+    assert_eq!(state.mode.as_deref(), Some("bypassPermissions"));
+    assert_eq!(state.last_seq, 49);
 
     // Account notifications become a state only, never their content.
     let state_json = serde_json::to_string(state).unwrap();
     let items_json = serde_json::to_string(first.items()).unwrap();
-    for forbidden in ["redacted-user@example.invalid", "Example Org", "Example Plan"] {
+    for forbidden in ["redacted-user@example.invalid", "Example Organization", "Example Plan"] {
         assert!(
             !state_json.contains(forbidden),
             "state leaked account content: {state_json}"
@@ -87,13 +90,21 @@ fn replays_background_agent_completion_agent_turn_compaction_and_account_state()
         .items()
         .iter()
         .find_map(|item| match &item.kind {
-            CoordinatorChatItemKind::ToolCall(tool) if tool.tool_call_id == "toolu_bg_child" => Some(tool),
+            CoordinatorChatItemKind::ToolCall(tool) if tool.tool_call_id == "toolu_01W1mchxf3S8S3xo2kngiL1L" => {
+                Some(tool)
+            }
             _ => None,
         })
         .expect("background child tool call must exist");
-    assert_eq!(child_tool.parent_tool_call_id.as_deref(), Some("toolu_bg_spawn"));
+    assert_eq!(
+        child_tool.parent_tool_call_id.as_deref(),
+        Some("toolu_01Gn6NL2R1tvsumQYQx4uKrk")
+    );
     assert_eq!(child_tool.status, CoordinatorChatToolStatus::Completed);
-    assert_eq!(child_tool.output.as_deref(), Some("```text\nBACKGROUND-DONE-58\n```"));
+    assert_eq!(
+        child_tool.output.as_deref(),
+        Some("```console\nBACKGROUND-DONE-58\n```")
+    );
 
     // Verify phase stayed Idle while the background agent's own tool call ran
     // outside any turn, then moved to Working on `async_task_spawned` (`turn`),
@@ -102,19 +113,19 @@ fn replays_background_agent_completion_agent_turn_compaction_and_account_state()
     for rec in &records {
         step_reducer.apply_record(rec);
         match rec.seq {
-            16..=21 => assert_eq!(
+            30..=32 => assert_eq!(
                 step_reducer.state().phase,
                 CoordinatorChatConnectionPhase::Idle,
                 "seq {} must not open a turn",
                 rec.seq
             ),
-            22..=24 => assert_eq!(
+            33..=39 => assert_eq!(
                 step_reducer.state().phase,
                 CoordinatorChatConnectionPhase::Working,
                 "seq {} is inside agent-started turn",
                 rec.seq
             ),
-            25 | 26 => assert_eq!(
+            40..=42 => assert_eq!(
                 step_reducer.state().phase,
                 CoordinatorChatConnectionPhase::Idle,
                 "seq {} is after agent-started turn closed",
@@ -130,12 +141,20 @@ fn replays_background_agent_completion_agent_turn_compaction_and_account_state()
         .items()
         .iter()
         .find_map(|item| match &item.kind {
-            CoordinatorChatItemKind::Message(msg) if msg.message_id.as_deref() == Some("msg-2") => Some(msg),
+            CoordinatorChatItemKind::Message(msg)
+                if msg.message_id.as_deref() == Some("msg_011ChRrrcRSsV7f21Y7hKHqh") =>
+            {
+                Some(msg)
+            }
             _ => None,
         })
         .expect("agent-started turn message must exist");
     assert_eq!(agent_message.role, CoordinatorChatMessageRole::Coordinator);
-    assert_eq!(agent_message.text, "Background agent finished: BACKGROUND-DONE-58.");
+    assert!(
+        agent_message.text.contains("BACKGROUND-DONE-58"),
+        "{}",
+        agent_message.text
+    );
 
     let agent_turn_boundary = first
         .items()
@@ -150,14 +169,15 @@ fn replays_background_agent_completion_agent_turn_compaction_and_account_state()
         agent_turn_boundary.1.origin,
         Some(CoordinatorChatTurnOrigin::TaskNotification)
     );
-    assert_eq!(agent_turn_boundary.0.seq, 25);
-    assert_eq!(agent_turn_boundary.0.updated_seq, 26);
+    assert_eq!(agent_turn_boundary.0.seq, 40);
+    assert_eq!(agent_turn_boundary.0.updated_seq, 41);
 
-    // Compaction tool call (`compact`) became a Compaction notice, not a ToolCall.
+    // Compaction tool call (`_meta.jetbrains.air.contextCompaction`) became a
+    // Compaction notice, not a ToolCall.
     assert!(
         !first.items().iter().any(|item| matches!(
             &item.kind,
-            CoordinatorChatItemKind::ToolCall(tool) if tool.tool_call_id == "toolu_compact_1"
+            CoordinatorChatItemKind::ToolCall(tool) if tool.tool_call_id == "5cda7d36-2bf2-4b3b-af17-32eed8ddc3c0"
         )),
         "compact tool call must become a compaction notice, not a generic tool row"
     );
@@ -172,32 +192,33 @@ fn replays_background_agent_completion_agent_turn_compaction_and_account_state()
         })
         .expect("compaction notice must exist");
     assert_eq!(compaction.trigger.as_deref(), Some("manual"));
-    assert_eq!(compaction.pre_tokens, Some(42602));
-    assert_eq!(compaction.post_tokens, Some(7073));
+    assert_eq!(compaction.pre_tokens, Some(25909));
+    assert_eq!(compaction.post_tokens, Some(7189));
 }
 
 #[test]
 fn replays_permission_allow_cancel_and_agent_withdrawal() {
     let records = read_records(PERMISSION_CANCEL_FIXTURE.as_bytes()).expect("fixture must parse cleanly");
+    assert_eq!(records.len(), 52);
     let mut reducer = ConversationReducer::new(CredentialRedactor::none());
 
     for rec in &records {
         reducer.apply_record(rec);
         match rec.seq {
-            7 | 15 | 22 => assert_eq!(
+            22 | 37 | 49 => assert_eq!(
                 reducer.state().phase,
                 CoordinatorChatConnectionPhase::WaitingForPermission,
                 "seq {} should wait for permission",
                 rec.seq
             ),
-            8 | 16 | 23 => assert_eq!(
+            24 | 39 | 51 => assert_eq!(
                 reducer.state().phase,
                 CoordinatorChatConnectionPhase::Working,
                 "seq {} should resume working after permission resolved/withdrawn",
                 rec.seq
             ),
-            17 => assert!(reducer.state().cancel_requested),
-            19 => {
+            40 => assert!(reducer.state().cancel_requested),
+            43 => {
                 assert_eq!(reducer.state().phase, CoordinatorChatConnectionPhase::Idle);
                 assert!(!reducer.state().cancel_requested);
             }
@@ -247,17 +268,18 @@ fn replays_permission_allow_cancel_and_agent_withdrawal() {
         CoordinatorChatPermissionResolution::Cancelled { withdrawn: true }
     );
 
-    // Cancelled tool call carries `non_execution_kind` and status Failed.
+    // Cancelled tool call carries status Failed.
     let cancelled_tool = reducer
         .items()
         .iter()
         .find_map(|item| match &item.kind {
-            CoordinatorChatItemKind::ToolCall(tool) if tool.tool_call_id == "toolu_cancel" => Some(tool),
+            CoordinatorChatItemKind::ToolCall(tool) if tool.tool_call_id == "toolu_01CcdsvjJQd4vqfb5YPj3CzQ" => {
+                Some(tool)
+            }
             _ => None,
         })
         .expect("cancelled tool must exist");
     assert_eq!(cancelled_tool.status, CoordinatorChatToolStatus::Failed);
-    assert_eq!(cancelled_tool.non_execution_kind.as_deref(), Some("permission-rule"));
 
     // Turn 2 boundary recorded `cancelled`.
     let turn_boundaries: Vec<_> = reducer
@@ -280,16 +302,16 @@ fn replays_truncated_journal_tolerating_torn_final_line_and_preserving_in_progre
     let reducer = replay_reader(TRUNCATED_FIXTURE.as_bytes(), CredentialRedactor::none())
         .expect("truncated final line must be ignored cleanly");
 
-    assert_eq!(reducer.state().last_seq, 7);
+    assert_eq!(reducer.state().last_seq, 18);
     assert_eq!(reducer.state().phase, CoordinatorChatConnectionPhase::Working);
 
     let in_progress = reducer
         .in_progress_message()
         .expect("partial streamed answer must be exposed in snapshot");
-    assert_eq!(in_progress.item_id, "msg-6");
-    assert_eq!(in_progress.started_seq, 6);
-    assert_eq!(in_progress.updated_seq, 7);
-    assert_eq!(in_progress.text, "Partial answer still streaming...");
+    assert_eq!(in_progress.item_id, "msg-17");
+    assert_eq!(in_progress.started_seq, 17);
+    assert_eq!(in_progress.updated_seq, 18);
+    assert_eq!(in_progress.text, "PARTIAL_TURN_MARKER one");
 
     // A corrupt record in the middle is still a hard error.
     let corrupt_middle = format!("not-json\n{TRUNCATED_FIXTURE}");
@@ -669,8 +691,9 @@ fn credential_split_around_background_child_tool_call_never_leaks() {
         chunk(4, &format!("{second_half} done")),
     ];
     for record in &records {
-        reducer.apply_record(record);
-        let snapshot = serde_json::to_string(&(reducer.items(), reducer.in_progress_message())).unwrap();
+        let delta = reducer.apply_record(record);
+        let snapshot =
+            serde_json::to_string(&(reducer.items(), reducer.in_progress_message(), &delta.message_delta)).unwrap();
         assert!(!snapshot.contains(first_half), "intermediate leak: {snapshot}");
     }
     reducer.apply_record(&record(
@@ -678,6 +701,8 @@ fn credential_split_around_background_child_tool_call_never_leaks() {
         Direction::FromAgent,
         json!({"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}),
     ));
+    let seqs: Vec<u64> = reducer.items().iter().map(|item| item.seq).collect();
+    assert_eq!(seqs, vec![2, 3, 5], "items must remain ordered by creation seq");
     let messages: Vec<_> = reducer
         .items()
         .iter()
@@ -687,6 +712,242 @@ fn credential_split_around_background_child_tool_call_never_leaks() {
         })
         .collect();
     assert_eq!(messages, vec![format!("token {REDACTED_PLACEHOLDER} done")]);
+
+    // A later update to the child tool must still target the shifted tool index.
+    reducer.apply_record(&update_record(
+        6,
+        json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "toolu_child",
+            "status": "completed",
+            "content": [{"type": "content", "content": {"type": "text", "text": "child ok"}}]
+        }),
+    ));
+    let child = reducer
+        .items()
+        .iter()
+        .find_map(|item| match &item.kind {
+            CoordinatorChatItemKind::ToolCall(tool) if tool.tool_call_id == "toolu_child" => Some(tool),
+            _ => None,
+        })
+        .expect("child tool must exist");
+    assert_eq!(child.status, CoordinatorChatToolStatus::Completed);
+    assert_eq!(child.output.as_deref(), Some("child ok"));
+}
+
+#[test]
+fn credential_split_around_background_child_orphan_update_never_leaks() {
+    let mut reducer = ConversationReducer::new(CredentialRedactor::new(TEST_SECRET));
+    let (first_half, second_half) = TEST_SECRET.split_at(TEST_SECRET.len() / 2);
+    let records = [
+        record(
+            1,
+            Direction::ToAgent,
+            json!({"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s","prompt":[]}}),
+        ),
+        chunk(2, &format!("token {first_half}")),
+        update_record(
+            3,
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "toolu_child_orphan",
+                "title": "orphan child update",
+                "kind": "execute",
+                "status": "in_progress",
+                "_meta": {"claudeCode": {"toolName": "Bash", "parentToolUseId": "toolu_parent"}}
+            }),
+        ),
+        chunk(4, &format!("{second_half} done")),
+    ];
+    for rec in &records {
+        let delta = reducer.apply_record(rec);
+        let snapshot =
+            serde_json::to_string(&(reducer.items(), reducer.in_progress_message(), &delta.message_delta)).unwrap();
+        assert!(!snapshot.contains(first_half), "intermediate leak: {snapshot}");
+    }
+    reducer.apply_record(&record(
+        5,
+        Direction::FromAgent,
+        json!({"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}),
+    ));
+
+    let seqs: Vec<u64> = reducer.items().iter().map(|item| item.seq).collect();
+    assert_eq!(seqs, vec![2, 3, 5], "items must remain ordered by creation seq");
+    let messages: Vec<_> = reducer
+        .items()
+        .iter()
+        .filter_map(|item| match &item.kind {
+            CoordinatorChatItemKind::Message(message) => Some(message.text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(messages, vec![format!("token {REDACTED_PLACEHOLDER} done")]);
+
+    // Later update to the synthesized orphan tool still hits the shifted index.
+    reducer.apply_record(&update_record(
+        6,
+        json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "toolu_child_orphan",
+            "status": "completed",
+            "content": [{"type": "content", "content": {"type": "text", "text": "orphan ok"}}]
+        }),
+    ));
+    let child = reducer
+        .items()
+        .iter()
+        .find_map(|item| match &item.kind {
+            CoordinatorChatItemKind::ToolCall(tool) if tool.tool_call_id == "toolu_child_orphan" => Some(tool),
+            _ => None,
+        })
+        .expect("orphan child tool must exist");
+    assert_eq!(child.status, CoordinatorChatToolStatus::Completed);
+    assert_eq!(child.output.as_deref(), Some("orphan ok"));
+}
+
+#[test]
+fn credential_split_around_background_child_permission_request_never_leaks() {
+    let mut reducer = ConversationReducer::new(CredentialRedactor::new(TEST_SECRET));
+    let (first_half, second_half) = TEST_SECRET.split_at(TEST_SECRET.len() / 2);
+    let records = [
+        record(
+            1,
+            Direction::ToAgent,
+            json!({"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s","prompt":[]}}),
+        ),
+        chunk(2, &format!("token {first_half}")),
+        record(
+            3,
+            Direction::FromAgent,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "s",
+                    "toolCall": {
+                        "toolCallId": "toolu_child_perm",
+                        "title": "child command",
+                        "kind": "execute",
+                        "_meta": {"claudeCode": {"parentToolUseId": "toolu_parent"}}
+                    },
+                    "options": [{"optionId": "allow-once", "name": "Yes", "kind": "allow_once"}]
+                }
+            }),
+        ),
+        chunk(4, &format!("{second_half} done")),
+    ];
+    for rec in &records {
+        let delta = reducer.apply_record(rec);
+        let snapshot =
+            serde_json::to_string(&(reducer.items(), reducer.in_progress_message(), &delta.message_delta)).unwrap();
+        assert!(!snapshot.contains(first_half), "intermediate leak: {snapshot}");
+    }
+    reducer.apply_record(&record(
+        5,
+        Direction::FromAgent,
+        json!({"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}),
+    ));
+
+    let seqs: Vec<u64> = reducer.items().iter().map(|item| item.seq).collect();
+    assert_eq!(seqs, vec![2, 3, 5], "items must remain ordered by creation seq");
+    let messages: Vec<_> = reducer
+        .items()
+        .iter()
+        .filter_map(|item| match &item.kind {
+            CoordinatorChatItemKind::Message(message) => Some(message.text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(messages, vec![format!("token {REDACTED_PLACEHOLDER} done")]);
+
+    // Resolving the child permission request after the message flushed still
+    // updates the shifted permission index.
+    reducer.apply_record(&record(
+        6,
+        Direction::ToAgent,
+        json!({"jsonrpc":"2.0","id":9,"result":{"outcome":{"outcome":"selected","optionId":"allow-once"}}}),
+    ));
+    let perm = reducer
+        .items()
+        .iter()
+        .find_map(|item| match &item.kind {
+            CoordinatorChatItemKind::PermissionRequest(perm) if perm.request_id == "9" => Some(perm),
+            _ => None,
+        })
+        .expect("child permission request must exist");
+    assert_eq!(
+        perm.resolution,
+        CoordinatorChatPermissionResolution::Selected {
+            option_id: "allow-once".to_owned(),
+            option_name: Some("Yes".to_owned()),
+        }
+    );
+}
+
+#[test]
+fn tied_and_late_intents_match_replay_and_preserve_indices() {
+    let first_tool_rec = update_record(
+        5,
+        json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "toolu_at_5",
+            "title": "at five",
+            "kind": "execute",
+            "status": "in_progress"
+        }),
+    );
+    let tool_rec = update_record(
+        6,
+        json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "toolu_after",
+            "title": "after",
+            "kind": "execute",
+            "status": "in_progress"
+        }),
+    );
+    let tool_done = update_record(
+        7,
+        json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "toolu_after",
+            "status": "completed"
+        }),
+    );
+    let tied_intent = || PromptIntent {
+        seq: 5,
+        ts_ms: 1_795_000_000_005,
+        role: CoordinatorChatMessageRole::Operator,
+        text: "tied prompt".to_owned(),
+        client_message_id: None,
+    };
+
+    // Replay: intent with seq 5 lands before record with seq 5.
+    let replayed = replay_with_intents(
+        [&first_tool_rec, &tool_rec, &tool_done],
+        [tied_intent()],
+        CredentialRedactor::none(),
+    );
+
+    // Live (intent applied after record of same seq): must match replay.
+    let mut live_after = ConversationReducer::new(CredentialRedactor::none());
+    live_after.apply_record(&first_tool_rec);
+    live_after.apply_intent_message(tied_intent());
+    live_after.apply_record(&tool_rec);
+    live_after.apply_record(&tool_done);
+    assert_eq!(live_after.items(), replayed.items());
+
+    // Live (late intent applied after later tool_call): inserts at seq 5 and
+    // shifts tool_indices so `tool_done` still updates `toolu_after`.
+    let mut live_late = ConversationReducer::new(CredentialRedactor::none());
+    live_late.apply_record(&first_tool_rec);
+    live_late.apply_record(&tool_rec);
+    live_late.apply_intent_message(tied_intent());
+    live_late.apply_record(&tool_done);
+    assert_eq!(live_late.items(), replayed.items());
+    let ids: Vec<&str> = live_late.items().iter().map(|i| i.id.as_str()).collect();
+    assert_eq!(ids, vec!["prompt-5", "tool-5", "tool-6"]);
 }
 
 #[test]

@@ -173,21 +173,14 @@ impl ConversationReducer {
 
     /// Records a prompt message from the engine's intent log as a chat item.
     ///
-    /// The text is redacted before being stored. Any open streaming message or
-    /// thought is finalized first so item ordering remains monotonic.
-    ///
-    /// Items are appended in call order, so callers must interleave intents with
-    /// wire records by `seq` (an intent no later than the next record it
-    /// precedes). [`replay_with_intents`] does this for replay.
+    /// The text is redacted before being stored. When `intent.seq` is strictly
+    /// greater than `state.last_seq`, any open streaming message or thought is
+    /// finalized first and the intent is appended. When `intent.seq <=
+    /// state.last_seq` (tied with or earlier than an already-applied wire
+    /// record), the intent is inserted at its `seq` position ahead of
+    /// wire-record items with the same `seq`, matching [`replay_with_intents`].
     pub fn apply_intent_message(&mut self, intent: PromptIntent) -> ReduceDelta {
-        debug_assert!(
-            intent.seq >= self.state.last_seq,
-            "intent seq {} applied after wire record seq {}",
-            intent.seq,
-            self.state.last_seq
-        );
         let mut delta = ReduceDelta::default();
-        self.flush_streams(intent.seq, &mut delta);
         let item_id = format!("prompt-{}", intent.seq);
         let mut item = CoordinatorChatItem {
             id: item_id.clone(),
@@ -203,9 +196,54 @@ impl ConversationReducer {
             }),
         };
         self.redactor.redact_item(&mut item);
-        self.items.items.push(item);
+        if intent.seq > self.state.last_seq {
+            self.flush_streams(intent.seq, &mut delta);
+            self.insert_item(item);
+        } else {
+            let idx = self.items.items.partition_point(|existing| {
+                existing.seq < intent.seq || (existing.seq == intent.seq && existing.id.starts_with("prompt-"))
+            });
+            self.insert_item_at(item, idx);
+        }
         delta.upserted_item_ids.push(item_id);
         delta
+    }
+
+    /// Inserts `item` into `self.items.items` in non-decreasing `seq` order,
+    /// shifting any stored item indices at or after the insertion point.
+    fn insert_item(&mut self, item: CoordinatorChatItem) -> usize {
+        if self.items.items.last().is_none_or(|last| last.seq <= item.seq) {
+            let idx = self.items.items.len();
+            self.items.items.push(item);
+            return idx;
+        }
+        let idx = self.items.items.partition_point(|existing| existing.seq <= item.seq);
+        self.insert_item_at(item, idx)
+    }
+
+    fn insert_item_at(&mut self, item: CoordinatorChatItem, idx: usize) -> usize {
+        self.items.items.insert(idx, item);
+        for slot in self.items.tool_indices.values_mut() {
+            if *slot >= idx {
+                *slot += 1;
+            }
+        }
+        for slot in self.items.compaction_indices.values_mut() {
+            if *slot >= idx {
+                *slot += 1;
+            }
+        }
+        for slot in self.items.permission_indices.values_mut() {
+            if *slot >= idx {
+                *slot += 1;
+            }
+        }
+        if let Some(last_idx) = &mut self.wire.last_turn_boundary_idx
+            && *last_idx >= idx
+        {
+            *last_idx += 1;
+        }
+        idx
     }
 
     /// Reduces one wire-journal record in place and reports what changed.
@@ -354,7 +392,28 @@ impl ConversationReducer {
         let Ok(request) = RequestPermissionRequest::parse_message(method, params) else {
             return;
         };
-        self.flush_streams(record.seq, delta);
+        let tool_call_id = request.tool_call.tool_call_id.to_string();
+        let is_child_permission = params
+            .pointer("/toolCall/_meta/claudeCode/parentToolUseId")
+            .or_else(|| params.pointer("/_meta/claudeCode/parentToolUseId"))
+            .and_then(Value::as_str)
+            .is_some()
+            || self
+                .items
+                .tool_indices
+                .get(&tool_call_id)
+                .and_then(|&idx| self.items.items.get(idx))
+                .is_some_and(|item| {
+                    matches!(
+                        &item.kind,
+                        CoordinatorChatItemKind::ToolCall(tool) if tool.parent_tool_call_id.is_some()
+                    )
+                });
+        // A background child's permission request interleaves with the
+        // coordinator's own streaming and must not finalize the open stream.
+        if !is_child_permission {
+            self.flush_streams(record.seq, delta);
+        }
 
         let display_id = id.to_string();
         let tool_call = &request.tool_call;
@@ -387,7 +446,7 @@ impl ConversationReducer {
             kind: CoordinatorChatItemKind::PermissionRequest(
                 CoordinatorChatPermissionRequestItem::builder()
                     .request_id(display_id.clone())
-                    .tool_call_id(tool_call.tool_call_id.to_string())
+                    .tool_call_id(tool_call_id)
                     .title(title)
                     .tool_kind(tool_kind)
                     .maybe_input(input)
@@ -396,8 +455,7 @@ impl ConversationReducer {
                     .build(),
             ),
         };
-        let index = self.items.items.len();
-        self.items.items.push(item);
+        let index = self.insert_item(item);
         self.items.permission_indices.insert(display_id.clone(), index);
         self.wire
             .pending_agent_permissions
@@ -798,7 +856,7 @@ impl ConversationReducer {
             return;
         }
         let item_id = active.meta.item_id;
-        self.items.items.push(CoordinatorChatItem {
+        self.insert_item(CoordinatorChatItem {
             id: item_id.clone(),
             seq: active.meta.started_seq,
             updated_seq: seq.max(active.meta.updated_seq),
@@ -823,7 +881,7 @@ impl ConversationReducer {
             return;
         }
         let item_id = active.meta.item_id;
-        self.items.items.push(CoordinatorChatItem {
+        self.insert_item(CoordinatorChatItem {
             id: item_id.clone(),
             seq: active.meta.started_seq,
             updated_seq: seq.max(active.meta.updated_seq),
@@ -859,16 +917,19 @@ impl ConversationReducer {
             .or_else(|| meta.pointer("/claudeCode/toolName").and_then(Value::as_str))
             .map(|name| self.redactor.redact_str(name));
 
-        // Spike finding: compaction arrives as a tool call (`toolName: "compact"`),
+        // Spike finding: compaction arrives as a tool call carrying
+        // `_meta.jetbrains.air.contextCompaction` (or `toolName: "compact"`),
         // not as one of the schema's compaction update kinds.
-        if tool_name
-            .as_deref()
-            .is_some_and(|name| name.eq_ignore_ascii_case("compact"))
-        {
-            let notice = build_compaction_notice(&self.redactor, Some(call.title.as_str()), call.raw_output.as_ref());
+        if is_compaction_tool_call(tool_name.as_deref(), meta) {
+            let notice = build_compaction_notice(
+                &self.redactor,
+                Some(call.title.as_str()),
+                call.raw_output.as_ref(),
+                meta,
+                None,
+            );
             let item_id = format!("notice-{}", record.seq);
-            let idx = self.items.items.len();
-            self.items.items.push(CoordinatorChatItem {
+            let idx = self.insert_item(CoordinatorChatItem {
                 id: item_id.clone(),
                 seq: record.seq,
                 updated_seq: record.seq,
@@ -894,8 +955,7 @@ impl ConversationReducer {
         let blocked_by_auto_mode = is_auto_mode_denial(non_execution_kind.as_deref());
 
         let item_id = format!("tool-{}", record.seq);
-        let idx = self.items.items.len();
-        self.items.items.push(CoordinatorChatItem {
+        let idx = self.insert_item(CoordinatorChatItem {
             id: item_id.clone(),
             seq: record.seq,
             updated_seq: record.seq,
@@ -935,8 +995,10 @@ impl ConversationReducer {
             {
                 let updated = build_compaction_notice(
                     &self.redactor,
-                    update.fields.title.as_deref().or(Some(notice.text.as_str())),
+                    update.fields.title.as_deref(),
                     update.fields.raw_output.as_ref(),
+                    meta,
+                    Some(notice),
                 );
                 *notice = updated;
                 item.updated_seq = record.seq;
@@ -1024,19 +1086,25 @@ impl ConversationReducer {
         }
 
         // Orphan update with no preceding `tool_call`: synthesize a row.
-        self.flush_streams(record.seq, delta);
-        if tool_name
-            .as_deref()
-            .is_some_and(|name| name.eq_ignore_ascii_case("compact"))
-        {
+        // Never finalize the coordinator's open message or thought for a
+        // background child's orphan update.
+        let parent_tool_call_id = meta
+            .pointer("/claudeCode/parentToolUseId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if parent_tool_call_id.is_none() {
+            self.flush_streams(record.seq, delta);
+        }
+        if is_compaction_tool_call(tool_name.as_deref(), meta) {
             let notice = build_compaction_notice(
                 &self.redactor,
                 update.fields.title.as_deref(),
                 update.fields.raw_output.as_ref(),
+                meta,
+                None,
             );
             let item_id = format!("notice-{}", record.seq);
-            let idx = self.items.items.len();
-            self.items.items.push(CoordinatorChatItem {
+            let idx = self.insert_item(CoordinatorChatItem {
                 id: item_id.clone(),
                 seq: record.seq,
                 updated_seq: record.seq,
@@ -1068,10 +1136,6 @@ impl ConversationReducer {
                     .map(compact_json)
             })
             .map(|text| self.redact_and_bound(&text));
-        let parent_tool_call_id = meta
-            .pointer("/claudeCode/parentToolUseId")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
         let non_execution_kind = meta
             .pointer("/claudeCode/nonExecutionKind")
             .and_then(Value::as_str)
@@ -1079,8 +1143,7 @@ impl ConversationReducer {
         let blocked_by_auto_mode = is_auto_mode_denial(non_execution_kind.as_deref());
 
         let item_id = format!("tool-{}", record.seq);
-        let idx = self.items.items.len();
-        self.items.items.push(CoordinatorChatItem {
+        let idx = self.insert_item(CoordinatorChatItem {
             id: item_id.clone(),
             seq: record.seq,
             updated_seq: record.seq,
@@ -1151,7 +1214,7 @@ impl ConversationReducer {
         let is_streaming = self.items.streaming.message.is_some() || self.items.streaming.thought.is_some();
         if !is_streaming && (summary.size > 0 || summary.used > 0) {
             let item_id = format!("usage-{}", record.seq);
-            self.items.items.push(CoordinatorChatItem {
+            self.insert_item(CoordinatorChatItem {
                 id: item_id.clone(),
                 seq: record.seq,
                 updated_seq: record.seq,
@@ -1170,7 +1233,7 @@ impl ConversationReducer {
         delta: &mut ReduceDelta,
     ) {
         let item_id = format!("notice-{}", record.seq);
-        self.items.items.push(CoordinatorChatItem {
+        self.insert_item(CoordinatorChatItem {
             id: item_id.clone(),
             seq: record.seq,
             updated_seq: record.seq,
@@ -1196,8 +1259,7 @@ impl ConversationReducer {
         delta: &mut ReduceDelta,
     ) {
         let item_id = format!("turn-{}", record.seq);
-        let idx = self.items.items.len();
-        self.items.items.push(CoordinatorChatItem {
+        let idx = self.insert_item(CoordinatorChatItem {
             id: item_id.clone(),
             seq: record.seq,
             updated_seq: record.seq,
@@ -1398,28 +1460,42 @@ fn extract_tool_output(content: &[ToolCallContent], raw_output: Option<&Value>) 
     Some(text)
 }
 
+fn is_compaction_tool_call(tool_name: Option<&str>, meta: &Value) -> bool {
+    meta.pointer("/jetbrains/air/contextCompaction").is_some()
+        || tool_name.is_some_and(|name| name.eq_ignore_ascii_case("compact"))
+}
+
 fn build_compaction_notice(
     redactor: &CredentialRedactor,
     title: Option<&str>,
     raw_output: Option<&Value>,
+    meta: &Value,
+    existing: Option<&CoordinatorChatNoticeItem>,
 ) -> CoordinatorChatNoticeItem {
-    let trigger = raw_output
+    let stats = meta.pointer("/jetbrains/air/contextCompaction").or(raw_output);
+    let trigger = stats
         .and_then(|output| output.get("trigger"))
         .and_then(Value::as_str)
-        .map(|value| redactor.redact_str(value));
-    let pre_tokens = raw_output
+        .map(|value| redactor.redact_str(value))
+        .or_else(|| existing.and_then(|prev| prev.trigger.clone()));
+    let pre_tokens = stats
         .and_then(|output| output.get("preTokens"))
-        .and_then(Value::as_u64);
-    let post_tokens = raw_output
+        .and_then(Value::as_u64)
+        .or_else(|| existing.and_then(|prev| prev.pre_tokens));
+    let post_tokens = stats
         .and_then(|output| output.get("postTokens"))
-        .and_then(Value::as_u64);
+        .and_then(Value::as_u64)
+        .or_else(|| existing.and_then(|prev| prev.post_tokens));
 
     let text = match (trigger.as_deref(), pre_tokens, post_tokens) {
         (Some(trigger), Some(pre), Some(post)) => {
             format!("Context compacted ({trigger}: {pre} -> {post} tokens)")
         }
         (None, Some(pre), Some(post)) => format!("Context compacted ({pre} -> {post} tokens)"),
-        _ => redactor.redact_str(title.unwrap_or("Compact conversation")),
+        _ => title
+            .map(|t| redactor.redact_str(t))
+            .or_else(|| existing.map(|prev| prev.text.clone()))
+            .unwrap_or_else(|| "Compact conversation".to_owned()),
     };
 
     CoordinatorChatNoticeItem {
