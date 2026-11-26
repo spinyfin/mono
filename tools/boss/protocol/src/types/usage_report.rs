@@ -59,7 +59,6 @@ pub fn coordinator_session_label(id: &str) -> String {
     };
     format!("Coordinator session {short}")
 }
-
 /// A way to slice usage: filter by it, group by it, or list its observed values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

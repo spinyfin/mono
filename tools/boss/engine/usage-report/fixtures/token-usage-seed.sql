@@ -176,4 +176,51 @@ INSERT INTO coordinator_usage_slices (
     (SELECT now FROM seed_clock)
   );
 
+-- Coordinator session usage slices: two measured sessions (including a Haiku
+-- subagent model slice under the historical Opus session, plus an active
+-- session) and one unmeasured session whose transcript could not be read.
+INSERT INTO coordinator_usage_slices (
+  id, session_id, spawn_token, source, driver, launched_model, host_id, status,
+  bucket_start_epoch_s, first_event_at, last_event_at, model_key, model,
+  input_tokens, output_tokens, cache_creation_tokens, cache_creation_5m_tokens,
+  cache_creation_1h_tokens, cache_read_tokens, rounds, agent_active_ms,
+  usage_unavailable, updated_at
+) VALUES
+  (
+    'coord_run_seed_prev_opus', 'coord_seed_prev', 'tok_seed_prev', 'claude_transcript', 'claude', 'opus', 'local', 'completed',
+    (SELECT ((now - 48 * 3600) / 3600) * 3600 FROM seed_clock),
+    (SELECT ((now - 48 * 3600) / 3600) * 3600 + 120 FROM seed_clock),
+    (SELECT ((now - 48 * 3600) / 3600) * 3600 + 2400 FROM seed_clock),
+    'claude-opus-5-5', 'claude-opus-5-5',
+    1800, 12000, 45000, 35000, 10000, 1200000, 38, 960000, NULL,
+    (SELECT now FROM seed_clock)
+  ),
+  (
+    'coord_run_seed_prev_haiku', 'coord_seed_prev', 'tok_seed_prev', 'claude_transcript', 'claude', 'opus', 'local', 'completed',
+    (SELECT ((now - 48 * 3600) / 3600) * 3600 FROM seed_clock),
+    (SELECT ((now - 48 * 3600) / 3600) * 3600 + 600 FROM seed_clock),
+    (SELECT ((now - 48 * 3600) / 3600) * 3600 + 1800 FROM seed_clock),
+    'claude-haiku-5-5', 'claude-haiku-5-5',
+    450, 1800, 6000, 6000, 0, 95000, 9, 180000, NULL,
+    (SELECT now FROM seed_clock)
+  ),
+  (
+    'coord_run_seed_live_opus', 'coord_seed_live', 'tok_seed_live', 'claude_transcript', 'claude', 'opus', 'local', 'active',
+    (SELECT ((now - 6 * 3600) / 3600) * 3600 FROM seed_clock),
+    (SELECT ((now - 6 * 3600) / 3600) * 3600 + 60 FROM seed_clock),
+    (SELECT ((now - 6 * 3600) / 3600) * 3600 + 2700 FROM seed_clock),
+    'claude-opus-5-5', 'claude-opus-5-5',
+    2200, 14500, 68000, 50000, 18000, 1650000, 52, 1320000, NULL,
+    (SELECT now FROM seed_clock)
+  ),
+  (
+    'coord_run_seed_unreadable', 'coord_seed_unreadable', 'tok_seed_bad', 'claude_transcript', 'claude', 'opus', 'local', 'completed',
+    (SELECT ((now - 30 * 3600) / 3600) * 3600 FROM seed_clock),
+    (SELECT ((now - 30 * 3600) / 3600) * 3600 + 300 FROM seed_clock),
+    (SELECT ((now - 30 * 3600) / 3600) * 3600 + 300 FROM seed_clock),
+    '', NULL,
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'Coordinator transcript unreadable',
+    (SELECT now FROM seed_clock)
+  );
+
 DROP TABLE seed_clock;

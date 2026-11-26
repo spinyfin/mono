@@ -224,7 +224,6 @@ fn coordinator_measure(runs: &[&RunFacts<'_>]) -> Option<CostMeasurement> {
         .collect();
     (!coord.is_empty()).then(|| measure(&coord))
 }
-
 fn spend_class_buckets(runs: &[&RunFacts<'_>]) -> Vec<CostBucket> {
     let mut by_class: BTreeMap<SpendClass, RunFold> = BTreeMap::new();
     for facts in runs {

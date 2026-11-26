@@ -792,6 +792,108 @@ final class TokenUsageTreeBuilderTests: XCTestCase {
         XCTAssertNil(model.tokenUsage.error)
     }
 
+    func testCoordinatorSessionsRenderAsTopLevelRowSeparateFromEngineOverhead() throws {
+        var coordExec = sampleExecution(
+            id: "coord_sess_abcd1234-5678-90ab-cdef-1234567890ab",
+            driver: "claude",
+            total: 120_000,
+            kind: TokenUsageTree.coordinatorKind
+        )
+        coordExec.spendClass = .overhead
+        coordExec.status = "active"
+        coordExec.runs = [
+            sampleRun(
+                id: "coord_run_1",
+                coverage: .measured,
+                total: 100_000,
+                convention: .net,
+                model: "claude-opus-5-5"
+            ),
+            sampleRun(
+                id: "coord_run_2",
+                coverage: .measured,
+                total: 20_000,
+                convention: .net,
+                model: "claude-haiku-5-5"
+            ),
+        ]
+        let coordMeasurement = measurement(measured: 2, totalTokens: 120_000)
+        var report = sampleReport(
+            tasks: [sampleChainRoot()],
+            taskless: [coordExec, sampleTasklessExecution()]
+        )
+        report.coordinatorMeasurement = coordMeasurement
+
+        let nodes = TokenUsageTree.build(report)
+        XCTAssertEqual(nodes.map(\.kind), [.coordinator, .task, .tasklessHeader])
+        let coordNode = try XCTUnwrap(nodes.first)
+        XCTAssertEqual(coordNode.name, "Coordinator")
+        XCTAssertEqual(coordNode.kindLabel, "coordinator")
+        XCTAssertEqual(coordNode.driver, "Claude")
+        XCTAssertEqual(coordNode.status, "active")
+        XCTAssertEqual(coordNode.totalTokens, 120_000)
+        XCTAssertEqual(coordNode.children?.count, 1)
+        XCTAssertEqual(coordNode.children?.first?.name, "Session abcd1234")
+        XCTAssertEqual(coordNode.children?.first?.model, "mixed")
+        XCTAssertEqual(nodes[2].children?.map(\.name), ["answer_agent"])
+    }
+
+    func testUnmeasuredCoordinatorMeasurementRendersUnknownNeverZero() throws {
+        var unmeasured = CostMeasurement.empty
+        unmeasured.runsTotal = 1
+        unmeasured.runsUnmeasured = 1
+        unmeasured.usageUnavailable = ["Coordinator transcript unreadable"]
+        let unmeasuredRun = RunUsageRow(
+            runId: "coord_run_bad",
+            coverage: .unmeasured,
+            createdAtEpochS: 1_795_514_400,
+            hostId: "local",
+            inputConvention: .net,
+            status: "completed",
+            caveats: [UsageCaveat(code: "usage_unavailable", detail: "Coordinator transcript unreadable")],
+            models: [],
+            tokens: nil,
+            agentActiveMs: nil,
+            finishedAtEpochS: 1_795_514_400,
+            modelObserved: nil,
+            rounds: nil,
+            startedAtEpochS: 1_795_514_400,
+            totalTokens: nil,
+            usageUnavailable: "Coordinator transcript unreadable",
+            estimatedUsd: nil,
+            unpriceableCause: nil
+        )
+        let coordExec = ExecutionUsageNode(
+            executionId: "coord_sess_bad",
+            workItemId: "coordinator:bad",
+            createdAtEpochS: 1_795_514_400,
+            driverSource: .launchTuple,
+            kind: TokenUsageTree.coordinatorKind,
+            measurement: unmeasured,
+            spendClass: .overhead,
+            status: "completed",
+            runs: [unmeasuredRun],
+            driver: "claude",
+            effortLaunched: nil,
+            finishedAtEpochS: 1_795_514_400,
+            hostId: "local",
+            modelLaunched: "opus",
+            prUrl: nil,
+            startedAtEpochS: 1_795_514_400
+        )
+        var report = sampleReport(tasks: [], taskless: [coordExec])
+        report.coordinatorMeasurement = unmeasured
+
+        let coordNode = try XCTUnwrap(TokenUsageTree.build(report).first)
+        XCTAssertNil(coordNode.totalTokens)
+        let formatted = TokenUsageFormatter.measurementTotal(
+            try XCTUnwrap(coordNode.measurement),
+            dominantCaveat: coordNode.dominantCaveat
+        )
+        XCTAssertTrue(formatted.isUnknown)
+        XCTAssertEqual(formatted.display, "— Coordinator transcript unreadable")
+    }
+
     // MARK: - Fixtures
 
     private func sampleReport(

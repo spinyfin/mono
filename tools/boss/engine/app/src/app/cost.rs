@@ -68,7 +68,6 @@ impl ServerState {
         }
     }
 }
-
 pub(super) async fn handle_stuck_report(ctx: Dispatch, req: FrontendRequest) {
     let FrontendRequest::GetStuckReport { minimum_age_secs } = req else {
         unreachable!()
@@ -135,6 +134,8 @@ pub(super) async fn handle_get_work_item_cost_report(ctx: Dispatch, req: Fronten
         send_response(&sink, &request_id, FrontendEvent::WorkItemCostReport { report });
     }
 }
+
+const ON_DEMAND_COORDINATOR_SYNC_MIN_INTERVAL: Duration = Duration::from_secs(2);
 
 pub(super) async fn handle_get_cost_window_report(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {

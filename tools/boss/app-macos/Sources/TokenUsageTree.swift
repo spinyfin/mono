@@ -6,6 +6,7 @@ import Foundation
 struct TokenUsageTableNode: Identifiable, Hashable {
     enum Kind: String, Hashable, Sendable {
         case group
+        case coordinator
         case task
         case revision
         case execution
@@ -86,6 +87,9 @@ struct TokenUsageTableNode: Identifiable, Hashable {
 }
 
 enum TokenUsageTree {
+    static let coordinatorKind = "coordinator"
+    static let coordinatorID = "coordinator"
+    static let coordinatorName = "Coordinator"
     static let tasklessHeaderID = "taskless"
     static let tasklessHeaderName = "Engine overhead (no task)"
 
@@ -93,7 +97,9 @@ enum TokenUsageTree {
         if !report.groups.isEmpty {
             return report.groups.map { groupNode($0, path: []) }
         }
-        return taskNodes(report.tasks, path: "root") + tasklessNodes(report.taskless, path: "root")
+        return coordinatorNodes(report.taskless, measurement: report.coordinatorMeasurement, path: "root")
+            + taskNodes(report.tasks, path: "root")
+            + tasklessNodes(report.taskless.filter { $0.kind != Self.coordinatorKind }, path: "root")
     }
 
     static func sort(_ nodes: [TokenUsageTableNode], by comparators: [KeyPathComparator<TokenUsageTableNode>]) -> [TokenUsageTableNode] {
@@ -153,7 +159,9 @@ enum TokenUsageTree {
         if !group.subgroups.isEmpty {
             children = group.subgroups.map { groupNode($0, path: path + [leaf?.value ?? ""]) }
         } else {
-            children = taskNodes(group.tasks, path: id) + tasklessNodes(group.taskless, path: id)
+            children = coordinatorNodes(group.taskless, measurement: group.coordinatorMeasurement, path: id)
+                + taskNodes(group.tasks, path: id)
+                + tasklessNodes(group.taskless.filter { $0.kind != Self.coordinatorKind }, path: id)
         }
         return aggregateNode(
             id: id,
@@ -239,17 +247,27 @@ enum TokenUsageTree {
         let id = "\(path)/exec:\(execution.executionId)"
         let children = execution.runs.map { runNode($0, execution: execution, path: id) }
         let convention = execution.runs.first?.inputConvention
+        let displayName = execution.kind == Self.coordinatorKind
+            ? "Session \(shortCoordinatorSessionId(execution.executionId))"
+            : execution.kind
+        let observedModels = Set(execution.runs.compactMap(\.modelObserved))
+        let executionModel: String
+        if observedModels.count == 1, let only = observedModels.first {
+            executionModel = only
+        } else if observedModels.count > 1 {
+            executionModel = "mixed"
+        } else {
+            executionModel = execution.modelLaunched ?? ""
+        }
         return TokenUsageTableNode(
             id: id,
             kind: .execution,
             children: children.isEmpty ? nil : children,
-            name: execution.kind,
+            name: displayName,
             kindLabel: execution.kind,
             driver: TokenUsageFormatter.driverLabel(execution.driver, source: execution.driverSource),
             driverSource: execution.driverSource,
-            model: execution.runs.compactMap(\.modelObserved).first
-                ?? execution.modelLaunched
-                ?? "",
+            model: executionModel,
             modelIsSynthetic: execution.runs.contains { $0.modelObserved == "<synthetic>" },
             launchedModel: execution.modelLaunched,
             launchedEffort: execution.effortLaunched,
@@ -298,11 +316,14 @@ enum TokenUsageTree {
 
     private static func runNode(_ run: RunUsageRow, execution: ExecutionUsageNode, path: String) -> TokenUsageTableNode {
         let id = "\(path)/run:\(run.runId)"
+        let displayName = execution.kind == Self.coordinatorKind
+            ? TokenUsageFormatter.utcTimestampString(epochS: run.startedAtEpochS ?? run.createdAtEpochS)
+            : shortRunId(run.runId)
         return TokenUsageTableNode(
             id: id,
             kind: .run,
             children: nil,
-            name: shortRunId(run.runId),
+            name: displayName,
             kindLabel: "run",
             driver: TokenUsageFormatter.driverLabel(execution.driver, source: execution.driverSource),
             driverSource: execution.driverSource,
@@ -351,6 +372,95 @@ enum TokenUsageTree {
             models: run.models,
             tokens: run.tokens
         )
+    }
+
+    // MARK: - Coordinator
+
+    /// Top-level Coordinator row using the engine-supplied `coordinatorMeasurement`
+    /// so the app never sums executions itself. Each child is a coordinator
+    /// session, expanding to its per-hour / per-model slices.
+    private static func coordinatorNodes(
+        _ executions: [ExecutionUsageNode],
+        measurement: CostMeasurement?,
+        path: String
+    ) -> [TokenUsageTableNode] {
+        let coordinatorExecutions = executions.filter { $0.kind == Self.coordinatorKind }
+        guard !coordinatorExecutions.isEmpty else { return [] }
+        let id = "\(path)/\(coordinatorID)"
+        let children = coordinatorExecutions.map { executionNode($0, path: id) }
+        let effective = measurement
+            ?? (coordinatorExecutions.count == 1 ? coordinatorExecutions[0].measurement : CostMeasurement.empty)
+        let status = coordinatorExecutions.contains(where: { $0.status == "active" }) ? "active" : "completed"
+        return [
+            TokenUsageTableNode(
+                id: id,
+                kind: .coordinator,
+                children: children,
+                name: coordinatorName,
+                kindLabel: coordinatorKind,
+                driver: uniqueDriver(coordinatorExecutions),
+                driverSource: nil,
+                model: uniqueModel(coordinatorExecutions),
+                modelIsSynthetic: children.contains(where: \.modelIsSynthetic),
+                launchedModel: nil,
+                launchedEffort: nil,
+                effort: "",
+                reasoning: "",
+                status: status,
+                runsMeasured: effective.runsMeasured,
+                runsTotal: effective.runsTotal,
+                runsOutsideWindow: 0,
+                inputTokens: effective.inputTokens,
+                outputTokens: effective.outputTokens,
+                cacheCreationTokens: effective.cacheCreationTokens,
+                cacheCreation5m: nil,
+                cacheCreation1h: nil,
+                cacheReadTokens: effective.cacheReadTokens,
+                totalTokens: effective.runsMeasured == 0 ? nil : effective.totalTokens,
+                tokensPartial: effective.tokensPartial,
+                agentActiveMs: effective.runsMeasured == 0 ? nil : effective.agentActiveMs,
+                estimatedUsd: effective.estimatedUsd,
+                estimatedUsdPartial: effective.estimatedUsdPartial,
+                unpriceableCause: aggregateUnpriceableCause(of: children),
+                inputConvention: convention(of: children),
+                containsGross: containsGrossInput(children),
+                inclusiveContainsGross: false,
+                coverage: nil,
+                caveats: [],
+                dominantCaveat: dominantCaveatCode(of: children),
+                inclusiveDominantCaveat: nil,
+                usageUnavailable: effective.usageUnavailable.first,
+                taskId: nil,
+                productId: nil,
+                prUrl: nil,
+                inclusive: nil,
+                bySpendClass: [],
+                measurement: effective,
+                createdAtEpochS: nil,
+                startedAtEpochS: nil,
+                finishedAtEpochS: nil,
+                hostId: nil,
+                spendClass: .overhead,
+                rounds: nil,
+                models: [],
+                tokens: nil
+            ),
+        ]
+    }
+
+    private static func shortCoordinatorSessionId(_ executionId: String) -> String {
+        var trimmed = executionId
+        if trimmed.hasPrefix("coord_sess_") {
+            trimmed = String(trimmed.dropFirst("coord_sess_".count))
+        }
+        if trimmed.hasPrefix("spawn:") {
+            trimmed = String(trimmed.dropFirst("spawn:".count))
+        }
+        let looksLikeUuid = trimmed.count >= 9 && trimmed[trimmed.index(trimmed.startIndex, offsetBy: 8)] == "-"
+        if looksLikeUuid || trimmed.count > 24 {
+            return String(trimmed.prefix(8))
+        }
+        return trimmed
     }
 
     // MARK: - Taskless
