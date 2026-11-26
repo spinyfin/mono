@@ -1929,7 +1929,7 @@ impl WorkDb {
             .query_row(
                 "SELECT COALESCE(merge_queue_state = 'resolving_conflicts', 0),
                         CASE WHEN json_valid(merge_queue_detail)
-                             THEN COALESCE(json_extract(merge_queue_detail, '$.source') = 'conflict_resolution', 0)
+                             THEN COALESCE(json_extract(merge_queue_detail, '$.source') IN ('conflict_resolution', 'ci_merge_rebase'), 0)
                              ELSE 0 END,
                         EXISTS(SELECT 1 FROM github_merge_intents
                                WHERE work_item_id = tasks.id AND status = 'disarm_pending')

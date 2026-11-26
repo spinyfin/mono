@@ -45,10 +45,13 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                 return;
             }
         };
-        let (pr_url, task_status, product_id) = match &item {
-            WorkItem::Task(task) | WorkItem::Chore(task) => {
-                (task.pr_url.clone(), task.status.clone(), task.product_id.clone())
-            }
+        let (pr_url, task_status, blocked_reason, product_id) = match &item {
+            WorkItem::Task(task) | WorkItem::Chore(task) => (
+                task.pr_url.clone(),
+                task.status.clone(),
+                task.blocked_reason.clone(),
+                task.product_id.clone(),
+            ),
             _ => {
                 refuse_merge_when_ready(
                     &sink,
@@ -59,7 +62,24 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                 return;
             }
         };
-        if task_status != TaskStatus::InReview {
+        let ci_blocked_reason = if task_status == TaskStatus::InReview {
+            // A previous Merge click may have rebased the PR and pushed, then
+            // failed to arm (head-wait timeout, arming error). The pushed rebase
+            // abandons the CI remediations, so the next in-flight CI poll can
+            // move the card back to review. Keep routing such a click through
+            // the verified-head arming path until arming records the rebased
+            // head or a terminal outcome consumes the record.
+            pr_url
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .and_then(|url| work_db.get_ci_merge_rebase(&work_item_id, url).ok().flatten())
+                .filter(|rebase| rebase.rebased_head_sha.is_none() && rebase.head_sha_before.is_some())
+                .map(|_| "ci_failure".to_owned())
+        } else if task_status == TaskStatus::Blocked
+            && matches!(blocked_reason.as_deref(), Some("ci_failure" | "ci_failure_exhausted"))
+        {
+            blocked_reason
+        } else {
             refuse_merge_when_ready(
                 &sink,
                 &request_id,
@@ -67,7 +87,7 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                 format!("merge_when_ready: task is not in review (status: {task_status})"),
             );
             return;
-        }
+        };
         let pr_url = match pr_url.filter(|s| !s.is_empty()) {
             Some(u) => u,
             None => {
@@ -130,195 +150,51 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                     return;
                 }
             };
+        if let Some(ci_blocked_reason) = ci_blocked_reason {
+            super::review_ci_rebase::handle_ci_failure_merge_rebase(
+                super::review_ci_rebase::CiFailureMergeRebaseContext {
+                    server_state,
+                    work_db,
+                    sink,
+                    request_id,
+                    product_id,
+                    product_name: product.name,
+                    product_slug: product.slug,
+                    work_item_id,
+                    pr_url,
+                    blocked_reason: ci_blocked_reason,
+                    mechanism,
+                    confirmed_revisions: confirmed_now,
+                },
+            )
+            .await;
+            return;
+        }
         match mechanism {
             boss_engine_runtime::merge_mechanism::MergeMechanism::Direct => {
-                // Spawn the GitHub interaction so the main loop isn't blocked.
-                let sink2 = sink.clone();
-                let request_id2 = request_id.clone();
-                let work_item_id2 = work_item_id.clone();
-                let pr_url2 = pr_url.clone();
-                let event_bus = server_state.event_bus.clone();
-                let direct_merge_executor = server_state.direct_merge_executor.clone();
-                let work_db2 = work_db.clone();
-                let product_name = product.name.clone();
-                let product_slug = product.slug.clone();
-                let publisher = server_state.publisher.clone();
-                let product_id2 = product_id.clone();
-                let confirmed_revisions_now = confirmed_now;
                 tracing::info!(%request_id, elapsed_ms = recv_instant.elapsed().as_secs_f64() * 1000.0, "merge request preflight completed");
+                let arm = DirectMergeArmRequest::builder()
+                    .work_db(work_db)
+                    .sink(sink)
+                    .request_id(request_id)
+                    .product_id(product_id)
+                    .product_name(product.name)
+                    .product_slug(product.slug)
+                    .work_item_id(work_item_id)
+                    .pr_url(pr_url)
+                    .confirmed_revisions(confirmed_now)
+                    .publisher(server_state.publisher.clone())
+                    .event_bus(server_state.event_bus.clone())
+                    .direct_merge_executor(server_state.direct_merge_executor.clone())
+                    .publish_reason("gh_merge_queue_submitted")
+                    .always_publish(false)
+                    .release_deferred_conflict_on_refusal(true)
+                    .kick_reconciler_on_error(false)
+                    .recv_instant(recv_instant)
+                    .build();
+                // Spawn the GitHub interaction so the main loop isn't blocked.
                 boss_task_scope::spawn(async move {
-                    tracing::info!(
-                        work_item_id = %work_item_id2,
-                        pr_url = %pr_url2,
-                        "merge_when_ready: requesting GitHub-native merge",
-                    );
-                    // Persist what the person confirmed, bound to this request,
-                    // before GitHub is called so the continuation can compare.
-                    let confirmation = match work_db2.remember_confirmed_merge_revisions(
-                        &work_item_id2,
-                        &pr_url2,
-                        &confirmed_revisions_now,
-                    ) {
-                        Ok(confirmation) => confirmation,
-                        Err(err) => {
-                            refuse_merge_when_ready(&sink2, &request_id2, &work_item_id2, err.to_string());
-                            return;
-                        }
-                    };
-                    let external_started = std::time::Instant::now();
-                    match direct_merge_executor.execute(&pr_url2).await {
-                        Ok(success) => {
-                            tracing::info!(request_id = %request_id2, elapsed_ms = external_started.elapsed().as_secs_f64() * 1000.0, "merge request external operation completed");
-                            let record_started = std::time::Instant::now();
-                            // `gh pr merge --auto --squash` has accepted a
-                            // merge request for this exact head. GitHub's
-                            // queue/auto-merge projection lags that command,
-                            // so persist the request and move the card before
-                            // asking the poller for its first observation.
-                            // A future empty probe is absence, not a dequeue;
-                            // the per-row intent keeps it from clobbering this
-                            // state until the timeline or terminal probe says
-                            // otherwise.
-                            let detail = boss_engine_storage_values::merge_queue_section::queued_no_position_detail();
-                            let record = work_db2.record_github_merge_intent(
-                                boss_work_db::GithubMergeIntentInsertInput::builder()
-                                    .work_item_id(work_item_id2.clone())
-                                    .pr_url(pr_url2.clone())
-                                    .head_sha(success.head_sha.clone())
-                                    .confirmation_request_id(confirmation.clone())
-                                    .build(),
-                                &detail,
-                            );
-                            let record = match record {
-                                Ok(record) => record,
-                                Err(err) => {
-                                    if let Err(forget) = work_db2.forget_confirmed_merge_revisions(&confirmation) {
-                                        tracing::warn!(work_item_id = %work_item_id2, ?forget, "merge_when_ready: could not drop the unrecorded request's confirmation");
-                                    }
-                                    tracing::error!(
-                                        work_item_id = %work_item_id2,
-                                        pr_url = %pr_url2,
-                                        head_sha = %success.head_sha,
-                                        ?err,
-                                        "merge_when_ready: GitHub accepted merge request but durable intent write failed",
-                                    );
-                                    send_response(
-                                        &sink2,
-                                        &request_id2,
-                                        FrontendEvent::WorkError {
-                                            message: format!(
-                                                "merge_when_ready accepted the GitHub request but could not record its merge intent: {err}"
-                                            ),
-                                        },
-                                    );
-                                    return;
-                                }
-                            };
-                            tracing::info!(
-                                work_item_id = %work_item_id2,
-                                pr_url = %pr_url2,
-                                head_sha = %success.head_sha,
-                                inserted_intent = record.inserted,
-                                merge_queue_state_changed = record.merge_queue_state_changed,
-                                action = merge_when_ready::MergeAction::Requested.as_str(),
-                                "merge_when_ready: GitHub merge request recorded",
-                            );
-                            let remembered =
-                                remember_merge_request(&work_db2, &work_item_id2, &pr_url2, Some(&success.head_sha));
-                            tracing::info!(request_id = %request_id2, elapsed_ms = record_started.elapsed().as_secs_f64() * 1000.0, "merge request durable write completed");
-                            // Acknowledge durable acceptance before publication takes
-                            // the shared decision-feed lock or wakes board readers.
-                            send_response(
-                                &sink2,
-                                &request_id2,
-                                FrontendEvent::MergeWhenReadyAccepted {
-                                    work_item_id: work_item_id2.clone(),
-                                    pr_url: pr_url2.clone(),
-                                    action: merge_when_ready::MergeAction::Requested.as_str().to_owned(),
-                                },
-                            );
-                            tracing::info!(request_id = %request_id2, elapsed_ms = recv_instant.elapsed().as_secs_f64() * 1000.0, "merge request acknowledgement enqueued");
-                            event_bus.publish(Event::PrReconcileRequested {
-                                pr_url: pr_url2.clone(),
-                            });
-                            let publication_started = std::time::Instant::now();
-                            if record.merge_queue_state_changed || remembered {
-                                publisher
-                                    .publish_work_item_changed(&product_id2, &work_item_id2, "gh_merge_queue_submitted")
-                                    .await;
-                            }
-                            tracing::info!(request_id = %request_id2, elapsed_ms = publication_started.elapsed().as_secs_f64() * 1000.0, "merge request board publication completed");
-                        }
-                        Err(err) => {
-                            let message = format!("{err:#}");
-                            tracing::warn!(
-                                work_item_id = %work_item_id2,
-                                pr_url = %pr_url2,
-                                error = %message,
-                                "merge_when_ready: GitHub refused the merge request",
-                            );
-                            // A merge request is what a deferred conflict
-                            // waits for, and GitHub can refuse the request
-                            // *because* of that conflict. The request still
-                            // stands as a human asking: release the conflict
-                            // so it is resolved now, and say so.
-                            let conflict_released = release_deferred_conflict_for_merge(
-                                &work_db2,
-                                publisher.as_ref(),
-                                &event_bus,
-                                (&product_id2, &work_item_id2, &pr_url2),
-                            )
-                            .await;
-                            // A released conflict becomes the standing request,
-                            // which keeps what this request confirmed.
-                            let confirmation_kept = conflict_released
-                                && work_db2
-                                    .attach_confirmed_merge_revisions(&work_item_id2, &pr_url2, &confirmation)
-                                    .unwrap_or(false);
-                            if !confirmation_kept {
-                                // The refused request never stood, so what it
-                                // confirmed must not carry into a later one.
-                                // Only this request's snapshot goes.
-                                if let Err(err) = work_db2.forget_confirmed_merge_revisions(&confirmation) {
-                                    tracing::warn!(work_item_id = %work_item_id2, ?err, "merge_when_ready: could not drop the refused request's confirmation");
-                                }
-                            }
-                            if boss_engine_runtime::merge_mechanism::is_push_restriction_error(&message) {
-                                let _ = work_db2.create_attention_item(boss_work_db::CreateAttentionItemInput {
-                                    work_item_id: Some(work_item_id2.clone()),
-                                    kind: boss_engine_runtime::merge_mechanism::PUSH_RESTRICTION_ATTENTION_KIND
-                                        .to_owned(),
-                                    title: boss_engine_runtime::merge_mechanism::PUSH_RESTRICTION_ATTENTION_TITLE
-                                        .to_owned(),
-                                    body_markdown:
-                                        boss_engine_runtime::merge_mechanism::render_push_restriction_attention_body(
-                                            &product_name,
-                                            &product_slug,
-                                            &message,
-                                        ),
-                                    execution_id: None,
-                                    status: None,
-                                    resolved_at: None,
-                                });
-                            }
-                            if conflict_released && let Err(err) = work_db2.note_merge_refusal(&work_item_id2, &message)
-                            {
-                                tracing::warn!(work_item_id = %work_item_id2, ?err, "merge_when_ready: could not keep the refusal");
-                            }
-                            let response = if conflict_released {
-                                FrontendEvent::MergeWhenReadyAccepted {
-                                    work_item_id: work_item_id2.clone(),
-                                    pr_url: pr_url2.clone(),
-                                    action: merge_when_ready::MergeAction::Requested.as_str().to_owned(),
-                                }
-                            } else {
-                                FrontendEvent::WorkError {
-                                    message: format!("merge_when_ready failed: {message}"),
-                                }
-                            };
-                            send_response(&sink2, &request_id2, response);
-                        }
-                    }
+                    arm_direct_github_merge(arm).await;
                 });
             }
             boss_engine_runtime::merge_mechanism::MergeMechanism::TrunkQueue { target_branch } => {
@@ -327,12 +203,15 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                     work_db,
                     sink,
                     request_id,
-                    TrunkQueueMergeRequest {
-                        product_id,
-                        work_item_id,
-                        pr_url,
-                        target_branch,
-                    },
+                    TrunkQueueMergeRequest::builder()
+                        .product_id(product_id)
+                        .work_item_id(work_item_id)
+                        .pr_url(pr_url)
+                        .target_branch(target_branch)
+                        .retire_stale_and_retry(false)
+                        .kick_pr_reconciler(false)
+                        .publish_reason("trunk_merge_submitted")
+                        .build(),
                 )
                 .await;
             }
@@ -346,12 +225,285 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
 /// been accepted, so a failed write is logged rather than surfaced: with no
 /// recorded request, a failed attempt returns the item to Review with no
 /// merge-request explanation on the card.
-fn remember_merge_request(work_db: &WorkDb, work_item_id: &str, pr_url: &str, approved_head_sha: Option<&str>) -> bool {
+pub(super) fn remember_merge_request(
+    work_db: &WorkDb,
+    work_item_id: &str,
+    pr_url: &str,
+    approved_head_sha: Option<&str>,
+) -> bool {
     match work_db.record_merge_intent(work_item_id, pr_url, approved_head_sha) {
         Ok(_) => true,
         Err(err) => {
             tracing::warn!(%work_item_id, %pr_url, ?err, "merge_when_ready: could not record the standing merge request");
             false
+        }
+    }
+}
+
+/// Shared Direct-path arming used by both the in-review Merge click and the
+/// post-CI-rebase path.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
+pub(super) struct DirectMergeArmRequest {
+    pub work_db: Arc<WorkDb>,
+    pub sink: Arc<SessionSink>,
+    pub request_id: String,
+    pub product_id: String,
+    pub product_name: String,
+    pub product_slug: String,
+    pub work_item_id: String,
+    pub pr_url: String,
+    pub confirmed_revisions: Vec<boss_protocol::OpenMergeRevision>,
+    pub publisher: Arc<dyn boss_execution_contracts::ExecutionPublisher>,
+    pub event_bus: Arc<EventBus>,
+    pub direct_merge_executor: Arc<dyn merge_when_ready::DirectMergeExecutor>,
+    pub publish_reason: &'static str,
+    pub always_publish: bool,
+    pub release_deferred_conflict_on_refusal: bool,
+    pub kick_reconciler_on_error: bool,
+    pub after_rebase: Option<AfterRebaseRecord>,
+    pub recv_instant: Option<std::time::Instant>,
+}
+
+/// Persist confirmation, call `gh pr merge --auto --squash`, record the
+/// GitHub merge intent, and optionally record a post-rebase marker.
+pub(super) async fn arm_direct_github_merge(req: DirectMergeArmRequest) {
+    let DirectMergeArmRequest {
+        work_db,
+        sink,
+        request_id,
+        product_id,
+        product_name,
+        product_slug,
+        work_item_id,
+        pr_url,
+        confirmed_revisions,
+        publisher,
+        event_bus,
+        direct_merge_executor,
+        publish_reason,
+        always_publish,
+        release_deferred_conflict_on_refusal,
+        kick_reconciler_on_error,
+        after_rebase,
+        recv_instant,
+    } = req;
+    tracing::info!(
+        work_item_id = %work_item_id,
+        pr_url = %pr_url,
+        "merge_when_ready: requesting GitHub-native merge",
+    );
+    // Persist what the person confirmed, bound to this request, before GitHub
+    // is called so the continuation can compare.
+    let confirmation = match work_db.remember_confirmed_merge_revisions(&work_item_id, &pr_url, &confirmed_revisions) {
+        Ok(confirmation) => confirmation,
+        Err(err) => {
+            refuse_merge_when_ready(&sink, &request_id, &work_item_id, err.to_string());
+            return;
+        }
+    };
+    let prior_intent = work_db
+        .get_active_github_merge_intent(&work_item_id, &pr_url)
+        .ok()
+        .flatten()
+        .map(|intent| intent.id);
+    let expected_head_sha = after_rebase
+        .as_ref()
+        .and_then(|after| after.rebased_head_sha.as_deref());
+    let external_started = std::time::Instant::now();
+    match direct_merge_executor
+        .execute_matching_head(&pr_url, expected_head_sha)
+        .await
+    {
+        Ok(success) => {
+            if after_rebase.as_ref().and_then(|after| after.head_sha_before.as_deref())
+                == Some(success.head_sha.as_str())
+            {
+                // GitHub already accepted `gh pr merge --auto` on the stale
+                // head; record a durable disarm obligation so the poller turns
+                // auto-merge off instead of leaving it armed and untracked.
+                if let Err(disarm_err) = work_db.record_unrecorded_merge_disarm(
+                    &work_item_id,
+                    &pr_url,
+                    &success.head_sha,
+                    prior_intent.as_deref(),
+                ) {
+                    tracing::warn!(
+                        work_item_id = %work_item_id,
+                        pr_url = %pr_url,
+                        ?disarm_err,
+                        "merge_when_ready: could not record a disarm obligation after rejecting a stale-head merge",
+                    );
+                }
+                event_bus.publish(Event::PrReconcileRequested { pr_url: pr_url.clone() });
+                let _ = work_db.forget_confirmed_merge_revisions(&confirmation);
+                refuse_merge_when_ready(
+                    &sink,
+                    &request_id,
+                    &work_item_id,
+                    "merge_when_ready: rebased onto base, but GitHub still reports the pre-rebase head; try again"
+                        .to_owned(),
+                );
+                return;
+            }
+            tracing::info!(request_id = %request_id, elapsed_ms = external_started.elapsed().as_secs_f64() * 1000.0, "merge request external operation completed");
+            let record_started = std::time::Instant::now();
+            // `gh pr merge --auto --squash` has accepted a merge request for
+            // this exact head. GitHub's queue/auto-merge projection lags that
+            // command, so persist the request and move the card before asking
+            // the poller for its first observation. A future empty probe is
+            // absence, not a dequeue; the per-row intent keeps it from
+            // clobbering this state until the timeline or terminal probe says
+            // otherwise.
+            let detail = boss_engine_storage_values::merge_queue_section::queued_no_position_detail();
+            let record = work_db.record_github_merge_intent(
+                boss_work_db::GithubMergeIntentInsertInput::builder()
+                    .work_item_id(work_item_id.clone())
+                    .pr_url(pr_url.clone())
+                    .head_sha(success.head_sha.clone())
+                    .confirmation_request_id(confirmation.clone())
+                    .build(),
+                &detail,
+            );
+            let record = match record {
+                Ok(record) => record,
+                Err(err) => {
+                    if let Err(forget) = work_db.forget_confirmed_merge_revisions(&confirmation) {
+                        tracing::warn!(work_item_id = %work_item_id, ?forget, "merge_when_ready: could not drop the unrecorded request's confirmation");
+                    }
+                    tracing::error!(
+                        work_item_id = %work_item_id,
+                        pr_url = %pr_url,
+                        head_sha = %success.head_sha,
+                        ?err,
+                        "merge_when_ready: GitHub accepted merge request but durable intent write failed",
+                    );
+                    let message = if after_rebase.is_some() {
+                        format!(
+                            "merge_when_ready accepted the GitHub request after rebase but could not record its merge intent: {err}"
+                        )
+                    } else {
+                        format!(
+                            "merge_when_ready accepted the GitHub request but could not record its merge intent: {err}"
+                        )
+                    };
+                    send_response(&sink, &request_id, FrontendEvent::WorkError { message });
+                    return;
+                }
+            };
+            tracing::info!(
+                work_item_id = %work_item_id,
+                pr_url = %pr_url,
+                head_sha = %success.head_sha,
+                inserted_intent = record.inserted,
+                merge_queue_state_changed = record.merge_queue_state_changed,
+                action = merge_when_ready::MergeAction::Requested.as_str(),
+                "merge_when_ready: GitHub merge request recorded",
+            );
+            let mut after_rebase = after_rebase;
+            if let Some(after) = after_rebase.as_mut() {
+                after.rebased_head_sha = Some(success.head_sha.clone());
+            }
+            record_after_rebase(&work_db, &work_item_id, &pr_url, after_rebase.as_ref());
+            let remembered = remember_merge_request(&work_db, &work_item_id, &pr_url, Some(&success.head_sha));
+            tracing::info!(request_id = %request_id, elapsed_ms = record_started.elapsed().as_secs_f64() * 1000.0, "merge request durable write completed");
+            // Acknowledge durable acceptance before publication takes the
+            // shared decision-feed lock or wakes board readers.
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::MergeWhenReadyAccepted {
+                    work_item_id: work_item_id.clone(),
+                    pr_url: pr_url.clone(),
+                    action: merge_when_ready::MergeAction::Requested.as_str().to_owned(),
+                },
+            );
+            if let Some(recv_instant) = recv_instant {
+                tracing::info!(request_id = %request_id, elapsed_ms = recv_instant.elapsed().as_secs_f64() * 1000.0, "merge request acknowledgement enqueued");
+            }
+            event_bus.publish(Event::PrReconcileRequested { pr_url: pr_url.clone() });
+            let publication_started = std::time::Instant::now();
+            if always_publish || record.merge_queue_state_changed || remembered {
+                publisher
+                    .publish_work_item_changed(&product_id, &work_item_id, publish_reason)
+                    .await;
+            }
+            tracing::info!(request_id = %request_id, elapsed_ms = publication_started.elapsed().as_secs_f64() * 1000.0, "merge request board publication completed");
+        }
+        Err(err) => {
+            let message = format!("{err:#}");
+            tracing::warn!(
+                work_item_id = %work_item_id,
+                pr_url = %pr_url,
+                error = %message,
+                "merge_when_ready: GitHub refused the merge request",
+            );
+            // When enabled (the InReview path), a merge request is what a
+            // deferred conflict waits for, and GitHub can refuse the request
+            // *because* of that conflict. The request still stands as a human
+            // asking: release the conflict so it is resolved now, and say so.
+            let conflict_released = if release_deferred_conflict_on_refusal {
+                release_deferred_conflict_for_merge(
+                    &work_db,
+                    publisher.as_ref(),
+                    &event_bus,
+                    (&product_id, &work_item_id, &pr_url),
+                )
+                .await
+            } else {
+                false
+            };
+            // A released conflict becomes the standing request, which keeps
+            // what this request confirmed.
+            let confirmation_kept = conflict_released
+                && work_db
+                    .attach_confirmed_merge_revisions(&work_item_id, &pr_url, &confirmation)
+                    .unwrap_or(false);
+            if !confirmation_kept {
+                // The refused request never stood, so what it confirmed must
+                // not carry into a later one. Only this request's snapshot
+                // goes.
+                if let Err(err) = work_db.forget_confirmed_merge_revisions(&confirmation) {
+                    tracing::warn!(work_item_id = %work_item_id, ?err, "merge_when_ready: could not drop the refused request's confirmation");
+                }
+            }
+            if boss_engine_runtime::merge_mechanism::is_push_restriction_error(&message) {
+                let _ = work_db.create_attention_item(boss_work_db::CreateAttentionItemInput {
+                    work_item_id: Some(work_item_id.clone()),
+                    kind: boss_engine_runtime::merge_mechanism::PUSH_RESTRICTION_ATTENTION_KIND.to_owned(),
+                    title: boss_engine_runtime::merge_mechanism::PUSH_RESTRICTION_ATTENTION_TITLE.to_owned(),
+                    body_markdown: boss_engine_runtime::merge_mechanism::render_push_restriction_attention_body(
+                        &product_name,
+                        &product_slug,
+                        &message,
+                    ),
+                    execution_id: None,
+                    status: None,
+                    resolved_at: None,
+                });
+            }
+            if conflict_released && let Err(err) = work_db.note_merge_refusal(&work_item_id, &message) {
+                tracing::warn!(work_item_id = %work_item_id, ?err, "merge_when_ready: could not keep the refusal");
+            }
+            if kick_reconciler_on_error {
+                event_bus.publish(Event::PrReconcileRequested { pr_url: pr_url.clone() });
+            }
+            let response = if conflict_released {
+                FrontendEvent::MergeWhenReadyAccepted {
+                    work_item_id: work_item_id.clone(),
+                    pr_url: pr_url.clone(),
+                    action: merge_when_ready::MergeAction::Requested.as_str().to_owned(),
+                }
+            } else {
+                FrontendEvent::WorkError {
+                    message: if after_rebase.is_some() {
+                        rebase_arm_error(after_rebase.as_ref(), &format!("arming merge failed: {message}"))
+                    } else {
+                        format!("merge_when_ready failed: {message}")
+                    },
+                }
+            };
+            send_response(&sink, &request_id, response);
         }
     }
 }
@@ -401,14 +553,32 @@ async fn release_deferred_conflict_for_merge(
     true
 }
 
+/// Optional post-rebase tracking recorded after merge is armed.
+pub(super) struct AfterRebaseRecord {
+    pub base_branch: String,
+    pub head_sha_before: Option<String>,
+    pub rebased_head_sha: Option<String>,
+}
+
 /// Bundles the per-call arguments [`handle_trunk_queue_merge`] needs beyond
 /// its shared server/session handles — kept as a single struct so adding a
 /// field there doesn't grow the function's argument list.
-struct TrunkQueueMergeRequest {
-    product_id: String,
-    work_item_id: String,
-    pr_url: String,
-    target_branch: String,
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
+pub(super) struct TrunkQueueMergeRequest {
+    pub product_id: String,
+    pub work_item_id: String,
+    pub pr_url: String,
+    pub target_branch: String,
+    /// After a CI-failure rebase, retire a stale (not live-in-queue) active
+    /// intent and insert a fresh one rather than refusing the click.
+    pub retire_stale_and_retry: bool,
+    /// Wake the GitHub merge poller after submit. The in-review Trunk path
+    /// skips this; the post-rebase path needs it so CI on the new head is
+    /// observed.
+    pub kick_pr_reconciler: bool,
+    pub publish_reason: &'static str,
+    pub after_rebase: Option<AfterRebaseRecord>,
 }
 
 /// The `trunk_queue` branch of [`handle_merge_when_ready`]: submit the PR
@@ -419,7 +589,7 @@ struct TrunkQueueMergeRequest {
 /// falls back to `gh pr merge` — a submission failure (including a
 /// missing/rejected Trunk API token) is a loud [`FrontendEvent::WorkError`]
 /// and the task stays exactly as it was.
-async fn handle_trunk_queue_merge(
+pub(super) async fn handle_trunk_queue_merge(
     server_state: Arc<ServerState>,
     work_db: Arc<WorkDb>,
     sink: Arc<SessionSink>,
@@ -431,6 +601,10 @@ async fn handle_trunk_queue_merge(
         work_item_id,
         pr_url,
         target_branch,
+        retire_stale_and_retry,
+        kick_pr_reconciler,
+        publish_reason,
+        after_rebase,
     } = req;
     let coords = match boss_engine_merge_poller::trunk_merge::parse_trunk_pr_coordinates(&pr_url) {
         Ok(coords) => coords,
@@ -459,18 +633,9 @@ async fn handle_trunk_queue_merge(
         .repo(format!("{}/{}", coords.owner, coords.repo))
         .target_branch(target_branch.clone())
         .build();
-    let intent = match work_db.insert_trunk_merge_intent(insert_input) {
+    let intent = match work_db.insert_trunk_merge_intent(insert_input.clone()) {
         Ok(Some(intent)) => intent,
         Ok(None) => {
-            // Duplicate click: an intent is already active for this work
-            // item. Never re-submit — repeatedly POSTing the same PR to
-            // Trunk is the hazard the guard exists to prevent. The reply
-            // must still be honest: "already in the queue" only when the
-            // intent is still live there; a terminal/non-advancing state
-            // (e.g. `failed`) is a refusal, not a success toast. Design:
-            // "a second merge click on an
-            // already-active intent is a no-op that re-reports current
-            // queue state".
             let active = match work_db.get_active_trunk_merge_intent(&work_item_id) {
                 Ok(active) => active,
                 Err(err) => {
@@ -492,8 +657,98 @@ async fn handle_trunk_queue_merge(
                 }
             };
             match active {
+                Some(active)
+                    if retire_stale_and_retry
+                        && boss_engine_merge_poller::trunk_merge::intent_is_live_in_queue(
+                            active.last_trunk_state.as_deref(),
+                        ) =>
+                {
+                    record_after_rebase(&work_db, &work_item_id, &pr_url, after_rebase.as_ref());
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::MergeWhenReadyAccepted {
+                            work_item_id,
+                            pr_url: pr_url.clone(),
+                            action: merge_when_ready::MergeAction::TrunkAlreadyEnqueued.as_str().to_owned(),
+                        },
+                    );
+                    if kick_pr_reconciler {
+                        server_state.event_bus.publish(Event::PrReconcileRequested { pr_url });
+                    }
+                    return;
+                }
+                Some(active)
+                    if retire_stale_and_retry
+                        && matches!(
+                            active.last_trunk_state.as_deref(),
+                            Some(boss_engine_merge_poller::trunk_merge::TRUNK_INTENT_WITHDRAW)
+                                | Some(boss_engine_merge_poller::trunk_merge::TRUNK_INTENT_SUPERSEDED_BY_CONFLICT)
+                        ) =>
+                {
+                    // Do not retire an intent whose `cancelPullRequest` is
+                    // still owed by the poller: if the replacement submit
+                    // failed and rolled back, Boss would stop tracking a PR
+                    // Trunk still holds.
+                    tracing::warn!(
+                        %work_item_id,
+                        %pr_url,
+                        intent_id = %active.id,
+                        last_trunk_state = ?active.last_trunk_state,
+                        outcome = "refused",
+                        "merge_when_ready: refusing to retire trunk intent while queue cancel is still pending",
+                    );
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: rebase_arm_error(
+                                after_rebase.as_ref(),
+                                "a previous queue withdrawal is still pending; try again shortly",
+                            ),
+                        },
+                    );
+                    return;
+                }
+                Some(active) if retire_stale_and_retry => {
+                    if let Err(err) = work_db.retire_trunk_merge_intent(&active.id, "cancelled") {
+                        tracing::warn!(
+                            %work_item_id,
+                            %pr_url,
+                            intent_id = %active.id,
+                            ?err,
+                            "merge_when_ready: failed to retire stale trunk merge intent before retry",
+                        );
+                    }
+                    match work_db.insert_trunk_merge_intent(insert_input) {
+                        Ok(Some(intent)) => intent,
+                        _ => {
+                            send_response(
+                                &sink,
+                                &request_id,
+                                FrontendEvent::WorkError {
+                                    message: rebase_arm_error(
+                                        after_rebase.as_ref(),
+                                        "could not record trunk merge intent",
+                                    ),
+                                },
+                            );
+                            return;
+                        }
+                    }
+                }
                 Some(active) => {
+                    // Duplicate click: an intent is already active for this
+                    // work item. Never re-submit — repeatedly POSTing the same
+                    // PR to Trunk is the hazard the guard exists to prevent.
+                    // The reply must still be honest: "already in the queue"
+                    // only when the intent is still live there; a
+                    // terminal/non-advancing state (e.g. `failed`) is a
+                    // refusal, not a success toast. Design: "a second merge
+                    // click on an already-active intent is a no-op that
+                    // re-reports current queue state".
                     reply_duplicate_trunk_merge_click(&sink, &request_id, work_item_id, pr_url, active);
+                    return;
                 }
                 None => {
                     // The insert reported a duplicate but no active row is
@@ -511,14 +766,18 @@ async fn handle_trunk_queue_merge(
                         &sink,
                         &request_id,
                         FrontendEvent::WorkError {
-                            message: "merge_when_ready: trunk merge intent insert was ignored but no active intent \
-                                      was found; retry the merge"
-                                .to_owned(),
+                            message: if after_rebase.is_some() {
+                                rebase_arm_error(after_rebase.as_ref(), "trunk merge intent insert was ignored")
+                            } else {
+                                "merge_when_ready: trunk merge intent insert was ignored but no active intent \
+                                 was found; retry the merge"
+                                    .to_owned()
+                            },
                         },
                     );
+                    return;
                 }
             }
-            return;
         }
         Err(err) => {
             tracing::warn!(
@@ -541,6 +800,7 @@ async fn handle_trunk_queue_merge(
 
     let trunk_client = server_state.trunk_client.clone();
     let publisher = server_state.publisher.clone();
+    let event_bus = server_state.event_bus.clone();
     tracing::info!(
         %work_item_id,
         %pr_url,
@@ -583,6 +843,7 @@ async fn handle_trunk_queue_merge(
                 }
                 // Trunk reports no head for the submission, so the request is
                 // for the PR as the merge poller last saw it.
+                record_after_rebase(&work_db, &work_item_id, &pr_url, after_rebase.as_ref());
                 let remembered = remember_merge_request(&work_db, &work_item_id, &pr_url, None);
                 tracing::info!(
                     %work_item_id,
@@ -600,9 +861,12 @@ async fn handle_trunk_queue_merge(
                         action: merge_when_ready::MergeAction::TrunkEnqueued.as_str().to_owned(),
                     },
                 );
+                if kick_pr_reconciler {
+                    event_bus.publish(Event::PrReconcileRequested { pr_url: pr_url.clone() });
+                }
                 if recorded.is_ok() || remembered {
                     publisher
-                        .publish_work_item_changed(&product_id, &work_item_id, "trunk_merge_submitted")
+                        .publish_work_item_changed(&product_id, &work_item_id, publish_reason)
                         .await;
                 }
             }
@@ -659,16 +923,48 @@ async fn handle_trunk_queue_merge(
                         }
                     }
                 }
+                if kick_pr_reconciler {
+                    event_bus.publish(Event::PrReconcileRequested { pr_url: pr_url.clone() });
+                }
                 send_response(
                     &sink,
                     &request_id,
                     FrontendEvent::WorkError {
-                        message: format!("merge_when_ready: trunk queue submission failed for {pr_url}: {err}"),
+                        message: if after_rebase.is_some() {
+                            rebase_arm_error(
+                                after_rebase.as_ref(),
+                                &format!("trunk queue submission failed for {pr_url}: {err}"),
+                            )
+                        } else {
+                            format!("merge_when_ready: trunk queue submission failed for {pr_url}: {err}")
+                        },
                     },
                 );
             }
         }
     });
+}
+
+fn record_after_rebase(work_db: &WorkDb, work_item_id: &str, pr_url: &str, after_rebase: Option<&AfterRebaseRecord>) {
+    let Some(after) = after_rebase else {
+        return;
+    };
+    if let Err(err) = work_db.record_ci_merge_rebase(
+        work_item_id,
+        pr_url,
+        &after.base_branch,
+        after.head_sha_before.as_deref(),
+        after.rebased_head_sha.as_deref(),
+    ) {
+        tracing::warn!(%work_item_id, ?err, "merge_when_ready: failed to record post-rebase tracking");
+    }
+}
+
+fn rebase_arm_error(after_rebase: Option<&AfterRebaseRecord>, detail: &str) -> String {
+    match after_rebase {
+        Some(after) => format!("merge_when_ready: rebased onto {}, but {detail}", after.base_branch),
+        None => format!("merge_when_ready: {detail}"),
+    }
 }
 
 /// Reply to a Merge click when an active trunk merge intent already exists
@@ -748,7 +1044,7 @@ fn reply_duplicate_trunk_merge_click(
 
 /// Pre-branch Merge-click refusal: log a production-visible record, then
 /// send the matching `WorkError`.
-fn refuse_merge_when_ready(sink: &Arc<SessionSink>, request_id: &str, work_item_id: &str, message: String) {
+pub(super) fn refuse_merge_when_ready(sink: &Arc<SessionSink>, request_id: &str, work_item_id: &str, message: String) {
     tracing::warn!(
         %work_item_id,
         reason = %message,

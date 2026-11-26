@@ -183,9 +183,11 @@ pub(crate) fn clear_resolved_signal_in_tx(
             });
         }
     }
-    let mut label_cleared = false;
-    let task_transitioned = if ci {
-        crate::blocking::clear_blocked_ci_failure_in_tx(conn, item, pr, false, actor)?.is_some()
+    let (task_transitioned, label_cleared) = if ci {
+        let transitioned = crate::blocking::clear_blocked_ci_failure_in_tx(conn, item, pr, false, actor)?.is_some();
+        crate::ci_merge_rebase::clear_in_tx(conn, item)?;
+        let cleared = crate::ci_merge_rebase::clear_stopped_detail_in_tx(conn, item)?;
+        (transitioned, cleared)
     } else {
         // A definitive mergeable observation of the task's current PR is the
         // authority for lifting the block, whichever attempt (if any) is
@@ -195,8 +197,8 @@ pub(crate) fn clear_resolved_signal_in_tx(
         let transitioned = crate::blocking::clear_blocked_merge_conflict_in_tx(conn, item, pr, actor)?.is_some();
         // The conflict is gone, so the "Merge paused" explanation for it is too,
         // whether the parent was blocked or already back in review.
-        label_cleared = crate::merge_conflict_merging::clear_stopped_on_conflict_lift(conn, item)?;
-        transitioned
+        let cleared = crate::merge_conflict_merging::clear_stopped_on_conflict_lift(conn, item)?;
+        (transitioned, cleared)
     };
     let retire_conflict = conflict.as_ref().is_some_and(|a| {
         a.status == "running"

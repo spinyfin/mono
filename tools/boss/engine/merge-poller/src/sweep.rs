@@ -804,6 +804,7 @@ pub(crate) async fn sweep_one(
     let parked_for_action = || parked || work_db.is_parked_or_assume_not(&candidate.work_item_id, "merge poller sweep");
     match &probe_result.state {
         PrLifecycleState::Merged => {
+            let _ = work_db.clear_ci_merge_rebase(&candidate.work_item_id);
             match work_db.retire_github_merge_intent(&candidate.work_item_id, &candidate.pr_url, "merged") {
                 Ok(true) => tracing::info!(
                     work_item_id = %candidate.work_item_id,
@@ -1021,6 +1022,7 @@ pub(crate) async fn sweep_one(
             }
         }
         PrLifecycleState::ClosedUnmerged => {
+            let _ = work_db.clear_ci_merge_rebase(&candidate.work_item_id);
             match work_db.retire_github_merge_intent(&candidate.work_item_id, &candidate.pr_url, "closed") {
                 Ok(true) => tracing::info!(
                     work_item_id = %candidate.work_item_id,
@@ -1497,6 +1499,13 @@ pub(crate) async fn dispatch_ci_axis(
     {
         outcome.ci_flagged += 1;
     }
+    if matches!(ci, OpenPrCiStatus::Clean)
+        && let Ok(Some(rebase)) = work_db.get_ci_merge_rebase(&candidate.work_item_id, &candidate.pr_url)
+        && let Some(head_sha) = probe_result.head_ref_oid.as_deref()
+        && (rebase.head_sha_before.as_deref() != Some(head_sha) || rebase.rebased_head_sha.as_deref() == Some(head_sha))
+    {
+        let _ = work_db.clear_ci_merge_rebase(&candidate.work_item_id);
+    }
     if matches!(ci, OpenPrCiStatus::InFlight) {
         if ci_watch::on_ci_in_flight_supersedes_failure(
             work_db,
@@ -1937,21 +1946,33 @@ pub async fn update_pr_poll_state(
             Ok(Some(intent)) => match probe.head_ref_oid.as_deref() {
                 None => true,
                 Some(sha) if sha == intent.head_sha => true,
-                Some(_) => {
-                    match work_db.retire_github_merge_intent(
-                        &candidate.work_item_id,
-                        &candidate.pr_url,
-                        "head_advanced",
-                    ) {
-                        Ok(_) => false,
-                        Err(err) => {
-                            tracing::warn!(
-                                work_item_id = %candidate.work_item_id,
-                                pr_url = %candidate.pr_url,
-                                ?err,
-                                "merge poller: failed to retire GitHub merge intent after head advanced",
-                            );
-                            true
+                Some(sha) => {
+                    let is_stale_pre_rebase_head = work_db
+                        .get_ci_merge_rebase(&candidate.work_item_id, &candidate.pr_url)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|rebase| {
+                            rebase.head_sha_before.as_deref() == Some(sha)
+                                && rebase.rebased_head_sha.as_deref() == Some(intent.head_sha.as_str())
+                        });
+                    if is_stale_pre_rebase_head {
+                        true
+                    } else {
+                        match work_db.retire_github_merge_intent(
+                            &candidate.work_item_id,
+                            &candidate.pr_url,
+                            "head_advanced",
+                        ) {
+                            Ok(_) => false,
+                            Err(err) => {
+                                tracing::warn!(
+                                    work_item_id = %candidate.work_item_id,
+                                    pr_url = %candidate.pr_url,
+                                    ?err,
+                                    "merge poller: failed to retire GitHub merge intent after head advanced",
+                                );
+                                true
+                            }
                         }
                     }
                 }

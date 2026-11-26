@@ -664,21 +664,24 @@ extension WorkTask {
     }
 
     /// `true` when the Merge When Ready control should be offered for this
-    /// task: it is sitting in the Review column, its status is genuinely
-    /// `"in_review"` (not merely review-phase-blocked), it has a non-empty
-    /// PR URL, and it is not already in the merge queue
-    /// (`mergeQueueState == nil`). This is the single source of truth for
-    /// that eligibility — both the board card's snapshot builder
-    /// (`ChatViewModel+BoardHelpers.swift`) and the review-guide viewer
-    /// header (`ReviewGuideViewerHeader.swift`) call this so they cannot
-    /// drift: a task that is only in Review because it is `blocked` with a
-    /// review-phase reason (`isReviewPhaseBlocked`) must never show the
-    /// control.
+    /// task: it is sitting in the Review column, it has a non-empty PR URL,
+    /// it is not already in the merge queue (`mergeQueueState == nil`), and
+    /// it is either genuinely `"in_review"` or `blocked` on `ci_failure` /
+    /// `ci_failure_exhausted`. The engine treats that CI-blocked click as
+    /// a behind-base rebase then arms merge; other review-phase blocks
+    /// (`merge_conflict`, `review_feedback`) still hide the control. This
+    /// is the single source of truth for that eligibility — both the board
+    /// card's snapshot builder (`ChatViewModel+BoardHelpers.swift`) and the
+    /// review-guide viewer header (`ReviewGuideViewerHeader.swift`) call
+    /// this so they cannot drift.
     var isMergeWhenReadyEligible: Bool {
         boardColumn == .review
-            && status == "in_review"
             && prURL.map { !$0.isEmpty } == true
             && mergeQueueState == nil
+            && (status == "in_review"
+                || (status == "blocked"
+                    && (blockedReason == "ci_failure"
+                        || blockedReason == "ci_failure_exhausted")))
     }
 
     /// Mirrors `Task::is_parked`: the row carries its own park stamp and is

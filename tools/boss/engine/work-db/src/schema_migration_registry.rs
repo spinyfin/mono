@@ -269,6 +269,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: cancel_provenance::migrate,
         },
         Migration {
+            id: ci_merge_rebase::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: ci_merge_rebase::migrate,
+        },
+        Migration {
             id: conflict_mismatch::MIGRATION_ID.into(),
             legacy_version: None,
             apply: conflict_mismatch::migrate,

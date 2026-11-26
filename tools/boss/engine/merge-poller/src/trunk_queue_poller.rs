@@ -66,7 +66,7 @@ use crate::conflict_stop_gate::{self, ConflictClearance};
 use crate::metrics::Registry;
 use crate::trunk_merge::{
     TRUNK_INTENT_AWAITING_RESUBMIT, TRUNK_INTENT_SUBMIT_FAILED, TRUNK_INTENT_SUPERSEDED_BY_CONFLICT,
-    is_terminal_trunk_state, trunk_repo_ref,
+    TRUNK_INTENT_WITHDRAW, is_terminal_trunk_state, trunk_repo_ref,
 };
 use crate::work::{ActiveTrunkMergeIntent, PendingMergeCheck, WorkDb};
 use crate::{CommandMergeProbe, RequiredCheckFailure};
@@ -330,6 +330,14 @@ fn is_awaiting_resubmit(member: &ActiveTrunkMergeIntent) -> bool {
 /// out via `cancelPullRequest`.
 fn is_superseded_by_conflict(member: &ActiveTrunkMergeIntent) -> bool {
     member.intent.last_trunk_state.as_deref() == Some(TRUNK_INTENT_SUPERSEDED_BY_CONFLICT)
+}
+
+/// Whether a Merge-click CI rebase whose rebased head is still red has
+/// asked the poller to pull the PR out of Trunk and then retire the
+/// intent. Distinct from [`is_superseded_by_conflict`]: that sentinel
+/// waits for conflict resolution to resubmit; this one is a withdrawal.
+fn is_withdrawing(member: &ActiveTrunkMergeIntent) -> bool {
+    member.intent.last_trunk_state.as_deref() == Some(TRUNK_INTENT_WITHDRAW)
 }
 
 /// Whether a failed `submitPullRequest` left this intent in place because
@@ -680,6 +688,10 @@ impl TrunkQueueProbe {
             // owns.
             if is_superseded_by_conflict(member) {
                 cancel_intent(ctx, member, &repo_ref, &key.target_branch, outcome).await;
+                continue;
+            }
+            if is_withdrawing(member) {
+                withdraw_intent(ctx, member, &repo_ref, &key.target_branch, outcome).await;
                 continue;
             }
             let observed = match by_pr_number.get(&(member.intent.pr_number as u64)) {
@@ -1411,6 +1423,72 @@ async fn cancel_intent(
     }
 }
 
+/// Pull a withdrawn intent out of the queue and retire it once Trunk
+/// confirms (or already has no live entry). Leaves the `boss:withdraw`
+/// sentinel in place on a transport error so the next due cycle retries.
+async fn withdraw_intent(
+    ctx: &TrunkSweepContext<'_>,
+    member: &ActiveTrunkMergeIntent,
+    repo: &TrunkRepoRef,
+    target_branch: &str,
+    outcome: &mut TrunkSweepOutcome,
+) {
+    let lookup = TrunkPrLookup::new(
+        repo.clone(),
+        TrunkPrRef::new(member.intent.pr_number as u64),
+        target_branch.to_owned(),
+    );
+    match ctx.api.cancel_pull_request(&lookup).await {
+        Ok(()) => {
+            outcome.queue_cancellations += 1;
+            tracing::info!(
+                work_item_id = %member.intent.work_item_id,
+                pr_url = %member.intent.pr_url,
+                "trunk queue poller: cancelled a queue entry withdrawn after a red rebased head",
+            );
+            retire_withdrawn_intent(ctx, member, outcome);
+        }
+        Err(TrunkError::NotFound(_)) => {
+            tracing::debug!(
+                work_item_id = %member.intent.work_item_id,
+                pr_url = %member.intent.pr_url,
+                "trunk queue poller: withdraw cancelPullRequest found no live entry; retiring intent",
+            );
+            retire_withdrawn_intent(ctx, member, outcome);
+        }
+        Err(err) => {
+            outcome.probe_failures += 1;
+            tracing::warn!(
+                work_item_id = %member.intent.work_item_id,
+                pr_url = %member.intent.pr_url,
+                error = %err,
+                "trunk queue poller: cancelPullRequest (withdraw) failed; retrying next cycle",
+            );
+        }
+    }
+}
+
+fn retire_withdrawn_intent(
+    ctx: &TrunkSweepContext<'_>,
+    member: &ActiveTrunkMergeIntent,
+    outcome: &mut TrunkSweepOutcome,
+) {
+    match ctx.work_db.retire_trunk_merge_intent(&member.intent.id, "cancelled") {
+        Ok(true) => {
+            outcome.intents_retired += 1;
+        }
+        Ok(false) => {}
+        Err(err) => {
+            tracing::warn!(
+                intent_id = %member.intent.id,
+                work_item_id = %member.intent.work_item_id,
+                ?err,
+                "trunk queue poller: failed to retire withdrawn trunk merge intent; retrying next cycle",
+            );
+        }
+    }
+}
+
 /// Apply one observed Trunk state to an intent, routing the terminal ones.
 async fn apply_resolved_state(
     ctx: &TrunkSweepContext<'_>,
@@ -1430,7 +1508,7 @@ async fn apply_resolved_state(
     // `probe_queue` loop guards its own live-entry arm the same way; this
     // covers the two routes that reach here without that check — the
     // `listPullRequests` reconciliation backstop and `resolve_missing_entry`.
-    if is_superseded_by_conflict(member) || is_awaiting_resubmit(member) {
+    if is_superseded_by_conflict(member) || is_awaiting_resubmit(member) || is_withdrawing(member) {
         return;
     }
     // Per-episode dedup, computed before `record_observed_state` below:

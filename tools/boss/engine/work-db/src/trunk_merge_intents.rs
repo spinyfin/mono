@@ -22,6 +22,10 @@ use super::*;
 pub const TRUNK_INTENT_AWAITING_RESUBMIT: &str = "boss:awaiting_resubmit";
 pub const TRUNK_INTENT_SUPERSEDED_BY_CONFLICT: &str = "boss:superseded_by_conflict";
 pub const TRUNK_INTENT_SUBMIT_FAILED: &str = "boss:submit_failed";
+/// Merge-click CI rebase whose rebased head is still red: the poller must
+/// `cancelPullRequest` and only then retire the intent, so Trunk does not
+/// keep a PR Boss has already stopped tracking.
+pub const TRUNK_INTENT_WITHDRAW: &str = "boss:withdraw";
 
 /// One `trunk_merge_intents` row.
 ///
@@ -86,6 +90,10 @@ pub struct TrunkMergeIntentInsertInput {
     /// Set only by `boss_engine::trunk_queue_adopt`, to that check run's
     /// `completedAt` — see [`TrunkMergeIntent::adopted_at_check_completed_at`].
     pub adopted_at_check_completed_at: Option<String>,
+    /// Optional initial `last_trunk_state` written atomically in the same
+    /// `INSERT OR IGNORE` transaction (e.g. `TRUNK_INTENT_SUPERSEDED_BY_CONFLICT`
+    /// so the poller never observes a fresh intent with `NULL` state).
+    pub initial_trunk_state: Option<String>,
 }
 
 /// One `active` intent joined with the two facts about its task the
@@ -136,11 +144,13 @@ impl WorkDb {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let id = next_id("tmi");
         let now = now_string();
+        let initial_state_at = input.initial_trunk_state.as_ref().map(|_| now.as_str());
         let rows = tx.execute(
             "INSERT OR IGNORE INTO trunk_merge_intents
-                (id, work_item_id, pr_url, pr_number, repo, target_branch, status, submit_count, created_at,
+                (id, work_item_id, pr_url, pr_number, repo, target_branch, status,
+                 last_trunk_state, last_trunk_state_at, submit_count, created_at,
                  adopted_at_head_sha, adopted_at_check_completed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 1, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 1, ?9, ?10, ?11)",
             params![
                 id,
                 input.work_item_id,
@@ -148,6 +158,8 @@ impl WorkDb {
                 input.pr_number,
                 input.repo,
                 input.target_branch,
+                input.initial_trunk_state,
+                initial_state_at,
                 now,
                 input.adopted_at_head_sha,
                 input.adopted_at_check_completed_at,
@@ -364,7 +376,7 @@ fn query_active_trunk_merge_intent(conn: &Connection, work_item_id: &str) -> Res
     Ok(row)
 }
 
-fn record_trunk_merge_intent_state_in_tx(conn: &Connection, id: &str, state: &str) -> Result<bool> {
+pub(crate) fn record_trunk_merge_intent_state_in_tx(conn: &Connection, id: &str, state: &str) -> Result<bool> {
     let changed = conn.execute(
         "UPDATE trunk_merge_intents
          SET last_trunk_state = ?2, last_trunk_state_at = ?3
@@ -374,6 +386,16 @@ fn record_trunk_merge_intent_state_in_tx(conn: &Connection, id: &str, state: &st
         params![id, state, now_string()],
     )?;
     Ok(changed > 0)
+}
+
+/// Stamp the active Trunk intent [`TRUNK_INTENT_WITHDRAW`] so the queue
+/// poller calls `cancelPullRequest` and retires the row only after Trunk
+/// confirms. A no-op when there is no active intent.
+pub(crate) fn mark_active_trunk_intent_withdraw_in_tx(conn: &Connection, work_item_id: &str) -> Result<bool> {
+    let Some(intent) = query_active_trunk_merge_intent(conn, work_item_id)? else {
+        return Ok(false);
+    };
+    record_trunk_merge_intent_state_in_tx(conn, &intent.id, TRUNK_INTENT_WITHDRAW)
 }
 
 pub(crate) fn mark_active_trunk_intent_awaiting_resubmit_in_tx(
@@ -739,5 +761,29 @@ mod tests {
         assert_eq!(row, ("cancelled".to_owned(), Some("cancelled".to_owned())));
         // The dedup slot is free: a fresh merge click can enqueue again.
         assert!(db.insert_trunk_merge_intent(input_for(&task_id)).unwrap().is_some());
+    }
+
+    #[test]
+    fn insert_can_atomically_set_initial_trunk_state() {
+        let db = test_db();
+        let (_, task_id) = seed_task(&db, "initial-state");
+        let intent = db
+            .insert_trunk_merge_intent(
+                TrunkMergeIntentInsertInput::builder()
+                    .work_item_id(task_id)
+                    .pr_url("https://github.com/brianduff/flunge/pull/978")
+                    .pr_number(978)
+                    .repo("brianduff/flunge")
+                    .target_branch("main")
+                    .initial_trunk_state(TRUNK_INTENT_SUPERSEDED_BY_CONFLICT)
+                    .build(),
+            )
+            .unwrap()
+            .expect("inserted");
+        assert_eq!(
+            intent.last_trunk_state.as_deref(),
+            Some(TRUNK_INTENT_SUPERSEDED_BY_CONFLICT)
+        );
+        assert!(intent.last_trunk_state_at.is_some());
     }
 }

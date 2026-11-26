@@ -1125,6 +1125,10 @@ mod floor_tests {
                 Box::new(|c| super::super::merge_conflict_merging::migrate_confirmed_revisions(c).unwrap()),
             ),
             (
+                super::super::ci_merge_rebase::MIGRATION_ID,
+                Box::new(|c| super::super::ci_merge_rebase::migrate(c).unwrap()),
+            ),
+            (
                 stuck_snapshot::MIGRATION_ID,
                 Box::new(|c| stuck_snapshot::migrate(c).unwrap()),
             ),

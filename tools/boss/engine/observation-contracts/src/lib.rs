@@ -407,6 +407,30 @@ pub trait MergeProbe: Send + Sync {
             .map(|(url, result)| (url, result.map(ShallowProbe::from_full)))
             .collect()
     }
+
+    /// Whether the PR's head branch is behind its base branch (`behind_by > 0`).
+    ///
+    /// The default implementation inspects `probe`'s own GitHub merge-state
+    /// fields (`raw_merge_state_status == "BEHIND"` or `"DIRTY"`, or
+    /// `OpenPrMergeability::Conflict`). `CommandMergeProbe` overrides this to
+    /// fall back to GitHub's compare API (`repos/{owner}/{repo}/compare/{base}...{head}`
+    /// `.behind_by`) when `mergeStateStatus` is `"BLOCKED"` or `"UNSTABLE"` —
+    /// GitHub reports `"BLOCKED"` whenever required checks are failing even
+    /// when the base branch has moved ahead.
+    async fn is_pr_behind_base(&self, _pr_url: &str, probe: &PrLifecycleProbe) -> Result<bool> {
+        Ok(probe_reports_behind(probe))
+    }
+}
+
+/// Fast-path behind check from the probe's own merge-state fields, without an
+/// extra GitHub round trip.
+pub fn probe_reports_behind(probe: &PrLifecycleProbe) -> bool {
+    probe.raw_merge_state_status.eq_ignore_ascii_case("BEHIND")
+        || probe.raw_merge_state_status.eq_ignore_ascii_case("DIRTY")
+        || matches!(
+            &probe.state,
+            PrLifecycleState::Open(open) if open.mergeability == OpenPrMergeability::Conflict
+        )
 }
 
 /// `MergeProbe` that always returns an error — used as the default in

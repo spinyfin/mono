@@ -130,6 +130,7 @@ pub(crate) mod proposals;
 mod queued_dispatch;
 pub(crate) mod readoption;
 mod review;
+mod review_ci_rebase;
 mod review_guide;
 mod review_start;
 mod run_writes;

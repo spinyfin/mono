@@ -251,7 +251,7 @@ fn restore_paused_merge_label(conn: &Connection, id: &str) -> Result<bool> {
             "SELECT merge_queue_detail FROM tasks
              WHERE id = ?1 AND merge_queue_state IS NULL
                AND CASE WHEN json_valid(merge_queue_detail)
-                   THEN json_extract(merge_queue_detail, '$.source') = 'conflict_resolution'
+                   THEN json_extract(merge_queue_detail, '$.source') IN ('conflict_resolution', 'ci_merge_rebase')
                     AND json_extract(merge_queue_detail, '$.disarm_error') IS NOT NULL
                    ELSE 0 END",
             [id],
@@ -360,7 +360,7 @@ pub(crate) fn clear_stopped(conn: &Connection, id: &str) -> Result<bool> {
         "UPDATE tasks SET merge_queue_detail = NULL
          WHERE id = ?1 AND merge_queue_state IS NULL
            AND CASE WHEN json_valid(merge_queue_detail)
-               THEN json_extract(merge_queue_detail, '$.source') = 'conflict_resolution' ELSE 0 END",
+               THEN json_extract(merge_queue_detail, '$.source') IN ('conflict_resolution', 'ci_merge_rebase') ELSE 0 END",
         [id],
     )? > 0)
 }
@@ -383,9 +383,12 @@ pub(crate) fn clear_stopped_on_conflict_lift(conn: &Connection, id: &str) -> Res
 }
 
 fn is_conflict_stop_detail(detail: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(detail)
-        .ok()
-        .is_some_and(|v| v.get("source").and_then(|s| s.as_str()) == Some("conflict_resolution"))
+    serde_json::from_str::<serde_json::Value>(detail).ok().is_some_and(|v| {
+        matches!(
+            v.get("source").and_then(|s| s.as_str()),
+            Some("conflict_resolution" | "ci_merge_rebase")
+        )
+    })
 }
 
 /// A different PR binding or an explicit move out of review cancels the request.
@@ -654,7 +657,12 @@ impl WorkDb {
         let mut detail = current
             .as_deref()
             .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
-            .filter(|value| value.get("source").and_then(|s| s.as_str()) == Some("conflict_resolution"))
+            .filter(|value| {
+                matches!(
+                    value.get("source").and_then(|s| s.as_str()),
+                    Some("conflict_resolution" | "ci_merge_rebase")
+                )
+            })
             .unwrap_or_else(|| serde_json::json!({"source": "conflict_resolution"}));
         let paused = detail
             .get("paused_label")
@@ -682,7 +690,7 @@ impl WorkDb {
              WHERE id = ?1 AND merge_queue_state IS NULL
                AND COALESCE(merge_queue_detail, '') != ?2
                AND CASE WHEN json_valid(merge_queue_detail)
-                   THEN json_extract(merge_queue_detail, '$.source') = 'conflict_resolution' ELSE 0 END",
+                   THEN json_extract(merge_queue_detail, '$.source') IN ('conflict_resolution', 'ci_merge_rebase') ELSE 0 END",
             params![id, detail],
         )? > 0)
     }
@@ -709,7 +717,7 @@ impl WorkDb {
                     "UPDATE tasks SET merge_queue_detail = ?2
                      WHERE id = ?1 AND merge_queue_state IS NULL
                        AND CASE WHEN json_valid(merge_queue_detail)
-                           THEN json_extract(merge_queue_detail, '$.source') = 'conflict_resolution' ELSE 0 END",
+                           THEN json_extract(merge_queue_detail, '$.source') IN ('conflict_resolution', 'ci_merge_rebase') ELSE 0 END",
                     params![
                         id,
                         serde_json::json!({

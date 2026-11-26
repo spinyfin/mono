@@ -2033,6 +2033,71 @@ async fn a_cancel_that_finds_no_live_entry_is_not_a_probe_failure() {
     assert_eq!(outcome.probe_failures, 0, "a NotFound cancel reply is not a failure");
 }
 
+/// A Merge-click CI rebase whose rebased head is still red stamps
+/// `boss:withdraw`. The poller must call `cancelPullRequest` while the
+/// entry is still live, then retire the intent so Boss does not drop
+/// tracking while Trunk still holds the PR.
+#[tokio::test]
+async fn a_withdrawn_intent_is_cancelled_then_retired() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let (_, task_id) = seed_intent(&db, "withdraw-live", 978);
+    let intent = db.get_active_trunk_merge_intent(&task_id).unwrap().unwrap();
+    db.record_trunk_merge_intent_state(&intent.id, crate::trunk_merge::TRUNK_INTENT_WITHDRAW)
+        .unwrap();
+
+    let api = StubTrunkApi::with_queue(vec![Ok(queue_of(
+        TrunkQueueState::Running,
+        vec![entry_of(978, TrunkPrState::Pending)],
+    ))]);
+    let publisher = RecordingPublisher::default();
+    let mut probe = probe();
+    let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
+        work_db: &db,
+        publisher: &publisher,
+        api: &api,
+    };
+
+    let outcome = probe.run_pass(&ctx, Instant::now()).await;
+
+    assert_eq!(outcome.queue_cancellations, 1);
+    assert_eq!(api.cancel_call_count(), 1);
+    let calls = api.cancel_calls.lock().unwrap().clone();
+    assert_eq!(calls[0], (REPO.to_owned(), 978, "main".to_owned()));
+    assert_eq!(outcome.intents_retired, 1);
+    assert!(
+        db.get_active_trunk_merge_intent(&task_id).unwrap().is_none(),
+        "withdrawn intent must retire only after Trunk confirms cancel"
+    );
+}
+
+#[tokio::test]
+async fn a_withdraw_cancel_that_finds_no_live_entry_still_retires_the_intent() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let (_, task_id) = seed_intent(&db, "withdraw-absent", 978);
+    let intent = db.get_active_trunk_merge_intent(&task_id).unwrap().unwrap();
+    db.record_trunk_merge_intent_state(&intent.id, crate::trunk_merge::TRUNK_INTENT_WITHDRAW)
+        .unwrap();
+
+    let api = StubTrunkApi::with_queue(vec![Ok(queue_of(TrunkQueueState::Running, Vec::new()))]);
+    api.set_cancel_replies(vec![Err(StubError::NotFound)]);
+    let publisher = RecordingPublisher::default();
+    let mut probe = probe();
+    let ctx = TrunkSweepContext {
+        contract_fetcher: &crate::queue_ci_contract::tests::FakeFetcher(None),
+        work_db: &db,
+        publisher: &publisher,
+        api: &api,
+    };
+
+    let outcome = probe.run_pass(&ctx, Instant::now()).await;
+
+    assert_eq!(outcome.queue_cancellations, 0);
+    assert_eq!(outcome.probe_failures, 0);
+    assert_eq!(outcome.intents_retired, 1);
+    assert!(db.get_active_trunk_merge_intent(&task_id).unwrap().is_none());
+}
+
 #[tokio::test]
 async fn an_entry_unknown_to_trunk_leaves_the_intent_untouched() {
     let (_tmp, db) = crate::test_support::open_db();
