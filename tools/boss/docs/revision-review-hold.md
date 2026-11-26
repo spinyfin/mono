@@ -41,6 +41,15 @@ The third row is why the order of events does not matter. A batch for the pushed
 
 Every release in this table cascades to the revisions queued behind the released one in the same transaction, so the next revision is dispatchable immediately.
 
+## When the pull request merges or closes during a hold
+
+A hold does not outlive its pull request. The row that owns the PR takes the same hold when its own implementation finishes, and the merge poller watches the PR of a row held `active` for a merge or a close (see [Rows watched only for merge or close](merge-poller-detection-pass.md#rows-watched-only-for-merge-or-close)). That holds while the review is queued, running, deferred or held by dispatch focus.
+
+| Event                                                                   | Result                                                                                                                                                   |
+| ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The PR merges or is closed while its owning row is held                 | The row moves to `done`. Its held revisions are settled in the same transaction, and every `pr_review_admission_deferred` item on the chain is resolved. |
+| The PR merges or is closed after its owning row was archived or deleted | Revisions resting `in_review` move to `done`, recorded in the status ledger as `settle_orphaned_revisions_pr_merged` or `..._pr_closed_unmerged`.        |
+
 ## When a revision stays `active` with nothing running
 
 Find what its hold rests on:

@@ -139,6 +139,22 @@ pub async fn reconcile_batch(
     let blocked_ci = candidates_for_pr_urls(work_db.list_chores_blocked_on_ci_failure(), &wanted);
     let blocked_other = candidates_for_pr_urls(work_db.list_chores_blocked_other_with_pr(), &wanted);
     let stranded_blocked = candidates_for_pr_urls(work_db.list_chores_stranded_blocked_remediation(), &wanted);
+    // Watched for a merge or a close only; see `run_one_pass`.
+    let held_active = candidates_for_pr_urls(work_db.list_chores_held_active_with_pr(), &wanted);
+    let orphaned_chains: Vec<crate::work::OrphanedRevisionChain> =
+        match work_db.list_orphaned_in_review_revision_chains() {
+            Ok(chains) => chains
+                .into_iter()
+                .filter(|chain| wanted.contains(chain.pr_url.as_str()))
+                .collect(),
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "merge poller: targeted reconcile orphaned-chain list query failed"
+                );
+                Vec::new()
+            }
+        };
 
     // Probe only the requested URLs that still have a live candidate row.
     // A URL that has dropped off every list costs nothing here and is
@@ -150,7 +166,9 @@ pub async fn reconcile_batch(
         .chain(blocked_ci.iter())
         .chain(blocked_other.iter())
         .chain(stranded_blocked.iter())
+        .chain(held_active.iter())
         .map(|candidate| candidate.pr_url.clone())
+        .chain(orphaned_chains.iter().map(|chain| chain.pr_url.clone()))
         .filter(|url| probe_seen.insert(url.clone()))
         .collect();
     if probe_urls.is_empty() {
@@ -189,6 +207,36 @@ pub async fn reconcile_batch(
             &mut outcome,
         )
         .await;
+    }
+    for candidate in &held_active {
+        // No open-PR upkeep for a held row: only a merge or a close is acted on.
+        let terminal = matches!(
+            probe_results.get(&candidate.pr_url),
+            Some(Ok(probe)) if !matches!(probe.state, PrLifecycleState::Open(_))
+        );
+        if !terminal || !seen.insert(candidate.work_item_id.clone()) {
+            continue;
+        }
+        sweep_one(
+            work_db,
+            &probe_results,
+            &source_observation_sequences,
+            (publisher, "adaptive_batch"),
+            SweepHandlers {
+                cube_client,
+                completion_handler,
+                host,
+                parked_ids: None,
+            },
+            candidate,
+            &mut outcome,
+        )
+        .await;
+    }
+    for chain in &orphaned_chains {
+        if let Some(Ok(probe)) = probe_results.get(&chain.pr_url) {
+            settle_orphaned_revision_chain(work_db, publisher, completion_handler, chain, probe, &mut outcome).await;
+        }
     }
     for candidate in &stranded_blocked {
         sweep_stranded_blocked_remediation(work_db, &probe_results, publisher, host, candidate, &mut outcome).await;
@@ -2363,6 +2411,73 @@ pub(crate) async fn mark_closed_unmerged(
          (closed-unmerged — not a merge)",
     );
     true
+}
+
+/// Settle the `in_review` revisions of a chain whose root is terminal or
+/// deleted, once a probe reports their PR merged or closed. A no-op while the
+/// PR is open.
+///
+/// The root's own merged or closed transition is what settles a chain's
+/// revisions; this is that step for a chain whose root will never make it.
+/// A merge into a branch other than the default did not land the work, so it
+/// is recorded as a close: the root that would have carried a base refusal
+/// is not there to carry it.
+pub(crate) async fn settle_orphaned_revision_chain(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    completion_handler: Option<&dyn CompletionRequests>,
+    chain: &crate::work::OrphanedRevisionChain,
+    probe: &PrLifecycleProbe,
+    outcome: &mut SweepOutcome,
+) {
+    let (close, reason, guide_reason) = match &probe.state {
+        PrLifecycleState::Open(_) => return,
+        PrLifecycleState::Merged if probe.base_branch_error.is_none() => {
+            (crate::work::PrClose::Merged, "pr_merged", "parent PR merged")
+        }
+        PrLifecycleState::Merged | PrLifecycleState::ClosedUnmerged => (
+            crate::work::PrClose::ClosedUnmerged,
+            "pr_closed_unmerged",
+            "PR closed unmerged",
+        ),
+    };
+    let settled = match work_db.settle_orphaned_revisions_after_pr_close(&chain.chain_root_id, &chain.pr_url, close) {
+        Ok(settled) => settled,
+        Err(err) => {
+            tracing::warn!(
+                chain_root_id = %chain.chain_root_id,
+                pr_url = %chain.pr_url,
+                ?err,
+                "merge poller: failed to settle revisions left in review by a closed PR",
+            );
+            return;
+        }
+    };
+    stop_live_review_guides(
+        work_db,
+        completion_handler,
+        &chain.chain_root_id,
+        &chain.pr_url,
+        guide_reason,
+    )
+    .await;
+    if settled.is_empty() {
+        return;
+    }
+    tracing::info!(
+        chain_root_id = %chain.chain_root_id,
+        pr_url = %chain.pr_url,
+        basis = close.orphaned_revision_basis(),
+        revisions = ?settled,
+        "merge poller: PR ended with its owning row already terminal or deleted; revisions in review moved to done",
+    );
+    for revision_id in &settled {
+        publisher
+            .publish_work_item_changed(&chain.product_id, revision_id, reason)
+            .await;
+    }
+    publisher.kick_scheduler();
+    outcome.orphaned_revisions_settled += settled.len();
 }
 
 /// Extract the PR number from a GitHub PR URL as an `i64` for DB storage.

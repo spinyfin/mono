@@ -418,6 +418,21 @@ pub async fn run_one_pass_observed(
     .await
 }
 
+/// The held rows that get no open-PR upkeep: those on no upkeep list. The
+/// lists are read one after another, so a row released to `in_review` between
+/// two reads can be on both; it then keeps the upkeep its new status calls for.
+fn terminal_watch_only_ids<'a>(
+    held_active: &'a [PendingMergeCheck],
+    upkeep: impl Iterator<Item = &'a PendingMergeCheck>,
+) -> std::collections::HashSet<&'a str> {
+    let upkeep: std::collections::HashSet<&str> = upkeep.map(|candidate| candidate.work_item_id.as_str()).collect();
+    held_active
+        .iter()
+        .map(|candidate| candidate.work_item_id.as_str())
+        .filter(|id| !upkeep.contains(id))
+        .collect()
+}
+
 /// Whether the snapshot reports `pr_url` merged or closed — a terminal fact
 /// the pass records before any open-PR upkeep.
 fn probed_terminal(results: &HashMap<String, std::result::Result<PrLifecycleProbe, String>>, pr_url: &str) -> bool {
@@ -511,6 +526,22 @@ pub async fn run_one_pass_tracked(
             Vec::new()
         }
     };
+    // Rows on none of the lists above whose PR nothing else observes: watched
+    // for a merge or a close only, never given open-PR upkeep.
+    let held_active = match work_db.list_chores_held_active_with_pr() {
+        Ok(items) => items,
+        Err(err) => {
+            tracing::warn!(?err, "merge poller: failed to list rows held active with a PR");
+            Vec::new()
+        }
+    };
+    let orphaned_chains = match work_db.list_orphaned_in_review_revision_chains() {
+        Ok(items) => items,
+        Err(err) => {
+            tracing::warn!(?err, "merge poller: failed to list orphaned in-review revision chains");
+            Vec::new()
+        }
+    };
     let pending_pr_recheck = match work_db.list_executions_pending_pr_detection() {
         Ok(items) => items,
         Err(err) => {
@@ -573,6 +604,8 @@ pub async fn run_one_pass_tracked(
         + blocked_conflict.len()
         + blocked_ci.len()
         + blocked_other.len()
+        + held_active.len()
+        + orphaned_chains.len()
         + pending_pr_recheck.len()
         + pending_background_nudges.len()
         + stranded_ci_attempts.len()
@@ -587,8 +620,17 @@ pub async fn run_one_pass_tracked(
         .chain(blocked_conflict.iter())
         .chain(blocked_ci.iter())
         .chain(blocked_other.iter())
+        .chain(held_active.iter())
         .filter(|candidate| seen.insert(candidate.work_item_id.as_str()))
         .collect();
+    let terminal_watch_only = terminal_watch_only_ids(
+        &held_active,
+        in_review
+            .iter()
+            .chain(blocked_conflict.iter())
+            .chain(blocked_ci.iter())
+            .chain(blocked_other.iter()),
+    );
     {
         // Keep the rotation memory the size of the live candidate set.
         let mut rotations = state.rotations();
@@ -625,6 +667,8 @@ pub async fn run_one_pass_tracked(
         blocked_conflict = blocked_conflict.len(),
         blocked_ci = blocked_ci.len(),
         blocked_other = blocked_other.len(),
+        held_active = held_active.len(),
+        orphaned_revision_chains = orphaned_chains.len(),
         pending_pr_recheck = pending_pr_recheck.len(),
         pending_background_nudges = pending_background_nudges.len(),
         stranded_ci_attempts = stranded_ci_attempts.len(),
@@ -645,7 +689,9 @@ pub async fn run_one_pass_tracked(
         .chain(blocked_ci.iter())
         .chain(blocked_other.iter())
         .chain(stranded_blocked.iter())
+        .chain(held_active.iter())
         .map(|candidate| candidate.pr_url.clone())
+        .chain(orphaned_chains.iter().map(|chain| chain.pr_url.clone()))
         .filter(|url| probe_url_seen.insert(url.clone()))
         .collect();
     state.probe_order.lock().unwrap().retain(&probe_urls);
@@ -692,13 +738,20 @@ pub async fn run_one_pass_tracked(
             work_db,
             completion_handler,
             state,
-            inputs: crate::probe_tier::TierInputs {
-                always_full,
-                in_review: &in_review,
-                parked: &in_review_parked,
-                merge_in_flight: merge_in_flight.as_ref(),
-                active_products: active_products.as_ref(),
-            },
+            inputs: crate::probe_tier::TierInputs::builder()
+                .always_full(always_full)
+                .in_review(&in_review)
+                .parked(&in_review_parked)
+                .maybe_merge_in_flight(merge_in_flight.as_ref())
+                .maybe_active_products(active_products.as_ref())
+                .terminal_watch(
+                    held_active
+                        .iter()
+                        .map(|candidate| candidate.pr_url.as_str())
+                        .chain(orphaned_chains.iter().map(|chain| chain.pr_url.as_str()))
+                        .collect(),
+                )
+                .build(),
             all_urls: &probe_urls,
         },
     )
@@ -711,11 +764,26 @@ pub async fn run_one_pass_tracked(
     // [`ProbeSnapshot::ensure_fresh`]. Terminal facts first, then open-PR
     // upkeep; each half least recently attended first.
     // A PR watched only for merge or close has nothing to walk unless that
-    // probe found it merged or closed.
+    // probe found it merged or closed. The same holds for a row watched only
+    // for those facts whose PR was probed in full for another row: the full
+    // result does not make open-PR upkeep apply to it.
     let (terminal, open): (Vec<&PendingMergeCheck>, Vec<&PendingMergeCheck>) = candidates
         .into_iter()
         .filter(|candidate| !unwalked.contains(&candidate.pr_url))
+        .filter(|candidate| {
+            probed_terminal(&snapshot.results, &candidate.pr_url)
+                || !terminal_watch_only.contains(candidate.work_item_id.as_str())
+        })
         .partition(|candidate| probed_terminal(&snapshot.results, &candidate.pr_url));
+    // Taken from the first probe: a merge or a close does not go stale, and
+    // a mid-pass re-probe covers only the candidate walks.
+    let orphaned_terminal: Vec<(&crate::work::OrphanedRevisionChain, PrLifecycleProbe)> = orphaned_chains
+        .iter()
+        .filter_map(|chain| match snapshot.results.get(&chain.pr_url) {
+            Some(Ok(probe)) if !matches!(probe.state, PrLifecycleState::Open(_)) => Some((chain, probe.clone())),
+            _ => None,
+        })
+        .collect();
     let terminal_walk: Vec<&PendingMergeCheck> = {
         let rotations = state.rotations();
         rotations
@@ -734,7 +802,7 @@ pub async fn run_one_pass_tracked(
         .collect();
     let mut parked_ids = parked_ids_for_pass(work_db, parked_scope.iter().copied());
     // Terminal merge observation always runs first and is never rotated.
-    trace.enter(PassPhase::TerminalWalk, terminal_walk.len());
+    trace.enter(PassPhase::TerminalWalk, terminal_walk.len() + orphaned_terminal.len());
     for idx in 0..terminal_walk.len() {
         let candidate = terminal_walk[idx];
         trace.start_item(&candidate.work_item_id);
@@ -768,6 +836,19 @@ pub async fn run_one_pass_tracked(
                 parked_ids: Some(&parked_ids),
             },
             candidate,
+            &mut outcome,
+        )
+        .await;
+        trace.finish_item();
+    }
+    for (chain, terminal_probe) in &orphaned_terminal {
+        trace.start_item(&chain.chain_root_id);
+        settle_orphaned_revision_chain(
+            work_db,
+            publisher,
+            completion_handler,
+            chain,
+            terminal_probe,
             &mut outcome,
         )
         .await;

@@ -725,6 +725,8 @@ pub fn spawn_loop<C: CompletionRequests + 'static>(
                     revision_invalidated = outcome.revision_invalidated,
                     worker_stopped_on_review = outcome.worker_stopped_on_review,
                     comments_reopened = outcome.comments_reopened,
+                    closed_unmerged = outcome.closed_unmerged,
+                    orphaned_revisions_settled = outcome.orphaned_revisions_settled,
                     trunk_episodes_adopted = outcome.trunk_episodes_adopted,
                     "merge poller: sweep transitions",
                 );

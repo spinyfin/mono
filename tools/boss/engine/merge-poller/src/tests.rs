@@ -671,6 +671,8 @@ mod schedule_tests;
 #[cfg(test)]
 mod sweep_tests;
 #[cfg(test)]
+mod unlisted_pr_terminal_tests;
+#[cfg(test)]
 mod unmergeable_reaction_tests;
 
 #[cfg(test)]

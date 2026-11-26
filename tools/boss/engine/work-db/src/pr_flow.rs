@@ -1555,7 +1555,9 @@ impl WorkDb {
     }
 
     /// Move the chore or project_task identified by `work_item_id`
-    /// from `in_review` to `done` after confirming its bound PR merged.
+    /// to `done` after confirming its bound PR merged: from `in_review`, from
+    /// a `blocked` state, or from `active` when it was still held for review
+    /// (see [`Self::list_chores_held_active_with_pr`]).
     /// Returns the updated task
     /// if a transition happened; `Ok(None)` if the row was already
     /// terminal, human-driven, or no longer bound to this PR. Matching late
@@ -1681,6 +1683,8 @@ impl WorkDb {
         // can see the row; once the PR has merged the hold has no remaining
         // purpose and must not stay open on the Done card.
         resolve_attention_kind_in_tx(&tx, &task.id, WORKSPACE_POSITIONING_REFUSED)?;
+        // A row held for review can merge before the review was admitted.
+        super::pr_terminal_watch::resolve_review_admission_markers_in_tx(&tx, &task.id)?;
         let updated =
             query_task(&tx, work_item_id)?.with_context(|| format!("unknown task after update: {work_item_id}"))?;
         commit_and_publish(tx, pending, self.event_bus())?;
@@ -1702,10 +1706,9 @@ impl WorkDb {
     /// `done` is the only terminal status the current enum offers — there is
     /// no `abandoned`/`cancelled` state to distinguish "shipped" from
     /// "closed unmerged" at the status level (open question, out of scope
-    /// here). Callers are expected to pre-filter on `kind` and `status =
-    /// in_review` the same way [`Self::list_chores_pending_merge_check`]
-    /// does for the merge path; this function itself only refuses rows
-    /// already past `in_review`.
+    /// here). Callers are expected to pre-filter on `kind` and on a status
+    /// the merge poller watches, the same way the merge path does; this
+    /// function itself only refuses rows that are already terminal.
     ///
     /// Mirrors `mark_chore_pr_merged`'s terminal-transition side effects
     /// (dependent cascade, revision flip/block) since the row's resulting
@@ -1775,6 +1778,7 @@ impl WorkDb {
         flip_in_review_revisions_to_done(&tx, &task.id, &now)?;
         block_pending_revisions_on_parent_close(&mut pending, &tx, &task.id, &now)?;
         resolve_attention_kind_in_tx(&tx, &task.id, WORKSPACE_POSITIONING_REFUSED)?;
+        super::pr_terminal_watch::resolve_review_admission_markers_in_tx(&tx, &task.id)?;
         let updated =
             query_task(&tx, work_item_id)?.with_context(|| format!("unknown task after update: {work_item_id}"))?;
         commit_and_publish(tx, pending, self.event_bus())?;

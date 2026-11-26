@@ -66,6 +66,7 @@ scalar fields.
 |         | `in_review` rows in an active product that are not parked and not dormant                                                                        | every pass                      |
 |         | `in_review` rows with a merge in flight (an active merge request, durable `tasks.merge_queue_state`, or last seen queued), including parked rows | every pass                      |
 | shallow | parked rows without a merge in flight, `in_review` rows in other products, rows GitHub has not updated for 14 days                               | when not observed for 5 minutes |
+|         | rows watched only for merge or close: a row held `active` for a review, and revisions in review whose root is terminal or deleted                | when not observed for 5 minutes |
 
 Merge and close detection covers every tracked PR in every product; only how
 often a PR is asked about, and how much, depends on its tier. A row that is
@@ -91,6 +92,41 @@ rows due, so they are asked again next pass.
 - **Nothing remembers "not merged".** The poller remembers when a PR was last
   observed and what `updatedAt` it showed, never that it was unmerged; a row
   that is not due is simply not asked about this pass.
+
+## Rows watched only for merge or close
+
+The lists a pass acts on are keyed on the status of the row that owns the PR:
+`in_review`, and `blocked` for a reason the poller remediates. Two states are
+on none of them, and their PR is watched so that a merge or a close is still
+recorded. Neither gets any open-PR upkeep.
+
+| Watched                                                                                           | Listed by                                 | On a merge or a close                                                                                                             |
+| ------------------------------------------------------------------------------------------------- | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| A PR-owning row held `active` with its PR bound and no unfinished run that could still push to it | `list_chores_held_active_with_pr`         | The same transition an `in_review` row takes: `done`, with its revisions settled and its queued review guides cancelled           |
+| Revisions resting `in_review` whose chain root is `done`, `archived`, deleted or missing          | `list_orphaned_in_review_revision_chains` | Each revision moves to `done`; the status ledger records `settle_orphaned_revisions_pr_merged` or `..._pr_closed_unmerged` for it |
+
+The first is the review hold. A row whose implementation finished stays
+`active` until the automated review of its PR decides, and the review can be
+held for as long as dispatch focus, an all-spawns pause or a full review pool
+lasts. The deferred-admission sweep does not read the PR of a held row, so
+without this watch a PR merged during the hold left the row `active` for
+good. Review work that is queued, running or held never keeps the row off the
+list; an unfinished run of a kind that writes the PR branch does, because
+that run's own completion reads the PR's state.
+
+The second exists because a revision is settled by its root's merged or
+closed transition. A root moved to `done` or `archived` by hand, or deleted,
+is not probed, so that transition never ran for its chain. A merge into a
+branch other than the default is recorded for these revisions as a close: the
+work did not land, and no root is left to carry a base refusal.
+
+Review guides still queued for the PR are cancelled with the reason `parent
+PR merged` or `PR closed unmerged`. A pre-merge review batch whose root has
+just become `done` is failed by the review-batch upkeep that follows the
+terminal walk, which retires its unfinished reviewers under the abandon cause
+`review_batch_reaped`. The row's open `pr_review_admission_deferred` item is
+resolved in the transition. Follow-up proposals and every other attention
+item are left open.
 
 Each tier's probe is split into fixed-size chunks, one GraphQL query per chunk,
 sent one at a time in attendance order (previously unfinished and known-terminal
@@ -129,6 +165,7 @@ Every pass logs one `merge poller: probe tiers` line at `info`:
 | `shallow_prs`, `shallow_due`, `shallow_observed`                                                                   | Shallow-tier PRs, those due this pass, those that answered                    |
 | `shallow_chunks_*`, `shallow_oldest_unobserved_secs`                                                               | The same for the shallow tier; this one growing past ~5 minutes is starvation |
 | `rows_blocked`, `rows_active_product`, `rows_merge_in_flight`, `rows_parked`, `rows_other_product`, `rows_dormant` | Why each row is in its tier                                                   |
+| `rows_terminal_watch`                                                                                              | Rows and chains watched only for merge or close                               |
 | `active_products`, `every_product_active`                                                                          | How many products are active, or that none was singled out                    |
 
 The chunk counts are also in the pass trace (`probe_chunks_full`,

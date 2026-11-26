@@ -962,6 +962,10 @@ mod pr_binding;
 pub use merge_evidence::{MergeEvidence, MergeObservation};
 mod pr_flow;
 mod pr_state;
+mod pr_terminal_watch;
+pub use pr_terminal_watch::{
+    ORPHANED_REVISION_PR_CLOSED_UNMERGED_BASIS, ORPHANED_REVISION_PR_MERGED_BASIS, OrphanedRevisionChain, PrClose,
+};
 mod prerequisite_link;
 mod prerequisite_question;
 mod products_design;

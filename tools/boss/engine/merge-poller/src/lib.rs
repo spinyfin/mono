@@ -28,6 +28,11 @@
 //!     execution. The sweep re-emits a fresh execution request so a
 //!     worker can be dispatched (covers engine-restart and worker-die
 //!     gaps without a full PR probe).
+//!   - [`WorkDb::list_chores_held_active_with_pr`] and
+//!     [`WorkDb::list_orphaned_in_review_revision_chains`] — rows on none
+//!     of the lists above whose PR nothing else observes: a row held
+//!     `active` for a review, and revisions in review whose root is
+//!     terminal or deleted. Watched for a merge or a close only.
 //!
 //! Errors are logged but never propagate — a temporary network blip
 //! must not crash the engine.
