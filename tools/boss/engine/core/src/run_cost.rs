@@ -8,7 +8,7 @@
 //! intentional: a run that is later orphaned still retains the spend observed
 //! up to its last hook.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -62,6 +62,21 @@ impl From<TailError> for CaptureError {
 
 mod native;
 
+/// Placeholder model Claude stamps on locally synthesized assistant records;
+/// it never priced anything, so it is not an observed model.
+const SYNTHETIC_MODEL: &str = "<synthetic>";
+
+/// Where a capture's parent transcript came from, which decides whether its
+/// sibling `<stem>/subagents` directory can be found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubagentSource {
+    /// The Claude-advertised path; the subagents directory sits beside it.
+    Local,
+    /// A flattened hub-custody copy of the parent only; sidechain transcripts
+    /// are not carried through custody, so they cannot be counted.
+    HubCopy,
+}
+
 #[derive(Debug, Clone, Default, bon::Builder)]
 #[builder(on(String, into))]
 struct MessageUsage {
@@ -80,6 +95,8 @@ struct CostAccumulator {
     native: native::NativeUsage,
     provider_usage: std::collections::BTreeMap<String, Value>,
     model: Option<String>,
+    observed_models: BTreeSet<String>,
+    saw_subagent_delegation: bool,
     messages: HashMap<String, Option<MessageUsage>>,
     codex_usage_by_transcript: HashMap<PathBuf, MessageUsage>,
     codex_rounds: std::collections::HashSet<String>,
@@ -112,6 +129,9 @@ impl CostAccumulator {
                     .insert(format!("codex:{}", transcript_path.display()), info.clone());
             }
         }
+        if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            self.saw_subagent_delegation = true;
+        }
         match value.get("type").and_then(Value::as_str) {
             Some("assistant") => self.ingest_assistant(value),
             Some("system") if value.get("subtype").and_then(Value::as_str) == Some("turn_duration") => {
@@ -133,9 +153,10 @@ impl CostAccumulator {
                     .pointer("/payload/model")
                     .and_then(Value::as_str)
                     .map(str::trim)
-                    .filter(|model| !model.is_empty())
+                    .filter(|model| !model.is_empty() && *model != SYNTHETIC_MODEL)
                 {
                     self.model = Some(model.to_owned());
+                    self.observed_models.insert(model.to_owned());
                 }
             }
             Some("event_msg") => self.ingest_codex_event(transcript_path, value),
@@ -147,6 +168,14 @@ impl CostAccumulator {
         let Some(message) = value.get("message").and_then(Value::as_object) else {
             return;
         };
+        if let Some(content) = message.get("content").and_then(Value::as_array)
+            && content.iter().any(|block| {
+                block.get("type").and_then(Value::as_str) == Some("tool_use")
+                    && matches!(block.get("name").and_then(Value::as_str), Some("Task" | "Agent"))
+            })
+        {
+            self.saw_subagent_delegation = true;
+        }
         let Some(message_id) = message.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()) else {
             return;
         };
@@ -155,9 +184,10 @@ impl CostAccumulator {
             .get("model")
             .and_then(Value::as_str)
             .map(str::trim)
-            .filter(|model| !model.is_empty())
+            .filter(|model| !model.is_empty() && *model != SYNTHETIC_MODEL)
         {
             self.model = Some(model.to_owned());
+            self.observed_models.insert(model.to_owned());
         }
 
         let usage = message.get("usage").and_then(Value::as_object).map(|usage| {
@@ -271,7 +301,7 @@ impl CostAccumulator {
             provider_usage_json: (!self.provider_usage.is_empty())
                 .then(|| serde_json::to_string(&self.provider_usage).expect("usage objects serialize")),
             full_replacement: false,
-            model_mixed: false,
+            model_mixed: self.observed_models.len() > 1,
             usage_unavailable: None,
             model: self.model.clone(),
             output_tokens: saw_usage.then(|| sum(|usage| usage.output_tokens)),
@@ -295,6 +325,8 @@ impl CostAccumulator {
         if let Some(model) = other.model.as_ref() {
             self.model = Some(model.clone());
         }
+        self.observed_models.extend(other.observed_models.iter().cloned());
+        self.saw_subagent_delegation |= other.saw_subagent_delegation;
         for (message_id, usage) in &other.messages {
             match usage {
                 Some(usage) => {
@@ -350,37 +382,40 @@ impl TranscriptCostTail {
 
 #[derive(Debug, Default)]
 struct RunCostTail {
-    tails: HashMap<PathBuf, TranscriptCostTail>,
+    tails: BTreeMap<PathBuf, TranscriptCostTail>,
+    parent_path: Option<PathBuf>,
+    subagents_unreadable_reason: Option<String>,
+    warned_subagents_reason: Option<String>,
     capture_provider_usage: Option<bool>,
 }
 
 impl RunCostTail {
-    async fn poll(
+    async fn poll_file(
         &mut self,
-        transcript_path: &Path,
+        path: &Path,
         containment_root: Option<&Path>,
         capture_provider_usage: bool,
         limit: u64,
     ) -> Result<bool, CaptureError> {
-        let replace = match self.tails.get(transcript_path) {
+        let replace = match self.tails.get(path) {
             Some(state)
                 if state.containment_root.is_some() && state.containment_root.as_deref() != containment_root =>
             {
                 return Err(CaptureError::Permanent(format!(
                     "refusing transcript containment downgrade or root change for {}",
-                    transcript_path.display()
+                    path.display()
                 )));
             }
             Some(state) => state.containment_root.as_deref() != containment_root,
             None => false,
         };
-        if replace || !self.tails.contains_key(transcript_path) {
-            let tail = TranscriptCostTail::new(transcript_path, containment_root)?;
-            self.tails.insert(transcript_path.to_owned(), tail);
+        if replace || !self.tails.contains_key(path) {
+            let tail = TranscriptCostTail::new(path, containment_root)?;
+            self.tails.insert(path.to_owned(), tail);
         }
         let state = self
             .tails
-            .get_mut(transcript_path)
+            .get_mut(path)
             .expect("transcript cost tail was just inserted");
         let values = state.tail.poll_through(limit).await?;
         let mut full_replacement = replace;
@@ -390,20 +425,143 @@ impl RunCostTail {
             full_replacement = true;
         }
         for value in values {
-            state
-                .accumulator
-                .ingest(transcript_path, &value, capture_provider_usage);
+            state.accumulator.ingest(path, &value, capture_provider_usage);
         }
         Ok(full_replacement)
     }
 
+    async fn poll(
+        &mut self,
+        transcript_path: &Path,
+        containment_root: Option<&Path>,
+        capture_provider_usage: bool,
+        limit: u64,
+        subagent_source: SubagentSource,
+    ) -> Result<bool, CaptureError> {
+        self.parent_path = Some(transcript_path.to_owned());
+        let mut full_replacement = self
+            .poll_file(transcript_path, containment_root, capture_provider_usage, limit)
+            .await?;
+
+        let mut unreadable_reason = None;
+        // Only Claude parents have sidechain transcripts; Claude assistant
+        // records are the ones keyed by message id, so other drivers skip
+        // enumeration entirely.
+        let (is_claude, saw_subagent_delegation) = self
+            .tails
+            .get(transcript_path)
+            .map(|state| {
+                (
+                    !state.accumulator.messages.is_empty(),
+                    state.accumulator.saw_subagent_delegation,
+                )
+            })
+            .unwrap_or((false, false));
+        let mut subagent_paths = Vec::new();
+        if is_claude {
+            match subagent_source {
+                SubagentSource::HubCopy => {
+                    if saw_subagent_delegation {
+                        unreadable_reason = Some(
+                            "Subagent transcripts are not carried through spoke custody; usage excludes delegated subagent work"
+                                .to_owned(),
+                        );
+                    }
+                }
+                SubagentSource::Local => match enumerate_subagent_transcripts(transcript_path).await {
+                    Ok(paths) => subagent_paths = paths,
+                    Err(reason) => unreadable_reason = Some(reason),
+                },
+            }
+        }
+        for subagent_path in subagent_paths {
+            match self
+                .poll_file(&subagent_path, containment_root, capture_provider_usage, u64::MAX)
+                .await
+            {
+                Ok(replaced) => full_replacement |= replaced,
+                Err(error) => {
+                    if unreadable_reason.is_none() {
+                        unreadable_reason = Some(format!(
+                            "Subagent transcript unreadable ({}): {error}",
+                            subagent_path.display()
+                        ));
+                    }
+                }
+            }
+        }
+        self.subagents_unreadable_reason = unreadable_reason;
+        Ok(full_replacement)
+    }
+
+    fn subagents_unreadable_reason(&self) -> Option<&str> {
+        self.subagents_unreadable_reason.as_deref()
+    }
+
     fn snapshot(&self) -> Option<RunCostSnapshot> {
         let mut combined = CostAccumulator::default();
-        for state in self.tails.values() {
+        // Fold subagent tails first and the parent tail last so the parent's
+        // observed model wins deterministically over any subagent model.
+        for (path, state) in &self.tails {
+            if self.parent_path.as_deref() == Some(path.as_path()) {
+                continue;
+            }
             combined.merge_from(&state.accumulator);
         }
-        combined.snapshot()
+        if let Some(parent_path) = &self.parent_path
+            && let Some(parent_state) = self.tails.get(parent_path)
+        {
+            combined.merge_from(&parent_state.accumulator);
+        }
+        let mut snapshot = combined.snapshot();
+        if let Some(reason) = &self.subagents_unreadable_reason {
+            let snap = snapshot.get_or_insert_with(RunCostSnapshot::default);
+            if snap.usage_unavailable.is_none() {
+                snap.usage_unavailable = Some(reason.clone());
+            }
+        }
+        snapshot
     }
+}
+
+fn subagents_dir_for_transcript(transcript_path: &Path) -> Option<PathBuf> {
+    let parent = transcript_path.parent()?;
+    let stem = transcript_path.file_stem()?;
+    if stem.is_empty() {
+        return None;
+    }
+    Some(parent.join(stem).join("subagents"))
+}
+
+async fn enumerate_subagent_transcripts(transcript_path: &Path) -> Result<Vec<PathBuf>, String> {
+    let Some(dir) = subagents_dir_for_transcript(transcript_path) else {
+        return Ok(Vec::new());
+    };
+    let mut entries = match tokio::fs::read_dir(&dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "Subagent transcript directory unreadable ({}): {error}",
+                dir.display()
+            ));
+        }
+    };
+    let unreadable =
+        |error: std::io::Error| format!("Subagent transcript directory unreadable ({}): {error}", dir.display());
+    let mut paths = Vec::new();
+    while let Some(entry) = entries.next_entry().await.map_err(unreadable)? {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let file_type = entry.file_type().await.map_err(unreadable)?;
+        if !file_type.is_dir() {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
 }
 
 /// Process-lifetime incremental tails keyed by execution id.
@@ -448,10 +606,41 @@ impl RunCostCapture {
         transcript_path: &Path,
         containment_root: Option<&Path>,
     ) -> Result<bool, CaptureError> {
+        self.capture_and_persist_from(
+            work_db,
+            execution_id,
+            transcript_path,
+            containment_root,
+            SubagentSource::Local,
+        )
+        .await
+    }
+
+    /// Like [`Self::capture_and_persist`], but states where the parent
+    /// transcript came from so a hub-custody copy is not mistaken for the
+    /// advertised path with a findable subagents directory.
+    pub async fn capture_and_persist_from(
+        &self,
+        work_db: &crate::work::WorkDb,
+        execution_id: &str,
+        transcript_path: &Path,
+        containment_root: Option<&Path>,
+        subagent_source: SubagentSource,
+    ) -> Result<bool, CaptureError> {
         if self.persist_blocked.load(Ordering::SeqCst) {
             return Err(CaptureError::Transient("run-cost persist blocked for test".to_owned()));
         }
-        let limit = transcript_read_limit(work_db, transcript_path)?.unwrap_or(u64::MAX);
+        let custody_limit = transcript_read_limit(work_db, transcript_path)?;
+        // Determine hub-copy provenance centrally from custody so hook-triggered
+        // captures (`persist_transcript_and_capture_cost`, cached-path hooks)
+        // cannot treat a spoke custody transcript as `SubagentSource::Local`
+        // and clear its incomplete marker.
+        let subagent_source = if custody_limit.is_some() {
+            SubagentSource::HubCopy
+        } else {
+            subagent_source
+        };
+        let limit = custody_limit.unwrap_or(u64::MAX);
         let state = {
             let mut guard = self.inner.lock().expect("run cost capture mutex poisoned");
             guard
@@ -467,8 +656,26 @@ impl RunCostCapture {
                 .is_some_and(|execution| execution.kind == boss_protocol::ExecutionKind::PrReviewGuide)
         });
         let full_replacement = state
-            .poll(transcript_path, containment_root, capture_provider_usage, limit)
+            .poll(
+                transcript_path,
+                containment_root,
+                capture_provider_usage,
+                limit,
+                subagent_source,
+            )
             .await?;
+        let current_reason = state.subagents_unreadable_reason().map(str::to_owned);
+        if current_reason != state.warned_subagents_reason {
+            if let Some(reason) = &current_reason {
+                tracing::warn!(
+                    execution_id,
+                    transcript_path = %transcript_path.display(),
+                    reason,
+                    "subagent usage incomplete; recording partial usage as unavailable",
+                );
+            }
+            state.warned_subagents_reason = current_reason;
+        }
         let mut snapshot = match state.snapshot() {
             Some(snapshot) => snapshot,
             None if full_replacement => RunCostSnapshot::default(),
@@ -627,7 +834,12 @@ mod tests {
         )
         .unwrap();
         let mut tail = RunCostTail::default();
-        assert!(!tail.poll(&path, None, false, u64::MAX).await.unwrap());
+        assert!(
+            !tail
+                .poll(&path, None, false, u64::MAX, SubagentSource::Local)
+                .await
+                .unwrap()
+        );
         let before = tail.snapshot().unwrap();
         assert_eq!(before.input_tokens, Some(150));
         assert_eq!(before.rounds, Some(2));
@@ -643,7 +855,11 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(tail.poll(&path, None, false, u64::MAX).await.unwrap());
+        assert!(
+            tail.poll(&path, None, false, u64::MAX, SubagentSource::Local)
+                .await
+                .unwrap()
+        );
         let after = tail.snapshot().unwrap();
         assert_eq!(after.model.as_deref(), Some("claude-sonnet"));
         assert_eq!(after.input_tokens, Some(7));
@@ -680,8 +896,13 @@ mod tests {
         .unwrap();
 
         let mut tail = RunCostTail::default();
-        tail.poll(&path, Some(&root), false, u64::MAX).await.unwrap();
-        let downgrade_error = tail.poll(&path, None, false, u64::MAX).await.unwrap_err();
+        tail.poll(&path, Some(&root), false, u64::MAX, SubagentSource::Local)
+            .await
+            .unwrap();
+        let downgrade_error = tail
+            .poll(&path, None, false, u64::MAX, SubagentSource::Local)
+            .await
+            .unwrap_err();
         assert!(
             matches!(&downgrade_error, CaptureError::Permanent(message) if message.contains("containment downgrade")),
             "a contained cost tail must never become unrestricted: {downgrade_error}",
@@ -689,12 +910,443 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         symlink(&outside, &path).unwrap();
 
-        let error = tail.poll(&path, Some(&root), false, u64::MAX).await.unwrap_err();
+        let error = tail
+            .poll(&path, Some(&root), false, u64::MAX, SubagentSource::Local)
+            .await
+            .unwrap_err();
         assert!(
             error.to_string().contains("transcript"),
             "contained run-cost tail must reject path replacement: {error}",
         );
         assert_eq!(tail.snapshot().unwrap().input_tokens, Some(1));
+    }
+
+    #[tokio::test]
+    async fn claude_subagent_transcripts_are_folded_and_deduplicated_by_message_id() {
+        let dir = TempDir::new().unwrap();
+        let parent_path = dir.path().join("sess-1.jsonl");
+        let subagents_dir = dir.path().join("sess-1").join("subagents");
+        std::fs::create_dir_all(&subagents_dir).unwrap();
+
+        std::fs::write(
+            &parent_path,
+            concat!(
+                r#"{"type":"assistant","message":{"id":"msg-parent-1","model":"claude-opus-4-6","usage":{"input_tokens":100,"output_tokens":20,"cache_creation_input_tokens":50,"cache_read_input_tokens":200}}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"id":"msg-shared","model":"claude-opus-4-6","usage":{"input_tokens":30,"output_tokens":5,"cache_creation_input_tokens":10,"cache_read_input_tokens":40}}}"#,
+                "\n",
+                r#"{"type":"system","subtype":"turn_duration","uuid":"turn-p1","durationMs":1000}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        // Subagent 1 shares `msg-shared` with the parent and adds `msg-sub-1`.
+        std::fs::write(
+            subagents_dir.join("agent-a.jsonl"),
+            concat!(
+                r#"{"type":"assistant","message":{"id":"msg-shared","model":"claude-haiku-4-5","usage":{"input_tokens":30,"output_tokens":5,"cache_creation_input_tokens":10,"cache_read_input_tokens":40}}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"id":"msg-sub-1","model":"claude-haiku-4-5","usage":{"input_tokens":40,"output_tokens":10,"cache_creation_input_tokens":15,"cache_read_input_tokens":60}}}"#,
+                "\n",
+                r#"{"type":"system","subtype":"turn_duration","uuid":"turn-s1","durationMs":250}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        // Subagent 2 adds `msg-sub-2`.
+        std::fs::write(
+            subagents_dir.join("agent-b.jsonl"),
+            concat!(
+                r#"{"type":"assistant","message":{"id":"msg-sub-2","model":"claude-sonnet-4-6","usage":{"input_tokens":25,"output_tokens":8,"cache_creation_input_tokens":5,"cache_read_input_tokens":15}}}"#,
+                "\n",
+                r#"{"type":"system","subtype":"turn_duration","uuid":"turn-s2","durationMs":150}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        // Non-jsonl sidecar metadata files must be ignored.
+        std::fs::write(subagents_dir.join("agent-a.meta.json"), r#"{"agentType":"Explore"}"#).unwrap();
+
+        let mut tail = RunCostTail::default();
+        tail.poll(&parent_path, None, false, u64::MAX, SubagentSource::Local)
+            .await
+            .unwrap();
+        assert_eq!(tail.subagents_unreadable_reason(), None);
+
+        let snapshot = tail.snapshot().unwrap();
+        // Deduplicated sum: msg-parent-1 + msg-shared + msg-sub-1 + msg-sub-2
+        assert_eq!(snapshot.input_tokens, Some(100 + 30 + 40 + 25));
+        assert_eq!(snapshot.output_tokens, Some(20 + 5 + 10 + 8));
+        assert_eq!(snapshot.cache_creation_tokens, Some(50 + 10 + 15 + 5));
+        assert_eq!(snapshot.cache_read_tokens, Some(200 + 40 + 60 + 15));
+        assert_eq!(snapshot.rounds, Some(4));
+        assert_eq!(snapshot.agent_active_ms, Some(1000 + 250 + 150));
+        // Subagents ran on haiku and sonnet, so no single model prices the total.
+        assert!(snapshot.model_mixed);
+        assert_eq!(snapshot.usage_unavailable, None);
+    }
+
+    #[tokio::test]
+    async fn subagents_on_the_parent_model_keep_a_single_model_label() {
+        let dir = TempDir::new().unwrap();
+        let parent_path = dir.path().join("sess-same.jsonl");
+        let subagents_dir = dir.path().join("sess-same").join("subagents");
+        std::fs::create_dir_all(&subagents_dir).unwrap();
+        std::fs::write(
+            &parent_path,
+            concat!(
+                r#"{"type":"assistant","message":{"id":"p","model":"claude-opus-4-6","usage":{"input_tokens":1}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            subagents_dir.join("agent-a.jsonl"),
+            concat!(
+                r#"{"type":"assistant","message":{"id":"s","model":"<synthetic>","usage":{"input_tokens":2}}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"id":"s2","model":"claude-opus-4-6","usage":{"input_tokens":3}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let mut tail = RunCostTail::default();
+        tail.poll(&parent_path, None, false, u64::MAX, SubagentSource::Local)
+            .await
+            .unwrap();
+        let snapshot = tail.snapshot().unwrap();
+        assert!(!snapshot.model_mixed);
+        assert_eq!(snapshot.model.as_deref(), Some("claude-opus-4-6"));
+        assert_eq!(snapshot.input_tokens, Some(6));
+    }
+
+    #[tokio::test]
+    async fn hub_copy_of_delegated_claude_transcript_is_marked_incomplete() {
+        let dir = TempDir::new().unwrap();
+        let parent_path = dir.path().join("transcript-abc.jsonl");
+        std::fs::write(
+            &parent_path,
+            concat!(
+                r#"{"type":"assistant","message":{"id":"p","model":"claude-opus-4-6","content":[{"type":"tool_use","id":"tu-1","name":"Agent","input":{"prompt":"explore"}}],"usage":{"input_tokens":1}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let mut tail = RunCostTail::default();
+        tail.poll(&parent_path, None, false, u64::MAX, SubagentSource::HubCopy)
+            .await
+            .unwrap();
+        let snapshot = tail.snapshot().unwrap();
+        assert!(
+            snapshot
+                .usage_unavailable
+                .as_deref()
+                .is_some_and(|reason| reason.contains("spoke custody"))
+        );
+        assert_eq!(snapshot.input_tokens, Some(1));
+
+        // Sidechain records in a hub copy also trigger the incomplete marker.
+        let sidechain_path = dir.path().join("transcript-sidechain.jsonl");
+        std::fs::write(
+            &sidechain_path,
+            concat!(
+                r#"{"type":"assistant","isSidechain":true,"message":{"id":"p-sc","model":"claude-opus-4-6","usage":{"input_tokens":2}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let mut sidechain_tail = RunCostTail::default();
+        sidechain_tail
+            .poll(&sidechain_path, None, false, u64::MAX, SubagentSource::HubCopy)
+            .await
+            .unwrap();
+        assert!(
+            sidechain_tail
+                .snapshot()
+                .unwrap()
+                .usage_unavailable
+                .as_deref()
+                .is_some_and(|reason| reason.contains("spoke custody"))
+        );
+    }
+
+    #[tokio::test]
+    async fn hub_copy_of_claude_transcript_without_delegation_stays_complete() {
+        let dir = TempDir::new().unwrap();
+        let parent_path = dir.path().join("transcript-no-sub.jsonl");
+        std::fs::write(
+            &parent_path,
+            concat!(
+                r#"{"type":"assistant","message":{"id":"p","model":"claude-opus-4-6","content":[{"type":"tool_use","id":"tu-1","name":"Bash","input":{"command":"ls"}}],"usage":{"input_tokens":4}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let mut tail = RunCostTail::default();
+        tail.poll(&parent_path, None, false, u64::MAX, SubagentSource::HubCopy)
+            .await
+            .unwrap();
+        let snapshot = tail.snapshot().unwrap();
+        assert_eq!(snapshot.usage_unavailable, None);
+        assert_eq!(snapshot.input_tokens, Some(4));
+    }
+
+    #[tokio::test]
+    async fn mixed_model_survives_when_tails_converge_to_same_last_model() {
+        let dir = TempDir::new().unwrap();
+        let parent_path = dir.path().join("sess-converge.jsonl");
+        let subagents_dir = dir.path().join("sess-converge").join("subagents");
+        std::fs::create_dir_all(&subagents_dir).unwrap();
+
+        let parent_turn_1 = concat!(
+            r#"{"type":"assistant","message":{"id":"p1","model":"claude-opus-4-6","usage":{"input_tokens":100}}}"#,
+            "\n",
+        );
+        std::fs::write(&parent_path, parent_turn_1).unwrap();
+        std::fs::write(
+            subagents_dir.join("agent-a.jsonl"),
+            concat!(
+                r#"{"type":"assistant","message":{"id":"s1","model":"claude-haiku-4-5","usage":{"input_tokens":20}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let mut tail = RunCostTail::default();
+        tail.poll(&parent_path, None, false, u64::MAX, SubagentSource::Local)
+            .await
+            .unwrap();
+        let first = tail.snapshot().unwrap();
+        assert!(first.model_mixed);
+        assert_eq!(first.input_tokens, Some(120));
+
+        // Poll 2: parent switches to haiku so both tails' last-seen model is haiku.
+        // Cumulative usage still contains opus tokens, so model_mixed must stay true.
+        let parent_turn_2 = concat!(
+            r#"{"type":"assistant","message":{"id":"p2","model":"claude-haiku-4-5","usage":{"input_tokens":15}}}"#,
+            "\n",
+        );
+        std::fs::write(&parent_path, format!("{parent_turn_1}{parent_turn_2}")).unwrap();
+        tail.poll(&parent_path, None, false, u64::MAX, SubagentSource::Local)
+            .await
+            .unwrap();
+        let second = tail.snapshot().unwrap();
+        assert!(
+            second.model_mixed,
+            "mixed-model flag must remain set after parent converges to subagent's model"
+        );
+        assert_eq!(second.input_tokens, Some(135));
+
+        // Truncating the parent to a single haiku record rebuilds its accumulator;
+        // both tails now contain only haiku tokens in their current generations.
+        std::fs::write(&parent_path, parent_turn_2).unwrap();
+        assert!(
+            tail.poll(&parent_path, None, false, u64::MAX, SubagentSource::Local)
+                .await
+                .unwrap()
+        );
+        let rebuilt = tail.snapshot().unwrap();
+        assert!(!rebuilt.model_mixed);
+        assert_eq!(rebuilt.model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(rebuilt.input_tokens, Some(35));
+    }
+
+    #[tokio::test]
+    async fn non_claude_transcripts_skip_subagent_enumeration() {
+        let dir = TempDir::new().unwrap();
+        let parent_path = dir.path().join("rollout.jsonl");
+        std::fs::write(&parent_path, "{\"type\":\"event_msg\"}\n").unwrap();
+        let mut tail = RunCostTail::default();
+        tail.poll(&parent_path, None, false, u64::MAX, SubagentSource::HubCopy)
+            .await
+            .unwrap();
+        assert_eq!(tail.subagents_unreadable_reason(), None);
+    }
+
+    #[tokio::test]
+    async fn subagent_growth_between_polls_counts_without_double_counting() {
+        let dir = TempDir::new().unwrap();
+        let parent_path = dir.path().join("sess-grow.jsonl");
+        let subagents_dir = dir.path().join("sess-grow").join("subagents");
+        std::fs::create_dir_all(&subagents_dir).unwrap();
+        std::fs::write(
+            &parent_path,
+            concat!(
+                r#"{"type":"assistant","message":{"id":"p","model":"claude-opus-4-6","usage":{"input_tokens":1}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let sub = subagents_dir.join("agent-a.jsonl");
+        let first = concat!(
+            r#"{"type":"assistant","message":{"id":"s1","model":"claude-opus-4-6","usage":{"input_tokens":10}}}"#,
+            "\n",
+        );
+        std::fs::write(&sub, first).unwrap();
+        // A directory named like a transcript must be skipped, not tailed.
+        std::fs::create_dir_all(subagents_dir.join("odd.jsonl")).unwrap();
+
+        let mut tail = RunCostTail::default();
+        tail.poll(&parent_path, None, false, u64::MAX, SubagentSource::Local)
+            .await
+            .unwrap();
+        assert_eq!(tail.snapshot().unwrap().input_tokens, Some(11));
+        assert_eq!(tail.subagents_unreadable_reason(), None);
+
+        let second = concat!(
+            r#"{"type":"assistant","message":{"id":"s2","model":"claude-opus-4-6","usage":{"input_tokens":5}}}"#,
+            "\n",
+        );
+        std::fs::write(&sub, format!("{first}{second}")).unwrap();
+        tail.poll(&parent_path, None, false, u64::MAX, SubagentSource::Local)
+            .await
+            .unwrap();
+        let snapshot = tail.snapshot().unwrap();
+        assert_eq!(snapshot.input_tokens, Some(16));
+        assert_eq!(snapshot.rounds, Some(3));
+    }
+
+    #[tokio::test]
+    async fn failing_subagent_file_marks_incomplete_but_keeps_other_totals() {
+        let dir = TempDir::new().unwrap();
+        let parent_path = dir.path().join("sess-bad.jsonl");
+        let subagents_dir = dir.path().join("sess-bad").join("subagents");
+        std::fs::create_dir_all(&subagents_dir).unwrap();
+        std::fs::write(
+            &parent_path,
+            concat!(
+                r#"{"type":"assistant","message":{"id":"p","model":"claude-opus-4-6","usage":{"input_tokens":1}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            subagents_dir.join("agent-a.jsonl"),
+            concat!(
+                r#"{"type":"assistant","message":{"id":"s1","model":"claude-opus-4-6","usage":{"input_tokens":10}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        // Invalid JSON is a permanent per-file failure without relying on
+        // filesystem permission semantics.
+        std::fs::write(subagents_dir.join("agent-b.jsonl"), "not json\n").unwrap();
+
+        let mut tail = RunCostTail::default();
+        tail.poll(&parent_path, None, false, u64::MAX, SubagentSource::Local)
+            .await
+            .unwrap();
+        let snapshot = tail.snapshot().unwrap();
+        assert!(
+            snapshot
+                .usage_unavailable
+                .as_deref()
+                .is_some_and(|reason| reason.contains("agent-b.jsonl"))
+        );
+        assert_eq!(snapshot.input_tokens, Some(11));
+    }
+
+    #[tokio::test]
+    async fn missing_subagents_directory_preserves_parent_totals_without_error() {
+        let dir = TempDir::new().unwrap();
+        let parent_path = dir.path().join("sess-no-sub.jsonl");
+        std::fs::write(
+            &parent_path,
+            concat!(
+                r#"{"type":"assistant","message":{"id":"msg-1","model":"claude-opus-4-6","usage":{"input_tokens":12,"output_tokens":3}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let mut tail = RunCostTail::default();
+        tail.poll(&parent_path, None, false, u64::MAX, SubagentSource::Local)
+            .await
+            .unwrap();
+        assert_eq!(tail.subagents_unreadable_reason(), None);
+
+        let snapshot = tail.snapshot().unwrap();
+        assert_eq!(snapshot.input_tokens, Some(12));
+        assert_eq!(snapshot.output_tokens, Some(3));
+        assert_eq!(snapshot.rounds, Some(1));
+        assert_eq!(snapshot.usage_unavailable, None);
+    }
+
+    #[tokio::test]
+    async fn unreadable_subagents_directory_marks_run_usage_incomplete() {
+        let (dir, db) = crate::test_support::open_db();
+        let product = crate::test_support::create_product(&db);
+        let task = crate::test_support::create_test_chore(&db, &product, "unreadable subagents");
+        let execution = crate::test_support::create_ready_chore_execution(&db, &task.id);
+        db.create_run(
+            boss_protocol::CreateRunInput::builder()
+                .execution_id(&execution.id)
+                .agent_id("worker")
+                .status("completed")
+                .build(),
+        )
+        .unwrap();
+
+        let parent_path = dir.path().join("sess-unreadable.jsonl");
+        std::fs::write(
+            &parent_path,
+            concat!(
+                r#"{"type":"assistant","message":{"id":"msg-1","model":"claude-opus-4-6","usage":{"input_tokens":50,"output_tokens":9}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        // Make `<stem>/subagents` a regular file so `read_dir` fails
+        // deterministically with ENOTDIR regardless of uid or chmod semantics,
+        // and never leaves an uncleanable directory behind on panic.
+        let session_dir = dir.path().join("sess-unreadable");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let subagents_path = session_dir.join("subagents");
+        std::fs::write(&subagents_path, b"not a directory").unwrap();
+
+        let capture = RunCostCapture::new();
+        let persisted = capture
+            .capture_and_persist(&db, &execution.id, &parent_path, None)
+            .await
+            .unwrap();
+        assert!(persisted);
+
+        let records = db.cost_records_for_window(0, i64::MAX).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].input_tokens, Some(50));
+        assert_eq!(records[0].output_tokens, Some(9));
+        let reason = records[0]
+            .usage_unavailable
+            .as_deref()
+            .expect("unreadable subagents dir must set usage_unavailable");
+        assert!(
+            reason.contains("Subagent transcript directory unreadable"),
+            "unexpected usage_unavailable reason: {reason}"
+        );
+
+        // Replacing the blocking file with a readable subagents directory on a
+        // subsequent poll folds the subagent transcript and clears the marker.
+        std::fs::remove_file(&subagents_path).unwrap();
+        std::fs::create_dir_all(&subagents_path).unwrap();
+        std::fs::write(
+            subagents_path.join("agent-1.jsonl"),
+            concat!(
+                r#"{"type":"assistant","message":{"id":"msg-sub","model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":2}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        capture
+            .capture_and_persist(&db, &execution.id, &parent_path, None)
+            .await
+            .unwrap();
+        let records = db.cost_records_for_window(0, i64::MAX).unwrap();
+        assert_eq!(records[0].input_tokens, Some(60));
+        assert_eq!(records[0].output_tokens, Some(11));
+        assert_eq!(records[0].usage_unavailable, None);
     }
 }
 

@@ -2634,3 +2634,152 @@ async fn spoke_usage_unavailable_gap_after_tokens_leaves_captured_usage() {
     assert_eq!(output_tokens, Some(33));
     assert_eq!(usage_unavailable, None);
 }
+
+#[tokio::test]
+async fn spoke_claude_delegated_transcript_keeps_usage_unavailable_across_stop_hook() {
+    use boss_engine_runtime::hub::projection::Custody;
+    use sha2::{Digest, Sha256};
+
+    let mut fx = delivered_with_a_resolvable_pr();
+    let root = boss_engine_driver::transcript_store::transcript_store_root().unwrap();
+    let custody = Arc::new(Custody::new(fx.state.work_db.as_ref().clone(), &root));
+
+    let chunk = br#"{"type":"assistant","message":{"id":"msg-spoke-1","model":"claude-opus-4-6","content":[{"type":"tool_use","id":"tu-1","name":"Agent","input":{"prompt":"inspect"}}],"usage":{"input_tokens":42,"output_tokens":7}}}
+"#;
+    fx.receive(record::Body::Transcript(v1::TranscriptDelta {
+        generation: "0-1".into(),
+        offset: 0,
+        data: chunk.to_vec(),
+        sha256: Sha256::digest(chunk).to_vec(),
+        eof: true,
+    }));
+    Projector::with_custody(
+        fx.state.work_db.as_ref().clone(),
+        crate::app::spoke_projection::applier(&fx.state),
+        fx.wire.clone(),
+        Arc::new(tokio::sync::Notify::new()),
+        ProjectorConfig::default(),
+        custody.clone(),
+    )
+    .drain()
+    .await;
+
+    let query_usage = |db: &boss_engine_runtime::work::WorkDb, exec_id: &str| -> (Option<i64>, Option<String>) {
+        db.connect()
+            .unwrap()
+            .query_row(
+                "SELECT input_tokens, usage_unavailable FROM work_runs WHERE execution_id = ?1",
+                [exec_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    };
+
+    let (input_tokens, usage_unavailable) = query_usage(&fx.state.work_db, &fx.execution_id);
+    assert_eq!(input_tokens, Some(42));
+    assert!(
+        usage_unavailable
+            .as_deref()
+            .is_some_and(|reason| reason.contains("spoke custody")),
+        "expected spoke custody usage_unavailable after transcript ingest, got {usage_unavailable:?}"
+    );
+
+    // A projected Stop hook for the same custody path reaches
+    // persist_transcript_and_capture_cost -> capture_and_persist. Central
+    // custody lookup must preserve HubCopy provenance so the marker survives.
+    let mut stop = worker_event::to_wire(&boss_protocol::WorkerEvent::Stop {
+        session_id: "remote-session".into(),
+        stop_hook_active: false,
+        stop_reason: boss_protocol::StopReason::AwaitingInput,
+    });
+    if let Some(v1::worker_event::Event::Stop(turn)) = &mut stop.event {
+        turn.transcript_generation = "0-1".into();
+        turn.transcript_through = chunk.len() as u64;
+        turn.capture_epoch = 1;
+    }
+    fx.receive(record::Body::Event(stop));
+    fx.receive(record::Body::Gap(v1::Gap {
+        resource: "output:concluded:1".into(),
+        reason: "[]".into(),
+        ..Default::default()
+    }));
+    Projector::with_custody(
+        fx.state.work_db.as_ref().clone(),
+        crate::app::spoke_projection::applier(&fx.state),
+        fx.wire.clone(),
+        Arc::new(tokio::sync::Notify::new()),
+        ProjectorConfig::default(),
+        custody,
+    )
+    .drain()
+    .await;
+
+    let (input_tokens_after, usage_unavailable_after) = query_usage(&fx.state.work_db, &fx.execution_id);
+    assert_eq!(input_tokens_after, Some(42));
+    assert!(
+        usage_unavailable_after
+            .as_deref()
+            .is_some_and(|reason| reason.contains("spoke custody")),
+        "projected Stop hook must not clear spoke custody usage_unavailable, got {usage_unavailable_after:?}"
+    );
+}
+
+#[tokio::test]
+async fn spoke_claude_non_delegated_transcript_stays_complete_across_stop_hook() {
+    use boss_engine_runtime::hub::projection::Custody;
+    use sha2::{Digest, Sha256};
+
+    let mut fx = delivered_with_a_resolvable_pr();
+    let root = boss_engine_driver::transcript_store::transcript_store_root().unwrap();
+    let custody = Arc::new(Custody::new(fx.state.work_db.as_ref().clone(), &root));
+
+    let chunk = br#"{"type":"assistant","message":{"id":"msg-spoke-2","model":"claude-opus-4-6","content":[{"type":"tool_use","id":"tu-1","name":"Bash","input":{"command":"ls"}}],"usage":{"input_tokens":17,"output_tokens":3}}}
+"#;
+    fx.receive(record::Body::Transcript(v1::TranscriptDelta {
+        generation: "0-1".into(),
+        offset: 0,
+        data: chunk.to_vec(),
+        sha256: Sha256::digest(chunk).to_vec(),
+        eof: true,
+    }));
+    let mut stop = worker_event::to_wire(&boss_protocol::WorkerEvent::Stop {
+        session_id: "remote-session".into(),
+        stop_hook_active: false,
+        stop_reason: boss_protocol::StopReason::AwaitingInput,
+    });
+    if let Some(v1::worker_event::Event::Stop(turn)) = &mut stop.event {
+        turn.transcript_generation = "0-1".into();
+        turn.transcript_through = chunk.len() as u64;
+        turn.capture_epoch = 1;
+    }
+    fx.receive(record::Body::Event(stop));
+    fx.receive(record::Body::Gap(v1::Gap {
+        resource: "output:concluded:1".into(),
+        reason: "[]".into(),
+        ..Default::default()
+    }));
+    Projector::with_custody(
+        fx.state.work_db.as_ref().clone(),
+        crate::app::spoke_projection::applier(&fx.state),
+        fx.wire.clone(),
+        Arc::new(tokio::sync::Notify::new()),
+        ProjectorConfig::default(),
+        custody,
+    )
+    .drain()
+    .await;
+
+    let (input_tokens, usage_unavailable): (Option<i64>, Option<String>) = fx
+        .state
+        .work_db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT input_tokens, usage_unavailable FROM work_runs WHERE execution_id = ?1",
+            [&fx.execution_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(input_tokens, Some(17));
+    assert_eq!(usage_unavailable, None);
+}
