@@ -173,12 +173,13 @@ impl ConversationReducer {
 
     /// Records a prompt message from the engine's intent log as a chat item.
     ///
-    /// The text is redacted before being stored. When `intent.seq` is strictly
-    /// greater than `state.last_seq`, any open streaming message or thought is
-    /// finalized first and the intent is appended. When `intent.seq <=
-    /// state.last_seq` (tied with or earlier than an already-applied wire
-    /// record), the intent is inserted at its `seq` position ahead of
-    /// wire-record items with the same `seq`, matching [`replay_with_intents`].
+    /// The text is redacted before being stored. An intent never finalizes an
+    /// open streaming message or thought: stream boundaries come only from wire
+    /// records, so live application and [`replay_with_intents`] (which applies a
+    /// tied intent before its record) agree on message boundaries, ids and
+    /// redaction. Finalized streams are inserted at their started `seq`, so the
+    /// intent lands at its `seq` position ahead of wire-record items with the
+    /// same `seq`.
     pub fn apply_intent_message(&mut self, intent: PromptIntent) -> ReduceDelta {
         let mut delta = ReduceDelta::default();
         let item_id = format!("prompt-{}", intent.seq);
@@ -196,15 +197,10 @@ impl ConversationReducer {
             }),
         };
         self.redactor.redact_item(&mut item);
-        if intent.seq > self.state.last_seq {
-            self.flush_streams(intent.seq, &mut delta);
-            self.insert_item(item);
-        } else {
-            let idx = self.items.items.partition_point(|existing| {
-                existing.seq < intent.seq || (existing.seq == intent.seq && existing.id.starts_with("prompt-"))
-            });
-            self.insert_item_at(item, idx);
-        }
+        let idx = self.items.items.partition_point(|existing| {
+            existing.seq < intent.seq || (existing.seq == intent.seq && existing.id.starts_with("prompt-"))
+        });
+        self.insert_item_at(item, idx);
         delta.upserted_item_ids.push(item_id);
         delta
     }

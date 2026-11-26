@@ -951,6 +951,73 @@ fn tied_and_late_intents_match_replay_and_preserve_indices() {
 }
 
 #[test]
+fn intent_tied_with_open_streams_matches_replay_and_never_leaks_credential() {
+    let (first_half, second_half) = TEST_SECRET.split_at(TEST_SECRET.len() / 2);
+    let thought = |seq: u64, text: &str| {
+        update_record(
+            seq,
+            json!({"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":text}}),
+        )
+    };
+    let records = [
+        thought(2, "thinking "),
+        thought(3, "more"),
+        chunk(4, &format!("token {first_half}")),
+        chunk(5, &format!("{second_half} done")),
+        update_record(
+            6,
+            json!({"sessionUpdate":"tool_call","toolCallId":"t","title":"x","kind":"execute","status":"in_progress"}),
+        ),
+    ];
+    // Tied with the second thought chunk, and tied with the second message chunk.
+    let intents = || {
+        vec![
+            PromptIntent {
+                seq: 3,
+                ts_ms: 3,
+                role: CoordinatorChatMessageRole::Operator,
+                text: "tied thought".to_owned(),
+                client_message_id: None,
+            },
+            PromptIntent {
+                seq: 5,
+                ts_ms: 5,
+                role: CoordinatorChatMessageRole::Operator,
+                text: "tied message".to_owned(),
+                client_message_id: None,
+            },
+        ]
+    };
+    let replayed = replay_with_intents(&records, intents(), CredentialRedactor::new(TEST_SECRET));
+
+    // Live: each intent arrives after the record it is tied with.
+    let mut live = ConversationReducer::new(CredentialRedactor::new(TEST_SECRET));
+    let [first_intent, second_intent]: [PromptIntent; 2] = intents().try_into().unwrap();
+    for record in &records[..2] {
+        live.apply_record(record);
+    }
+    live.apply_intent_message(first_intent);
+    for record in &records[2..4] {
+        live.apply_record(record);
+    }
+    live.apply_intent_message(second_intent);
+    live.apply_record(&records[4]);
+
+    assert_eq!(live.items(), replayed.items());
+    assert_eq!(live.state(), replayed.state());
+    assert_eq!(live.in_progress_message(), replayed.in_progress_message());
+    for reducer in [&live, &replayed] {
+        let texts: Vec<String> = reducer.items().iter().map(|item| format!("{item:?}")).collect();
+        assert!(
+            texts.iter().all(|t| !t.contains(first_half)),
+            "partial credential leaked: {texts:?}"
+        );
+        let message = texts.iter().find(|t| t.contains("token")).expect("message item");
+        assert!(message.contains("[REDACTED") || message.contains("REDACT") || !message.contains(second_half));
+    }
+}
+
+#[test]
 fn replay_with_intents_matches_live_interleaved_reduction() {
     let records = [
         record(
