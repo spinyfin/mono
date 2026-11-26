@@ -813,13 +813,13 @@ fn the_tier_decision_orders_merging_before_parked_before_product_before_dormancy
     let active_products: HashSet<String> = ["a".to_owned()].into();
 
     let plan = plan_tiers(
-        &TierInputs {
-            always_full: vec![],
-            in_review: &rows,
-            parked: &parked,
-            merge_in_flight: Some(&merging),
-            active_products: Some(&active_products),
-        },
+        &TierInputs::builder()
+            .always_full(vec![])
+            .in_review(&rows)
+            .parked(&parked)
+            .merge_in_flight(&merging)
+            .active_products(&active_products)
+            .build(),
         &memory,
         now,
         epoch_now,
@@ -835,6 +835,35 @@ fn the_tier_decision_orders_merging_before_parked_before_product_before_dormancy
     assert_eq!(counts(TierReason::ActiveProduct), 1);
 }
 
+/// A PR watched only for merge or close is shallow on its own account, and
+/// rides the full probe when another row needs one for the same PR.
+#[test]
+fn a_terminal_watch_pr_is_shallow_unless_another_row_needs_it_in_full() {
+    let now = Instant::now();
+    let rows = [candidate("live", "a", 1)];
+    let watched = [pr(1), pr(2), pr(2)];
+    let no_ids: HashSet<String> = HashSet::new();
+    let mut memory = ProbeMemory::default();
+    memory.track(&[pr(1).as_str(), pr(2).as_str()].into_iter().collect(), now);
+
+    let plan = plan_tiers(
+        &TierInputs::builder()
+            .always_full(vec![])
+            .in_review(&rows)
+            .parked(&no_ids)
+            .merge_in_flight(&no_ids)
+            .terminal_watch(watched.iter().map(String::as_str).collect())
+            .build(),
+        &memory,
+        now,
+        1_800_000_000,
+    );
+
+    assert_eq!((plan.full, plan.shallow), (vec![pr(1)], vec![pr(2)]));
+    assert_eq!(plan.shallow_due, vec![pr(2)], "never observed is due at once");
+    assert_eq!(plan.reasons.get(TierReason::TerminalWatch.key()).copied(), Some(3));
+}
+
 #[test]
 fn unknown_merges_in_flight_probe_every_row_in_full() {
     let now = Instant::now();
@@ -845,13 +874,12 @@ fn unknown_merges_in_flight_probe_every_row_in_full() {
     let active_products: HashSet<String> = ["a".to_owned()].into();
 
     let plan = plan_tiers(
-        &TierInputs {
-            always_full: vec![],
-            in_review: &rows,
-            parked: &parked,
-            merge_in_flight: None,
-            active_products: Some(&active_products),
-        },
+        &TierInputs::builder()
+            .always_full(vec![])
+            .in_review(&rows)
+            .parked(&parked)
+            .active_products(&active_products)
+            .build(),
         &memory,
         now,
         1_800_000_000,

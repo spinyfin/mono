@@ -13,6 +13,7 @@
 //! |         | `in_review` rows in an active product, not parked, not dormant                               | every pass    |
 //! |         | `in_review` rows with a merge in flight (a recorded merge request, durable queue state, or last seen queued), including parked rows | every pass    |
 //! | shallow | parked rows without a merge in flight, rows in other products, rows GitHub has not touched for [`DORMANT_AFTER_SECS`] | every [`SHALLOW_PROBE_INTERVAL`] |
+//! |         | rows held `active` for a review, and revisions in review under a root that is terminal or deleted | every [`SHALLOW_PROBE_INTERVAL`] |
 //!
 //! Merge and close detection covers every tracked PR in every product; only
 //! how often a PR is asked about, and how much, depends on the tier. Nothing
@@ -160,6 +161,11 @@ pub(crate) enum TierReason {
     OtherProduct,
     /// Not updated on GitHub for [`DORMANT_AFTER_SECS`].
     Dormant,
+    /// Not an `in_review` or blocked row at all: a row held `active` for a
+    /// review, or revisions in review whose root is terminal or deleted. No
+    /// open-PR upkeep exists for these, so they are never probed in full on
+    /// their own account.
+    TerminalWatch,
 }
 
 impl TierReason {
@@ -169,6 +175,8 @@ impl TierReason {
 }
 
 /// What a pass knows about its candidates when it chooses tiers.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub(crate) struct TierInputs<'a> {
     /// PR urls of rows that are always probed in full.
     pub(crate) always_full: Vec<&'a str>,
@@ -183,6 +191,10 @@ pub(crate) struct TierInputs<'a> {
     /// by dispatch focus. `None` when no product is singled out, which makes
     /// every product active.
     pub(crate) active_products: Option<&'a HashSet<String>>,
+    /// PR urls watched only for merge or close, one per watching row or
+    /// chain (see [`TierReason::TerminalWatch`]).
+    #[builder(default)]
+    pub(crate) terminal_watch: Vec<&'a str>,
 }
 
 /// The tiers one pass probes.
@@ -208,6 +220,7 @@ impl TierReason {
             Self::Parked => "parked",
             Self::OtherProduct => "other_product",
             Self::Dormant => "dormant",
+            Self::TerminalWatch => "terminal_watch",
         }
     }
 }
@@ -263,6 +276,10 @@ pub(crate) fn plan_tiers(inputs: &TierInputs<'_>, memory: &ProbeMemory, now: Ins
         } else {
             shallow_candidates.push(&row.pr_url);
         }
+    }
+    for url in &inputs.terminal_watch {
+        *plan.reasons.entry(TierReason::TerminalWatch.key()).or_default() += 1;
+        shallow_candidates.push(url);
     }
     let mut shallow_seen: HashSet<&str> = HashSet::new();
     for url in shallow_candidates {
@@ -328,6 +345,7 @@ pub(crate) fn log_tier_outcome(outcome: &TierOutcome<'_>, memory: &ProbeMemory, 
         rows_parked = count(TierReason::Parked),
         rows_other_product = count(TierReason::OtherProduct),
         rows_dormant = count(TierReason::Dormant),
+        rows_terminal_watch = count(TierReason::TerminalWatch),
         active_products = outcome.active_products.map_or(0, HashSet::len),
         every_product_active = outcome.active_products.is_none(),
         "merge poller: probe tiers",

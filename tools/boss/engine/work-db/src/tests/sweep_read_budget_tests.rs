@@ -209,6 +209,17 @@ fn recurring_reads() -> Vec<Read> {
         ("merge poller: stranded remediation", "60 s", READ_BUDGET_PAGES, |db| {
             db.list_chores_stranded_blocked_remediation().unwrap();
         }),
+        ("merge poller: held active with PR", "60 s", READ_BUDGET_PAGES, |db| {
+            db.list_chores_held_active_with_pr().unwrap();
+        }),
+        (
+            "merge poller: orphaned revision chains",
+            "60 s",
+            READ_BUDGET_PAGES,
+            |db| {
+                db.list_orphaned_in_review_revision_chains().unwrap();
+            },
+        ),
         ("merge poller: merges in flight", "60 s", READ_BUDGET_PAGES, |db| {
             db.list_work_item_ids_with_pending_merge().unwrap();
         }),

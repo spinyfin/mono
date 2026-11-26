@@ -95,6 +95,11 @@ pub struct SweepOutcome {
     /// than folded into `merged`) so operators can tell "shipped" from
     /// "abandoned" retires apart in the sweep summary log.
     pub closed_unmerged: usize,
+    /// Number of `in_review` revisions moved to `done` because the PR they
+    /// are bound to merged or closed while the row that owns it was already
+    /// terminal or deleted, so that row's own transition could not carry
+    /// them. See `boss_work_db::WorkDb::settle_orphaned_revisions_after_pr_close`.
+    pub orphaned_revisions_settled: usize,
     /// Number of Trunk merge-queue episodes adopted this sweep because
     /// Trunk's own head check reported an eviction for a `trunk_queue`
     /// product's PR that no active merge intent was tracking — i.e. a queue
@@ -135,6 +140,7 @@ impl SweepOutcome {
             + self.stranded_blocked_recanonicalized
             + self.comments_reopened
             + self.closed_unmerged
+            + self.orphaned_revisions_settled
             + self.trunk_episodes_adopted
             + self.review_admission_recovered
             + self.review_batches_reaped

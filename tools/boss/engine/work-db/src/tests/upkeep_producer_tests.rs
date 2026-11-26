@@ -665,6 +665,10 @@ const NOT_UPKEEP: &[(&str, &str)] = &[
         "re-submits a guide body already produced by a finished attempt; no work item is acted on",
     ),
     (
+        "list_orphaned_in_review_revision_chains",
+        "names PRs to watch for a merge or a close, which is recorded for a parked row too; nothing is done while the PR is open",
+    ),
+    (
         "list_superseded_preserved",
         "housekeeping of terminal executions' preserved bookmarks once a successor published; no work item is acted on",
     ),

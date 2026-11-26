@@ -1555,11 +1555,16 @@ impl WorkDb {
     }
 
     /// Move the chore or project_task identified by `work_item_id`
-    /// from `in_review` to `done` after confirming its bound PR merged.
+    /// to `done` after confirming its bound PR merged: from `in_review`, from
+    /// a `blocked` state, or from `active` when it was still held for review
+    /// (see [`Self::list_chores_held_active_with_pr`]).
     /// Returns the updated task
     /// if a transition happened; `Ok(None)` if the row was already
-    /// terminal, human-driven, or no longer bound to this PR. Matching late
-    /// observations still persist merge evidence without changing status.
+    /// terminal, deleted, human-driven, no longer bound to this PR, or
+    /// `active` with an unfinished writer. Matching late
+    /// observations still persist merge evidence without changing status
+    /// (except for deleted rows, rebound rows, and `active` rows owned by an
+    /// unfinished writer).
     /// Callers are expected to pre-filter on `kind` via
     /// [`Self::list_chores_pending_merge_check`]; this function
     /// itself does not gate on kind so that the SQL filter remains
@@ -1590,6 +1595,11 @@ impl WorkDb {
             .as_deref()
             .is_some_and(|bound| merge_evidence::same_binding(bound, pr_url))
         {
+            return Ok(MergeObservation::default());
+        }
+        // An `active` row with an unfinished writer belongs to that run; do
+        // not retire it or record merge side effects underneath it.
+        if task.status == TaskStatus::Active && super::pr_terminal_watch::has_unfinished_writer_in_tx(&tx, &task.id)? {
             return Ok(MergeObservation::default());
         }
         let now = now_string();
@@ -1681,6 +1691,8 @@ impl WorkDb {
         // can see the row; once the PR has merged the hold has no remaining
         // purpose and must not stay open on the Done card.
         resolve_attention_kind_in_tx(&tx, &task.id, WORKSPACE_POSITIONING_REFUSED)?;
+        // A row held for review can merge before the review was admitted.
+        super::pr_terminal_watch::resolve_review_admission_markers_in_tx(&tx, &task.id)?;
         let updated =
             query_task(&tx, work_item_id)?.with_context(|| format!("unknown task after update: {work_item_id}"))?;
         commit_and_publish(tx, pending, self.event_bus())?;
@@ -1691,21 +1703,25 @@ impl WorkDb {
         })
     }
 
-    /// Move the chore or project_task identified by `work_item_id`
-    /// from `in_review` to `done` because its bound PR was **closed
-    /// without merging** — the on-close counterpart to
-    /// [`Self::mark_chore_pr_merged`] (`chore-lifecycle-pr-closed-unmerged.md`).
-    /// Returns the updated task if a transition happened; `Ok(None)` if the
-    /// row was already past `in_review` (idempotent for late-arriving close
-    /// events, and safe if a concurrent sweep already retired it).
+    /// Move the chore or project_task identified by `work_item_id` to `done`
+    /// because its bound PR was **closed without merging**: from `in_review`,
+    /// from a `blocked` state, or from `active` when it was still held for
+    /// review (see [`Self::list_chores_held_active_with_pr`]) — the on-close
+    /// counterpart to [`Self::mark_chore_pr_merged`]
+    /// (`chore-lifecycle-pr-closed-unmerged.md`). Returns the updated task if a
+    /// transition happened; `Ok(None)` if the row was already terminal,
+    /// deleted, human-driven, or `active` with an unfinished writer (idempotent
+    /// for late-arriving close events, and safe if a concurrent sweep already
+    /// retired it or a redo run started). A mismatched `pr_url` leaves the
+    /// row's status unchanged via the `WHERE pr_url = ?2` guard.
     ///
     /// `done` is the only terminal status the current enum offers — there is
     /// no `abandoned`/`cancelled` state to distinguish "shipped" from
     /// "closed unmerged" at the status level (open question, out of scope
-    /// here). Callers are expected to pre-filter on `kind` and `status =
-    /// in_review` the same way [`Self::list_chores_pending_merge_check`]
-    /// does for the merge path; this function itself only refuses rows
-    /// already past `in_review`.
+    /// here). Callers are expected to pre-filter on `kind` and on a status
+    /// the merge poller watches, the same way the merge path does; this
+    /// function itself refuses terminal, deleted, human-driven, and
+    /// writer-owned `active` rows.
     ///
     /// Mirrors `mark_chore_pr_merged`'s terminal-transition side effects
     /// (dependent cascade, revision flip/block) since the row's resulting
@@ -1743,6 +1759,11 @@ impl WorkDb {
             );
             return Ok(None);
         }
+        // An `active` row with an unfinished writer belongs to that run; do
+        // not retire it underneath it.
+        if task.status == TaskStatus::Active && super::pr_terminal_watch::has_unfinished_writer_in_tx(&tx, &task.id)? {
+            return Ok(None);
+        }
         let now = now_string();
         // `merge_queue_state` / `merge_queue_detail` are cleared for exactly
         // the reason the merged twin above clears them, and the omission here
@@ -1775,6 +1796,7 @@ impl WorkDb {
         flip_in_review_revisions_to_done(&tx, &task.id, &now)?;
         block_pending_revisions_on_parent_close(&mut pending, &tx, &task.id, &now)?;
         resolve_attention_kind_in_tx(&tx, &task.id, WORKSPACE_POSITIONING_REFUSED)?;
+        super::pr_terminal_watch::resolve_review_admission_markers_in_tx(&tx, &task.id)?;
         let updated =
             query_task(&tx, work_item_id)?.with_context(|| format!("unknown task after update: {work_item_id}"))?;
         commit_and_publish(tx, pending, self.event_bus())?;

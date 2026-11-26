@@ -474,8 +474,10 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
          the deferred-admission sweep's retry, or an explicit review start, which is admitted \
          against the root while the item sits on the deferred revision). The sweep also resolves it \
          when an existing batch or legacy reviewer already covers the target, and releasing a held \
-         revision at its review's verdict resolves that revision's. A later unrelated run start \
-         does not mean a review slot opened.",
+         revision at its review's verdict resolves that revision's. The PR merging or closing \
+         resolves it for the whole chain in the transition that ends the row, since no review of \
+         that PR is still to be admitted. A later unrelated run start does not mean a review slot \
+         opened.",
     ),
     entry(
         REVIEW_DESIGN_DOC_UNRESOLVED_ATTENTION_KIND,
