@@ -243,6 +243,27 @@ extension EngineClient {
         ], queueIfDisconnected: false, reportIfDisconnected: false)
     }
 
+    /// Bucketed token usage with engine-computed normalizers for the Token
+    /// Usage window's Over time tab. Like the rows request it is never queued
+    /// while disconnected.
+    @discardableResult
+    func sendGetTokenUsageSeries(_ query: TokenUsageSeriesQuery) -> String? {
+        let filters: [[String: Any]] = query.filters.map { filter in
+            ["dimension": filter.dimension.rawValue, "values": filter.values]
+        }
+        var payload: [String: Any] = [
+            "type": "get_token_usage_series",
+            "since_epoch_s": query.sinceEpochS,
+            "until_epoch_s": query.untilEpochS,
+            "filters": filters,
+            "estimate_usd": query.estimateUsd,
+        ]
+        if let groupBy = query.groupBy {
+            payload["group_by"] = groupBy.rawValue
+        }
+        return sendLine(payload, queueIfDisconnected: false, reportIfDisconnected: false)
+    }
+
     /// Signal the engine that the Boss app window just became active.
     /// The engine schedules an immediate pass of every PR-state reconciler
     /// so the kanban reflects upstream GitHub changes (merged PRs, new

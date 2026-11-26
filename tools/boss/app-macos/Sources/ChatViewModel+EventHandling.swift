@@ -462,6 +462,8 @@ extension ChatViewModel {
             engineMetrics = entries
         case .tokenUsageRows(let report, let requestId):
             receiveTokenUsageRows(report, requestId: requestId)
+        case .tokenUsageSeries(let report, let requestId):
+            receiveTokenUsageSeries(report, requestId: requestId)
         case .projectDesignDocResolved(let output):
             applyResolvedProjectDesignDoc(output)
         case .executionLabelsResolved(let labels):

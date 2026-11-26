@@ -24,6 +24,31 @@ extension ChatViewModel {
         tokenUsage.invalidatePending()
     }
 
+    func invalidatePendingTokenUsageSeries() {
+        tokenUsageSeries.invalidatePending()
+    }
+
+    /// One round trip for the Over time tab, with the same generation and
+    /// request-id rules as `requestTokenUsage`.
+    func requestTokenUsageSeries(_ query: TokenUsageSeriesQuery) {
+        guard isConnected else {
+            return
+        }
+        let requestId = engine.sendGetTokenUsageSeries(query)
+        guard let generation = tokenUsageSeries.beginRequest(requestId: requestId) else {
+            return
+        }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 45_000_000_000)
+            guard let self else { return }
+            _ = self.tokenUsageSeries.failOnTimeout(generation: generation)
+        }
+    }
+
+    func receiveTokenUsageSeries(_ report: TokenUsageSeriesReport, requestId: String?) {
+        _ = tokenUsageSeries.receive(report, requestId: requestId)
+    }
+
     func receiveTokenUsageRows(_ report: TokenUsageRowsReport, requestId: String?) {
         _ = tokenUsage.receiveRows(report, requestId: requestId)
     }
@@ -33,9 +58,11 @@ extension ChatViewModel {
     /// matches the in-flight usage request.
     func receiveTokenUsageError(message: String, requestId: String?) -> Bool {
         tokenUsage.receiveError(message: message, requestId: requestId)
+            || tokenUsageSeries.receiveError(message: message, requestId: requestId)
     }
 
     func failTokenUsageOnDisconnect() {
         tokenUsage.failOnDisconnect()
+        tokenUsageSeries.failOnDisconnect()
     }
 }
