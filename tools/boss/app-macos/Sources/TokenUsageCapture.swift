@@ -3,8 +3,10 @@ import SwiftUI
 
 /// Capture the Token Usage window after the isolated app's cold connection.
 /// Requires `--capture-to`, `--capture-token-usage`, and an isolated socket.
-/// Optional `--capture-token-usage-scene=tree|grouped|capture-boundary|inspector`
-/// selects which screenshot to take; default is `tree`.
+/// Optional `--capture-token-usage-scene=tree|grouped|capture-boundary|inspector|
+/// over-time|over-time-grouped|over-time-all|over-time-hover` selects which
+/// screenshot to take; default is `tree`. The Over time scenes use a taller
+/// window so all five cards fit without scrolling.
 @MainActor
 enum TokenUsageCapture {
     private static var window: NSWindow?
@@ -44,8 +46,9 @@ enum TokenUsageCapture {
         model.startIfNeeded()
         let captureScene = Self.scene
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            let height: CGFloat = captureScene.isOverTime ? 1200 : 720
             let captureWindow = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 1180, height: 720),
+                contentRect: NSRect(x: 0, y: 0, width: 1180, height: height),
                 styleMask: [.titled, .closable, .resizable],
                 backing: .buffered,
                 defer: false
@@ -59,10 +62,14 @@ enum TokenUsageCapture {
             captureWindow.contentView?.layoutSubtreeIfNeeded()
             Task { @MainActor in
                 for _ in 0..<150 {
-                    if model.tokenUsage.report != nil {
+                    let ready = captureScene.isOverTime
+                        ? model.tokenUsageSeries.report != nil
+                        : model.tokenUsage.report != nil
+                    if ready {
                         try? await Task.sleep(nanoseconds: 250_000_000)
                         expandOutlines(in: captureWindow.contentView)
-                        try? await Task.sleep(nanoseconds: 150_000_000)
+                        // Charts lay out a beat after the data arrives.
+                        try? await Task.sleep(nanoseconds: captureScene.isOverTime ? 1_000_000_000 : 150_000_000)
                         do {
                             try BossWindowCapture.captureWindow(captureWindow, to: path)
                             NSApp.terminate(nil)
@@ -72,13 +79,14 @@ enum TokenUsageCapture {
                             exit(1)
                         }
                     }
-                    if let error = model.tokenUsage.error, model.tokenUsage.report == nil {
+                    let failure = captureScene.isOverTime ? model.tokenUsageSeries.error : model.tokenUsage.error
+                    if let error = failure, !ready {
                         fputs("token-usage capture failed: \(error)\n", stderr)
                         exit(1)
                     }
                     try? await Task.sleep(nanoseconds: 100_000_000)
                 }
-                fputs("token-usage capture did not receive a rows reply\n", stderr)
+                fputs("token-usage capture did not receive a usage reply\n", stderr)
                 exit(1)
             }
         }

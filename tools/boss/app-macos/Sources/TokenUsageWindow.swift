@@ -17,11 +17,39 @@ enum TokenUsageRangePreset: String, CaseIterable, Identifiable {
     }
 }
 
+enum TokenUsageTab: String, CaseIterable, Identifiable {
+    case breakdown
+    case overTime
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .breakdown: return "Breakdown"
+        case .overTime: return "Over time"
+        }
+    }
+}
+
 enum TokenUsageCaptureScene: String, Equatable, Sendable {
     case tree
     case grouped
     case captureBoundary = "capture-boundary"
     case inspector
+    /// Over time tab, ungrouped, every card including estimated USD.
+    case overTime = "over-time"
+    /// Over time tab grouped by driver, normalized per active hour.
+    case overTimeGrouped = "over-time-grouped"
+    /// Over time tab over all history, showing the shaded pre-capture region.
+    case overTimeAll = "over-time-all"
+    /// Over time tab with the pointer readout on the normalized card.
+    case overTimeHover = "over-time-hover"
+
+    var isOverTime: Bool {
+        switch self {
+        case .overTime, .overTimeGrouped, .overTimeAll, .overTimeHover: return true
+        case .tree, .grouped, .captureBoundary, .inspector: return false
+        }
+    }
 }
 
 /// Window → Token Usage. Thin client of `get_token_usage_rows`: the engine
@@ -30,6 +58,7 @@ struct TokenUsageWindow: View {
     @EnvironmentObject private var chatModel: ChatViewModel
     @AppStorage("boss.tokenUsage.visible", store: BossDefaults.store) private var isOpen = false
 
+    @State private var tab: TokenUsageTab
     @State private var range: TokenUsageRangePreset
     @State private var customSince: Date
     @State private var customUntil: Date
@@ -45,6 +74,10 @@ struct TokenUsageWindow: View {
     @State private var roots: [TokenUsageTableNode] = []
     @State private var debounceTask: Task<Void, Never>?
     @State private var hasAppeared = false
+    /// Series inputs last sent, so a change that cannot alter the series
+    /// (such as the revision roll-up) neither re-requests it nor drops its
+    /// in-flight reply.
+    @State private var lastSeriesFingerprint = ""
 
     private let captureScene: TokenUsageCaptureScene?
     private let pollTimer = Timer.publish(every: 60, on: .main, in: .common).autoconnect()
@@ -54,9 +87,12 @@ struct TokenUsageWindow: View {
         let now = Date()
         _customUntil = State(initialValue: now)
         _customSince = State(initialValue: now.addingTimeInterval(-7 * 86_400))
+        _tab = State(initialValue: captureScene?.isOverTime == true ? .overTime : .breakdown)
         switch captureScene {
-        case .captureBoundary:
+        case .captureBoundary, .overTimeAll:
             _range = State(initialValue: .all)
+        case .overTime, .overTimeGrouped, .overTimeHover:
+            _range = State(initialValue: .d30)
         default:
             _range = State(initialValue: .d7)
         }
@@ -64,44 +100,33 @@ struct TokenUsageWindow: View {
         case .grouped:
             _groupPrimary = State(initialValue: .driver)
             _groupSecondary = State(initialValue: .model)
+        case .overTimeGrouped:
+            _groupPrimary = State(initialValue: .driver)
+            _groupSecondary = State(initialValue: nil)
         default:
             _groupPrimary = State(initialValue: nil)
             _groupSecondary = State(initialValue: nil)
         }
         _rollUpRevisions = State(initialValue: true)
-        _estimateUsd = State(initialValue: captureScene == .inspector)
+        _estimateUsd = State(initialValue: captureScene == .inspector || captureScene == .overTime)
     }
 
     var body: some View {
         VStack(spacing: 0) {
             toolbar
             Divider()
-            if let message = chatModel.tokenUsage.error {
-                inlineBanner(message)
+            switch tab {
+            case .breakdown:
+                breakdownContent
+            case .overTime:
+                overTimeContent
             }
-            if TokenUsageTree.mixesInputConventions(roots) {
-                mixedConventionNote
-            }
-            HSplitView {
-                table
-                    .opacity(chatModel.tokenUsage.error != nil && chatModel.tokenUsage.report != nil ? 0.55 : 1)
-                if let node = selectedNode {
-                    TokenUsageInspector(node: node, spansCaptureBoundary: spansCaptureBoundary) {
-                        revealOnBoard(node)
-                    }
-                    .frame(minWidth: 280, idealWidth: 320, maxWidth: 420)
-                }
-            }
-            Divider()
-            footer
         }
         .frame(minWidth: 900, minHeight: 520)
         .onAppear {
             isOpen = true
             hasAppeared = true
-            if chatModel.isConnected {
-                chatModel.requestTokenUsage(makeQuery())
-            }
+            requestAll()
         }
         .onDisappear {
             isOpen = false
@@ -109,11 +134,16 @@ struct TokenUsageWindow: View {
         }
         .onReceive(pollTimer) { _ in
             guard isOpen, chatModel.isConnected else { return }
-            chatModel.requestTokenUsage(makeQuery())
+            requestAll()
         }
         .onChange(of: chatModel.isConnected) { _, connected in
             guard connected, isOpen else { return }
-            chatModel.requestTokenUsage(makeQuery())
+            requestAll()
+        }
+        .onChange(of: tab) { _, newTab in
+            // The series is requested lazily: it is the heavier scan, so the
+            // Breakdown tab never pays for it.
+            if newTab == .overTime { requestSeries() }
         }
         .onChange(of: queryFingerprint) { _, _ in
             guard hasAppeared else { return }
@@ -129,6 +159,54 @@ struct TokenUsageWindow: View {
         .background(TokenUsageOutlineExpander(expand: captureScene == .tree || captureScene == .inspector))
     }
 
+    @ViewBuilder
+    private var breakdownContent: some View {
+        if let message = chatModel.tokenUsage.error {
+            inlineBanner(message) { chatModel.tokenUsage.error = nil }
+        }
+        if TokenUsageTree.mixesInputConventions(roots) {
+            mixedConventionNote
+        }
+        HSplitView {
+            table
+                .opacity(chatModel.tokenUsage.error != nil && chatModel.tokenUsage.report != nil ? 0.55 : 1)
+            if let node = selectedNode {
+                TokenUsageInspector(node: node, spansCaptureBoundary: spansCaptureBoundary) {
+                    revealOnBoard(node)
+                }
+                .frame(minWidth: 280, idealWidth: 320, maxWidth: 420)
+            }
+        }
+        Divider()
+        footer
+    }
+
+    @ViewBuilder
+    private var overTimeContent: some View {
+        if let message = chatModel.tokenUsageSeries.error {
+            inlineBanner(message) { chatModel.tokenUsageSeries.error = nil }
+        }
+        TokenUsageOverTimeView(
+            report: chatModel.tokenUsageSeries.report,
+            loading: chatModel.tokenUsageSeries.loading,
+            estimateUsd: estimateUsd,
+            connected: chatModel.isConnected,
+            initial: overTimeInitial
+        )
+        .opacity(chatModel.tokenUsageSeries.error != nil && chatModel.tokenUsageSeries.report != nil ? 0.55 : 1)
+    }
+
+    private var overTimeInitial: TokenUsageOverTimeInitial {
+        switch captureScene {
+        case .overTimeGrouped:
+            return TokenUsageOverTimeInitial(normalizer: .perActiveHour)
+        case .overTimeHover:
+            return TokenUsageOverTimeInitial(normalizer: .perRun, hover: TokenUsageHover(bucketIndex: 3, card: .normalized))
+        default:
+            return TokenUsageOverTimeInitial()
+        }
+    }
+
     // MARK: - Toolbar
 
     private var toolbar: some View {
@@ -136,6 +214,13 @@ struct TokenUsageWindow: View {
             HStack(spacing: 10) {
                 Text("Token Usage")
                     .font(.headline)
+                NativeSegmentedPicker(
+                    "View",
+                    selection: $tab,
+                    options: TokenUsageTab.allCases,
+                    title: \.title
+                )
+                .frame(width: 190)
                 NativeSegmentedPicker(
                     "Range",
                     selection: $range,
@@ -152,12 +237,14 @@ struct TokenUsageWindow: View {
                         .labelsHidden()
                 }
                 Spacer()
-                Toggle("Roll up revisions", isOn: $rollUpRevisions)
-                    .toggleStyle(.checkbox)
+                if tab == .breakdown {
+                    Toggle("Roll up revisions", isOn: $rollUpRevisions)
+                        .toggleStyle(.checkbox)
+                }
                 Toggle("Estimated USD", isOn: $estimateUsd)
                     .toggleStyle(.checkbox)
                 stalePill
-                Button(action: { chatModel.requestTokenUsage(makeQuery()) }) {
+                Button(action: requestAll) {
                     Image(systemName: "arrow.clockwise")
                 }
                 .buttonStyle(.borderless)
@@ -166,8 +253,10 @@ struct TokenUsageWindow: View {
             }
             HStack(spacing: 8) {
                 groupPicker("Group by", selection: $groupPrimary, excluding: groupSecondary)
-                groupPicker("Then by", selection: $groupSecondary, excluding: groupPrimary)
-                    .disabled(groupPrimary == nil)
+                if tab == .breakdown {
+                    groupPicker("Then by", selection: $groupSecondary, excluding: groupPrimary)
+                        .disabled(groupPrimary == nil)
+                }
                 if groupPrimary != nil {
                     Button("Clear grouping") {
                         groupPrimary = nil
@@ -176,7 +265,7 @@ struct TokenUsageWindow: View {
                     .buttonStyle(.borderless)
                 }
                 Spacer()
-                if chatModel.tokenUsage.loading {
+                if chatModel.tokenUsage.loading || (tab == .overTime && chatModel.tokenUsageSeries.loading) {
                     ProgressView()
                         .controlSize(.small)
                 }
@@ -250,7 +339,7 @@ struct TokenUsageWindow: View {
 
     private var stalePill: some View {
         Group {
-            if let received = chatModel.tokenUsage.receivedAt {
+            if let received = tab == .overTime ? chatModel.tokenUsageSeries.receivedAt : chatModel.tokenUsage.receivedAt {
                 let age = Date().timeIntervalSince(received)
                 Text(age >= 60 ? "stale" : "live")
                     .font(.caption2.weight(.semibold))
@@ -263,7 +352,7 @@ struct TokenUsageWindow: View {
         }
     }
 
-    private func inlineBanner(_ message: String) -> some View {
+    private func inlineBanner(_ message: String, dismiss: @escaping () -> Void) -> some View {
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
@@ -271,7 +360,7 @@ struct TokenUsageWindow: View {
                 .font(.callout)
                 .textSelection(.enabled)
             Spacer()
-            Button("Dismiss") { chatModel.tokenUsage.error = nil }
+            Button("Dismiss", action: dismiss)
                 .buttonStyle(.borderless)
         }
         .padding(.horizontal, 14)
@@ -597,6 +686,10 @@ struct TokenUsageWindow: View {
         "\(range.rawValue)-\(customSince.timeIntervalSince1970)-\(customUntil.timeIntervalSince1970)-\(groupPrimary?.rawValue ?? "")-\(groupSecondary?.rawValue ?? "")-\(rollUpRevisions)-\(estimateUsd)-\(selectedFilterValues.map { "\($0.key.rawValue):\($0.value.sorted().joined(separator: ","))" }.sorted().joined(separator: "|"))"
     }
 
+    private var seriesFingerprint: String {
+        "\(range.rawValue)-\(customSince.timeIntervalSince1970)-\(customUntil.timeIntervalSince1970)-\(groupPrimary?.rawValue ?? "")-\(estimateUsd)-\(selectedFilterValues.map { "\($0.key.rawValue):\($0.value.sorted().joined(separator: ","))" }.sorted().joined(separator: "|"))"
+    }
+
     private var spansCaptureBoundary: Bool {
         chatModel.tokenUsage.report?.spansCaptureBoundary ?? false
     }
@@ -642,12 +735,43 @@ struct TokenUsageWindow: View {
 
     private func debounceRefresh() {
         chatModel.invalidatePendingTokenUsage()
+        let seriesChanged = tab == .overTime && seriesFingerprint != lastSeriesFingerprint
+        if seriesChanged {
+            chatModel.invalidatePendingTokenUsageSeries()
+        }
         debounceTask?.cancel()
         debounceTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 150_000_000)
             guard !Task.isCancelled else { return }
+            guard chatModel.isConnected else { return }
             chatModel.requestTokenUsage(makeQuery())
+            if seriesChanged { requestSeries() }
         }
+    }
+
+    /// Rows always (they feed the filter chips on both tabs); the series
+    /// only while the Over time tab is showing.
+    private func requestAll() {
+        guard chatModel.isConnected else { return }
+        chatModel.requestTokenUsage(makeQuery())
+        if tab == .overTime { requestSeries() }
+    }
+
+    private func requestSeries() {
+        guard chatModel.isConnected else { return }
+        lastSeriesFingerprint = seriesFingerprint
+        chatModel.requestTokenUsageSeries(makeSeriesQuery())
+    }
+
+    private func makeSeriesQuery() -> TokenUsageSeriesQuery {
+        let rows = makeQuery()
+        return TokenUsageSeriesQuery(
+            sinceEpochS: rows.sinceEpochS,
+            untilEpochS: rows.untilEpochS,
+            filters: rows.filters,
+            groupBy: groupPrimary,
+            estimateUsd: estimateUsd
+        )
     }
 
     private func rebuildTree(from report: TokenUsageRowsReport?) {

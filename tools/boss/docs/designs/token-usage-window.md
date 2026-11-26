@@ -1,7 +1,7 @@
 # Boss: Token Usage window — the app never adds two token counts together
 
 - **Date:** 2026-10-28
-- **Status:** Design. Both engine requests (`GetTokenUsageRows` and `GetTokenUsageSeries`), the `boss-usage-report` crate, projections, `boss cost rows` / `boss cost series` callers, the seed fixture, and the app Token Usage table window are implemented; the over-time tab is not.
+- **Status:** Design. Both engine requests (`GetTokenUsageRows` and `GetTokenUsageSeries`), the `boss-usage-report` crate, projections, `boss cost rows` / `boss cost series` callers, the seed fixture, the app Token Usage table window, and its Over time tab are implemented.
 - **Revised:** 2026-11-23, against `spinyfin/mono` `main` after #3799 (Grok and Antigravity token capture). Grok and Antigravity now record tokens as **net** input, so the earlier statements that Grok records nothing and that Grok input is gross are corrected throughout; `work_runs.usage_unavailable` is the per-run capture status this design reserved; the driver, `usage_unavailable` and projection paths moved (`engine/work-db`, `engine/app`). Where this revision and an older sentence disagree, this revision wins.
 - **Product:** Boss. **Project:** Token Usage window (`proj_18e2c00c59cb8790_22c`, slug `token-usage-window`).
 - **Deliverable:** this document. The task breakdown at the end is the handoff to scheduling.
@@ -301,15 +301,21 @@ When the performance-metrics design's `GetMetricSeries` lands, `TokenUsageSeries
 
 ### 7. The over-time view
 
-A second tab in the Token Usage window ("Over time"; the table is "Breakdown"), sharing the toolbar's range, filters and group-by (single level in this tab). Chart cards in a two-column grid, each a Swift Charts view over `TokenUsageSeriesReport` cells:
+A second tab in the Token Usage window ("Over time"; the table is "Breakdown"), sharing the toolbar's range, filters, estimated-USD toggle and group-by (single level in this tab; the "Then by" picker and the revision roll-up toggle are hidden there). Chart cards in a two-column grid, each a Swift Charts view over `TokenUsageSeriesReport` cells, built by the pure `UsageSeriesMapper` (cell to bars, line segments, flags and shading; unit-tested without a view):
 
-- **Tokens** by class (stacked `AreaMark`) or by the chosen group.
-- **Work volume**: runs, completed executions, completed tasks, distinct PRs (`BarMark`s on a shared axis).
-- **Normalized**: one `LineMark` per group for the selected normalizer (picker: per run, per completed execution, per active hour, per completed task, per PR), with a `None` cell leaving a gap.
-- **Mix**: `share_of_bucket_total_tokens` per group as a stacked 100 % area.
-- **Estimated USD** when enabled, with the unpriceable share drawn hollow and the title saying "estimated".
+- **Tokens**: stacked bars by class when ungrouped (the engine returns one cell per bucket, so the class split needs no summing in Swift) and stacked bars by group when grouped. A class the provider did not report has no segment. The chosen shape is bars, not `AreaMark`: a bucket is a discrete fact, an area would interpolate across absent buckets, and a bar can be left out cleanly. Class mode is unavailable while grouped because the engine does not return a per-class total across groups and the app must not compute one.
+- **Work volume**: runs, completed executions, completed tasks and distinct PRs as side-by-side bars when ungrouped; when grouped, a measure picker and one stacked bar per group (a PR whose executions span groups counts in each, and the card says so).
+- **Normalized**: one line per group for the selected normalizer (per run, per completed execution, per active hour, per completed task, per PR). A `None` ratio or an absent bucket ends a line segment, so no line crosses a gap, and an isolated value is still drawn as a point. The card caption states what the normalizer leaves out; for per-active-hour it quotes `runs_excluded_from_active_hour` (Grok runs record tokens without active time).
+- **Mix**: `share_of_bucket_total_tokens` per group as stacked 0 to 100 % bars. Shown only when grouped (ungrouped, every share is 100 %).
+- **Estimated USD**: only while the toolbar toggle is on. A bucket with no priced run, or whose estimate is partial, is flagged, never drawn as `$0`. The title and caption say "estimated".
 
-Every card shades the pre-coverage region and draws no line through it; hover shows every group's value for the bucket via `chartXSelection`. Range changes re-query with the same debounce and generation rule as the table. Brush, pinch and the mini-map are not built here (non-goal); when the performance-metrics design ships them for the Metrics window, this tab adopts the same overlay.
+**Unknowns are marked, never zero.** Per bucket, a bucket with no measured run, or a group with none, draws a cross marker; a bucket whose figure is a floor (some runs unmeasured, or a class not reported, as for Grok and Antigravity cache creation) keeps its bar and draws a diamond marker. The hover readout names the class or group and says "unknown" or "no token data". A measured zero is drawn as a zero-height bar and is the only path to a zero.
+
+**Range and coverage.** Every card shades from the first bucket to the `capture_started` boundary (and, when grouped, to the grouping dimension's first recorded value; the `tasks.completed_at` boundary shades the cards that count completed tasks) and labels the shading. The x domain starts at the first bucket rather than the requested start, because "All" asks from the epoch. The footer lists every engine coverage note verbatim, the effective bucket width, and the number of runs with gross input (a driver-mix shift changes comparability).
+
+**Interaction.** `chartXSelection` snaps the pointer to a bucket; a dashed rule follows it on every card and the hovered card shows its values for every group. Range, group, filter and USD changes re-query behind the same 150 ms debounce and generation counter as the table, and the series is requested only while the tab is showing, so a change that cannot alter it (the revision roll-up) neither re-requests it nor drops its in-flight reply. The rows request still runs on both tabs, because the filter chips are built from its `dimension_values`. Brush, pinch and the mini-map are not built here (non-goal).
+
+**Plot space.** Swift Charts snaps calendar-unit bars in the viewer's time zone, ignoring a calendar passed through the environment, so a UTC midnight bucket would land on the previous local day. The mapper places every mark at the same wall-clock reading in the viewer's calendar and the axis reads the engine's UTC boundaries; hover titles are labelled UTC. Week bars use a Thursday-first calendar (engine weeks count from the epoch); that alignment is covered by a unit test but was not exercised visually, because the seeded ranges never chose week buckets.
 
 ### 8. Forward compatibility with the cost-attribution project
 

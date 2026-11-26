@@ -305,8 +305,11 @@ struct TokenUsageQuery: Equatable, Sendable {
     var estimateUsd: Bool
 }
 
-struct TokenUsageSessionState: Equatable, Sendable {
-    var report: TokenUsageRowsReport?
+/// Request/reply bookkeeping shared by the rows and series requests: one
+/// in-flight request id, a generation counter for timeouts, and an expected
+/// id that rejects any late or untagged reply.
+struct UsageRequestState<Report: Equatable & Sendable>: Equatable, Sendable {
+    var report: Report?
     var error: String?
     var loading: Bool = false
     var receivedAt: Date?
@@ -345,10 +348,10 @@ struct TokenUsageSessionState: Equatable, Sendable {
         expectedRequestId = nil
     }
 
-    /// Accept a rows reply only when it matches the latest expected in-flight
+    /// Accept a reply only when it matches the latest expected in-flight
     /// request id. Missing or mismatched ids are rejected.
     @discardableResult
-    mutating func receiveRows(_ report: TokenUsageRowsReport, requestId: String?, now: Date = Date()) -> Bool {
+    mutating func receive(_ report: Report, requestId: String?, now: Date = Date()) -> Bool {
         guard let requestId,
               let expected = expectedRequestId,
               requestId == expected,
@@ -393,5 +396,14 @@ struct TokenUsageSessionState: Equatable, Sendable {
         loading = false
         error = "Connection lost while loading token usage."
         pendingRequestId = nil
+    }
+}
+
+typealias TokenUsageSessionState = UsageRequestState<TokenUsageRowsReport>
+
+extension UsageRequestState where Report == TokenUsageRowsReport {
+    @discardableResult
+    mutating func receiveRows(_ report: TokenUsageRowsReport, requestId: String?, now: Date = Date()) -> Bool {
+        receive(report, requestId: requestId, now: now)
     }
 }

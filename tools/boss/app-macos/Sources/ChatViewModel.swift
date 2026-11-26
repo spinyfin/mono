@@ -655,6 +655,7 @@ final class ChatViewModel: ObservableObject {
     /// Latest Token Usage rows reply, error and in-flight generation.
     /// Owned here so the window is a thin client of one engine round trip.
     @Published var tokenUsage = TokenUsageSessionState()
+    @Published var tokenUsageSeries = TokenUsageSeriesSessionState()
 
     /// Engine feature-flag snapshot, sourced from `list_feature_flags`
     /// on debug-pane open and kept in sync via `feature_flag_set`

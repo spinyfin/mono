@@ -1454,6 +1454,13 @@ final class EngineClient: @unchecked Sendable {
             } else {
                 emit(.error(message: "received invalid token_usage_rows payload", requestId: envelopeRequestId))
             }
+        case "token_usage_series":
+            if let reportRaw = payload["report"],
+               let report = TokenUsageSeriesReport.parse(reportRaw) {
+                emit(.tokenUsageSeries(report: report, requestId: envelopeRequestId))
+            } else {
+                emit(.error(message: "received invalid token_usage_series payload", requestId: envelopeRequestId))
+            }
         case "attention_items_for_work_item_list":
             let workItemID = payload["work_item_id"] as? String ?? ""
             let raw = payload["items"] as? [[String: Any]] ?? []
