@@ -7,7 +7,7 @@ use boss_protocol::{
 use serde_json::json;
 
 use crate::redact::{CredentialRedactor, REDACTED_PLACEHOLDER};
-use crate::reducer::{ConversationReducer, PromptIntent, replay_reader, replay_records};
+use crate::reducer::{ConversationReducer, PromptIntent, replay_reader, replay_records, replay_with_intents};
 
 const BG_FIXTURE: &str = include_str!("../testdata/background_agent_turn.jsonl");
 const PERMISSION_CANCEL_FIXTURE: &str = include_str!("../testdata/permission_and_cancel.jsonl");
@@ -627,4 +627,135 @@ fn peer_origin_and_thought_chunks_and_invalid_records_are_handled() {
         .expect("turn boundary must exist");
     assert!(boundary.agent_initiated);
     assert_eq!(boundary.origin, Some(CoordinatorChatTurnOrigin::Peer));
+}
+
+fn update_record(seq: u64, update: serde_json::Value) -> WireRecord {
+    record(
+        seq,
+        Direction::FromAgent,
+        json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":update}}),
+    )
+}
+
+fn chunk(seq: u64, text: &str) -> WireRecord {
+    update_record(
+        seq,
+        json!({"sessionUpdate":"agent_message_chunk","messageId":"m1","content":{"type":"text","text":text}}),
+    )
+}
+
+#[test]
+fn credential_split_around_background_child_tool_call_never_leaks() {
+    let mut reducer = ConversationReducer::new(CredentialRedactor::new(TEST_SECRET));
+    let (first_half, second_half) = TEST_SECRET.split_at(TEST_SECRET.len() / 2);
+    let records = [
+        record(
+            1,
+            Direction::ToAgent,
+            json!({"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s","prompt":[]}}),
+        ),
+        chunk(2, &format!("token {first_half}")),
+        update_record(
+            3,
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "toolu_child",
+                "title": "child work",
+                "kind": "other",
+                "status": "in_progress",
+                "_meta": {"claudeCode": {"toolName": "Read", "parentToolUseId": "toolu_parent"}}
+            }),
+        ),
+        chunk(4, &format!("{second_half} done")),
+    ];
+    for record in &records {
+        reducer.apply_record(record);
+        let snapshot = serde_json::to_string(&(reducer.items(), reducer.in_progress_message())).unwrap();
+        assert!(!snapshot.contains(first_half), "intermediate leak: {snapshot}");
+    }
+    reducer.apply_record(&record(
+        5,
+        Direction::FromAgent,
+        json!({"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}),
+    ));
+    let messages: Vec<_> = reducer
+        .items()
+        .iter()
+        .filter_map(|item| match &item.kind {
+            CoordinatorChatItemKind::Message(message) => Some(message.text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(messages, vec![format!("token {REDACTED_PLACEHOLDER} done")]);
+}
+
+#[test]
+fn replay_with_intents_matches_live_interleaved_reduction() {
+    let records = [
+        record(
+            2,
+            Direction::ToAgent,
+            json!({"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s","prompt":[]}}),
+        ),
+        chunk(3, "answer"),
+        record(
+            4,
+            Direction::FromAgent,
+            json!({"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}),
+        ),
+    ];
+    let intent = || PromptIntent {
+        seq: 1,
+        ts_ms: 1_795_000_000_001,
+        role: CoordinatorChatMessageRole::Operator,
+        text: "hello".to_owned(),
+        client_message_id: None,
+    };
+    let mut live = ConversationReducer::new(CredentialRedactor::none());
+    live.apply_intent_message(intent());
+    for record in &records {
+        live.apply_record(record);
+    }
+    let replayed = replay_with_intents(&records, [intent()], CredentialRedactor::none());
+    assert_eq!(replayed.items(), live.items());
+    assert_eq!(replayed.state(), live.state());
+    assert!(matches!(
+        &replayed.items()[0].kind,
+        CoordinatorChatItemKind::Message(m) if m.role == CoordinatorChatMessageRole::Operator
+    ));
+}
+
+#[test]
+fn cancel_requested_clears_when_agent_started_turn_closes() {
+    let mut reducer = ConversationReducer::new(CredentialRedactor::none());
+    let spawn = |seq, id: &str| {
+        update_record(
+            seq,
+            json!({"sessionUpdate":"async_task_spawned","asyncTaskId":id,"taskType":"turn"}),
+        )
+    };
+    let stop = |seq, id: &str| {
+        update_record(
+            seq,
+            json!({"sessionUpdate":"async_task_state_update","asyncTaskId":id,"state":"stopped"}),
+        )
+    };
+    reducer.apply_record(&spawn(1, "t1"));
+    reducer.apply_record(&record(
+        2,
+        Direction::ToAgent,
+        json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"s"}}),
+    ));
+    assert!(reducer.state().cancel_requested);
+    reducer.apply_record(&stop(3, "t1"));
+    assert!(!reducer.state().cancel_requested);
+    reducer.apply_record(&spawn(4, "t2"));
+    assert!(!reducer.state().cancel_requested);
+}
+
+#[test]
+fn truncated_fenced_tool_output_closes_the_fence_before_the_notice() {
+    let text = format!("```text\n{}\n```", "x".repeat(200));
+    let bounded = crate::reducer::bound_text(&text, 50);
+    assert!(bounded.contains("\n```\n… truncated"), "{bounded}");
 }

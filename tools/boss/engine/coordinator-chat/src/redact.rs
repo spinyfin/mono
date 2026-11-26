@@ -95,7 +95,15 @@ impl CredentialRedactor {
         input.map(|value| self.redact_str(&value))
     }
 
-    /// Redacts every text-bearing field on `item` in place.
+    /// Redacts every free-text field on `item` in place.
+    ///
+    /// Adapter- and engine-generated opaque identifiers (`message_id`,
+    /// `client_message_id`, `tool_call_id`, `parent_tool_call_id`, permission
+    /// `request_id` / option ids, and the connection `session_id`) are
+    /// deliberately left untouched: they are random routing keys the app must
+    /// echo back verbatim (for example in a permission response), they are never
+    /// derived from prompt or tool text, and rewriting them would break
+    /// correlation.
     ///
     /// Exhaustively matches [`CoordinatorChatItemKind`] so adding a new item
     /// variant forces its text fields to be covered here.
@@ -170,6 +178,26 @@ impl CredentialRedactor {
         in_progress.text = self.redact_str(&in_progress.text);
     }
 
+    /// Byte offset of the earliest suffix of `text` that is a proper prefix of
+    /// some secret, i.e. a match that could still complete with more input.
+    fn earliest_unresolved_start(&self, text: &str) -> Option<usize> {
+        if self.holdback_chars == 0 {
+            return None;
+        }
+        // A proper prefix is at most `holdback_chars` characters long.
+        let skip = text.chars().count().saturating_sub(self.holdback_chars);
+        let window = text.char_indices().nth(skip).map_or(text.len(), |(idx, _)| idx);
+        text.char_indices()
+            .map(|(idx, _)| idx)
+            .filter(|&idx| idx >= window)
+            .find(|&idx| {
+                let suffix = &text[idx..];
+                self.secrets
+                    .iter()
+                    .any(|secret| suffix.len() < secret.len() && secret.starts_with(suffix))
+            })
+    }
+
     /// Finds the earliest (leftmost, breaking ties by longest) match of any
     /// secret in `haystack`, returning its byte range `(start, end)`.
     fn find_earliest_match(&self, haystack: &str) -> Option<(usize, usize)> {
@@ -193,7 +221,9 @@ impl CredentialRedactor {
 /// Incremental redactor for streamed message text.
 ///
 /// Maintains the already-emitted safe prefix separately from the held-back
-/// tail (`holdback_chars = max_secret_chars - 1`), so:
+/// tail. The tail starts at the earliest offset whose remaining text is a
+/// proper prefix of some secret (at most `holdback_chars` long), and a complete
+/// match is committed only once no earlier or longer candidate can still win, so:
 /// - No prefix of a split credential is ever exposed before enough bytes arrive
 ///   to rule out a match.
 /// - Every emitted delta appends monotonically at `offset == prev_safe.len()`.
@@ -232,28 +262,22 @@ impl StreamingRedactor {
 
         self.pending.push_str(chunk);
 
-        while let Some((match_start, match_end)) = self.redactor.find_earliest_match(&self.pending) {
-            self.emitted.push_str(&self.pending[..match_start]);
-            self.emitted.push_str(REDACTED_PLACEHOLDER);
-            self.pending.drain(..match_end);
-        }
-
-        let holdback = self.redactor.holdback_chars();
-        if holdback == 0 {
-            self.emitted.push_str(&self.pending);
-            self.pending.clear();
-        } else {
-            let pending_chars = self.pending.chars().count();
-            if pending_chars > holdback {
-                let safe_chars = pending_chars - holdback;
-                let cut = self
-                    .pending
-                    .char_indices()
-                    .nth(safe_chars)
-                    .map(|(idx, _)| idx)
-                    .unwrap_or(self.pending.len());
-                self.emitted.push_str(&self.pending[..cut]);
-                self.pending.drain(..cut);
+        loop {
+            let hold_from = self.redactor.earliest_unresolved_start(&self.pending);
+            // A complete match is committed only when no earlier start, and no
+            // longer secret starting at the same offset, could still complete.
+            match self.redactor.find_earliest_match(&self.pending) {
+                Some((match_start, match_end)) if hold_from.is_none_or(|hold| match_start < hold) => {
+                    self.emitted.push_str(&self.pending[..match_start]);
+                    self.emitted.push_str(REDACTED_PLACEHOLDER);
+                    self.pending.drain(..match_end);
+                }
+                _ => {
+                    let cut = hold_from.unwrap_or(self.pending.len());
+                    self.emitted.push_str(&self.pending[..cut]);
+                    self.pending.drain(..cut);
+                    break;
+                }
             }
         }
 
@@ -277,9 +301,10 @@ impl StreamingRedactor {
     pub fn finish(mut self) -> (usize, String, String) {
         let flush_offset = self.emitted.len();
         if !self.pending.is_empty() {
-            // `pending` is already free of any complete secret matches because
-            // `push` drained every match as soon as it closed.
-            self.emitted.push_str(&self.pending);
+            // The held-back tail may still contain complete matches that were
+            // waiting behind an earlier unresolved start, so redact it as a whole.
+            let tail = self.redactor.redact_str(&self.pending);
+            self.emitted.push_str(&tail);
             self.pending.clear();
         }
         let flushed = self.emitted[flush_offset..].to_owned();

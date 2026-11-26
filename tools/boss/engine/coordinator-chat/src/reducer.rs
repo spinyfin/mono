@@ -175,7 +175,17 @@ impl ConversationReducer {
     ///
     /// The text is redacted before being stored. Any open streaming message or
     /// thought is finalized first so item ordering remains monotonic.
+    ///
+    /// Items are appended in call order, so callers must interleave intents with
+    /// wire records by `seq` (an intent no later than the next record it
+    /// precedes). [`replay_with_intents`] does this for replay.
     pub fn apply_intent_message(&mut self, intent: PromptIntent) -> ReduceDelta {
+        debug_assert!(
+            intent.seq >= self.state.last_seq,
+            "intent seq {} applied after wire record seq {}",
+            intent.seq,
+            self.state.last_seq
+        );
         let mut delta = ReduceDelta::default();
         self.flush_streams(intent.seq, &mut delta);
         let item_id = format!("prompt-{}", intent.seq);
@@ -709,6 +719,7 @@ impl ConversationReducer {
                 {
                     self.wire.open_agent_turns.remove(pos);
                     self.flush_streams(record.seq, delta);
+                    self.state.cancel_requested = false;
                     let origin = self.wire.current_turn_origin.take();
                     self.push_turn_boundary(record, true, origin, Some(state.to_owned()), None, delta);
                     self.recompute_phase();
@@ -830,9 +841,18 @@ impl ConversationReducer {
             self.handle_tool_call_update(record, &ToolCallUpdate::from(call.clone()), raw_update, delta);
             return;
         }
-        self.flush_streams(record.seq, delta);
-
         let meta = raw_update.get("_meta").unwrap_or(&Value::Null);
+        let parent_tool_call_id = meta
+            .pointer("/claudeCode/parentToolUseId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        // A background child's call interleaves with the coordinator's own
+        // streaming and does not end the open message. Finalizing here would
+        // flush the redaction holdback raw and split one message in two.
+        if parent_tool_call_id.is_none() {
+            self.flush_streams(record.seq, delta);
+        }
+
         let tool_name = call
             .name
             .as_deref()
@@ -867,10 +887,6 @@ impl ConversationReducer {
             .map(|value| self.redact_and_bound(&compact_json(value)));
         let output =
             extract_tool_output(&call.content, call.raw_output.as_ref()).map(|text| self.redact_and_bound(&text));
-        let parent_tool_call_id = meta
-            .pointer("/claudeCode/parentToolUseId")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
         let non_execution_kind = meta
             .pointer("/claudeCode/nonExecutionKind")
             .and_then(Value::as_str)
@@ -1288,6 +1304,28 @@ pub fn replay_records<'a>(
     reducer
 }
 
+/// Replays wire records and intent-log prompts merged by `seq` through a fresh
+/// reducer. Both inputs must already be ordered by `seq`; on a tie the intent is
+/// applied first.
+pub fn replay_with_intents<'a>(
+    records: impl IntoIterator<Item = &'a WireRecord>,
+    intents: impl IntoIterator<Item = PromptIntent>,
+    redactor: CredentialRedactor,
+) -> ConversationReducer {
+    let mut reducer = ConversationReducer::new(redactor);
+    let mut intents = intents.into_iter().peekable();
+    for record in records {
+        while let Some(intent) = intents.next_if(|intent| intent.seq <= record.seq) {
+            reducer.apply_intent_message(intent);
+        }
+        reducer.apply_record(record);
+    }
+    for intent in intents {
+        reducer.apply_intent_message(intent);
+    }
+    reducer
+}
+
 /// Reads a wire journal from `reader` (tolerating a torn final record via
 /// [`boss_agent_host::journal::read_records`]) and replays it through a fresh
 /// reducer.
@@ -1317,14 +1355,20 @@ fn compact_json(value: &Value) -> String {
     }
 }
 
-fn bound_text(text: &str, limit: usize) -> String {
+pub(crate) fn bound_text(text: &str, limit: usize) -> String {
     match text.char_indices().nth(limit) {
         None => text.to_owned(),
-        Some((cut, _)) => format!(
-            "{}\n… truncated: {limit} of {} characters shown",
-            &text[..cut],
-            text.chars().count()
-        ),
+        Some((cut, _)) => {
+            let kept = &text[..cut];
+            // Tool output arrives wrapped in a markdown fence; close it so the
+            // notice does not land inside an unterminated code block.
+            let fence_open = kept.lines().filter(|line| line.trim_start().starts_with("```")).count() % 2 == 1;
+            format!(
+                "{kept}{}\n… truncated: {limit} of {} characters shown",
+                if fence_open { "\n```" } else { "" },
+                text.chars().count()
+            )
+        }
     }
 }
 

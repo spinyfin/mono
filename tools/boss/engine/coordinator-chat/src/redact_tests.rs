@@ -282,3 +282,71 @@ fn empty_and_duplicate_secrets_are_handled_cleanly() {
         format!("a {REDACTED_PLACEHOLDER} b")
     );
 }
+
+fn stream_all(redactor: &CredentialRedactor, chunks: &[&str]) -> String {
+    let mut stream = StreamingRedactor::new(redactor.clone());
+    for chunk in chunks {
+        stream.push(chunk);
+    }
+    stream.finish().2
+}
+
+#[test]
+fn streaming_overlapping_secrets_match_whole_string_redaction_at_every_split() {
+    let redactor = CredentialRedactor::from_secrets(["short", "short-longer", "ort-lo"]);
+    for input in [
+        "x short-longer y",
+        "short-longer",
+        "short",
+        "shortshort-longer",
+        "a short-lon",
+        "ort-longer short",
+    ] {
+        let expected = redactor.redact_str(input);
+        for cut in (0..=input.len()).filter(|cut| input.is_char_boundary(*cut)) {
+            let (a, b) = input.split_at(cut);
+            assert_eq!(stream_all(&redactor, &[a, b]), expected, "input {input:?} cut {cut}");
+        }
+        let singles: Vec<String> = input.chars().map(String::from).collect();
+        let refs: Vec<&str> = singles.iter().map(String::as_str).collect();
+        assert_eq!(stream_all(&redactor, &refs), expected, "char-wise {input:?}");
+    }
+}
+
+#[test]
+fn streaming_does_not_emit_prefix_of_longer_overlapping_secret() {
+    let redactor = CredentialRedactor::from_secrets(["short", "short-longer"]);
+    let mut stream = StreamingRedactor::new(redactor);
+    stream.push("short");
+    assert!(!stream.safe_text().contains("short"));
+    stream.push("-longer");
+    assert_eq!(stream.finish().2, REDACTED_PLACEHOLDER);
+}
+
+#[test]
+fn opaque_identifier_fields_are_deliberately_not_redacted() {
+    let redactor = CredentialRedactor::new(TEST_SECRET);
+    let mut item = CoordinatorChatItem {
+        id: "msg-1".to_owned(),
+        seq: 1,
+        updated_seq: 1,
+        ts_ms: 1,
+        kind: CoordinatorChatItemKind::Message(CoordinatorChatMessageItem {
+            role: CoordinatorChatMessageRole::Engine,
+            text: format!("secret {TEST_SECRET}"),
+            client_message_id: Some(format!("client-{TEST_SECRET}")),
+            message_id: Some(format!("m-{TEST_SECRET}")),
+            sender: None,
+        }),
+    };
+    redactor.redact_item(&mut item);
+    let CoordinatorChatItemKind::Message(message) = &item.kind else {
+        unreachable!()
+    };
+    assert_eq!(message.text, format!("secret {REDACTED_PLACEHOLDER}"));
+    assert_eq!(
+        message.client_message_id.as_deref(),
+        Some(format!("client-{TEST_SECRET}").as_str())
+    );
+    assert_eq!(message.message_id.as_deref(), Some(format!("m-{TEST_SECRET}").as_str()));
+}

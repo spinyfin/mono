@@ -20,4 +20,5 @@ pub use boss_agent_host::journal::{Direction, WireRecord, read_records};
 pub use redact::{CredentialRedactor, REDACTED_PLACEHOLDER, StreamingRedactor};
 pub use reducer::{
     ConversationReducer, DEFAULT_TOOL_TEXT_LIMIT, PromptIntent, ReduceDelta, replay_reader, replay_records,
+    replay_with_intents,
 };
