@@ -1,0 +1,12 @@
+[package]
+name = "boss-engine-coordinator-chat"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+boss-acp-client = { path = "../../acp_client" }
+boss-agent-host = { path = "../../agent-host" }
+boss-protocol = { path = "../../protocol" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }

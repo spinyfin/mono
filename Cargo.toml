@@ -36,6 +36,7 @@ members = [
   "tools/boss/engine/codex-rollout-retention",
   "tools/boss/engine/completion",
   "tools/boss/engine/conflict-diagnosis",
+  "tools/boss/engine/coordinator-chat",
   "tools/boss/engine/deterministic-resolvers",
   "tools/boss/engine/dispatch",
   "tools/boss/engine/dispatch-events",
