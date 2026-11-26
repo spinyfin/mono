@@ -162,7 +162,8 @@ pub struct UsageExecutionRecord {
 ///   (so grouping by model/coverage/host sees the observed latest run) **plus**
 ///   every all-time `work_runs` row belonging to the revision chain of any
 ///   root task completed in `[since, until)` (so `tasks_completed_cost`
-///   includes out-of-window runs). The builder filters to `[since, until)` for
+///   includes out-of-window runs, including runs created at or after `until`
+///   such as a post-merge review of an already-done root). The builder filters to `[since, until)` for
 ///   bucket `measurement` and uses all chain runs for `tasks_completed_cost`.
 /// * `finished_executions` holds every `work_executions` row with
 ///   `finished_at` in `[since, until)`.

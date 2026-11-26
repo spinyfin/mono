@@ -522,9 +522,13 @@ impl WorkDb {
             // to bucket measurement; the builder keeps measurement on
             // `wr.created_at` in `[since, until)`.
             //
-            // Skip executions created at or after `since`: a run cannot exist
-            // before its execution row, so the in-window run projection already
-            // has every run. Binding tens of thousands of in-window ids into
+            // Executions created before `since` may have runs on either side
+            // of the window, so they are fetched by id. Executions created at
+            // or after `since` cannot have a run before `since` (a run cannot
+            // predate its execution), so only their runs at or after `until`
+            // can be missing; those come from the index-seeked
+            // `created_at >= until` range below, which is empty when `until`
+            // is now. Binding tens of thousands of in-window ids into
             // `json_each` looking for an empty out-of-window set is what
             // pushed 7d/30d series past the 150 ms budget.
             if !finished_executions.is_empty() {
@@ -552,6 +556,17 @@ impl WorkDb {
                         )?
                         .collect::<rusqlite::Result<Vec<_>>>()?;
                     runs.extend(extra_exec_runs);
+                }
+                let mut newer_exec_ids: Vec<&str> = finished_executions
+                    .iter()
+                    .filter(|exec| exec.execution_created_at_epoch_s >= since_epoch_s)
+                    .map(|exec| exec.execution_id.as_str())
+                    .collect();
+                newer_exec_ids.sort_unstable();
+                newer_exec_ids.dedup();
+                if !newer_exec_ids.is_empty() {
+                    let late = late_usage_runs(&tx, until_epoch_s, &newer_exec_ids, &[])?;
+                    runs.extend(late);
                 }
             }
 
@@ -587,10 +602,13 @@ impl WorkDb {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
 
             if !chain_members.is_empty() {
-                // A task created at or after `since` cannot have a run created
-                // before it existed, so the in-window run projection already
-                // covers it. Keep the extra lookup for older chain members
-                // (a root completed this week whose own run is 40 days old).
+                // A member created before `since` may have runs on either side
+                // of the window (a root completed this week whose own run is
+                // 40 days old), so it is fetched by id. A member created at or
+                // after `since` cannot have a run before `since`, but it can
+                // have runs at or after `until` (for example a post-merge
+                // review of an already-done root in a window that ended in the
+                // past); those come from the `created_at >= until` range below.
                 let mut chain_task_ids: Vec<&str> = chain_members
                     .iter()
                     .filter(|(_, _, created_at)| *created_at < since_epoch_s)
@@ -616,7 +634,23 @@ impl WorkDb {
                         .collect::<rusqlite::Result<Vec<_>>>()?;
                     runs.extend(extra_runs);
                 }
+                let mut newer_member_ids: Vec<&str> = chain_members
+                    .iter()
+                    .filter(|(_, _, created_at)| *created_at >= since_epoch_s)
+                    .map(|(id, _, _)| id.as_str())
+                    .collect();
+                newer_member_ids.sort_unstable();
+                newer_member_ids.dedup();
+                if !newer_member_ids.is_empty() {
+                    let late = late_usage_runs(&tx, until_epoch_s, &[], &newer_member_ids)?;
+                    runs.extend(late);
+                }
             }
+
+            // The by-id and late-range fetches can overlap (an old chain member
+            // whose execution is newer than `since`); keep each run once.
+            let mut seen_runs = std::collections::HashSet::new();
+            runs.retain(|run| seen_runs.insert(run.run_id.clone()));
 
             let mut work_item_ids: Vec<&str> = runs
                 .iter()
@@ -890,6 +924,38 @@ mod sol_report_db {
             assert!(!records[0].merged);
         }
     }
+}
+
+/// Runs created at or after `until_epoch_s` that belong to one of the given
+/// executions or work items. The restriction is in SQL (the id sets are the
+/// ones the caller already resolved), so cost is bounded by those items' own
+/// late runs, not by all history after `until`.
+fn late_usage_runs(
+    tx: &rusqlite::Transaction<'_>,
+    until_epoch_s: i64,
+    execution_ids: &[&str],
+    work_item_ids: &[&str],
+) -> Result<Vec<UsageRunRecord>> {
+    let sql = format!(
+        "SELECT {USAGE_RUN_COLUMNS}
+         FROM work_runs wr
+         JOIN work_executions we ON we.id = wr.execution_id
+         WHERE CAST(wr.created_at AS INTEGER) >= ?1
+           AND (wr.execution_id IN (SELECT value FROM json_each(?2))
+                OR we.work_item_id IN (SELECT value FROM json_each(?3)))
+         ORDER BY CAST(wr.created_at AS INTEGER) ASC, wr.id ASC"
+    );
+    Ok(tx
+        .prepare(&sql)?
+        .query_map(
+            params![
+                until_epoch_s,
+                query_ensure::id_array(execution_ids),
+                query_ensure::id_array(work_item_ids)
+            ],
+            map_usage_run_record,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 #[cfg(test)]
@@ -1405,6 +1471,94 @@ mod tests {
         assert_eq!(ghost.runs_outside_window, 1);
         assert_eq!(ghost.revisions.len(), 1);
         assert!(ghost.inclusive.as_ref().unwrap().total_tokens > 0);
+    }
+
+    #[test]
+    fn usage_series_records_include_chain_member_runs_after_until_for_members_created_in_window() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let chore = create_test_chore(&db, &product_id, "created in window");
+        let execution = create_ready_chore_execution(&db, &chore.id);
+        let in_window = create_run(&db, &execution.id, "completed");
+        let late = create_run(&db, &execution.id, "completed");
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET created_at = '1500', completed_at = '1800' WHERE id = ?1",
+                params![chore.id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE work_executions SET created_at = '1500', finished_at = '1800' WHERE id = ?1",
+                params![execution.id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE work_runs SET created_at = '1600' WHERE id = ?1",
+                params![in_window],
+            )
+            .unwrap();
+            conn.execute("UPDATE work_runs SET created_at = '3000' WHERE id = ?1", params![late])
+                .unwrap();
+        }
+        let records = db.usage_series_records_for_window(1_000, 2_000).unwrap();
+        assert!(records.runs.iter().any(|r| r.run_id == in_window));
+        assert_eq!(
+            records.runs.iter().filter(|r| r.run_id == late).count(),
+            1,
+            "a run after `until` of a chain member created inside the window is counted once"
+        );
+    }
+
+    #[test]
+    fn usage_series_completion_cost_includes_member_run_after_until_independent_of_since() {
+        use boss_protocol::UsageBucketWidth;
+        use boss_usage_report::{UsageSeriesQuery, build_usage_series_report};
+
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let conn = db.connect().unwrap();
+        insert_task(&conn, "root", &product_id, "chore", None);
+        conn.execute(
+            "UPDATE tasks SET created_at = '1500', completed_at = '1800' WHERE id = 'root'",
+            [],
+        )
+        .unwrap();
+        // In-window execution (finished inside the window): 5 in / 7 out.
+        insert_run(&conn, "r_in", "e_in", "root", "chore_implementation", 1_600);
+        conn.execute("UPDATE work_executions SET finished_at = '1800' WHERE id = 'e_in'", [])
+            .unwrap();
+        // Post-merge execution created after `until` and still unfinished, so it
+        // cannot enter the finished-executions fetch: only the chain-member
+        // fetch can supply it. 5 in / 7 out.
+        insert_run(&conn, "r_late", "e_late", "root", "chore_implementation", 3_100);
+        drop(conn);
+
+        let build = |since: i64| {
+            let records = db.usage_series_records_for_window(since, 2_000).unwrap();
+            let q = UsageSeriesQuery::builder()
+                .since_epoch_s(since)
+                .until_epoch_s(2_000)
+                .generated_at_epoch_s(10_000)
+                .capture_start_epoch_s(0)
+                .completed_at_start_epoch_s(0)
+                .retention_max_age_secs(14 * 86_400)
+                .bucket(UsageBucketWidth::Week)
+                .build();
+            let report = build_usage_series_report(&q, &records, None);
+            let sum = |f: &dyn Fn(&boss_protocol::CostMeasurement) -> Option<i64>| -> (i64, i64) {
+                let cells = report.buckets.iter().flat_map(|b| b.cells.iter());
+                let own: i64 = cells.clone().filter_map(|c| f(&c.measurement)).sum();
+                let completed: i64 = cells.filter_map(|c| f(&c.tasks_completed_cost)).sum();
+                (own, completed)
+            };
+            (sum(&|m| m.input_tokens), sum(&|m| m.output_tokens))
+        };
+        // The window's own measurement excludes the post-`until` run; the
+        // completed root's attributed cost includes it exactly once.
+        assert_eq!(build(1_000), ((5, 10), (7, 14)));
+        // Widening `since` must not change the completion bucket's cost.
+        assert_eq!(build(0), ((5, 10), (7, 14)));
     }
 
     #[test]

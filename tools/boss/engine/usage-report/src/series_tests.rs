@@ -643,6 +643,45 @@ fn recent_window_with_complete_dimension_emits_no_spurious_boundary_notes() {
     );
 }
 
+#[test]
+fn grouping_by_dimension_without_recording_era_never_reports_a_boundary() {
+    let q = UsageSeriesQuery {
+        bucket: Some(UsageBucketWidth::Day),
+        group_by: Some(UsageDimension::Product),
+        ..series_query(DAY0, DAY0 + 5 * DAY)
+    };
+    // The earliest fact is a taskless run (no product, permanently), followed
+    // by an ordinary task run that has a product.
+    let early = with_tokens(
+        run("r_answer", "e_answer", "comment_1", DAY0),
+        Some(10),
+        Some(5),
+        Some(0),
+        Some(0),
+        Some(1_000),
+    );
+    let later = with_tokens(
+        run("r_task", "e_task", "t1", DAY0 + 2 * DAY),
+        Some(100),
+        Some(50),
+        Some(10),
+        Some(20),
+        Some(60_000),
+    );
+    let recs = UsageSeriesRecords {
+        runs: vec![early, later],
+        finished_executions: Vec::new(),
+        tasks: vec![task("t1", "t1", None)],
+    };
+    let report = build_usage_series_report(&q, &recs, None);
+    assert_eq!(report.coverage.dimension_from_epoch_s, None);
+    assert!(
+        report.coverage.notes.iter().all(|n| n.code != note::DIMENSION_STARTED),
+        "unexpected dimension_started note: {:?}",
+        report.coverage.notes
+    );
+}
+
 // ── Bucket coarsening at the cell cap ────────────────────────────────────
 
 #[test]

@@ -1821,17 +1821,24 @@ impl WorkDb {
 /// path/cost writes that belong to the real session row, and so the
 /// live-status resolver does not report NULL/wrong-host when only a failed
 /// sibling is newer than a path-bearing session.
-pub(crate) fn resolve_run_id_for_execution_hooks(conn: &Connection, execution_id: &str) -> Result<Option<String>> {
-    conn.query_row(
-        "SELECT id FROM work_runs
-         WHERE execution_id = ?1
-         ORDER BY
-           CASE WHEN finished_at IS NULL THEN 0 ELSE 1 END,
+///
+/// This precedence is encoded in [`HOOK_RUN_ORDER_BY`], which the batched
+/// driver lookup's window function reuses.
+pub(crate) const HOOK_RUN_ORDER_BY: &str = "CASE WHEN finished_at IS NULL THEN 0 ELSE 1 END,
            CASE WHEN status = 'failed' THEN 1 ELSE 0 END,
            CASE WHEN transcript_path IS NOT NULL THEN 0 ELSE 1 END,
            created_at DESC,
-           id DESC
-         LIMIT 1",
+           id DESC";
+
+/// Picks the first of an execution's runs by [`HOOK_RUN_ORDER_BY`].
+pub(crate) fn resolve_run_id_for_execution_hooks(conn: &Connection, execution_id: &str) -> Result<Option<String>> {
+    conn.query_row(
+        &format!(
+            "SELECT id FROM work_runs
+             WHERE execution_id = ?1
+             ORDER BY {HOOK_RUN_ORDER_BY}
+             LIMIT 1"
+        ),
         params![execution_id],
         |row| row.get(0),
     )
