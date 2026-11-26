@@ -195,6 +195,7 @@ pub(super) async fn attach_coordinator_to_registered_app(server_state: Arc<Serve
                 .working_directory(&working_directory)
                 .version_probe(&boss_engine_runtime::coordinator_tmux::RealClaudeVersionProbe)
                 .design_docs(&server_state.design_docs)
+                .maybe_engine_socket_path(server_state.coordinator_engine_socket())
                 .build(),
         )
         .await
@@ -844,6 +845,7 @@ impl CoordinatorReset {
                     .working_directory(&working_directory)
                     .version_probe(&boss_engine_runtime::coordinator_tmux::RealClaudeVersionProbe)
                     .design_docs(&server_state.design_docs)
+                    .maybe_engine_socket_path(server_state.coordinator_engine_socket())
                     .build(),
                 &expected_spawn_token,
                 reason,

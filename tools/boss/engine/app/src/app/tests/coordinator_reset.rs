@@ -1314,3 +1314,58 @@ async fn a_pending_delivery_to_a_replaced_session_does_not_suppress_its_replacem
     let credential_b = f.state.work_db.coordinator_handoff_authorization().unwrap().unwrap();
     assert!(prompts[1].contains(&credential_b), "{prompts:?}");
 }
+
+fn state_bound_to(socket: Option<PathBuf>, temp: &Path) -> Arc<ServerState> {
+    let mut work = boss_engine_runtime::config::WorkConfig::builder()
+        .cwd(temp.to_path_buf())
+        .db_path(temp.join("state.db"))
+        .build();
+    work.frontend_socket_path = socket;
+    ServerState::new_arc_with_app_pid_and_merge_probe(
+        Arc::new(RuntimeConfig::from_parts(work, None)),
+        None,
+        None,
+        ServerStateOverrides::builder().build(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn non_production_engine_resolves_a_session_directory_beside_its_own_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("boss-test-abc.sock");
+    let expected_dir = temp.path().join("boss-test-abc.boss-session");
+    assert!(
+        !expected_dir.exists(),
+        "fixture session directory should not exist before resolution"
+    );
+    let state = state_bound_to(Some(socket.clone()), temp.path());
+
+    let dir = state.coordinator_session_directory().unwrap();
+    assert_eq!(dir, expected_dir);
+    assert!(
+        dir.is_dir(),
+        "engine must create the fixture session directory so engine-only fixtures can start a coordinator"
+    );
+    let production = boss_engine_runtime::coordinator_tmux::coordinator_working_directory().unwrap();
+    assert_ne!(
+        dir, production,
+        "a non-production engine must never use the production session directory"
+    );
+    assert_eq!(
+        state.coordinator_engine_socket(),
+        Some(socket.as_path()),
+        "the coordinator session must be pointed at the engine that launched it"
+    );
+}
+
+#[tokio::test]
+async fn production_socket_keeps_the_production_session_directory_and_exports_no_socket() {
+    let temp = tempfile::tempdir().unwrap();
+    let production_dir = boss_engine_runtime::coordinator_tmux::coordinator_working_directory().unwrap();
+    let production_socket = boss_log_files::default_frontend_socket_path().unwrap();
+    let state = state_bound_to(Some(production_socket), temp.path());
+
+    assert_eq!(state.coordinator_session_directory().unwrap(), production_dir);
+    assert_eq!(state.coordinator_engine_socket(), None);
+}

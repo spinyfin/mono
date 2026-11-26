@@ -807,6 +807,7 @@ async fn serve_scoped(
                                 .working_directory(&working_directory)
                                 .version_probe(&boss_engine_runtime::coordinator_tmux::RealClaudeVersionProbe)
                                 .design_docs(&coordinator_supervisor_state.design_docs)
+                                .maybe_engine_socket_path(coordinator_supervisor_state.coordinator_engine_socket())
                                 .build(),
                             restart_failures.restart_churn(),
                         )

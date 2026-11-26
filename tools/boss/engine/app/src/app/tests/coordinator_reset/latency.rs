@@ -105,6 +105,7 @@ async fn supervisor_pass(state: Arc<ServerState>) {
             .working_directory(&working_directory)
             .version_probe(&boss_engine_runtime::coordinator_tmux::RealClaudeVersionProbe)
             .design_docs(&state.design_docs)
+            .maybe_engine_socket_path(state.coordinator_engine_socket())
             .build(),
         0,
     )

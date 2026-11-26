@@ -29,6 +29,7 @@ pub mod reset_handoff;
 
 pub const COORDINATOR_SESSION_NAME: &str = "boss-coordinator";
 const SPAWN_TOKEN_ENV: &str = "BOSS_SPAWN_TOKEN";
+const FRONTEND_SOCKET_ENV: &str = "BOSS_SOCKET_PATH";
 const SESSION_SCHEMA_ENV: &str = "BOSS_SESSION_SCHEMA";
 const SPAWN_TOKEN_OPTION: &str = "@boss_spawn_token";
 
@@ -89,6 +90,10 @@ pub struct CoordinatorSpawn<'a> {
     /// GitHub reader for each product's `BOSS_COORDINATOR.md`, injected
     /// into the session-start brief of a fresh session.
     pub(crate) design_docs: &'a Arc<boss_engine_design_docs::DesignDocsService>,
+    /// Frontend socket of a non-production engine, exported to the session as
+    /// `BOSS_SOCKET_PATH` so the coordinator's `boss` / `bossctl` reach the
+    /// engine that launched it. `None` for production (default resolution).
+    pub(crate) engine_socket_path: Option<&'a Path>,
 }
 
 /// A completed spawn carries the exact command line that tmux received. It
@@ -999,6 +1004,7 @@ async fn start_new(spawn: &CoordinatorSpawn<'_>, reason: CoordinatorStartReason)
         working_directory,
         version_probe,
         design_docs,
+        engine_socket_path,
         ..
     } = *spawn;
     let model = model.trim();
@@ -1067,6 +1073,9 @@ async fn start_new(spawn: &CoordinatorSpawn<'_>, reason: CoordinatorStartReason)
     {
         environment.insert("BOSS_BIN_DIR".to_owned(), bin_dir.clone());
         environment.insert("BOSS_BIN".to_owned(), format!("{bin_dir}/boss"));
+    }
+    if let Some(socket) = engine_socket_path {
+        environment.insert(FRONTEND_SOCKET_ENV.to_owned(), socket.display().to_string());
     }
     insert_color_environment(&mut environment);
     // Keep one bounded input directory for this singleton session. The relay
@@ -1331,6 +1340,7 @@ pub fn coordinator_working_directory() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     mod reset_handoff_tests;
+    mod session_environment_tests;
     use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::path::Path;
@@ -1705,6 +1715,7 @@ mod tests {
             working_directory,
             version_probe,
             design_docs: offline_design_docs(),
+            engine_socket_path: None,
         }
     }
 

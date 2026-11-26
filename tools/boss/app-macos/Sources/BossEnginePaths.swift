@@ -136,6 +136,10 @@ struct BossEnginePaths {
         else {
             return false
         }
+        return isIsolatedSocket(sock)
+    }
+
+    private static func isIsolatedSocket(_ sock: String) -> Bool {
         let normalized = URL(fileURLWithPath: sock).standardizedFileURL.path
         let legacy = URL(fileURLWithPath: legacyProductionSocket).standardizedFileURL.path
         if normalized == legacy {
@@ -146,6 +150,57 @@ struct BossEnginePaths {
             return false
         }
         return true
+    }
+
+    /// Canonical production frontend socket path under the Boss state root
+    /// (`<HOME>/Library/Application Support/Boss/engine.sock`). Safe to call
+    /// from tests — reads `HOME` only and never consults `BOSS_SOCKET_PATH`.
+    static func defaultProductionFrontendSocketPath() -> String {
+        URL(fileURLWithPath: productionStateRoot(), isDirectory: true)
+            .appendingPathComponent("engine.sock").path
+    }
+
+    /// Session directory of a non-production engine, beside that engine's
+    /// own state: `<socket dir>/<socket stem>.boss-session`. Mirrors the
+    /// engine's `IsolationPaths::coordinator_session_directory` and
+    /// `is_test_fixture_socket`, so the app prepares exactly the directory
+    /// the engine launches the coordinator in: only the normalized actual
+    /// production frontend socket under the Boss state root yields `nil`.
+    /// Any other socket — including `/tmp/boss-engine.sock` and private
+    /// directories such as `.../Library/Application Support/Boss-test/...`
+    /// — gets its own `<stem>.boss-session` directory. Pure: safe to call
+    /// from tests.
+    static func isolatedCoordinatorSessionDirectory(
+        socketPath: String?,
+        productionSocketPath: String = defaultProductionFrontendSocketPath()
+    ) -> URL? {
+        guard let socketPath, !socketPath.isEmpty else {
+            return nil
+        }
+        if resolveForCompare(socketPath) == resolveForCompare(productionSocketPath) {
+            return nil
+        }
+        let url = URL(fileURLWithPath: socketPath)
+        let stem = url.deletingPathExtension().lastPathComponent
+        return url.deletingLastPathComponent().appendingPathComponent("\(stem).boss-session", isDirectory: true)
+    }
+
+    /// Normalize a path for equality comparison, matching Rust's
+    /// `isolation::resolve_for_compare`: lexical `.`/`..` normalization first,
+    /// then canonicalize the parent directory when it exists and re-attach the
+    /// filename so symlinked ancestors compare equal before the socket exists.
+    private static func resolveForCompare(_ path: String) -> String {
+        let lexical = URL(fileURLWithPath: path).standardizedFileURL
+        let parent = lexical.deletingLastPathComponent()
+        let name = lexical.lastPathComponent
+        guard !name.isEmpty, name != "/" else {
+            return lexical.path
+        }
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: parent.path, isDirectory: &isDir), isDir.boolValue {
+            return parent.resolvingSymlinksInPath().appendingPathComponent(name).path
+        }
+        return lexical.path
     }
 
     /// Production pid-file path. Honours `BOSS_ENGINE_PID_PATH`;
