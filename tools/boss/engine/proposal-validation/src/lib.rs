@@ -288,6 +288,7 @@ pub fn validate_payload(kind: ProposalKind, payload: &Value) -> Result<Validated
                      asking the owner this question meets",
                 );
             }
+            let answer_actions = reader.answer_actions(question.as_ref());
             let queue_ci_evidence = reader.raw("queue_ci_evidence").and_then(|value| {
                 match serde_json::from_value::<boss_protocol::QueueCiEvidence>(value.clone()) {
                     Ok(evidence) => Some(evidence),
@@ -325,7 +326,16 @@ pub fn validate_payload(kind: ProposalKind, payload: &Value) -> Result<Validated
                 queue_ci_evidence,
                 superseded_by,
             });
-            with_criterion(canonical, criterion)
+            let canonical = with_side_key(
+                canonical,
+                "criterion",
+                criterion.map(|criterion| Value::String(criterion.as_str().to_owned())),
+            );
+            with_side_key(
+                canonical,
+                boss_protocol::ANSWER_ACTIONS_KEY,
+                (!answer_actions.is_empty()).then(|| serde_json::json!(answer_actions)),
+            )
         }
         ProposalKind::Wait => {
             let duration_secs = reader.required_u64("duration_secs", 1, WAIT_MAX_DURATION_SECS);
@@ -597,22 +607,37 @@ fn to_json<T: serde::Serialize>(payload: &T) -> String {
     serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_owned())
 }
 
-/// Add the progression question `criterion` to a canonical `run_done` payload.
-/// It rides beside the typed payload (see
-/// [`boss_protocol::run_done_question_criterion`]) and, being part of the
-/// canonical form, is part of the idempotency hash: re-asking the same question
-/// under a different criterion is a different submission.
-fn with_criterion(canonical: String, criterion: Option<ProgressionQuestionCriterion>) -> String {
-    let Some(criterion) = criterion else {
+/// Add a key that rides beside the typed `run_done` payload to its canonical
+/// form: the progression question `criterion` (see
+/// [`boss_protocol::run_done_question_criterion`]) and the changes bound to the
+/// question's answers (see [`boss_protocol::run_done_answer_actions`]). Being
+/// part of the canonical form, each is part of the idempotency hash: re-asking
+/// the same question under a different criterion, or with a different change
+/// bound to an answer, is a different submission.
+fn with_side_key(canonical: String, key: &str, value: Option<Value>) -> String {
+    let Some(value) = value else {
         return canonical;
     };
     match serde_json::from_str::<Value>(&canonical) {
         Ok(Value::Object(mut object)) => {
-            object.insert("criterion".to_owned(), Value::String(criterion.as_str().to_owned()));
+            object.insert(key.to_owned(), value);
             Value::Object(object).to_string()
         }
         _ => canonical,
     }
+}
+
+/// Why `text` is not a work-item id, or `None` when it is one.
+fn work_item_ref_problem(text: &str) -> Option<String> {
+    let short = text
+        .strip_prefix(['T', 't'])
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()));
+    if (text.starts_with("task_") || short) && !text.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(format!(
+        "`{text}` is not a work-item id; expected a `task_…` id or a short `T<n>` id"
+    ))
 }
 
 /// Read `automation_outcome`'s tag-dependent field set.
@@ -869,11 +894,27 @@ impl<'a> PayloadReader<'a> {
                 pr_url,
             };
         } else {
-            if let boss_protocol::OperatorAnswerType::MultipleChoice { choices } = &question.answer_type
-                && let Err(message) = boss_protocol::OperatorAnswerType::validate_choices(choices)
-            {
-                self.error("question.answer_type.choices", message);
-                return None;
+            if let boss_protocol::OperatorAnswerType::MultipleChoice { choices } = &question.answer_type {
+                if let Err(message) = boss_protocol::OperatorAnswerType::validate_choices(choices) {
+                    self.error("question.answer_type.choices", message);
+                    return None;
+                }
+                // An option names what happens when it is picked. One that
+                // speaks as the person answering ("I will delete the row")
+                // leaves the work to them, and no engine or worker acts on it.
+                if let Some(choice) = choices
+                    .iter()
+                    .find(|choice| boss_protocol::owner_voiced_label(choice).is_some())
+                {
+                    self.error(
+                        "question.answer_type.choices",
+                        format!(
+                            "`{choice}` speaks as the person answering; an option names what the engine or the \
+                             next worker does when it is picked, never something the repo owner promises to do"
+                        ),
+                    );
+                    return None;
+                }
             }
             question.text = self.text_from("question.text", &Value::String(question.text), 500)?;
             if question.text.contains(['\n', '\r']) {
@@ -993,17 +1034,55 @@ impl<'a> PayloadReader<'a> {
     /// neighbourhood.
     fn required_work_item_ref(&mut self, field: &'static str) -> Option<String> {
         let text = self.required_text(field, MAX_SHORT_FIELD_CHARS)?;
-        let short = text
-            .strip_prefix(['T', 't'])
-            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()));
-        if !(text.starts_with("task_") || short) || text.contains(char::is_whitespace) {
-            self.error(
-                field,
-                format!("`{text}` is not a work-item id; expected a `task_…` id or a short `T<n>` id"),
-            );
+        if let Some(problem) = work_item_ref_problem(&text) {
+            self.error(field, problem);
             return None;
         }
         Some(text)
+    }
+
+    /// Read the changes bound to the question's answers (see
+    /// [`boss_protocol::AnswerAction`]). Absent is the common case. Present,
+    /// they need a question to belong to, each must name one of its answers,
+    /// and every id must be a work-item id. `yes` / `no` are stored lowercase
+    /// so one question has one canonical form.
+    fn answer_actions(
+        &mut self,
+        question: Option<&boss_protocol::OperatorQuestion>,
+    ) -> Vec<boss_protocol::AnswerAction> {
+        let key = boss_protocol::ANSWER_ACTIONS_KEY;
+        let Some(value) = self.raw(key) else {
+            return Vec::new();
+        };
+        let mut actions = match serde_json::from_value::<Vec<boss_protocol::AnswerAction>>(value.clone()) {
+            Ok(actions) => actions,
+            Err(err) => {
+                self.error(key, format!("not a list of changes bound to answers: {err}"));
+                return Vec::new();
+            }
+        };
+        if actions.is_empty() {
+            return actions;
+        }
+        let Some(question) = question else {
+            self.error(key, "a change is bound to an answer, so it only accompanies a question");
+            return Vec::new();
+        };
+        if let Err(message) = boss_protocol::validate_answer_actions(&question.answer_type, &actions) {
+            self.error(key, message);
+            return Vec::new();
+        }
+        let mut valid = true;
+        for bound in &mut actions {
+            if question.answer_type == boss_protocol::OperatorAnswerType::YesNo {
+                bound.answer = bound.answer.to_ascii_lowercase();
+            }
+            for problem in bound.action.targets().into_iter().filter_map(work_item_ref_problem) {
+                self.error(key, problem);
+                valid = false;
+            }
+        }
+        if valid { actions } else { Vec::new() }
     }
 
     /// Read `field` as a canonical GitHub PR URL.

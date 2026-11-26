@@ -22,6 +22,7 @@
 //! reshuffling, to keep the split reviewable as a pure move, so some
 //! submodules are not strictly sorted yet.
 
+mod answer_actions;
 mod answer_labels;
 mod attachment;
 mod attention;
@@ -63,6 +64,7 @@ mod worker_tier;
 #[cfg(test)]
 mod tests;
 
+pub use answer_actions::*;
 pub use answer_labels::*;
 pub use attachment::*;
 pub use attention::*;

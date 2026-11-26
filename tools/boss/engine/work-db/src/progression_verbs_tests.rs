@@ -19,6 +19,9 @@ mod redispatch_pr;
 #[path = "progression_finished_revision_tests.rs"]
 mod finished_revisions;
 
+#[path = "progression_answer_action_tests.rs"]
+mod answer_actions;
+
 struct Fx {
     db: WorkDb,
     product: String,
@@ -1149,6 +1152,9 @@ fn done(fx: &Fx, run: &str, payload: serde_json::Value, key: &str) -> SubmitWork
         .unwrap()
 }
 
+/// A decision question (criterion 3): its answer informs the next run and binds
+/// no board change. A question that asks for an action is covered in
+/// `progression_answer_action_tests.rs`.
 fn question() -> serde_json::Value {
     json!({"text": "Merge this PR?", "answer_type": {"kind": "yes_no"}, "explanation": "Merging is human-only."})
 }
@@ -1292,7 +1298,7 @@ fn asking_parks_the_item_on_the_question_and_completes_the_run_as_asked() {
     let asked = done(
         &fx,
         &run,
-        json!({"outcome": "blocked", "summary": "Needs the owner", "question": question(), "criterion": "1"}),
+        json!({"outcome": "blocked", "summary": "Needs the owner", "question": question(), "criterion": "3"}),
         "ask",
     );
 
@@ -1310,7 +1316,7 @@ fn asking_parks_the_item_on_the_question_and_completes_the_run_as_asked() {
     );
     assert_eq!(
         boss_protocol::run_done_question_criterion(&asked.proposal.payload_json),
-        Some(boss_protocol::ProgressionQuestionCriterion::HumanOnlyAction)
+        Some(boss_protocol::ProgressionQuestionCriterion::HumanDecision)
     );
     let finished = fx.db.finish_progression_declared(&run).unwrap().unwrap();
     assert_eq!(
@@ -1341,7 +1347,7 @@ fn declaration_after_deadline_observation_still_parks_the_question() {
     let asked = done(
         &fx,
         &run,
-        json!({"outcome": "blocked", "summary": "Needs the owner", "question": question(), "criterion": "1"}),
+        json!({"outcome": "blocked", "summary": "Needs the owner", "question": question(), "criterion": "3"}),
         "ask",
     );
 
@@ -1359,7 +1365,7 @@ fn declaration_after_deadline_observation_still_parks_the_question() {
     );
     assert_eq!(
         boss_protocol::run_done_question_criterion(&asked.proposal.payload_json),
-        Some(boss_protocol::ProgressionQuestionCriterion::HumanOnlyAction)
+        Some(boss_protocol::ProgressionQuestionCriterion::HumanDecision)
     );
     let finished = fx
         .db
@@ -1389,7 +1395,7 @@ fn a_second_question_is_refused_while_one_is_open() {
     done(
         &fx,
         &first,
-        json!({"outcome": "blocked", "summary": "Ask", "question": question(), "criterion": "2"}),
+        json!({"outcome": "blocked", "summary": "Ask", "question": question(), "criterion": "3"}),
         "q1",
     );
     fx.db.finish_progression_declared(&first).unwrap();
@@ -1398,7 +1404,7 @@ fn a_second_question_is_refused_while_one_is_open() {
     let again = done(
         &fx,
         &second,
-        json!({"outcome": "blocked", "summary": "Ask", "question": question(), "criterion": "2"}),
+        json!({"outcome": "blocked", "summary": "Ask", "question": question(), "criterion": "3"}),
         "q2",
     );
 
@@ -1420,7 +1426,7 @@ fn the_owners_answer_returns_an_asked_pr_item_to_review_instead_of_failing() {
     done(
         &fx,
         &run,
-        json!({"outcome": "blocked", "summary": "Needs the owner", "question": question(), "criterion": "1"}),
+        json!({"outcome": "blocked", "summary": "Needs the owner", "question": question(), "criterion": "3"}),
         "ask",
     );
     fx.db.finish_progression_declared(&run).unwrap();
@@ -1463,7 +1469,7 @@ fn the_owners_answer_makes_the_item_a_candidate_at_once_instead_of_after_the_coo
     done(
         &fx,
         &run,
-        json!({"outcome": "blocked", "summary": "Needs the owner", "question": question(), "criterion": "1"}),
+        json!({"outcome": "blocked", "summary": "Needs the owner", "question": question(), "criterion": "3"}),
         "ask",
     );
     fx.db.finish_progression_declared(&run).unwrap();
@@ -1500,7 +1506,7 @@ fn an_answer_without_a_pr_returns_to_progression_without_an_ordinary_worker() {
     done(
         &fx,
         &run,
-        json!({"outcome": "blocked", "summary": "Needs the owner", "question": question(), "criterion": "1"}),
+        json!({"outcome": "blocked", "summary": "Needs the owner", "question": question(), "criterion": "3"}),
         "ask",
     );
     fx.db.finish_progression_declared(&run).unwrap();

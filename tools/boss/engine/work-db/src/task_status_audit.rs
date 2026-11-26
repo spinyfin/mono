@@ -113,6 +113,16 @@ pub(crate) mod abandon_cause {
         "finish_execution_run",
         "run finished and the caller marked the execution abandoned",
     );
+    pub(crate) const MOOT_CI_FIX_RETIRED: AbandonCause<'static> = AbandonCause::engine(
+        "moot_ci_fix_retired",
+        "retire_moot_pending_ci_fixes",
+        "CI-fix revision became moot before a worker started; its not-yet-live executions withdrawn before it was archived",
+    );
+    pub(crate) const OWNER_ANSWER_ARCHIVED_REVISION: AbandonCause<'static> = AbandonCause::engine(
+        "owner_answer_archived_revision",
+        "apply_bound_in_tx",
+        "the owner's answer archived the revision; its not-yet-live executions withdrawn before it was archived",
+    );
 }
 
 /// The task-field changes `boss task show` reports from the ledger: the two

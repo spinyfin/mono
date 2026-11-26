@@ -17,6 +17,11 @@ pub struct OperatorAnswerOutcome {
     /// the conflict revision it replaced), so the RPC layer can invalidate them.
     #[builder(default)]
     pub touched_work_item_ids: Vec<String>,
+    /// CI attempts the bound change retired with the revision it closed. The
+    /// RPC layer publishes their terminal state so the card's "ci failing"
+    /// badge is not left on a stale pending row.
+    #[builder(default)]
+    pub retired_ci_attempts: Vec<CiRemediation>,
     /// The task whose ready execution the answer wants dispatched immediately,
     /// like `bossctl agents launch`: through the global dispatch pause and
     /// focus mode. Set when the answer creates work (an architectural-mismatch

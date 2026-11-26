@@ -89,9 +89,9 @@ use sha2::{Digest, Sha256};
 pub(super) const MIGRATION_ID: &str = "20261110_1800_progression_ladder";
 
 /// The choices of the question the engine files, in the order the card shows them.
-pub const PARK_IT: &str = "Park it";
-pub const ARCHIVE_IT: &str = "Archive it";
-pub const KEEP_TRYING: &str = "Keep trying";
+pub const PARK_IT: &str = boss_protocol::LADDER_PARK_IT;
+pub const ARCHIVE_IT: &str = boss_protocol::LADDER_ARCHIVE_IT;
+pub const KEEP_TRYING: &str = boss_protocol::LADDER_KEEP_TRYING;
 
 /// The question the engine files. The reason is in the explanation, so the card
 /// reads the same whichever rung ran out.

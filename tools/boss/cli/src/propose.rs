@@ -595,8 +595,10 @@ pub(crate) struct RunDoneArgs {
 
     /// The options of a `multiple-choice` question, each a short single-line
     /// button label: two to six distinct, non-empty values, e.g.
-    /// `--choices "Merge now" "Wait for review"`. The kanban card shows one
-    /// button per option and the chosen option reaches the next run verbatim.
+    /// `--choices "Gradual" "All at once"`. The kanban card shows one button per
+    /// option and the chosen option reaches the next run verbatim. An option
+    /// names what happens when it is picked, never something the repo owner
+    /// would then have to do.
     #[arg(
         long,
         num_args = 1..,
@@ -613,6 +615,16 @@ pub(crate) struct RunDoneArgs {
     /// question so asking can be audited.
     #[arg(long, value_parser = ["1", "2", "3", "4"], requires = "question")]
     criterion: Option<String>,
+
+    /// Progression agents only: a board change the engine makes itself when
+    /// the owner picks an answer, as `<answer>=<change>`. `<answer>` is `yes`
+    /// or `no`, or the option label of a `multiple-choice` question, verbatim.
+    /// `<change>` is `archive-revision <id>`, `start <id>` or
+    /// `undepend <dependent-id> <prerequisite-id>`. Repeat the flag to bind a
+    /// change to more than one answer. An answer never leaves the owner a
+    /// board change to make: bind the change here and the engine makes it.
+    #[arg(long = "on-answer", value_name = "ANSWER=CHANGE", requires = "question")]
+    on_answer: Vec<String>,
 
     /// Labelled explanation source. Exactly one of `--explanation` /
     /// `--explanation-file` is required with `--answer-type`. Prefer
@@ -1020,6 +1032,11 @@ fn payload_for(command: ProposeCommand) -> Result<(ProposalKind, serde_json::Val
         ),
         ProposeCommand::Done(args) => {
             let criterion = args.criterion.clone();
+            let answer_actions = args
+                .on_answer
+                .iter()
+                .map(|flag| boss_protocol::AnswerAction::parse(flag).map_err(CliError::usage))
+                .collect::<Result<Vec<_>, _>>()?;
             let question = operator_question_from_flags(&args)?;
             let mut payload = serde_json::to_value(RunDoneProposalPayload {
                 queue_ci_evidence: read_queue_ci_evidence(args.queue_ci_evidence_file)?,
@@ -1033,6 +1050,16 @@ fn payload_for(command: ProposeCommand) -> Result<(ProposalKind, serde_json::Val
             // `boss_protocol::run_done_question_criterion`.
             if let (Some(criterion), Some(object)) = (criterion, payload.as_object_mut()) {
                 object.insert("criterion".to_owned(), serde_json::Value::String(criterion));
+            }
+            // So do the changes bound to answers; see
+            // `boss_protocol::run_done_answer_actions`.
+            if !answer_actions.is_empty()
+                && let Some(object) = payload.as_object_mut()
+            {
+                object.insert(
+                    boss_protocol::ANSWER_ACTIONS_KEY.to_owned(),
+                    serde_json::json!(answer_actions),
+                );
             }
             (ProposalKind::RunDone, payload, args.common.idempotency_key)
         }
@@ -1473,6 +1500,7 @@ fn flag_hint_for_field(kind: ProposalKind, field: &str) -> Option<&'static str> 
         (ProposalKind::Wait, "duration_secs") => Some("--duration"),
         (ProposalKind::Wait, "waiting_on") => Some("--waiting-on"),
         (ProposalKind::RunDone, "criterion") => Some("--criterion"),
+        (ProposalKind::RunDone, "answer_actions") => Some("--on-answer"),
         (ProposalKind::Revise, "brief") => Some("--brief / --brief-file"),
         (ProposalKind::Precursor, "name") => Some("--name"),
         (ProposalKind::Precursor, "brief") => Some("--brief / --brief-file"),
@@ -2278,11 +2306,17 @@ mod tests {
                 serde_json::json!({"reason": "merge_conflict"})
             )
         );
+        let revision = format!("T{}", 9);
         assert_eq!(
-            shape(&["archive-revision", "T9", "--reason", "dead; parent is green"]),
+            shape(&[
+                "archive-revision",
+                revision.as_str(),
+                "--reason",
+                "dead; parent is green"
+            ]),
             (
                 ProposalKind::ArchiveRevision,
-                serde_json::json!({"revision": "T9", "reason": "dead; parent is green"})
+                serde_json::json!({"revision": revision, "reason": "dead; parent is green"})
             )
         );
         assert_eq!(shape(&["unblock"]), (ProposalKind::Unblock, serde_json::json!({})));
@@ -2290,12 +2324,13 @@ mod tests {
 
     #[test]
     fn progression_verbs_reject_malformed_invocations() {
+        let missing_reason = format!("T{}", 1);
         for args in [
             vec!["revise", "--brief", "a", "--brief-file", "b.md"],
             vec!["precursor", "--brief", "no name"],
             vec!["depend"],
             vec!["clear-signal", "--reason", "worker_failed"],
-            vec!["archive-revision", "T1"],
+            vec!["archive-revision", missing_reason.as_str()],
             vec!["redispatch", "--brief-addendum", "a", "--brief-addendum-file", "b.md"],
         ] {
             let mut full = vec!["boss", "propose"];
@@ -2485,6 +2520,70 @@ mod tests {
         let mut full = vec!["boss", "propose"];
         full.extend(&out_of_range);
         assert!(Cli::try_parse_from(full).is_err());
+    }
+
+    #[test]
+    fn done_on_answer_binds_a_board_change_to_an_answer() {
+        let base = [
+            "done",
+            "--outcome",
+            "blocked",
+            "--summary",
+            "Needs the owner",
+            "--question",
+            "Skip the build-fix?",
+            "--answer-type",
+            "yes-no",
+            "--criterion",
+            "2",
+            "--explanation",
+            "Context:\nc\nYes:\nIt is skipped.\nNo:\nIt runs first.\nRecommendation:\nI recommend Yes because CI is green.",
+        ];
+        let revision = format!("T{}", 12);
+        let archive = format!("yes=archive-revision {revision}");
+        let start = format!("no=start {revision}");
+        let mut args = base.to_vec();
+        args.extend(["--on-answer", archive.as_str(), "--on-answer", start.as_str()]);
+        let (kind, payload, _) = payload_for(command_for(&args)).unwrap();
+        assert_eq!(kind, ProposalKind::RunDone);
+        let bound = boss_protocol::run_done_answer_actions(&payload.to_string()).unwrap();
+        assert_eq!(bound.len(), 2);
+        assert_eq!(bound[0].answer, "yes");
+        assert_eq!(
+            bound[0].action,
+            boss_protocol::OwnerAction::ArchiveRevision {
+                revision: revision.clone()
+            }
+        );
+        assert_eq!(
+            bound[1].action,
+            boss_protocol::OwnerAction::Start { item: revision.clone() }
+        );
+        // Without the flag the payload carries no key.
+        let (_, payload, _) = payload_for(command_for(&base)).unwrap();
+        assert!(payload.get(boss_protocol::ANSWER_ACTIONS_KEY).is_none());
+        // A change the engine cannot make is a usage error naming the ones it can.
+        let mut unknown = base.to_vec();
+        let delete = format!("yes=delete {revision}");
+        unknown.extend(["--on-answer", delete.as_str()]);
+        let error = payload_for(command_for(&unknown)).unwrap_err().to_string();
+        assert!(error.contains("archive-revision <id>"), "{error}");
+        // A change is bound to an answer, so it needs a question.
+        let start_only = format!("yes=start {revision}");
+        assert!(
+            Cli::try_parse_from([
+                "boss",
+                "propose",
+                "done",
+                "--outcome",
+                "delivered",
+                "--summary",
+                "s",
+                "--on-answer",
+                start_only.as_str()
+            ])
+            .is_err()
+        );
     }
 
     #[test]

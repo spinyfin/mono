@@ -832,6 +832,7 @@ impl WorkDb {
 
 // ---- module tree (see PR description for the split rationale) ----
 
+mod answer_actions;
 mod answer_agent_runs;
 mod attachments;
 mod attention_filing;
@@ -906,6 +907,8 @@ mod github_api_usage_db;
 mod github_merge_intents;
 mod merge_conflict_merging;
 mod merge_intent;
+mod moot_ci_fix;
+pub use moot_ci_fix::{MootCiFixReason, MootCiFixRetirement};
 mod operator_answer_outcome;
 mod operator_disposition;
 pub mod parking;

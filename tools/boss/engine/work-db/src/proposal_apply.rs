@@ -1180,6 +1180,10 @@ fn apply_run_done(
     {
         return Ok(ApplyDecision::Rejected(reason));
     }
+    // Every answer to a question has to do something: see `answer_actions`.
+    if let Some(reason) = super::answer_actions::refuse_question_shape(tx, &execution, &payload, payload_json)? {
+        return Ok(ApplyDecision::Rejected(reason));
+    }
 
     let stored_question = if let Some(question) = &payload.question {
         let asking = query_task(tx, &execution.work_item_id)?;

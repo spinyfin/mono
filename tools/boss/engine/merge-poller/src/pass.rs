@@ -543,6 +543,19 @@ pub async fn run_one_pass_tracked(
             Vec::new()
         }
     };
+    // Items held for an owner question with an active CI-fix. Probed only to
+    // retire a moot fix; never admitted to `sweep_one` (no merge, no new
+    // remediation). Included in `total` so an otherwise empty pass still runs.
+    let awaiting_answer = match work_db.list_chores_awaiting_operator_answer_with_active_ci_fix() {
+        Ok(items) => items,
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "merge poller: failed to list chores awaiting an owner answer with an active CI-fix",
+            );
+            Vec::new()
+        }
+    };
     // Late-PR candidates (Bug B recovery): terminal executions within
     // the last 60 min whose task is still `active` with no `pr_url`.
     // These arise from the double-spawn race where the orphan sweep
@@ -577,7 +590,8 @@ pub async fn run_one_pass_tracked(
         + pending_background_nudges.len()
         + stranded_ci_attempts.len()
         + stranded_blocked.len()
-        + late_pr_candidates.len();
+        + late_pr_candidates.len()
+        + awaiting_answer.len();
     // De-duplicate by work_item_id: a chore that's both pending and
     // blocked-on-CI (shouldn't happen but defensive) only gets one
     // probe per sweep.
@@ -630,6 +644,7 @@ pub async fn run_one_pass_tracked(
         stranded_ci_attempts = stranded_ci_attempts.len(),
         stranded_blocked = stranded_blocked.len(),
         late_pr_candidates = late_pr_candidates.len(),
+        awaiting_answer = awaiting_answer.len(),
         "merge poller: sweep started",
     );
     let mut outcome = SweepOutcome::default();
@@ -645,6 +660,7 @@ pub async fn run_one_pass_tracked(
         .chain(blocked_ci.iter())
         .chain(blocked_other.iter())
         .chain(stranded_blocked.iter())
+        .chain(awaiting_answer.iter())
         .map(|candidate| candidate.pr_url.clone())
         .filter(|url| probe_url_seen.insert(url.clone()))
         .collect();
@@ -679,6 +695,7 @@ pub async fn run_one_pass_tracked(
         .chain(blocked_ci.iter())
         .chain(blocked_other.iter())
         .chain(stranded_blocked.iter())
+        .chain(awaiting_answer.iter())
         .map(|candidate| candidate.pr_url.as_str())
         .collect();
     let crate::probe_tier::TieredProbe {
@@ -705,6 +722,23 @@ pub async fn run_one_pass_tracked(
     .await;
     let mut snapshot = ProbeSnapshot::at(results, taken_at);
     trace.finish_item();
+
+    // Retire a moot CI-fix on an item held for an owner question. The
+    // question's hold stays; these rows are not in `candidates`.
+    for candidate in &awaiting_answer {
+        if unwalked.contains(&candidate.pr_url) {
+            continue;
+        }
+        super::sweep::observe_awaiting_answer_for_moot_ci_fix(
+            work_db,
+            publisher,
+            host,
+            candidate,
+            &snapshot.results,
+            "full_sweep",
+        )
+        .await;
+    }
 
     // The pass's candidate walk, materialised so a mid-pass re-probe can be
     // scoped to the part of it that has not happened yet — see
