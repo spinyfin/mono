@@ -4,9 +4,9 @@ load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 exports_files(["Cargo.toml"])
 
 # The relay behind `boss-agent-host`. It knows nothing about what the lines
-# mean, so it carries no protocol dependency. Nothing links it yet except its
-# own binary and tests; widen the visibility when a consumer needs the
-# journal record type.
+# mean, so it carries no protocol dependency. It owns the journal record type,
+# which is the wire contract with the client, so the ACP client links it for
+# that one module.
 rust_library(
     name = "agent_host",
     srcs = glob(
@@ -17,7 +17,7 @@ rust_library(
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    visibility = ["//visibility:private"],
+    visibility = ["//tools/boss/acp_client:__pkg__"],
     deps = all_crate_deps(normal = True),
 )
 
@@ -54,8 +54,9 @@ rust_binary(
     deps = [":agent_host"] + all_crate_deps(normal = True),
 )
 
-# Test helper: a child that replays a recorded journal over stdio. Later
-# entries that need a scripted agent depend on it; widen the visibility then.
+# Test helper: a child that replays a recorded journal over stdio. Other tests
+# that need a scripted line-speaking agent can depend on it; widen the
+# visibility when one does.
 rust_binary(
     name = "boss-agent-host-scripted-child",
     testonly = True,

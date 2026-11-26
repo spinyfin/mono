@@ -1,7 +1,7 @@
 //! A line-speaking child that replays a recorded journal, for tests.
 //!
 //! ```text
-//! scripted-child <script.jsonl> [--delay-ms N] [--stderr TEXT] [--exit-code N]
+//! scripted-child <script.jsonl> [--delay-ms N] [--stdin-delay-ms N] [--stderr TEXT] [--exit-code N]
 //! ```
 //!
 //! The script is a journal as the host writes it: one JSON object per line
@@ -17,7 +17,9 @@
 //! So a `to_agent` record is a gate: a test controls when the child moves on
 //! by sending the line. When the script ends the child exits with
 //! `--exit-code` (default 0). `--stderr TEXT` prints one line to stderr
-//! before anything else.
+//! before anything else. `--stdin-delay-ms N` makes the child wait that long
+//! before its first read of stdin, so a test can leave a line unread in the
+//! pipe.
 //!
 //! The child speaks bytes and lines only, so it can stand in for any
 //! line-oriented agent; nothing here knows about ACP.
@@ -44,6 +46,7 @@ struct Step {
 struct Options {
     script: String,
     delay: Duration,
+    stdin_delay: Duration,
     stderr: Option<String>,
     exit_code: u8,
 }
@@ -54,6 +57,7 @@ fn parse_args() -> Result<Options, String> {
     let mut options = Options {
         script,
         delay: Duration::ZERO,
+        stdin_delay: Duration::ZERO,
         stderr: None,
         exit_code: 0,
     };
@@ -62,6 +66,9 @@ fn parse_args() -> Result<Options, String> {
         match flag.as_str() {
             "--delay-ms" => {
                 options.delay = Duration::from_millis(value.parse().map_err(|_| "bad --delay-ms")?);
+            }
+            "--stdin-delay-ms" => {
+                options.stdin_delay = Duration::from_millis(value.parse().map_err(|_| "bad --stdin-delay-ms")?);
             }
             "--stderr" => options.stderr = Some(value),
             "--exit-code" => options.exit_code = value.parse().map_err(|_| "bad --exit-code")?,
@@ -105,6 +112,7 @@ fn main() -> ExitCode {
     let mut stdin = stdin.lock();
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
+    let mut stdin_delay = options.stdin_delay;
     for step in steps {
         match step.dir {
             Dir::FromAgent => {
@@ -116,6 +124,7 @@ fn main() -> ExitCode {
                 }
             }
             Dir::ToAgent => {
+                std::thread::sleep(std::mem::take(&mut stdin_delay));
                 let mut got = String::new();
                 match stdin.read_line(&mut got) {
                     Ok(0) | Err(_) => {

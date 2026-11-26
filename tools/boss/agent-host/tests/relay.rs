@@ -30,6 +30,7 @@ fn script_line(dir: Direction, line: &str) -> String {
         ts_ms: 0,
         dir,
         line: line.to_owned(),
+        invalid: None,
     };
     serde_json::to_string(&record).unwrap()
 }
@@ -353,22 +354,102 @@ async fn output_written_just_before_the_child_exits_still_reaches_the_client() {
 }
 
 #[tokio::test]
-async fn a_second_host_does_not_take_a_live_hosts_socket() {
-    let host = Host::start(&[to_agent("go")], &[]).await;
-    let dir = tempfile::tempdir().unwrap();
+async fn a_second_host_does_not_take_a_live_hosts_socket_or_touch_its_journal() {
+    let host = Host::start(&[from_agent("one"), to_agent("go")], &[]).await;
+    host.wait_for_journal_len(1).await;
+    let before = std::fs::read(&host.journal).unwrap();
+
+    // The refused host is pointed at the live host's own journal.
     let result = run(Config {
         socket_path: host.socket.clone(),
-        journal_path: dir.path().join("other.jsonl"),
+        journal_path: host.journal.clone(),
         command: vec![helper("BOSS_AGENT_HOST_TEST_CHILD").into_os_string()],
     })
     .await;
     assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AddrInUse);
+    assert_eq!(
+        std::fs::read(&host.journal).unwrap(),
+        before,
+        "the journal is untouched"
+    );
 
-    // The live host is untouched.
+    // The live host is untouched: it replays what it had and keeps appending.
     let mut client = host.connect(1).await;
+    client.expect(1, Direction::FromAgent, "one").await;
     client.send("go").await;
-    client.expect(1, Direction::ToAgent, "go").await;
+    client.expect(2, Direction::ToAgent, "go").await;
+    assert_eq!(host.journal_records().len(), 2);
     assert_eq!(host.finish().await, 0);
+}
+
+#[tokio::test]
+async fn replacing_a_client_while_a_large_line_is_unread_by_the_child_keeps_lines_whole() {
+    // Far past a pipe buffer, and the child does not read for a while, so the
+    // write to its stdin is still pending when the client is replaced.
+    let big = "x".repeat(1 << 20);
+    let host = Host::start(
+        &[
+            from_agent("ready"),
+            to_agent(&big),
+            to_agent("small"),
+            from_agent("done"),
+        ],
+        &["--stdin-delay-ms", "700"],
+    )
+    .await;
+    let mut first = host.connect(1).await;
+    first.expect(1, Direction::FromAgent, "ready").await;
+    first.send(&big).await;
+    host.wait_for_journal_len(2).await;
+
+    let mut second = host.connect(1).await;
+    second.expect(1, Direction::FromAgent, "ready").await;
+    let record = second.next().await.unwrap();
+    assert_eq!(
+        (record.seq, record.dir, record.line.len()),
+        (2, Direction::ToAgent, big.len())
+    );
+    second.send("small").await;
+    // The scripted child exits 3 on any line that is not exactly the script's.
+    second.expect(3, Direction::ToAgent, "small").await;
+    second.expect(4, Direction::FromAgent, "done").await;
+    assert!(second.next().await.is_none());
+    assert_eq!(host.finish().await, 0, "the child read both lines whole");
+}
+
+#[tokio::test]
+async fn a_termination_signal_reaches_the_child_before_it_is_killed() {
+    let dir = tempfile::tempdir().unwrap();
+    let ready = dir.path().join("ready");
+    let cleaned = dir.path().join("cleaned");
+    let mut host = tokio::process::Command::new(helper("BOSS_AGENT_HOST_TEST_BIN"))
+        .arg("--socket")
+        .arg(dir.path().join("h.sock"))
+        .arg("--journal")
+        .arg(dir.path().join("wire.jsonl"))
+        .arg("--")
+        .args(["/bin/sh", "-c"])
+        .arg(format!(
+            "trap 'touch {cleaned:?}; exit 0' TERM; touch {ready:?}; while :; do sleep 0.1; done"
+        ))
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(STEP_TIMEOUT, async {
+        while !ready.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the child installs its handler");
+
+    // SAFETY: signalling a child process this test just spawned.
+    unsafe {
+        libc::kill(host.id().unwrap() as i32, libc::SIGTERM);
+    }
+    let status = tokio::time::timeout(STEP_TIMEOUT, host.wait()).await.unwrap().unwrap();
+    assert_eq!(status.code(), Some(128 + libc::SIGTERM));
+    assert!(cleaned.exists(), "the child's own handler ran");
 }
 
 #[tokio::test]

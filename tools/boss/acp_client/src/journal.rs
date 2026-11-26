@@ -19,40 +19,20 @@
 //! - `invalid` is absent for every ordinary record. When present it names why
 //!   the framer rejected the bytes: `invalid_utf8`, `too_long` or
 //!   `unterminated_at_eof`.
+//!
+//! The record shape is the wire contract with `boss-agent-host`, which
+//! journals the same stream on the far side of its socket, so it is defined
+//! once there (`boss_agent_host::journal`) and re-exported here.
 
-use std::fs::OpenOptions;
-use std::io::{self, BufRead, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::schema::RequestId;
 
-/// Which way a line travelled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Direction {
-    /// Client to agent.
-    ToAgent,
-    /// Agent to client.
-    FromAgent,
-}
-
-/// One journalled line.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WireRecord {
-    pub seq: u64,
-    pub ts_ms: u64,
-    pub dir: Direction,
-    pub line: String,
-    /// Why the received bytes were unusable, when `line` is only a preview.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub invalid: Option<String>,
-}
+pub use boss_agent_host::journal::{Direction, WireRecord, read_records};
 
 /// The single ordered writer of a journal.
 ///
@@ -77,13 +57,7 @@ impl Journal {
     /// Creates (or truncates) the journal file, readable by its owner only:
     /// the lines hold prompts, local paths and whatever the agent printed.
     pub fn create(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        Ok(Self::to_writer(file))
+        Ok(Self::to_writer(boss_agent_host::journal::create_private_file(path)?))
     }
 
     /// A journal over any sink. Each record is one `write_all`.
@@ -112,7 +86,7 @@ impl Journal {
         let seq = state.next_seq;
         let record = WireRecord {
             seq,
-            ts_ms: now_ms(),
+            ts_ms: boss_agent_host::journal::now_ms(),
             dir,
             line: line.to_owned(),
             invalid,
@@ -124,37 +98,6 @@ impl Journal {
         state.next_seq += 1;
         Ok(seq)
     }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-/// Reads a journal back. A final line that was cut off mid-write is ignored;
-/// any other unreadable line is an error.
-pub fn read_records(reader: impl BufRead) -> io::Result<Vec<WireRecord>> {
-    let mut records = Vec::new();
-    let mut lines = reader.lines().peekable();
-    while let Some(line) = lines.next() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<WireRecord>(&line) {
-            Ok(record) => records.push(record),
-            Err(_) if lines.peek().is_none() => break,
-            Err(error) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("journal record after seq {}: {error}", records.len()),
-                ));
-            }
-        }
-    }
-    Ok(records)
 }
 
 /// A request that the journal shows was published and never answered.

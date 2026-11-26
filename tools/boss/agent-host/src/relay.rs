@@ -11,6 +11,13 @@
 //! replay itself runs after the lock is released, so a slow client never
 //! holds up the child.
 //!
+//! Lines for the child take the same route. The journal append and the
+//! hand-off to the host's stdin writer task happen under the same lock, so
+//! the child reads lines in journal order. The write itself runs in that
+//! task, not in a connection's task: a connection that is replaced or fails
+//! part-way through a large line must not leave half of it in the child's
+//! pipe. The hand-off queue is unbounded for the reason below.
+//!
 //! The queue is unbounded on purpose. Bounding it would mean dropping or
 //! blocking, and the journal already holds everything: a client that cannot
 //! keep up costs memory in the host, not correctness. The client fixes a
@@ -70,7 +77,8 @@ struct Inner {
 /// State shared by the child pump, the accept loop and every connection.
 pub(crate) struct Relay {
     inner: Mutex<Inner>,
-    stdin: tokio::sync::Mutex<ChildStdin>,
+    /// Lines for the child, written by the task started in [`Relay::new`].
+    to_child: mpsc::UnboundedSender<String>,
     fatal: mpsc::UnboundedSender<io::Error>,
     journal_path: PathBuf,
 }
@@ -79,13 +87,15 @@ impl Relay {
     pub(crate) fn new(journal: Journal, stdin: ChildStdin) -> (Arc<Self>, mpsc::UnboundedReceiver<io::Error>) {
         let (fatal, fatal_rx) = mpsc::unbounded_channel();
         let journal_path = journal.path().to_path_buf();
+        let (to_child, to_child_rx) = mpsc::unbounded_channel();
+        tokio::spawn(write_to_child(stdin, to_child_rx));
         let relay = Arc::new(Self {
             inner: Mutex::new(Inner {
                 journal,
                 client: None,
                 next_client_id: 1,
             }),
-            stdin: tokio::sync::Mutex::new(stdin),
+            to_child,
             fatal,
             journal_path,
         });
@@ -101,6 +111,12 @@ impl Relay {
     /// A journal that cannot be written is fatal: a line delivered but not
     /// journalled could never be replayed, so the host stops instead.
     fn record(&self, dir: Direction, line: &str) -> io::Result<()> {
+        self.record_with(dir, line, |_| {})
+    }
+
+    /// [`Relay::record`], running `then` under the same lock once the line is
+    /// journalled, so whatever it does is ordered with the journal.
+    fn record_with(&self, dir: Direction, line: &str, then: impl FnOnce(&str)) -> io::Result<()> {
         let mut inner = self.lock();
         let appended = match inner.journal.append(dir, line) {
             Ok(appended) => appended,
@@ -116,11 +132,14 @@ impl Relay {
         {
             inner.client = None;
         }
+        then(line);
         Ok(())
     }
 
-    /// Reads the child's stdout to its end, journalling each line.
-    pub(crate) async fn pump_child_output(self: Arc<Self>, stdout: tokio::process::ChildStdout) {
+    /// Reads the child's stdout to its end, journalling each line. An error
+    /// means the journal could not be written, which the host treats as
+    /// fatal.
+    pub(crate) async fn pump_child_output(self: Arc<Self>, stdout: tokio::process::ChildStdout) -> io::Result<()> {
         let mut reader = BufReader::new(stdout);
         let mut buf = Vec::new();
         loop {
@@ -130,9 +149,7 @@ impl Relay {
                 // A final line the child never terminated is still a line
                 // the child sent.
                 Ok(_) => {
-                    if self.record(Direction::FromAgent, &decode_line(&buf)).is_err() {
-                        break;
-                    }
+                    self.record(Direction::FromAgent, &decode_line(&buf))?;
                 }
                 Err(err) => {
                     eprintln!("boss-agent-host: reading the child's output failed: {err}");
@@ -140,19 +157,19 @@ impl Relay {
                 }
             }
         }
+        Ok(())
     }
 
-    /// Journals a line from the client and writes it to the child.
+    /// Journals a line from the client and queues it for the child.
     ///
-    /// The journal append and the write to the child's stdin happen under
-    /// the stdin lock, so the journal's `to_agent` order is the order the
-    /// child read them in.
-    async fn send_to_child(&self, line: &str) -> io::Result<()> {
-        let mut stdin = self.stdin.lock().await;
-        self.record(Direction::ToAgent, line)?;
-        stdin.write_all(line.as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
-        stdin.flush().await
+    /// Nothing here waits on the child's pipe, so the caller being dropped
+    /// (its connection was replaced or died) cannot cut a line short.
+    fn send_to_child(&self, line: &str) -> io::Result<()> {
+        self.record_with(Direction::ToAgent, line, |line| {
+            // The writer task only ends once the child's stdin is gone; the
+            // child is exiting and the line has nowhere to go.
+            let _ = self.to_child.send(line.to_owned());
+        })
     }
 
     /// Serves one accepted connection until it ends, is replaced, or the
@@ -233,7 +250,7 @@ impl Relay {
                 Ok(0) | Err(_) => return,
                 Ok(_) if buf.last() != Some(&b'\n') => return,
                 Ok(_) => {
-                    if self.send_to_child(&decode_line(&buf)).await.is_err() {
+                    if self.send_to_child(&decode_line(&buf)).is_err() {
                         return;
                     }
                 }
@@ -251,6 +268,18 @@ impl Relay {
         {
             drop(queue);
             let _ = tokio::time::timeout(grace, closed).await;
+        }
+    }
+}
+
+/// The only writer of the child's stdin: whole lines, in the order they were
+/// queued, regardless of which connection (if any) queued them.
+async fn write_to_child(mut stdin: ChildStdin, mut lines: mpsc::UnboundedReceiver<String>) {
+    while let Some(line) = lines.recv().await {
+        let mut bytes = line.into_bytes();
+        bytes.push(b'\n');
+        if stdin.write_all(&bytes).await.is_err() || stdin.flush().await.is_err() {
+            return;
         }
     }
 }

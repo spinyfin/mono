@@ -44,6 +44,9 @@ pub struct WireRecord {
     pub ts_ms: u64,
     pub dir: Direction,
     pub line: String,
+    /// Why the received bytes were unusable, when `line` is only a preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalid: Option<String>,
 }
 
 /// A record just written: its decoded form and the exact bytes appended to
@@ -84,19 +87,19 @@ impl Journal {
     /// same place is that host's generation and is not appended to: its
     /// sequence numbers would collide with this one's.
     pub fn create(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        Ok(Self {
+        Ok(Self::over_file(path, create_private_file(path)?))
+    }
+
+    /// A journal that writes to `file`, which must be empty and is reported
+    /// as living at `path`.
+    pub(crate) fn over_file(path: &Path, file: File) -> Self {
+        Self {
             path: path.to_path_buf(),
             file,
             offsets: Vec::new(),
             len: 0,
             failed: false,
-        })
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -120,6 +123,7 @@ impl Journal {
             ts_ms: now_ms(),
             dir,
             line: line.to_owned(),
+            invalid: None,
         };
         let mut encoded = serde_json::to_vec(&record).map_err(io::Error::other)?;
         encoded.push(b'\n');
@@ -153,7 +157,18 @@ impl Journal {
     }
 }
 
-fn now_ms() -> u64 {
+/// Creates (or truncates) a journal file, readable by its owner only.
+pub fn create_private_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Wall-clock milliseconds since the Unix epoch.
+pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
@@ -167,13 +182,18 @@ pub fn read_records(reader: impl BufRead) -> io::Result<Vec<WireRecord>> {
     let mut lines = reader.lines().peekable();
     while let Some(line) = lines.next() {
         let line = line?;
-        if line.is_empty() {
+        if line.trim().is_empty() {
             continue;
         }
         match serde_json::from_str::<WireRecord>(&line) {
             Ok(record) => records.push(record),
             Err(_) if lines.peek().is_none() => break,
-            Err(err) => return Err(io::Error::new(io::ErrorKind::InvalidData, err)),
+            Err(err) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("journal record after seq {}: {err}", records.len()),
+                ));
+            }
         }
     }
     Ok(records)
@@ -245,6 +265,12 @@ mod tests {
     fn a_corrupt_record_before_the_end_is_an_error() {
         let bytes = b"not json\n{\"seq\":1,\"ts_ms\":1,\"dir\":\"to_agent\",\"line\":\"x\"}\n";
         assert!(read_records(bytes.as_slice()).is_err());
+    }
+
+    #[test]
+    fn whitespace_only_lines_are_skipped_on_read() {
+        let bytes = b"  \n{\"seq\":1,\"ts_ms\":1,\"dir\":\"to_agent\",\"line\":\"x\"}\n\t\n";
+        assert_eq!(read_records(bytes.as_slice()).unwrap().len(), 1);
     }
 
     #[test]

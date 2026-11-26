@@ -54,6 +54,10 @@ pub use relay::Handshake;
 /// the child's stdout open must not hold the host up.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
+/// How long a child that was sent a termination signal has to exit before the
+/// host kills it.
+const STOP_GRACE: Duration = Duration::from_secs(5);
+
 /// What to run and where to put the socket and journal.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -74,10 +78,18 @@ pub async fn run(config: Config) -> io::Result<i32> {
         .split_first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no child command given"))?;
 
-    let journal = journal::Journal::create(&config.journal_path)?;
-    // Bind before spawning, so a host that cannot be reached never starts a
-    // child nobody can talk to.
+    // Bind first. Binding is where a live host on this socket is refused, and
+    // the refused host must not have touched that host's journal. It also
+    // means a host that cannot be reached never starts a child nobody can
+    // talk to.
     let listener = bind_socket(&config.socket_path).await?;
+    let journal = match journal::Journal::create(&config.journal_path) {
+        Ok(journal) => journal,
+        Err(err) => {
+            let _ = std::fs::remove_file(&config.socket_path);
+            return Err(err);
+        }
+    };
     let result = run_bound(program, args, journal, listener).await;
     let _ = std::fs::remove_file(&config.socket_path);
     result
@@ -128,21 +140,41 @@ async fn run_bound(
             accept.abort();
             return Err(err);
         }
-        _ = sigterm.recv() => stop_child(&mut child, 15).await,
-        _ = sigint.recv() => stop_child(&mut child, 2).await,
-        _ = sighup.recv() => stop_child(&mut child, 1).await,
+        _ = sigterm.recv() => stop_child(&mut child, libc::SIGTERM).await,
+        _ = sigint.recv() => stop_child(&mut child, libc::SIGINT).await,
+        _ = sighup.recv() => stop_child(&mut child, libc::SIGHUP).await,
     };
 
     // Let the rest of the child's output reach the journal and the client
     // before the socket goes away.
-    let _ = tokio::time::timeout(DRAIN_GRACE, pump).await;
+    let pumped = tokio::time::timeout(DRAIN_GRACE, pump).await;
     accept.abort();
     relay.finish_client(DRAIN_GRACE).await;
+    // A journal that failed while draining means records are missing, so the
+    // child's status is not the whole story.
+    if let Ok(Ok(Err(err))) = pumped {
+        return Err(err);
+    }
+    if let Ok(err) = fatal.try_recv() {
+        return Err(err);
+    }
     Ok(code)
 }
 
+/// Forwards `signal_number` to the child so it can clean up (the Claude
+/// adapter runs its own child), and kills it if it has not exited after
+/// [`STOP_GRACE`]. Returns the exit code the host should use.
 async fn stop_child(child: &mut tokio::process::Child, signal_number: i32) -> i32 {
-    let _ = child.kill().await;
+    if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
+        // SAFETY: `kill` has no memory-safety preconditions; the pid is a
+        // child this process has not yet reaped, so it cannot be recycled.
+        unsafe {
+            libc::kill(pid, signal_number);
+        }
+    }
+    if tokio::time::timeout(STOP_GRACE, child.wait()).await.is_err() {
+        let _ = child.kill().await;
+    }
     128 + signal_number
 }
 
@@ -173,4 +205,27 @@ async fn bind_socket(path: &Path) -> io::Result<UnixListener> {
     };
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(listener)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A journal that cannot be written (its file is open read-only), over a
+    /// file in `dir`.
+    fn unwritable_journal(dir: &Path) -> journal::Journal {
+        let path = dir.join("wire.jsonl");
+        std::fs::write(&path, b"").unwrap();
+        journal::Journal::over_file(&path, std::fs::File::open(&path).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_journal_that_fails_while_the_child_output_is_drained_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = UnixListener::bind(dir.path().join("h.sock")).unwrap();
+        let program = OsString::from("/bin/sh");
+        let args = [OsString::from("-c"), OsString::from("echo hello")];
+        let result = run_bound(&program, &args, unwritable_journal(dir.path()), listener).await;
+        assert!(result.is_err(), "the child exited 0 but its output was not journalled");
+    }
 }
