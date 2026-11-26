@@ -24,6 +24,179 @@ struct ExecutionDriverRow {
     product_default_driver: Option<String>,
 }
 
+/// In-memory outcome after the batch (or single) lookups have been fetched.
+enum ResolvedDriverSlug {
+    Slug(Option<String>),
+    AnswerAgent { work_item_id: String },
+}
+
+fn claimed_worker_pool_driver(claimed_worker_id: Option<&str>) -> Option<String> {
+    claimed_worker_id
+        .and_then(boss_engine_storage_values::pool_policy::pool_dispatch_policy_for_worker_id)
+        .map(|policy| policy.driver.to_owned())
+}
+
+/// Task-bound half of [`WorkDb::get_execution_driver_slug`]: pool short-circuit,
+/// live pin, recorded allocation, then the ordinary default chain.
+fn resolve_task_bound_driver(
+    execution_id: &str,
+    claimed_worker_id: Option<&str>,
+    row: &ExecutionDriverRow,
+    allocation: Option<&DriverDecision>,
+) -> Result<String> {
+    let exec_kind: ExecutionKind = row.exec_kind_raw.parse().map_err(|err| {
+        anyhow::anyhow!(
+            "execution {execution_id} has unrecognised kind {:?}: {err}",
+            row.exec_kind_raw
+        )
+    })?;
+    // Before a worker slot is claimed, pool-bound kinds resolve to their home
+    // pool. Once a slot exists, the caller used its actual policy instead: a
+    // spill into an ordinary worker must honour the row's own driver.
+    if claimed_worker_id.is_none()
+        && let Some(pool_driver) =
+            boss_engine_storage_values::pool_policy::pool_driver_slug_for_execution_kind(&exec_kind)
+    {
+        return Ok(pool_driver.to_owned());
+    }
+
+    // Precedence: a LIVE explicit pin (`tasks.driver`, then
+    // `products.default_driver`) that clears the capability gate for this
+    // execution → the recorded traffic-allocation decision → the ordinary
+    // default resolution.
+    //
+    // The pins are read fresh rather than taken from the recorded decision on
+    // purpose. An operator can pin a driver on a row after its execution row
+    // already exists but before it dispatches, and that must still win when
+    // the gate accepts it — "an explicit driver on the row always wins" is
+    // about the row, not about the instant the execution was created.
+    // Allocation is revalidated at claim and launch composition (see
+    // `work::driver_allocation`). Hook reads use that saved decision so split
+    // changes do not reroute a running worker.
+    //
+    // A pin the gate refuses for this execution kind is dropped here exactly
+    // as at spawn: honouring it would point the events-socket normaliser at a
+    // driver the worker never ran.
+    //
+    // Design/Investigation tier rows are NOT exempted from pin honouring here:
+    // `decide_execution_driver` and `resolve_spawn_config_in` both honour a
+    // live `tasks.driver` / `products.default_driver` pin for tier rows too
+    // (subject to the same capability gate, plus — for a product default — a
+    // dedicated tier model, mirrored below via
+    // `driver_has_design_investigation_model`), so suppressing the pin here
+    // would point the events-socket normaliser at a driver the worker never
+    // ran on.
+    let task_kind: Option<TaskKind> = row.task_kind_raw.parse().ok();
+    let reasoning = row
+        .reasoning_raw
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse().ok());
+    let design_or_investigation_tier =
+        boss_engine_effort::is_design_or_investigation_tier(task_kind.as_ref(), reasoning);
+    let task_pin = row.task_driver.as_deref().filter(|s| !s.trim().is_empty());
+    let product_pin = row.product_default_driver.as_deref().filter(|s| !s.trim().is_empty());
+    let pinned = task_pin.or(product_pin);
+    if let Some(pinned) = pinned {
+        let from_task_pin = task_pin.is_some();
+        let honourable = pin_is_honourable(
+            pinned,
+            task_kind.as_ref(),
+            &exec_kind,
+            design_or_investigation_tier,
+            from_task_pin,
+        );
+        if honourable {
+            return Ok(pinned.to_owned());
+        }
+    }
+    // Only an `allocation` decision routes. An `explicit` one is an audit
+    // record of a pin that the branch above reads live, so honouring it here
+    // would resurrect a pin the operator removed.
+    if let Some(allocated) = allocation
+        .filter(|d| matches!(d.reason, REASON_ALLOCATION | REASON_LEGACY_PERCENTAGE))
+        .and_then(|d| d.driver.clone())
+    {
+        // Compatibility for workers launched before allocation revalidation:
+        // the old spawn resolver substituted the default for an allocated
+        // driver without a tier model. New launches persist an eligible
+        // allocation first.
+        if design_or_investigation_tier && !driver_has_design_investigation_model(&allocated) {
+            return Ok(boss_engine_effort::ENGINE_DEFAULT_DRIVER.to_owned());
+        }
+        return Ok(allocated);
+    }
+    // No honourable pin and no allocation (an ineligible row, a pin the gate
+    // refused, or an execution created before this feature landed) — resolves
+    // through the ordinary default chain. When a pin was dropped above it is
+    // deliberately not re-fed into `resolve_driver`, which would re-honour it.
+    let honourable_task = row.task_driver.as_deref().filter(|s| {
+        !s.trim().is_empty()
+            && task_kind
+                .as_ref()
+                .is_none_or(|tk| driver_clears_dispatch_gate(s, tk, &exec_kind))
+    });
+    let honourable_product = row.product_default_driver.as_deref().filter(|s| {
+        !s.trim().is_empty()
+            && task_kind
+                .as_ref()
+                .is_none_or(|tk| driver_clears_dispatch_gate(s, tk, &exec_kind))
+    });
+    Ok(boss_engine_effort::resolve_driver(honourable_task, honourable_product))
+}
+
+fn resolve_taskless_driver(
+    claimed_worker_id: Option<&str>,
+    kind: ExecutionKind,
+    work_item_id: String,
+    launched_driver: Option<String>,
+) -> ResolvedDriverSlug {
+    match kind {
+        ExecutionKind::AnswerAgent => ResolvedDriverSlug::AnswerAgent { work_item_id },
+        // Fixed driver pin, never resolved per-comment/per-product like
+        // `AnswerAgent` above: a `pr_review_guide` execution always
+        // dispatches on `codex` (the enforced Astra profile) or does not
+        // dispatch at all — see `resolve_review_guide_spawn_config`.
+        ExecutionKind::PrReviewGuide => ResolvedDriverSlug::Slug(Some("codex".to_owned())),
+        // A triage execution has no task row to supply a pin/allocation
+        // ladder. If it spilled into an ordinary worker, its frozen launch
+        // configuration is the only truthful driver source; do not reassert
+        // the automation pool's driver from provenance.
+        ExecutionKind::AutomationTriage if claimed_worker_id.is_some() => ResolvedDriverSlug::Slug(launched_driver),
+        // `automation_triage` binds to an `automations.id`, so the tasks join
+        // never matches. Its driver is still the automation pool's fixed pin
+        // — return that rather than `None`, which would drop every hook event
+        // the triage worker sends.
+        kind if claimed_worker_id.is_none()
+            && boss_engine_storage_values::pool_policy::kind_always_dispatches_on_pool_driver(&kind) =>
+        {
+            ResolvedDriverSlug::Slug(
+                boss_engine_storage_values::pool_policy::pool_driver_slug_for_execution_kind(&kind).map(str::to_owned),
+            )
+        }
+        _ => ResolvedDriverSlug::Slug(None),
+    }
+}
+
+fn driver_decision_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DriverDecision> {
+    let reason_raw: String = row.get(2)?;
+    let reason = match reason_raw.as_str() {
+        REASON_EXPLICIT => REASON_EXPLICIT,
+        REASON_ALLOCATION => REASON_ALLOCATION,
+        REASON_POOL => REASON_POOL,
+        REASON_LEGACY_PERCENTAGE => REASON_LEGACY_PERCENTAGE,
+        REASON_ALLOCATION_FAILED => REASON_ALLOCATION_FAILED,
+        _ => REASON_DEFAULT,
+    };
+    let split_raw: Option<String> = row.get(3)?;
+    Ok(DriverDecision {
+        model: row.get(4)?,
+        driver: row.get(1)?,
+        reason,
+        split_at_decision: split_raw.and_then(|raw| serde_json::from_str(&raw).ok()),
+    })
+}
+
 #[work_db_boundary::instrument]
 impl WorkDb {
     /// Resolve the driver slug for `execution_id`'s worker, applying the
@@ -78,12 +251,8 @@ impl WorkDb {
             return Ok(Some(member.requested_driver));
         }
         let claimed_worker_id = self.latest_run_agent_id_for_execution(execution_id)?;
-        if let Some(pool_driver) = claimed_worker_id
-            .as_deref()
-            .and_then(boss_engine_storage_values::pool_policy::pool_dispatch_policy_for_worker_id)
-            .map(|policy| policy.driver)
-        {
-            return Ok(Some(pool_driver.to_owned()));
+        if let Some(pool_driver) = claimed_worker_pool_driver(claimed_worker_id.as_deref()) {
+            return Ok(Some(pool_driver));
         }
         // Scoped so the pooled connection is released before the non-task-bound
         // fallback below, which re-enters `WorkDb` methods that take the same
@@ -113,116 +282,14 @@ impl WorkDb {
                     },
                 )
                 .optional()?;
-            if let Some(ExecutionDriverRow {
-                exec_kind_raw,
-                task_kind_raw,
-                task_driver,
-                reasoning_raw,
-                product_default_driver,
-            }) = row
-            {
-                let exec_kind: ExecutionKind = exec_kind_raw.parse().map_err(|err| {
-                    anyhow::anyhow!("execution {execution_id} has unrecognised kind {exec_kind_raw:?}: {err}")
-                })?;
-                // Before a worker slot is claimed, pool-bound kinds resolve
-                // to their home pool. Once a slot exists, the branch at the
-                // top of this method used its actual policy instead: a spill
-                // into an ordinary worker must honour the row's own driver.
-                if claimed_worker_id.is_none()
-                    && let Some(pool_driver) =
-                        boss_engine_storage_values::pool_policy::pool_driver_slug_for_execution_kind(&exec_kind)
-                {
-                    return Ok(Some(pool_driver.to_owned()));
-                }
-
-                // Precedence: a LIVE explicit pin (`tasks.driver`, then
-                // `products.default_driver`) that clears the capability gate
-                // for this execution → the recorded traffic-allocation
-                // decision → the ordinary default resolution.
-                //
-                // The pins are read fresh rather than taken from the recorded
-                // decision on purpose. An operator can pin a driver on a row
-                // after its execution row already exists but before it
-                // dispatches, and that must still win when the gate accepts
-                // it — "an explicit driver on the row always wins" is about
-                // the row, not about the instant the execution was created.
-                // Allocation is revalidated at claim and launch composition
-                // (see `work::driver_allocation`). Hook reads use that saved
-                // decision so split changes do not reroute a running worker.
-                //
-                // A pin the gate refuses for this execution kind is dropped
-                // here exactly as at spawn: honouring it would point the
-                // events-socket normaliser at a driver the worker never ran.
-                //
-                // Design/Investigation tier rows are NOT exempted from pin
-                // honouring here: `decide_execution_driver` and
-                // `resolve_spawn_config_in` both honour a live `tasks.driver`
-                // / `products.default_driver` pin for tier rows too (subject
-                // to the same capability gate, plus — for a product default —
-                // a dedicated tier model, mirrored below via
-                // `driver_has_design_investigation_model`), so suppressing
-                // the pin here would point the events-socket normaliser at a
-                // driver the worker never ran on.
-                let task_kind: Option<TaskKind> = task_kind_raw.parse().ok();
-                let reasoning = reasoning_raw
-                    .as_deref()
-                    .filter(|value| !value.is_empty())
-                    .and_then(|value| value.parse().ok());
-                let design_or_investigation_tier =
-                    boss_engine_effort::is_design_or_investigation_tier(task_kind.as_ref(), reasoning);
-                let task_pin = task_driver.as_deref().filter(|s| !s.trim().is_empty());
-                let product_pin = product_default_driver.as_deref().filter(|s| !s.trim().is_empty());
-                let pinned = task_pin.or(product_pin);
-                if let Some(pinned) = pinned {
-                    let from_task_pin = task_pin.is_some();
-                    let honourable = pin_is_honourable(
-                        pinned,
-                        task_kind.as_ref(),
-                        &exec_kind,
-                        design_or_investigation_tier,
-                        from_task_pin,
-                    );
-                    if honourable {
-                        return Ok(Some(pinned.to_owned()));
-                    }
-                }
-                // Only an `allocation` decision routes. An `explicit` one is an
-                // audit record of a pin that the branch above reads live, so
-                // honouring it here would resurrect a pin the operator removed.
-                if let Some(allocated) = get_execution_driver_decision_conn(&conn, execution_id)?
-                    .filter(|d| matches!(d.reason, REASON_ALLOCATION | REASON_LEGACY_PERCENTAGE))
-                    .and_then(|d| d.driver)
-                {
-                    // Compatibility for workers launched before allocation
-                    // revalidation: the old spawn resolver substituted the
-                    // default for an allocated driver without a tier model.
-                    // New launches persist an eligible allocation first.
-                    if design_or_investigation_tier && !driver_has_design_investigation_model(&allocated) {
-                        return Ok(Some(boss_engine_effort::ENGINE_DEFAULT_DRIVER.to_owned()));
-                    }
-                    return Ok(Some(allocated));
-                }
-                // No honourable pin and no allocation (an ineligible row, a
-                // pin the gate refused, or an execution created before this
-                // feature landed) — resolves through the ordinary default
-                // chain. When a pin was dropped above it is deliberately not
-                // re-fed into `resolve_driver`, which would re-honour it.
-                let honourable_task = task_driver.as_deref().filter(|s| {
-                    !s.trim().is_empty()
-                        && task_kind
-                            .as_ref()
-                            .is_none_or(|tk| driver_clears_dispatch_gate(s, tk, &exec_kind))
-                });
-                let honourable_product = product_default_driver.as_deref().filter(|s| {
-                    !s.trim().is_empty()
-                        && task_kind
-                            .as_ref()
-                            .is_none_or(|tk| driver_clears_dispatch_gate(s, tk, &exec_kind))
-                });
-                return Ok(Some(boss_engine_effort::resolve_driver(
-                    honourable_task,
-                    honourable_product,
-                )));
+            if let Some(row) = row {
+                let allocation = get_execution_driver_decision_conn(&conn, execution_id)?;
+                return Ok(Some(resolve_task_bound_driver(
+                    execution_id,
+                    claimed_worker_id.as_deref(),
+                    &row,
+                    allocation.as_ref(),
+                )?));
             }
 
             // No `tasks` row. Either the execution does not exist at all, or it
@@ -233,32 +300,203 @@ impl WorkDb {
         let Some((kind, work_item_id, launched_driver)) = binding else {
             return Ok(None);
         };
-        match kind {
-            ExecutionKind::AnswerAgent => Ok(Some(self.answer_agent_driver_slug(&work_item_id))),
-            // Fixed driver pin, never resolved per-comment/per-product like
-            // `AnswerAgent` above: a `pr_review_guide` execution always
-            // dispatches on `codex` (the enforced Astra profile) or does not
-            // dispatch at all — see `resolve_review_guide_spawn_config`.
-            ExecutionKind::PrReviewGuide => Ok(Some("codex".to_owned())),
-            // A triage execution has no task row to supply a pin/allocation
-            // ladder. If it spilled into an ordinary worker, its frozen
-            // launch configuration is the only truthful driver source; do
-            // not reassert the automation pool's driver from provenance.
-            ExecutionKind::AutomationTriage if claimed_worker_id.is_some() => Ok(launched_driver),
-            // `automation_triage` binds to an `automations.id`, so the tasks
-            // join above never matches. Its driver is still the automation
-            // pool's fixed pin — return that rather than `None`, which would
-            // drop every hook event the triage worker sends.
-            kind if claimed_worker_id.is_none()
-                && boss_engine_storage_values::pool_policy::kind_always_dispatches_on_pool_driver(&kind) =>
-            {
-                Ok(
-                    boss_engine_storage_values::pool_policy::pool_driver_slug_for_execution_kind(&kind)
-                        .map(str::to_owned),
-                )
-            }
-            _ => Ok(None),
+        match resolve_taskless_driver(claimed_worker_id.as_deref(), kind, work_item_id, launched_driver) {
+            ResolvedDriverSlug::Slug(slug) => Ok(slug),
+            ResolvedDriverSlug::AnswerAgent { work_item_id } => Ok(Some(self.answer_agent_driver_slug(&work_item_id))),
         }
+    }
+
+    /// Resolve drivers for many executions in a handful of queries rather than
+    /// one [`Self::get_execution_driver_slug`] round-trip each. Same precedence
+    /// as the single-id path. An unrecognised `kind` on one row is logged and
+    /// recorded as `None` so a single bad execution cannot fail a usage window.
+    pub(crate) fn get_execution_driver_slugs_lenient(
+        &self,
+        execution_ids: &[&str],
+    ) -> Result<HashMap<String, Option<String>>> {
+        let mut unique: Vec<&str> = execution_ids.iter().copied().filter(|id| !id.is_empty()).collect();
+        unique.sort_unstable();
+        unique.dedup();
+        if unique.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let id_json = query_ensure::id_array(&unique);
+
+        let mut review_drivers: HashMap<String, String> = HashMap::new();
+        let mut claimed_agents: HashMap<String, Option<String>> = HashMap::new();
+        let mut task_bound: HashMap<String, ExecutionDriverRow> = HashMap::new();
+        let mut taskless: HashMap<String, (String, String, Option<String>)> = HashMap::new();
+        let mut decisions: HashMap<String, DriverDecision> = HashMap::new();
+
+        {
+            let conn = self.connect()?;
+            let mut stmt = conn.prepare(
+                "SELECT execution_id, requested_driver
+                 FROM pr_review_batch_members
+                 WHERE execution_id IN (SELECT value FROM json_each(?1))",
+            )?;
+            let rows = stmt.query_map([&id_json], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, driver) = row?;
+                review_drivers.insert(id, driver);
+            }
+
+            let mut stmt = conn.prepare(
+                "SELECT execution_id, agent_id FROM (
+                     SELECT execution_id, agent_id,
+                            ROW_NUMBER() OVER (
+                              PARTITION BY execution_id
+                              ORDER BY
+                                CASE WHEN finished_at IS NULL THEN 0 ELSE 1 END,
+                                CASE WHEN status = 'failed' THEN 1 ELSE 0 END,
+                                CASE WHEN transcript_path IS NOT NULL THEN 0 ELSE 1 END,
+                                created_at DESC,
+                                id DESC
+                            ) AS rn
+                     FROM work_runs
+                     WHERE execution_id IN (SELECT value FROM json_each(?1))
+                 )
+                 WHERE rn = 1",
+            )?;
+            let rows = stmt.query_map([&id_json], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            for row in rows {
+                let (id, agent_id) = row?;
+                claimed_agents.insert(id, agent_id);
+            }
+
+            let mut stmt = conn.prepare(
+                "SELECT e.id, e.kind, t.kind, t.driver, t.reasoning, p.default_driver,
+                        e.work_item_id, e.driver
+                   FROM work_executions e
+                   LEFT JOIN tasks t ON t.id = e.work_item_id
+                   LEFT JOIN products p ON p.id = t.product_id
+                  WHERE e.id IN (SELECT value FROM json_each(?1))",
+            )?;
+            let rows = stmt.query_map([&id_json], |row| {
+                let id: String = row.get(0)?;
+                let exec_kind_raw: String = row.get(1)?;
+                let task_kind_raw: Option<String> = row.get(2)?;
+                let task_driver: Option<String> = row.get(3)?;
+                let reasoning_raw: Option<String> = row.get(4)?;
+                let product_default_driver: Option<String> = row.get(5)?;
+                let work_item_id: String = row.get(6)?;
+                let launched_driver: Option<String> = row.get(7)?;
+                Ok((
+                    id,
+                    exec_kind_raw,
+                    task_kind_raw,
+                    task_driver,
+                    reasoning_raw,
+                    product_default_driver,
+                    work_item_id,
+                    launched_driver,
+                ))
+            })?;
+            for row in rows {
+                let (
+                    id,
+                    exec_kind_raw,
+                    task_kind_raw,
+                    task_driver,
+                    reasoning_raw,
+                    product_default_driver,
+                    work_item_id,
+                    launched_driver,
+                ) = row?;
+                if let Some(task_kind_raw) = task_kind_raw {
+                    task_bound.insert(
+                        id,
+                        ExecutionDriverRow {
+                            exec_kind_raw,
+                            task_kind_raw,
+                            task_driver,
+                            reasoning_raw,
+                            product_default_driver,
+                        },
+                    );
+                } else {
+                    taskless.insert(id, (exec_kind_raw, work_item_id, launched_driver));
+                }
+            }
+
+            let mut stmt = conn.prepare(
+                "SELECT execution_id, driver, reason, split_at_decision, model
+                   FROM execution_driver_decisions
+                  WHERE execution_id IN (SELECT value FROM json_each(?1))",
+            )?;
+            let rows = stmt.query_map([&id_json], |row| {
+                let id: String = row.get(0)?;
+                Ok((id, driver_decision_from_row(row)?))
+            })?;
+            for row in rows {
+                let (id, decision) = row?;
+                decisions.insert(id, decision);
+            }
+        }
+
+        let mut out: HashMap<String, Option<String>> = HashMap::with_capacity(unique.len());
+        let mut answer_agents: Vec<(String, String)> = Vec::new();
+        for id in unique {
+            if let Some(driver) = review_drivers.get(id) {
+                out.insert(id.to_owned(), Some(driver.clone()));
+                continue;
+            }
+            let claimed = claimed_agents.get(id).and_then(|v| v.as_deref());
+            if let Some(pool_driver) = claimed_worker_pool_driver(claimed) {
+                out.insert(id.to_owned(), Some(pool_driver));
+                continue;
+            }
+            if let Some(row) = task_bound.get(id) {
+                match resolve_task_bound_driver(id, claimed, row, decisions.get(id)) {
+                    Ok(slug) => {
+                        out.insert(id.to_owned(), Some(slug));
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            execution_id = %id,
+                            error = %format!("{err:#}"),
+                            "failed to resolve driver for usage report execution; leaving unknown"
+                        );
+                        out.insert(id.to_owned(), None);
+                    }
+                }
+                continue;
+            }
+            let Some((kind_raw, work_item_id, launched_driver)) = taskless.remove(id) else {
+                out.insert(id.to_owned(), None);
+                continue;
+            };
+            let kind: ExecutionKind = match kind_raw.parse() {
+                Ok(kind) => kind,
+                Err(err) => {
+                    tracing::warn!(
+                        execution_id = %id,
+                        error = %format!(
+                            "execution {id} has unrecognised kind {kind_raw:?}: {err}"
+                        ),
+                        "failed to resolve driver for usage report execution; leaving unknown"
+                    );
+                    out.insert(id.to_owned(), None);
+                    continue;
+                }
+            };
+            match resolve_taskless_driver(claimed, kind, work_item_id, launched_driver) {
+                ResolvedDriverSlug::Slug(slug) => {
+                    out.insert(id.to_owned(), slug);
+                }
+                ResolvedDriverSlug::AnswerAgent { work_item_id } => {
+                    answer_agents.push((id.to_owned(), work_item_id));
+                }
+            }
+        }
+        for (id, comment_id) in answer_agents {
+            out.insert(id, Some(self.answer_agent_driver_slug(&comment_id)));
+        }
+        Ok(out)
     }
 
     /// The driver slug an `answer_agent` execution's worker was spawned with,
@@ -781,5 +1019,44 @@ mod tests {
             db.get_execution_driver_slug(&execution.id).unwrap().as_deref(),
             Some("claude"),
         );
+    }
+
+    #[test]
+    fn batched_lookup_matches_single_id_lookup_for_mixed_executions() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        db.update_work_item(
+            &product.id,
+            WorkItemPatch {
+                default_driver: Some("codex".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let chore = create_test_chore(&db, &product.id, "pinned chore");
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                driver: Some("copilot".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let pinned = create_ready_chore_execution(&db, &chore.id);
+        let defaulted_chore = create_test_chore(&db, &product.id, "product default chore");
+        let defaulted = create_ready_chore_execution(&db, &defaulted_chore.id);
+        let answer = answer_agent_execution(&db, &product.id);
+        let missing = "exec_missing";
+
+        let ids = [pinned.id.as_str(), defaulted.id.as_str(), answer.as_str(), missing];
+        let batch = db.get_execution_driver_slugs_lenient(&ids).unwrap();
+        for id in ids {
+            let single = db.get_execution_driver_slug(id).unwrap();
+            assert_eq!(
+                batch.get(id).cloned().flatten(),
+                single,
+                "batch and single lookup must agree for {id}"
+            );
+        }
     }
 }

@@ -37,14 +37,26 @@ pub const DEFAULT_RUN_CAP: u32 = 5_000;
 /// Grouping depth the reply shape supports: the outer level and one subgroup level.
 pub const MAX_GROUP_LEVELS: usize = 2;
 
-/// Note codes on [`UsageCoverage::notes`].
+/// Note codes on [`UsageCoverage::notes`] and [`boss_protocol::UsageSeriesCoverage::notes`].
 pub mod note {
     /// The window starts before per-run token capture began.
     pub const CAPTURE_STARTED: &str = "capture_started";
-    /// The window starts before the failed-execution retention bound.
+    /// A grouped dimension or derived metric (`tasks.completed_at`) only has
+    /// meaningful history starting at `epoch_s`.
+    pub const DIMENSION_STARTED: &str = "dimension_started";
+    /// The window starts before the never-started-execution retention bound.
     pub const RETENTION_BOUNDED: &str = "retention_bounded";
     /// A USD estimate left some models out.
     pub const PRICING_GAPS: &str = "pricing_gaps";
+    /// The engine coarsened the requested or default bucket width to stay
+    /// within the reply cell cap.
+    pub const BUCKET_COARSENED: &str = "bucket_coarsened";
+    /// The coarsest bucket width still produces more cells than the cap;
+    /// every fact is kept and this note says the grid is over cap.
+    pub const CELL_CAP_EXCEEDED: &str = "cell_cap_exceeded";
+    /// One or more measured runs lacked `agent_active_ms` (e.g. Grok) and were
+    /// excluded from both numerator and denominator of `tokens_per_active_hour`.
+    pub const ACTIVE_TIME_MISSING: &str = "active_time_missing";
 }
 
 /// What a rows request asks for, plus the engine constants the report
@@ -56,8 +68,10 @@ pub struct UsageRowsQuery {
     pub generated_at_epoch_s: i64,
     /// Before this instant no run has token data (`TOKEN_CAPTURE_START_EPOCH_S`).
     pub capture_start_epoch_s: i64,
-    /// The age past which failed, abandoned, orphaned and cancelled
-    /// executions are pruned (`DEFAULT_RETENTION_MAX_AGE_SECS`).
+    /// The age past which never-started failed, abandoned, orphaned and
+    /// cancelled executions become eligible for pruning
+    /// (`DEFAULT_RETENTION_MAX_AGE_SECS`); executions with a worker run are
+    /// kept.
     pub retention_max_age_secs: i64,
     #[builder(default)]
     pub filters: Vec<UsageFilter>,
@@ -217,7 +231,7 @@ fn spend_class_buckets(runs: &[&RunFacts<'_>]) -> Vec<CostBucket> {
 /// filters on the same dimension union their values (OR within one
 /// dimension), matching the wire contract and a client that sends one chip
 /// row per value. Distinct dimensions still AND.
-fn compile_filters(filters: &[UsageFilter]) -> Vec<(UsageDimension, HashSet<&str>)> {
+pub(crate) fn compile_filters(filters: &[UsageFilter]) -> Vec<(UsageDimension, HashSet<&str>)> {
     let mut by_dimension: BTreeMap<UsageDimension, HashSet<&str>> = BTreeMap::new();
     for filter in filters {
         if filter.values.is_empty() {
@@ -231,7 +245,7 @@ fn compile_filters(filters: &[UsageFilter]) -> Vec<(UsageDimension, HashSet<&str
     by_dimension.into_iter().collect()
 }
 
-fn passes_filters(
+pub(crate) fn passes_filters(
     facts: &RunFacts<'_>,
     filters: &[(UsageDimension, HashSet<&str>)],
     skip: Option<UsageDimension>,
@@ -277,7 +291,7 @@ fn dimension_values(
 /// Distinct models a requested USD estimate left out, among measured runs.
 /// Subscription-billed drivers (`subscription_unpriced`) are excluded by driver
 /// rather than a pricing gap, so they are omitted.
-fn pricing_gaps(runs: &[&RunFacts<'_>]) -> BTreeSet<String> {
+pub(crate) fn pricing_gaps(runs: &[&RunFacts<'_>]) -> BTreeSet<String> {
     runs.iter()
         .filter(|facts| {
             facts.coverage != RunCoverage::Unmeasured
@@ -312,7 +326,7 @@ fn coverage(query: &UsageRowsQuery, runs: &[&RunFacts<'_>], gaps: &BTreeSet<Stri
         notes.push(UsageNote {
             code: note::RETENTION_BOUNDED.to_owned(),
             detail: format!(
-                "the window starts more than {} days ago; failed, abandoned, orphaned and cancelled executions older than that are pruned, so older ranges undercount them",
+                "the window starts more than {} days ago; never-started failed, abandoned, orphaned and cancelled executions older than that are pruned past a per-work-item floor, so older ranges can undercount those never-started rows. Executions that had a worker run are retained",
                 query.retention_max_age_secs / 86_400
             ),
         });

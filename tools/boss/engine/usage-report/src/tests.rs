@@ -591,6 +591,19 @@ fn report_notes_name_the_capture_boundary_the_retention_bound_and_pricing_gaps()
     assert!(old.spans_capture_boundary);
     let codes: Vec<&str> = old.coverage.notes.iter().map(|n| n.code.as_str()).collect();
     assert_eq!(codes, ["capture_started", "retention_bounded", "pricing_gaps"]);
+    let retention = old
+        .coverage
+        .notes
+        .iter()
+        .find(|n| n.code == "retention_bounded")
+        .unwrap();
+    assert!(
+        retention.detail.contains("never-started")
+            && retention.detail.contains("per-work-item floor")
+            && retention.detail.contains("worker run"),
+        "{}",
+        retention.detail
+    );
     assert_eq!(old.pricing_gaps, ["<synthetic>"]);
 
     let recent = build(&query(now - DAY, now), &records(vec![], vec![]));

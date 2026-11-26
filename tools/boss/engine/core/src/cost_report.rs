@@ -189,6 +189,12 @@ pub mod sol {
 /// can be flagged rather than silently under-reported.
 pub const TOKEN_CAPTURE_START_EPOCH_S: i64 = 1_785_144_180;
 
+/// 2026-06-30T07:40:32Z (PR #1667) — when `tasks.completed_at` went live.
+/// Tasks that were already terminal when the column was added were backfilled
+/// with `created_at`, so `tokens_per_completed_task` is only meaningful from
+/// this instant forward.
+pub const COMPLETED_AT_MIGRATION_EPOCH_S: i64 = 1_782_805_232;
+
 pub use boss_engine_storage_values::{CostRunRecord, CostRunRecordBuilder};
 
 const NO_VALUE_LABEL: &str = "(none)";

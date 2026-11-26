@@ -6,8 +6,8 @@
 //! to re-derive one.
 
 use boss_protocol::{
-    DRIVER_SLUG_AGY, DRIVER_SLUG_CLAUDE, DRIVER_SLUG_CODEX, DRIVER_SLUG_GROK, ExecutionKind, InputConvention,
-    RunCoverage, SpendClass, TokenClasses, UsageCaveat, UsageDimension,
+    DRIVER_SLUG_AGY, DRIVER_SLUG_CLAUDE, DRIVER_SLUG_CODEX, DRIVER_SLUG_GROK, DriverSource, ExecutionKind,
+    InputConvention, RunCoverage, SpendClass, TokenClasses, UsageCaveat, UsageDimension,
 };
 
 pub(crate) use crate::fold::UsdOutcome;
@@ -143,8 +143,14 @@ pub(crate) fn classify<'a>(rec: &'a UsageRunRecord, task: Option<&'a UsageTaskRe
 
 /// Populates pricing and caveats on a run that survived filtering and the cap.
 pub(crate) fn finalize_kept(facts: &mut RunFacts<'_>, ctx: &ClassifyContext<'_>) {
-    facts.usd = price_run(facts.rec, facts.driver, facts.coverage, facts.convention, ctx.pricer);
+    price_if_requested(facts, ctx);
     facts.caveats = caveats(facts, ctx);
+}
+
+/// Prices a run when the caller requested USD. The series path uses this
+/// without attaching per-run caveat detail strings.
+pub(crate) fn price_if_requested(facts: &mut RunFacts<'_>, ctx: &ClassifyContext<'_>) {
+    facts.usd = price_run(facts.rec, facts.driver, facts.coverage, facts.convention, ctx.pricer);
 }
 
 /// The execution kind's spend class. The match is exhaustive over
@@ -266,55 +272,67 @@ fn price_run(
     }
 }
 
-fn caveats(facts: &RunFacts<'_>, ctx: &ClassifyContext<'_>) -> Vec<UsageCaveat> {
+/// Single source of truth for per-run caveat predicates. Detail strings are
+/// computed lazily so callers that only need caveat codes (such as
+/// `build_usage_series_report`) avoid per-run allocations without duplicating
+/// any predicate.
+fn visit_caveats(
+    facts: &RunFacts<'_>,
+    ctx: &ClassifyContext<'_>,
+    mut visit: impl FnMut(&'static str, &dyn Fn() -> Option<String>),
+) {
     let rec = facts.rec;
     let measured = facts.coverage != RunCoverage::Unmeasured;
-    let mut out = Vec::new();
-    let mut push = |code: &str, detail: Option<String>| {
-        out.push(UsageCaveat {
-            code: code.to_owned(),
-            detail,
-        })
-    };
 
     if rec.run_created_at_epoch_s < ctx.capture_start_epoch_s {
-        push(caveat::PRE_CAPTURE, None);
+        visit(caveat::PRE_CAPTURE, &|| None);
     }
     if facts.driver.is_none() {
-        push(caveat::DRIVER_NOT_RECORDED, None);
+        visit(caveat::DRIVER_NOT_RECORDED, &|| None);
     }
     if measured && facts.convention == InputConvention::Gross {
-        push(caveat::GROSS_INPUT, None);
+        visit(caveat::GROSS_INPUT, &|| None);
     }
     if measured && facts.driver == Some(DRIVER_SLUG_CLAUDE) {
-        push(caveat::SUBAGENTS_EXCLUDED, None);
+        visit(caveat::SUBAGENTS_EXCLUDED, &|| None);
     }
     if rec.run_model.as_deref() == Some(SYNTHETIC_MODEL) {
-        push(caveat::SYNTHETIC_MODEL, rec.execution_model.clone());
+        visit(caveat::SYNTHETIC_MODEL, &|| rec.execution_model.clone());
     }
     if rec.run_model.is_none() && rec.execution_model.is_some() {
-        push(caveat::MODEL_FROM_LAUNCH_TUPLE, rec.execution_model.clone());
+        visit(caveat::MODEL_FROM_LAUNCH_TUPLE, &|| rec.execution_model.clone());
     }
     if facts.coverage == RunCoverage::Partial {
-        let missing: Vec<&str> = run_tokens(rec)
-            .classes()
-            .into_iter()
-            .filter(|(_, value)| value.is_none())
-            .map(|(name, _)| name)
-            .collect();
-        push(
-            caveat::TOKENS_PARTIAL,
-            Some(format!("not reported: {}", missing.join(", "))),
-        );
+        visit(caveat::TOKENS_PARTIAL, &|| {
+            let missing: Vec<&str> = run_tokens(rec)
+                .classes()
+                .into_iter()
+                .filter(|(_, value)| value.is_none())
+                .map(|(name, _)| name)
+                .collect();
+            Some(format!("not reported: {}", missing.join(", ")))
+        });
     }
     if let Some(reason) = &rec.usage_unavailable {
-        push(caveat::USAGE_UNAVAILABLE, Some(reason.clone()));
+        visit(caveat::USAGE_UNAVAILABLE, &|| Some(reason.clone()));
     }
     match facts.usd {
-        UsdOutcome::Estimate(_) => push(caveat::ESTIMATE_ONLY, None),
-        UsdOutcome::Unpriceable(cause::UNKNOWN_MODEL) => push(caveat::UNPRICED_MODEL, Some(model_label(rec))),
+        UsdOutcome::Estimate(_) => visit(caveat::ESTIMATE_ONLY, &|| None),
+        UsdOutcome::Unpriceable(cause::UNKNOWN_MODEL) => {
+            visit(caveat::UNPRICED_MODEL, &|| Some(model_label(rec)));
+        }
         UsdOutcome::Unpriceable(_) | UsdOutcome::NotRequested => {}
     }
+}
+
+fn caveats(facts: &RunFacts<'_>, ctx: &ClassifyContext<'_>) -> Vec<UsageCaveat> {
+    let mut out = Vec::new();
+    visit_caveats(facts, ctx, |code, detail| {
+        out.push(UsageCaveat {
+            code: code.to_owned(),
+            detail: detail(),
+        });
+    });
     out
 }
 
@@ -326,46 +344,244 @@ pub(crate) fn model_label(rec: &UsageRunRecord) -> String {
         .unwrap_or_else(|| "(no model recorded)".to_owned())
 }
 
+/// Fields a dimension reads. Built from a run, from an execution (latest-run
+/// model/host, aggregated coverage) or from a completed task (representative
+/// run), so group keys and labels cannot drift across those grains.
+#[derive(Clone, Copy, bon::Builder)]
+pub(crate) struct DimensionSource<'a> {
+    pub task: Option<&'a UsageTaskRecord>,
+    pub execution_kind: Option<&'a str>,
+    pub execution_status: Option<&'a str>,
+    pub execution_effort: Option<&'a str>,
+    pub execution_model: Option<&'a str>,
+    pub driver: Option<&'a str>,
+    pub driver_source: DriverSource,
+    pub run_model: Option<&'a str>,
+    pub coverage: Option<RunCoverage>,
+    pub host_id: Option<&'a str>,
+    pub spend_class: Option<SpendClass>,
+}
+
+impl<'a> DimensionSource<'a> {
+    pub(crate) fn from_run(facts: &'a RunFacts<'a>) -> Self {
+        Self {
+            task: facts.task,
+            execution_kind: Some(facts.rec.execution_kind.as_str()),
+            execution_status: Some(facts.rec.execution_status.as_str()),
+            execution_effort: facts.rec.execution_effort.as_deref(),
+            execution_model: facts.rec.execution_model.as_deref(),
+            driver: facts.driver,
+            driver_source: facts.rec.driver.source(),
+            run_model: facts.rec.run_model.as_deref(),
+            coverage: Some(facts.coverage),
+            host_id: Some(facts.rec.run_host_id.as_str()),
+            spend_class: Some(facts.spend_class),
+        }
+    }
+}
+
 /// A run's value for a dimension: the machine value filters match on, and the
 /// label a client shows. Both are borrowed so scanning the window for filter
 /// counts and grouping allocates nothing per run.
-pub(crate) fn dimension_value<'a>(facts: &RunFacts<'a>, dimension: UsageDimension) -> (&'a str, &'a str) {
-    let rec = facts.rec;
-    let task = facts.task;
+pub(crate) fn dimension_value<'a>(facts: &'a RunFacts<'a>, dimension: UsageDimension) -> (&'a str, &'a str) {
+    dimension_value_of(&DimensionSource::from_run(facts), dimension)
+}
+
+pub(crate) fn dimension_value_of<'a>(src: &DimensionSource<'a>, dimension: UsageDimension) -> (&'a str, &'a str) {
     let same = |value: &'a str| (value, value);
     let none = |label: &'static str| (NONE_VALUE, label);
     match dimension {
-        UsageDimension::Product => match task {
+        UsageDimension::Product => match src.task {
             Some(task) => (
                 task.product_id.as_str(),
                 task.product_name.as_deref().unwrap_or(task.product_id.as_str()),
             ),
             None => none("(no task)"),
         },
-        UsageDimension::Project => match task.and_then(|task| task.project_id.as_deref().map(|id| (id, task))) {
+        UsageDimension::Project => match src
+            .task
+            .and_then(|task| task.project_id.as_deref().map(|id| (id, task)))
+        {
             Some((id, task)) => (id, task.project_name.as_deref().unwrap_or(id)),
             None => none("(no project)"),
         },
-        UsageDimension::TaskKind => task.map_or_else(|| none("(no task)"), |task| same(task.kind.as_str())),
-        UsageDimension::ExecutionKind => same(rec.execution_kind.as_str()),
-        UsageDimension::SpendClass => same(facts.spend_class.as_str()),
-        UsageDimension::Driver => facts.driver.map_or_else(|| none("not recorded"), same),
-        UsageDimension::Model => rec
-            .run_model
-            .as_deref()
-            .or(rec.execution_model.as_deref())
-            .map_or_else(|| none("(no model recorded)"), same),
-        UsageDimension::Effort => rec
-            .execution_effort
-            .as_deref()
-            .or(task.and_then(|task| task.effort_level.as_deref()))
+        UsageDimension::TaskKind => src
+            .task
+            .map_or_else(|| none("(no task)"), |task| same(task.kind.as_str())),
+        UsageDimension::ExecutionKind => src
+            .execution_kind
+            .filter(|kind| !kind.is_empty())
             .map_or_else(|| none("(none)"), same),
-        UsageDimension::Reasoning => task
+        UsageDimension::SpendClass => src
+            .spend_class
+            .map_or_else(|| none("(none)"), |class| same(class.as_str())),
+        UsageDimension::Driver => src.driver.map_or_else(|| none("not recorded"), same),
+        UsageDimension::Model => src
+            .run_model
+            .or(src.execution_model)
+            .map_or_else(|| none("(no model recorded)"), same),
+        UsageDimension::Effort => src
+            .execution_effort
+            .or(src.task.and_then(|task| task.effort_level.as_deref()))
+            .map_or_else(|| none("(none)"), same),
+        UsageDimension::Reasoning => src
+            .task
             .and_then(|task| task.reasoning.as_deref())
             .map_or_else(|| none("(none)"), same),
-        UsageDimension::TaskStatus => task.map_or_else(|| none("(no task)"), |task| same(task.status.as_str())),
-        UsageDimension::ExecutionStatus => same(rec.execution_status.as_str()),
-        UsageDimension::Coverage => same(facts.coverage.as_str()),
-        UsageDimension::Host => same(rec.run_host_id.as_str()),
+        UsageDimension::TaskStatus => src
+            .task
+            .map_or_else(|| none("(no task)"), |task| same(task.status.as_str())),
+        UsageDimension::ExecutionStatus => src
+            .execution_status
+            .filter(|status| !status.is_empty())
+            .map_or_else(|| none("(none)"), same),
+        UsageDimension::Coverage => src
+            .coverage
+            .map_or_else(|| none("(no runs)"), |coverage| same(coverage.as_str())),
+        UsageDimension::Host => src.host_id.map_or_else(|| none("(none)"), same),
+    }
+}
+
+/// Whether a dimension has a recorded (not placeholder) value. Driver uses
+/// the launch-tuple source so `dimension_started` tracks when slugs were
+/// written on the execution row, not later resolution.
+pub(crate) fn has_recorded_dimension(src: &DimensionSource<'_>, dimension: UsageDimension) -> bool {
+    match dimension {
+        UsageDimension::Driver => src.driver_source == DriverSource::LaunchTuple,
+        UsageDimension::Model => src.run_model.is_some() || src.execution_model.is_some(),
+        UsageDimension::Effort => src.execution_effort.is_some(),
+        _ => dimension_value_of(src, dimension).0 != NONE_VALUE,
+    }
+}
+
+/// Latest run by `created_at`, then `run_id`. Shared by execution grouping
+/// and completed-task representative selection.
+pub(crate) fn latest_run<'a, I>(runs: I) -> Option<&'a RunFacts<'a>>
+where
+    I: IntoIterator<Item = &'a RunFacts<'a>>,
+{
+    runs.into_iter().max_by(|a, b| {
+        a.rec
+            .run_created_at_epoch_s
+            .cmp(&b.rec.run_created_at_epoch_s)
+            .then_with(|| a.rec.run_id.cmp(&b.rec.run_id))
+    })
+}
+
+/// Visit each caveat code for a run without allocating per-run detail strings
+/// or a temporary `Vec`.
+pub(crate) fn for_each_caveat_code(
+    facts: &RunFacts<'_>,
+    ctx: &ClassifyContext<'_>,
+    mut visit: impl FnMut(&'static str),
+) {
+    visit_caveats(facts, ctx, |code, _| visit(code));
+}
+
+/// Collect caveat codes without allocating per-run detail strings.
+#[cfg(test)]
+pub(crate) fn count_caveat_codes(facts: &RunFacts<'_>, ctx: &ClassifyContext<'_>) -> Vec<&'static str> {
+    let mut codes = Vec::new();
+    for_each_caveat_code(facts, ctx, |code| codes.push(code));
+    codes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::record::RecordedDriver;
+
+    struct FixedPricer;
+
+    impl UsdEstimator for FixedPricer {
+        fn estimate_usd(&self, model: &str, _tokens: PricedTokens) -> Option<f64> {
+            (model == "claude-sonnet-4").then_some(1.25)
+        }
+    }
+
+    fn base_run(id: &str, created_at: i64) -> UsageRunRecord {
+        UsageRunRecord::builder()
+            .run_id(id)
+            .run_status("completed")
+            .run_created_at_epoch_s(created_at)
+            .run_host_id("host-1")
+            .execution_id("e1")
+            .work_item_id("t1")
+            .execution_kind("task_implementation")
+            .execution_status("completed")
+            .execution_created_at_epoch_s(created_at)
+            .build()
+    }
+
+    #[test]
+    fn count_caveat_codes_matches_caveats_across_every_condition() {
+        let capture_start = 1_000;
+        let pricer = FixedPricer;
+        let ctx = ClassifyContext {
+            capture_start_epoch_s: capture_start,
+            pricer: Some(&pricer),
+        };
+
+        // 1. Pre-capture + driver_not_recorded + model_from_launch_tuple + usage_unavailable
+        let mut r_pre = base_run("r_pre", capture_start - 10);
+        r_pre.driver = RecordedDriver::Unknown;
+        r_pre.execution_model = Some("opus".to_owned());
+        r_pre.usage_unavailable = Some("transcript missing".to_owned());
+
+        // 2. Codex gross_input + tokens_partial
+        let mut r_codex = base_run("r_codex", capture_start + 10);
+        r_codex.driver = RecordedDriver::LaunchTuple(DRIVER_SLUG_CODEX.to_owned());
+        r_codex.input_tokens = Some(100);
+        r_codex.output_tokens = Some(20);
+
+        // 3. Claude subagents_excluded + estimate_only (priced USD)
+        let mut r_claude_priced = base_run("r_claude_priced", capture_start + 20);
+        r_claude_priced.driver = RecordedDriver::LaunchTuple(DRIVER_SLUG_CLAUDE.to_owned());
+        r_claude_priced.run_model = Some("claude-sonnet-4".to_owned());
+        r_claude_priced.input_tokens = Some(100);
+        r_claude_priced.output_tokens = Some(20);
+        r_claude_priced.cache_creation_tokens = Some(0);
+        r_claude_priced.cache_read_tokens = Some(0);
+
+        // 4. Claude synthetic_model + unpriced_model (unknown model USD)
+        let mut r_synthetic = base_run("r_synthetic", capture_start + 30);
+        r_synthetic.driver = RecordedDriver::LaunchTuple(DRIVER_SLUG_CLAUDE.to_owned());
+        r_synthetic.run_model = Some(SYNTHETIC_MODEL.to_owned());
+        r_synthetic.execution_model = Some("sonnet".to_owned());
+        r_synthetic.input_tokens = Some(100);
+        r_synthetic.output_tokens = Some(20);
+        r_synthetic.cache_creation_tokens = Some(0);
+        r_synthetic.cache_read_tokens = Some(0);
+
+        let runs = [r_pre, r_codex, r_claude_priced, r_synthetic];
+        let mut seen_codes = std::collections::BTreeSet::new();
+        for rec in &runs {
+            let mut facts = classify(rec, None);
+            price_if_requested(&mut facts, &ctx);
+            let from_caveats: Vec<String> = caveats(&facts, &ctx).into_iter().map(|c| c.code).collect();
+            let from_codes: Vec<String> = count_caveat_codes(&facts, &ctx)
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            assert_eq!(from_codes, from_caveats, "caveat code mismatch for {}", rec.run_id);
+            seen_codes.extend(from_codes);
+        }
+
+        let expected_all: std::collections::BTreeSet<String> = [
+            caveat::PRE_CAPTURE,
+            caveat::DRIVER_NOT_RECORDED,
+            caveat::GROSS_INPUT,
+            caveat::SUBAGENTS_EXCLUDED,
+            caveat::SYNTHETIC_MODEL,
+            caveat::MODEL_FROM_LAUNCH_TUPLE,
+            caveat::TOKENS_PARTIAL,
+            caveat::USAGE_UNAVAILABLE,
+            caveat::ESTIMATE_ONLY,
+            caveat::UNPRICED_MODEL,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        assert_eq!(seen_codes, expected_all, "parity test must cover every caveat code");
     }
 }

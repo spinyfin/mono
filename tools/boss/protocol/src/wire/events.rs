@@ -1048,6 +1048,9 @@ pub enum FrontendEvent {
     /// Response to [`FrontendRequest::GetTokenUsageRows`].
     #[worker(passthrough)]
     TokenUsageRows { report: crate::TokenUsageRowsReport },
+    /// Response to [`FrontendRequest::GetTokenUsageSeries`].
+    #[worker(passthrough)]
+    TokenUsageSeries { report: crate::TokenUsageSeriesReport },
     /// Response to [`FrontendRequest::ListPlannerRuns`]: every
     /// `planner_runs` audit row for the project, newest first.
     #[worker(passthrough)]
