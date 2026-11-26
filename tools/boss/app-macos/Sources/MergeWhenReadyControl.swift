@@ -13,29 +13,30 @@ import SwiftUI
 /// source of truth for the actual merge request and its eligibility/error
 /// handling.
 struct MergeWhenReadyControl: View {
+    enum Style {
+        case compact
+        case regular
+    }
+
     var isRequesting = false
+    var style: Style = .compact
     var onConfirm: () -> Void
 
     @State private var showConfirmation = false
 
     var body: some View {
-        Button {
-            showConfirmation = true
-        } label: {
-            if isRequesting {
-                HStack(spacing: 4) {
-                    ProgressView().controlSize(.small)
-                    Text("Requesting merge…").font(.caption)
-                }
-            } else {
-                Image(systemName: "arrow.triangle.merge")
-                    .font(.caption)
-                    .foregroundStyle(Color.secondary)
-                    .accessibilityLabel("Merge when ready")
+        Group {
+            switch style {
+            case .compact:
+                button
+                    .buttonStyle(.plain)
+            case .regular:
+                button
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.regular)
             }
         }
         .disabled(isRequesting)
-        .buttonStyle(.plain)
         .help("Merge When Ready: enqueue this PR for merging once all required checks pass")
         // Always-attached: confirmationDialog needs false→true while
         // installed; mount-with-true is a known intermittent failure.
@@ -50,6 +51,30 @@ struct MergeWhenReadyControl: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("This will queue the PR for merging once all required checks pass. This action cannot be undone.")
+        }
+    }
+
+    private var button: some View {
+        Button {
+            showConfirmation = true
+        } label: {
+            if isRequesting {
+                HStack(spacing: 4) {
+                    ProgressView().controlSize(.small)
+                    Text("Requesting merge…")
+                        .font(style == .compact ? .caption : .body)
+                }
+            } else {
+                switch style {
+                case .compact:
+                    Image(systemName: "arrow.triangle.merge")
+                        .font(.caption)
+                        .foregroundStyle(Color.secondary)
+                        .accessibilityLabel("Merge when ready")
+                case .regular:
+                    Label("Merge When Ready", systemImage: "arrow.triangle.merge")
+                }
+            }
         }
     }
 }
