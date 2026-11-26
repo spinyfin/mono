@@ -919,6 +919,12 @@ mod floor_tests {
                 }),
             ),
             (
+                super::super::review_guide_jobs::TERMINAL_OBSERVATIONS_MIGRATION_ID,
+                Box::new(|c| {
+                    super::super::review_guide_jobs::migrate_terminal_observations(c).unwrap();
+                }),
+            ),
+            (
                 cancel_provenance::MIGRATION_ID,
                 Box::new(|c| {
                     c.execute_batch(

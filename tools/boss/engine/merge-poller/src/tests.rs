@@ -23,13 +23,28 @@ use crate::work::{
 
 pub struct StubProbe {
     pub states: std::sync::Mutex<std::collections::HashMap<String, Result<PrLifecycleProbe, String>>>,
+    pub calls: std::sync::Mutex<Vec<String>>,
 }
 
 impl StubProbe {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             states: std::sync::Mutex::new(Default::default()),
+            calls: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    pub fn call_count(&self, url: &str) -> usize {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|seen| seen.as_str() == url)
+            .count()
+    }
+
+    pub fn set_probe(&self, url: &str, probe: PrLifecycleProbe) {
+        self.states.lock().unwrap().insert(url.to_owned(), Ok(probe));
     }
 
     pub fn set(&self, url: &str, state: PrLifecycleState) {
@@ -173,6 +188,7 @@ impl LoopPasses for NoopSweepHost {
 #[async_trait]
 impl MergeProbe for StubProbe {
     async fn probe(&self, pr_url: &str) -> Result<PrLifecycleProbe> {
+        self.calls.lock().unwrap().push(pr_url.to_owned());
         let map = self.states.lock().unwrap();
         match map.get(pr_url) {
             Some(Ok(state)) => Ok(state.clone()),

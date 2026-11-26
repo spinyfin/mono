@@ -961,6 +961,50 @@ fn cancel_live_guides_continues_after_a_mid_loop_attempt_error() {
 }
 
 #[test]
+fn first_terminal_observation_cancels_once_and_reopen_rearms_cancellation() {
+    let (_dir, db) = open_db();
+    let (root, series, comparison) = seeded_series(&db);
+    let pr = "https://github.com/acme/widget/pull/9";
+    let first = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
+    let first = db.dispatch_pr_review_guide_attempt(&first.id, &root).unwrap();
+    let first_exec = first.execution_id.clone().unwrap();
+
+    let cancelled = db
+        .cancel_live_pr_review_guides_on_first_terminal_observation(&root, pr, "PR closed unmerged")
+        .unwrap();
+    assert_eq!(cancelled, vec![first_exec.clone()]);
+    assert_eq!(
+        db.get_execution(&first_exec).unwrap().status,
+        ExecutionStatus::Cancelled
+    );
+
+    // Explicit attempt created after the first terminal observation stays live on repeat passes.
+    let second = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
+    let second = db.dispatch_pr_review_guide_attempt(&second.id, &root).unwrap();
+    let second_exec = second.execution_id.clone().unwrap();
+    let repeated = db
+        .cancel_live_pr_review_guides_on_first_terminal_observation(&root, pr, "PR closed unmerged")
+        .unwrap();
+    assert!(repeated.is_empty());
+    assert_ne!(
+        db.get_execution(&second_exec).unwrap().status,
+        ExecutionStatus::Cancelled
+    );
+
+    // Reopening clears the recorded terminal observation so a later close cancels again.
+    assert!(db.clear_pr_review_guide_terminal_observation(&root, pr).unwrap());
+    assert!(!db.clear_pr_review_guide_terminal_observation(&root, pr).unwrap());
+    let after_reopen = db
+        .cancel_live_pr_review_guides_on_first_terminal_observation(&root, pr, "PR merged")
+        .unwrap();
+    assert_eq!(after_reopen, vec![second_exec.clone()]);
+    assert_eq!(
+        db.get_execution(&second_exec).unwrap().status,
+        ExecutionStatus::Cancelled
+    );
+}
+
+#[test]
 fn cancellation_failure_prevents_replacement() {
     let (_dir, db) = open_db();
     let (root, series, _) = seeded_series(&db);

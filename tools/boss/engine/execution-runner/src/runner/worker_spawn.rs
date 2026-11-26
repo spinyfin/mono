@@ -498,6 +498,10 @@ fn resolve_batch_reviewer_spawn(
         .map_err(|error| anyhow::anyhow!("review batch effort/model resolution: {error}"))
 }
 
+const REVIEW_GUIDE_MODEL: &str = "gpt-6-astra";
+const REVIEW_GUIDE_EFFORT: EffortLevel = EffortLevel::Medium;
+const REVIEW_GUIDE_EFFORT_VALUE: &str = "high";
+
 /// The enforced-fixed Astra profile for every `pr_review_guide` execution:
 /// driver `codex`, model `gpt-6-astra`, `EffortLevel::Medium` (which
 /// `codex_effort_value_for_level` maps to provider `"high"`). Bypasses task/
@@ -509,10 +513,6 @@ fn resolve_batch_reviewer_spawn(
 /// configuration must fail the spawn (a retryable pre-start failure through
 /// the normal execution retry path) rather than quietly run at a different
 /// model/effort. See design "Generation and read-only enforcement".
-const REVIEW_GUIDE_MODEL: &str = "gpt-6-astra";
-const REVIEW_GUIDE_EFFORT: EffortLevel = EffortLevel::Medium;
-const REVIEW_GUIDE_EFFORT_VALUE: &str = "high";
-
 fn resolve_review_guide_spawn_config(registry: &crate::driver::DriverRegistry) -> anyhow::Result<SpawnConfig> {
     let input = SpawnResolutionInput::builder()
         .effort_level(REVIEW_GUIDE_EFFORT)

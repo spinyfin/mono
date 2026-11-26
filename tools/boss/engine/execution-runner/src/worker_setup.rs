@@ -180,13 +180,13 @@ fn render_review_guide_claude_md(lease_id: &str, workspace_path: &str, boss: &st
          ## Read-only mandate (HARD CONSTRAINT)\n\
          \n\
          **Your only state-changing action is submitting the guide with\n\
-         `{boss} propose review-guide`.** Tool calls for anything else are denied\n\
-         at the dispatch layer (deny-by-default `dontAsk` permission mode plus an\n\
-         explicit deny list) — this is enforced, not advisory.\n\
+         `{boss} propose review-guide`.** Anything else is denied by the\n\
+         engine's read-only sandbox and command guard — this is enforced, not\n\
+         advisory.\n\
          \n\
-         Forbidden (tool calls for these are denied):\n\
+         Forbidden (denied by the sandbox and command guard):\n\
          \n\
-         - Editing or writing ANY file (`Edit`, `Write`, `NotebookEdit`).\n\
+         - Editing or writing ANY file.\n\
          - Committing or pushing (`jj git push`, `git push`).\n\
          - Opening, updating, merging, closing, editing, or commenting on a PR\n\
            (`gh pr …`, `cube pr create`, `cube pr update`).\n\
@@ -202,8 +202,8 @@ fn render_review_guide_claude_md(lease_id: &str, workspace_path: &str, boss: &st
          ## What you can read\n\
          \n\
          - The captured comparison and the pinned sources in your prompt.\n\
-         - Code in your leased workspace — use `Read`, `Grep`, `Glob`, and\n\
-           read-only shell (`cat`, `nl`, `head`, `tail`, `wc -l`, `sed -n`,\n\
+         - Code in your leased workspace — use read-only shell forms\n\
+           only (`cat`, `nl`, `head`, `tail`, `wc -l`, `sed -n`,\n\
            `rg`, and pinned `git show` / `git diff` / `git --git-dir` forms).\n\
          \n\
          ## Your workspace\n\
