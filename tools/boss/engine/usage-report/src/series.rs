@@ -777,6 +777,11 @@ fn build_coverage(
 
     let (dimension_from_epoch_s, has_unrecorded_before_dim_start) = match query.group_by {
         None => (None, false),
+        // Only the launch-tuple dimensions have a recording era. Every other
+        // dimension is absent permanently for some facts (a taskless run has
+        // no product, a project-less chore no project), which is not a
+        // coverage boundary the app should shade.
+        Some(dimension) if !dimension_has_recording_era(dimension) => (None, false),
         Some(dimension) => {
             let mut recorded_min: Option<i64> = None;
             let mut unrecorded_min: Option<i64> = None;
@@ -937,4 +942,14 @@ fn build_coverage(
         .maybe_data_from_epoch_s(data_from_epoch_s)
         .maybe_dimension_from_epoch_s(dimension_from_epoch_s)
         .build()
+}
+
+/// Dimensions whose value was only recorded from some point in time (the
+/// launch-tuple driver, model and effort columns). All others either always
+/// existed or are legitimately absent for some facts.
+fn dimension_has_recording_era(dimension: UsageDimension) -> bool {
+    matches!(
+        dimension,
+        UsageDimension::Driver | UsageDimension::Model | UsageDimension::Effort
+    )
 }

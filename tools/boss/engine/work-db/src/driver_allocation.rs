@@ -372,6 +372,31 @@ impl WorkDb {
     }
 }
 
+/// Map `driver, reason, split_at_decision, model` columns starting at
+/// `first_col` into a [`DriverDecision`]. Shared by the single-id and batched
+/// lookups so a new reason constant is recognised by both.
+pub(crate) fn driver_decision_from_columns(
+    row: &rusqlite::Row<'_>,
+    first_col: usize,
+) -> rusqlite::Result<DriverDecision> {
+    let reason_raw: String = row.get(first_col + 1)?;
+    let reason = match reason_raw.as_str() {
+        REASON_EXPLICIT => REASON_EXPLICIT,
+        REASON_ALLOCATION => REASON_ALLOCATION,
+        REASON_POOL => REASON_POOL,
+        REASON_LEGACY_PERCENTAGE => REASON_LEGACY_PERCENTAGE,
+        REASON_ALLOCATION_FAILED => REASON_ALLOCATION_FAILED,
+        _ => REASON_DEFAULT,
+    };
+    let split_raw: Option<String> = row.get(first_col + 2)?;
+    Ok(DriverDecision {
+        model: row.get(first_col + 3)?,
+        driver: row.get(first_col)?,
+        reason,
+        split_at_decision: split_raw.and_then(|raw| serde_json::from_str(&raw).ok()),
+    })
+}
+
 /// `WorkDb::get_execution_driver_decision`, but reusing an already-open
 /// `Connection` (see `load_driver_traffic_split_conn`'s doc for why this
 /// split exists).
@@ -384,24 +409,7 @@ pub(crate) fn get_execution_driver_decision_conn(
            FROM execution_driver_decisions
           WHERE execution_id = ?1",
         params![execution_id],
-        |row| {
-            let reason_raw: String = row.get(1)?;
-            let reason = match reason_raw.as_str() {
-                REASON_EXPLICIT => REASON_EXPLICIT,
-                REASON_ALLOCATION => REASON_ALLOCATION,
-                REASON_POOL => REASON_POOL,
-                REASON_LEGACY_PERCENTAGE => REASON_LEGACY_PERCENTAGE,
-                REASON_ALLOCATION_FAILED => REASON_ALLOCATION_FAILED,
-                _ => REASON_DEFAULT,
-            };
-            let split_raw: Option<String> = row.get(2)?;
-            Ok(DriverDecision {
-                model: row.get(3)?,
-                driver: row.get(0)?,
-                reason,
-                split_at_decision: split_raw.and_then(|raw| serde_json::from_str(&raw).ok()),
-            })
-        },
+        |row| driver_decision_from_columns(row, 0),
     )
     .optional()
     .map_err(Into::into)

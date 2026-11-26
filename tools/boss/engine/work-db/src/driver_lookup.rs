@@ -178,25 +178,6 @@ fn resolve_taskless_driver(
     }
 }
 
-fn driver_decision_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DriverDecision> {
-    let reason_raw: String = row.get(2)?;
-    let reason = match reason_raw.as_str() {
-        REASON_EXPLICIT => REASON_EXPLICIT,
-        REASON_ALLOCATION => REASON_ALLOCATION,
-        REASON_POOL => REASON_POOL,
-        REASON_LEGACY_PERCENTAGE => REASON_LEGACY_PERCENTAGE,
-        REASON_ALLOCATION_FAILED => REASON_ALLOCATION_FAILED,
-        _ => REASON_DEFAULT,
-    };
-    let split_raw: Option<String> = row.get(3)?;
-    Ok(DriverDecision {
-        model: row.get(4)?,
-        driver: row.get(1)?,
-        reason,
-        split_at_decision: split_raw.and_then(|raw| serde_json::from_str(&raw).ok()),
-    })
-}
-
 #[work_db_boundary::instrument]
 impl WorkDb {
     /// Resolve the driver slug for `execution_id`'s worker, applying the
@@ -343,23 +324,19 @@ impl WorkDb {
                 review_drivers.insert(id, driver);
             }
 
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 "SELECT execution_id, agent_id FROM (
                      SELECT execution_id, agent_id,
                             ROW_NUMBER() OVER (
                               PARTITION BY execution_id
-                              ORDER BY
-                                CASE WHEN finished_at IS NULL THEN 0 ELSE 1 END,
-                                CASE WHEN status = 'failed' THEN 1 ELSE 0 END,
-                                CASE WHEN transcript_path IS NOT NULL THEN 0 ELSE 1 END,
-                                created_at DESC,
-                                id DESC
+                              ORDER BY {}
                             ) AS rn
                      FROM work_runs
                      WHERE execution_id IN (SELECT value FROM json_each(?1))
                  )
                  WHERE rn = 1",
-            )?;
+                crate::run_rows::HOOK_RUN_ORDER_BY
+            ))?;
             let rows = stmt.query_map([&id_json], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
             })?;
@@ -430,7 +407,7 @@ impl WorkDb {
             )?;
             let rows = stmt.query_map([&id_json], |row| {
                 let id: String = row.get(0)?;
-                Ok((id, driver_decision_from_row(row)?))
+                Ok((id, crate::driver_allocation::driver_decision_from_columns(row, 1)?))
             })?;
             for row in rows {
                 let (id, decision) = row?;
@@ -1048,9 +1025,58 @@ mod tests {
         let answer = answer_agent_execution(&db, &product.id);
         let missing = "exec_missing";
 
-        let ids = [pinned.id.as_str(), defaulted.id.as_str(), answer.as_str(), missing];
+        // Precedence branches the plain executions above do not reach: a
+        // durable allocation decision, a run that claimed a review-pool slot
+        // (with an older failed sibling to exercise the run ordering), and
+        // review-batch members.
+        let allocated_chore = create_test_chore(&db, &product.id, "allocated chore");
+        let allocated = create_ready_chore_execution(&db, &allocated_chore.id);
+        {
+            let conn = db.connect().unwrap();
+            crate::driver_allocation::record_execution_driver_decision(
+                &conn,
+                &allocated.id,
+                &allocated_chore.id,
+                &crate::driver_allocation::DriverDecision {
+                    driver: Some("grok".to_owned()),
+                    reason: crate::driver_allocation::REASON_ALLOCATION,
+                    split_at_decision: None,
+                    model: None,
+                },
+                "100",
+            )
+            .unwrap();
+        }
+        let claimed_chore = create_test_chore(&db, &product.id, "claimed chore");
+        let claimed = create_ready_chore_execution(&db, &claimed_chore.id);
+        for (status, agent) in [("failed", "worker-1"), ("active", "review-pending")] {
+            let run = db
+                .create_run(
+                    boss_protocol::CreateRunInput::builder()
+                        .agent_id(agent)
+                        .execution_id(claimed.id.as_str())
+                        .status(status)
+                        .build(),
+                )
+                .unwrap();
+            if agent == "review-pending" {
+                db.set_run_agent_id(&run.id, "review-1").unwrap();
+            }
+        }
+        let cycle_root = crate::test_support::create_test_chore_manual(&db, &product.id, "review target");
+        let leaves = fan_out_batch_leaves(&db, &cycle_root.id);
+
+        let mut ids = vec![
+            pinned.id.as_str(),
+            defaulted.id.as_str(),
+            answer.as_str(),
+            allocated.id.as_str(),
+            claimed.id.as_str(),
+            missing,
+        ];
+        ids.extend(leaves.iter().map(|(execution, _)| execution.id.as_str()));
         let batch = db.get_execution_driver_slugs_lenient(&ids).unwrap();
-        for id in ids {
+        for id in ids.iter().copied() {
             let single = db.get_execution_driver_slug(id).unwrap();
             assert_eq!(
                 batch.get(id).cloned().flatten(),
