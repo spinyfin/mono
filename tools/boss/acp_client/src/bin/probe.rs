@@ -560,8 +560,7 @@ fn refuse_production_paths(args: &SessionArgs) -> Result<()> {
 }
 
 fn is_production_path(text: &str) -> bool {
-    const PRODUCTION_STATE: &str = "Library/Application Support/Boss";
-    text.contains(PRODUCTION_STATE) || text == "/tmp/boss-engine.sock"
+    text.contains(boss_log_files::STATE_ROOT_SUFFIX) || text == "/tmp/boss-engine.sock"
 }
 
 struct AgentEnvironment {
@@ -875,7 +874,9 @@ impl Probe {
                 self.in_flight.push(InFlight::Request { method, pending });
             }
             Command::Processes => {
-                let processes = self.descendants()?;
+                let Some(processes) = self.descendants_or_report() else {
+                    return Ok(());
+                };
                 self.report(json!({
                     "event": "processes",
                     "agent_pid": self.agent_pid,
@@ -885,7 +886,10 @@ impl Probe {
             Command::KillDescendant { name } => {
                 let table = SystemWorkspaceProcessTable;
                 let mut killed = Vec::new();
-                for process in self.descendants()? {
+                let Some(descendants) = self.descendants_or_report() else {
+                    return Ok(());
+                };
+                for process in descendants {
                     if process.argv_summary().contains(&name) {
                         let outcome = table.signal(process.pid, Signal::Kill);
                         let mut summary = process_summary(&process);
@@ -896,8 +900,10 @@ impl Probe {
                 self.report(json!({"event": "killed", "signal": "SIGKILL", "name": name, "processes": killed}));
             }
             Command::InboxRegistrations => {
-                let registrations: Vec<Value> = self
-                    .descendants()?
+                let Some(descendants) = self.descendants_or_report() else {
+                    return Ok(());
+                };
+                let registrations: Vec<Value> = descendants
                     .iter()
                     .map(|process| transcript::inbox_registration(process.pid, &process.argv_summary()))
                     .collect();
@@ -931,14 +937,37 @@ impl Probe {
         Ok(())
     }
 
+    /// The agent's descendants, or `None` after reporting that the process
+    /// listing failed.
+    fn descendants_or_report(&mut self) -> Option<Vec<LiveProcess>> {
+        match self.descendants() {
+            Ok(processes) => Some(processes),
+            Err(error) => {
+                self.report(json!({"event": "command_error", "error": error.to_string()}));
+                None
+            }
+        }
+    }
+
     async fn prompt(&mut self, text: String, images: &[PathBuf]) -> Result<()> {
         let mut blocks = Vec::new();
         for image in images {
-            let bytes = tokio::fs::read(image)
-                .await
-                .with_context(|| format!("reading {image:?}"))?;
-            let mime =
-                image_mime_type(&bytes).ok_or_else(|| anyhow!("{image:?} is not a PNG, JPEG, GIF or WebP image"))?;
+            // A bad attachment is this command's problem, not the
+            // conversation's: report it and carry on.
+            let bytes = match tokio::fs::read(image).await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    self.report(json!({"event": "command_error", "error": format!("reading {image:?}: {error}")}));
+                    return Ok(());
+                }
+            };
+            let Some(mime) = image_mime_type(&bytes) else {
+                self.report(json!({
+                    "event": "command_error",
+                    "error": format!("{image:?} is not a PNG, JPEG, GIF or WebP image"),
+                }));
+                return Ok(());
+            };
             let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
             blocks.push(ContentBlock::Image(ImageContent::new(encoded, mime)));
         }
@@ -1634,6 +1663,29 @@ mod tests {
 
     fn end_of_turn(id: &Value) -> Value {
         json!({"jsonrpc": "2.0", "id": id, "result": {"stopReason": "end_turn"}})
+    }
+
+    #[tokio::test]
+    async fn a_prompt_naming_a_missing_image_reports_command_error_and_leaves_the_probe_running() {
+        let mut harness = Harness::new();
+        harness
+            .probe
+            .run(Command::Prompt {
+                text: "look".into(),
+                images: vec![PathBuf::from("/nonexistent/boss-acp-probe/missing.png")],
+            })
+            .await
+            .unwrap();
+        let errors = harness.event("command_error");
+        assert_eq!(errors.len(), 1, "{:?}", harness.reported());
+        assert!(errors[0]["error"].as_str().unwrap().contains("missing.png"));
+        assert!(harness.event("turn_started").is_empty());
+
+        // The conversation carries on.
+        let id = harness.prompt("again").await;
+        harness.agent_says(&[end_of_turn(&id)]).await;
+        harness.pump(1).await;
+        assert_eq!(harness.event("turn_ended").len(), 1);
     }
 
     #[tokio::test]

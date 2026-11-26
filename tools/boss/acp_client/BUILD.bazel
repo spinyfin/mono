@@ -67,6 +67,7 @@ rust_binary(
         ":acp_client",
         "//lib/rust/workspace_procs",
         "//tools/boss/engine/transcript-markdown:transcript_markdown",
+        "//tools/boss/log-files",
     ] + all_crate_deps(normal = True),
 )
 
@@ -83,6 +84,7 @@ rust_test(
         ":acp_client",
         "//lib/rust/workspace_procs",
         "//tools/boss/engine/transcript-markdown:transcript_markdown",
+        "//tools/boss/log-files",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,

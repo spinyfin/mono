@@ -334,6 +334,7 @@ mod tests {
             ts_ms: 0,
             dir,
             line: line.to_string(),
+            invalid: None,
         }
     }
 

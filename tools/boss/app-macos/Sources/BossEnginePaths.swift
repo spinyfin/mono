@@ -140,16 +140,17 @@ struct BossEnginePaths {
     }
 
     private static func isIsolatedSocket(_ sock: String) -> Bool {
-        let normalized = URL(fileURLWithPath: sock).standardizedFileURL.path
+        !isProductionPath(sock)
+    }
+
+    /// Does `path` name something production owns: the legacy production
+    /// socket, or anything under a production-shaped state root? The one rule
+    /// behind both "is this instance isolated" and the chat fixture's refusal
+    /// to hand production paths to the probe.
+    static func isProductionPath(_ path: String) -> Bool {
+        let normalized = URL(fileURLWithPath: path).standardizedFileURL.path
         let legacy = URL(fileURLWithPath: legacyProductionSocket).standardizedFileURL.path
-        if normalized == legacy {
-            return false
-        }
-        // Production-shaped Application Support paths are not isolation.
-        if sock.contains("Library/Application Support/Boss") {
-            return false
-        }
-        return true
+        return normalized == legacy || path.contains("Library/Application Support/Boss")
     }
 
     /// Canonical production frontend socket path under the Boss state root

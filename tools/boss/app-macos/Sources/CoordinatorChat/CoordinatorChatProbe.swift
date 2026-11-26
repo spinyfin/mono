@@ -595,7 +595,7 @@ struct CoordinatorChatProbeLaunch: Equatable {
     func validate(isIsolatedInstance: Bool, fileExists: (String) -> Bool) throws {
         guard isIsolatedInstance else { throw CoordinatorChatProbeLaunchError.notIsolated }
         for path in [sessionDirectory.path, journal.path] + probeArguments
-        where path.contains("Library/Application Support/Boss") || path == BossEnginePaths.legacyProductionSocket {
+        where BossEnginePaths.isProductionPath(path) {
             throw CoordinatorChatProbeLaunchError.productionPath(path)
         }
         guard fileExists(probe.path) else { throw CoordinatorChatProbeLaunchError.probeMissing(probe.path) }
