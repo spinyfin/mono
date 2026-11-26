@@ -42,8 +42,9 @@
 # of minutes the first time.
 set -euo pipefail
 
-# What every worker runs. Change these together with patches/ and with the
-# version the runbook names; ../tests/config_test.sh keeps the three in step.
+# What every binary runs, worker or hub. Change these together with patches/
+# and with the version the runbook names; ../tests/config_test.sh keeps the
+# three in step.
 NATIVELINK_REPOSITORY="https://github.com/TraceMachina/nativelink"
 NATIVELINK_VERSION="1.8.6"
 NATIVELINK_COMMIT="37f3b206a8e6d55613abae2b18a0665fff24e096"
