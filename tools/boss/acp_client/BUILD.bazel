@@ -1,0 +1,90 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+# ACP v1 client: line framing, the wire journal record, and a connection that
+# owns its request-id table. Nothing depends on it yet except the probe below;
+# widen the visibility when the engine's coordinator chat service lands.
+rust_library(
+    name = "acp_client",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/bin/**"],
+    ),
+    crate_name = "boss_acp_client",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//visibility:private"],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "acp_client_test",
+    size = "small",
+    crate = ":acp_client",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# Framing and connection behaviour through the public API, plus the checks of
+# what the official SDK's own connection type does on a stream that an earlier
+# process already initialised.
+rust_test(
+    name = "framing_test",
+    size = "small",
+    srcs = ["tests/framing.rs"],
+    crate_root = "tests/framing.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [":acp_client"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# Manual harness: holds a conversation with a real ACP adapter as a child
+# process and records the wire. Launched by path, never bundled with the app.
+rust_binary(
+    name = "boss-acp-probe",
+    srcs = glob(["src/bin/**/*.rs"]),
+    crate_root = "src/bin/probe.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//visibility:private"],
+    deps = [
+        ":acp_client",
+        "//lib/rust/workspace_procs",
+        "//tools/boss/engine/transcript-markdown:transcript_markdown",
+    ] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "boss-acp-probe_test",
+    size = "small",
+    crate = ":boss-acp-probe",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":acp_client",
+        "//lib/rust/workspace_procs",
+        "//tools/boss/engine/transcript-markdown:transcript_markdown",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

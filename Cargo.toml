@@ -10,6 +10,7 @@ members = [
   "tools/boss/build-provenance",
   "tools/boss/claude_client",
   "tools/boss/codex_auth",
+  "tools/boss/acp_client",
   "tools/boss/backoff",
   "tools/boss/cli",
   "tools/boss/comment_anchor",
@@ -147,6 +148,12 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
+# Official Agent Client Protocol SDK: the typed v1 schema and the SDK's own
+# connection type. Pinned exactly because the crate ships a minor release every
+# few days and each one may move its schema pin; the coordinator ACP findings
+# (tools/boss/docs/investigations/coordinator-acp-spike.md) were recorded
+# against this release.
+agent-client-protocol = "=5.5.1"
 anyhow = "1.0.97"
 async-trait = "0.1.92"
 base64 = "0.22"
@@ -161,6 +168,7 @@ clap = "4.5.39"
 directories = "5.0"
 flate2 = "1.1.5"
 fs4 = "0.13"
+futures = "0.3.32"
 comfy-table = "7.2.2"
 console = "0.15.11"
 fastrand = "2.3.0"

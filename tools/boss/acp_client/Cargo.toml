@@ -1,0 +1,32 @@
+[package]
+name = "boss-acp-client"
+version.workspace = true
+edition.workspace = true
+workspace = "../../.."
+
+[[bin]]
+name = "boss-acp-probe"
+path = "src/bin/probe.rs"
+
+[dependencies]
+agent-client-protocol = { workspace = true }
+anyhow = { workspace = true }
+base64 = { workspace = true }
+bon = { workspace = true }
+boss-transcript-markdown = { path = "../engine/transcript-markdown" }
+clap = { workspace = true, features = ["derive"] }
+futures = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = [
+  "fs",
+  "io-std",
+  "io-util",
+  "macros",
+  "process",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
+workspace-procs = { path = "../../../lib/rust/workspace_procs" }
