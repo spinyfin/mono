@@ -2807,6 +2807,59 @@ impl WorkDb {
             })?;
             mapped.collect::<rusqlite::Result<Vec<_>>>()?
         };
+        self.fail_review_batch_rows(&mut conn, rows, stale_secs, false)
+    }
+
+    /// Fail the live pre-merge review batches of a chain whose PR just merged
+    /// or closed. The PR ending is the reason, so unlike
+    /// [`Self::reap_inert_review_batches`] this files no
+    /// [`PR_REVIEW_BATCH_STALE_ATTENTION_KIND`] item (nothing is wrong that a
+    /// human has to decide) and records the abandon cause
+    /// `review_batch_pr_ended` on the member executions it retires. Only the
+    /// batches reviewing `pr_url` are failed, so a replacement PR under the
+    /// same root keeps its own review. Post-merge batches are left alone.
+    /// Returns the failed batch ids.
+    pub fn fail_pre_merge_review_batches_for_ended_pr(&self, chain_root_id: &str, pr_url: &str) -> Result<Vec<String>> {
+        let mut conn = self.connect()?;
+        let root = crate::chain_helpers::chain_root(&conn, chain_root_id)?;
+        let rows: Vec<(String, String, String, Option<String>)> = {
+            let mut statement = conn.prepare(
+                "SELECT b.id, b.cycle_root_id, b.pr_url, t.deleted_at
+                 FROM pr_review_batches b
+                 JOIN tasks t ON t.id = b.cycle_root_id
+                 WHERE b.cycle_root_id = ?1
+                   AND b.phase = 'pre_merge'
+                   AND b.status NOT IN ('completed', 'failed')
+                 ORDER BY b.updated_at ASC, b.id ASC",
+            )?;
+            let mapped = statement.query_map(params![root], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?;
+            mapped
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|(_, _, batch_pr_url, _)| crate::merge_evidence::same_binding(batch_pr_url, pr_url))
+                .collect()
+        };
+        self.fail_review_batch_rows(&mut conn, rows, 0, true)
+    }
+
+    /// Fail each listed batch, retire its non-terminal members and release
+    /// the revisions held for its head. `pr_ended` marks a batch retired
+    /// because its PR merged or closed: it takes the `review_batch_pr_ended`
+    /// abandon cause and files no stale-batch attention.
+    fn fail_review_batch_rows(
+        &self,
+        conn: &mut rusqlite::Connection,
+        rows: Vec<(String, String, String, Option<String>)>,
+        stale_secs: u64,
+        pr_ended: bool,
+    ) -> Result<Vec<String>> {
         let now = now_string();
         let mut reaped = Vec::new();
         for (batch_id, cycle_root_id, pr_url, deleted_at) in rows {
@@ -2886,7 +2939,11 @@ impl WorkDb {
             };
             crate::task_status_audit::abandon(
                 &tx,
-                crate::task_status_audit::abandon_cause::REVIEW_BATCH_REAPED,
+                if pr_ended {
+                    crate::task_status_audit::abandon_cause::REVIEW_BATCH_PR_ENDED
+                } else {
+                    crate::task_status_audit::abandon_cause::REVIEW_BATCH_REAPED
+                },
                 "UPDATE work_executions
                  SET status = 'abandoned', finished_at = ?2
                  WHERE id IN (SELECT execution_id FROM pr_review_batch_members WHERE batch_id = ?1)
@@ -2902,7 +2959,7 @@ impl WorkDb {
                  WHERE batch_id = ?1 AND status IN ('pending', 'running')",
                 params![batch_id, now],
             )?;
-            if deleted_at.is_none() {
+            if deleted_at.is_none() && !pr_ended {
                 super::workitems::insert_attention_item_row(
                     &tx,
                     &CreateAttentionItemInput::builder()

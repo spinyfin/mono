@@ -319,8 +319,17 @@ async fn merged_pr_retires_the_review_still_queued_for_a_held_chore() {
     let outcome = run_one_pass(&db, probe.as_ref(), &RecordingPublisher::default(), None, None, None).await;
 
     assert_eq!(outcome.merged, 1, "{outcome:?}");
-    assert_eq!(outcome.review_batches_reaped, 1, "{outcome:?}");
+    // The merge poller retires the batch itself, with the merge as the reason,
+    // so the inert-batch reaper has nothing left to reap.
+    assert_eq!(outcome.review_batches_reaped, 0, "{outcome:?}");
     assert_eq!(task(&db, &chore_id).status, TaskStatus::Done);
+    assert!(
+        db.list_attention_items_for_work_item(&chore_id)
+            .unwrap()
+            .iter()
+            .all(|item| item.kind != crate::work::PR_REVIEW_BATCH_STALE_ATTENTION_KIND),
+        "a merge during a review is not a stale batch for a human to dismiss",
+    );
     let conn = db.connect().unwrap();
     let batch_status: String = conn
         .query_row(
@@ -343,7 +352,7 @@ async fn merged_pr_retires_the_review_still_queued_for_a_held_chore() {
             )
             .unwrap();
         assert_eq!(status, "abandoned", "{}", execution.id);
-        assert_eq!(reason.as_deref(), Some("review_batch_reaped"), "{}", execution.id);
+        assert_eq!(reason.as_deref(), Some("review_batch_pr_ended"), "{}", execution.id);
     }
 }
 
@@ -742,4 +751,44 @@ async fn merged_pr_settles_in_review_revisions_whose_root_is_gone() {
             .as_deref(),
         Some(crate::work::ORPHANED_REVISION_PR_MERGED_BASIS),
     );
+}
+
+/// The legacy single-reviewer pipeline (fan-out off): a held row whose
+/// `pr_review` is still queued, because focus is on another project, goes to
+/// `done` when the PR ends. The queued review is cancelled with the reason
+/// rather than left to spawn against a PR that is gone.
+async fn single_reviewer_held_row_ends_with(state: PrLifecycleState, reason: &str) {
+    let (_dir, db) = open_db();
+    let (_product_id, chore_id, _) = chore_held_for_review(&db, "held-single", PR);
+    focus_on_another_project(&db);
+    let review = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .repo_remote_url(REPO)
+                .build(),
+        )
+        .unwrap();
+    let probe = StubProbe::new();
+    probe.set(PR, state);
+
+    let outcome = run_one_pass(&db, probe.as_ref(), &RecordingPublisher::default(), None, None, None).await;
+
+    assert_eq!(outcome.merged + outcome.closed_unmerged, 1, "{outcome:?}");
+    assert_eq!(task(&db, &chore_id).status, TaskStatus::Done);
+    let execution = db.get_execution(&review.id).unwrap();
+    assert_eq!(execution.status, ExecutionStatus::Cancelled);
+    assert_eq!(execution.last_error.as_deref(), Some(reason));
+}
+
+#[tokio::test]
+async fn merged_pr_cancels_the_single_reviewer_still_queued_for_a_held_chore() {
+    single_reviewer_held_row_ends_with(PrLifecycleState::Merged, "parent PR merged").await;
+}
+
+#[tokio::test]
+async fn closed_pr_cancels_the_single_reviewer_still_queued_for_a_held_chore() {
+    single_reviewer_held_row_ends_with(PrLifecycleState::ClosedUnmerged, "PR closed unmerged").await;
 }

@@ -1178,6 +1178,74 @@ impl WorkDb {
         Ok(executions)
     }
 
+    /// Cancel the single-reviewer `pr_review` executions still pending or
+    /// running for a chain whose PR merged or closed: the chain root's own and
+    /// those of its revisions. Reviewers that belong to a review batch are
+    /// left to the batch path: pre-merge batches are failed by
+    /// [`Self::fail_pre_merge_review_batches_for_ended_pr`], and a post-merge
+    /// batch reviews the landed code on purpose. Returns the cancelled
+    /// execution ids so the caller can release their panes and leases. The
+    /// reason is stamped on a never-started reviewer's `last_error` so the
+    /// cancelled row says why. An
+    /// execution already bound to a different PR (a replacement under the same
+    /// root) is kept.
+    pub fn cancel_single_pr_reviews_for_chain(
+        &self,
+        chain_root_id: &str,
+        pr_url: &str,
+        reason: &str,
+    ) -> Result<Vec<String>> {
+        let execution_ids: Vec<String> = {
+            let conn = self.connect()?;
+            let mut work_item_ids = collect_chain_revision_ids_including_deleted(&conn, chain_root_id)?;
+            work_item_ids.push(chain_root_id.to_owned());
+            let mut stmt = conn.prepare_cached(
+                "SELECT e.id, e.pr_url
+                 FROM work_executions e
+                 WHERE e.work_item_id = ?1
+                   AND e.kind = 'pr_review'
+                   AND e.status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+                   AND NOT EXISTS (SELECT 1 FROM pr_review_batch_members m WHERE m.execution_id = e.id)
+                 ORDER BY e.created_at ASC, e.id ASC",
+            )?;
+            let mut ids = Vec::new();
+            for work_item_id in &work_item_ids {
+                let rows = stmt.query_map([work_item_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })?;
+                for (id, bound_pr_url) in rows.collect::<rusqlite::Result<Vec<_>>>()? {
+                    let other_pr = bound_pr_url
+                        .as_deref()
+                        .is_some_and(|url| !url.is_empty() && !crate::merge_evidence::same_binding(url, pr_url));
+                    if !other_pr {
+                        ids.push(id);
+                    }
+                }
+            }
+            ids
+        };
+        let mut cancelled = Vec::new();
+        for execution_id in execution_ids {
+            match self.cancel_execution_with(
+                &execution_id,
+                CancelExecutionOpts {
+                    reason: Some(reason.to_owned()),
+                    queued_only: false,
+                    record_failure_reason: true,
+                },
+            ) {
+                Ok(_) => cancelled.push(execution_id),
+                Err(err) => tracing::warn!(
+                    execution_id = %execution_id,
+                    chain_root_id,
+                    ?err,
+                    "failed to cancel a pending PR review of an ended PR; continuing with the rest",
+                ),
+            }
+        }
+        Ok(cancelled)
+    }
+
     pub fn reconcile_product_executions(&self, product_id: &str) -> Result<ExecutionReconcileResult> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;

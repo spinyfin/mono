@@ -102,7 +102,7 @@ recorded. Neither gets any open-PR upkeep.
 
 | Watched                                                                                           | Listed by                                 | On a merge or a close                                                                                                             |
 | ------------------------------------------------------------------------------------------------- | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| A PR-owning row held `active` with its PR bound and no unfinished run that could still push to it | `list_chores_held_active_with_pr`         | The same transition an `in_review` row takes: `done`, with its revisions settled and its queued review guides cancelled           |
+| A PR-owning row held `active` with its PR bound and no unfinished run that could still push to it | `list_chores_held_active_with_pr`         | The same transition an `in_review` row takes: `done`, with its revisions settled and its pending reviews cancelled (see below)    |
 | Revisions resting `in_review` whose chain root is `done`, `archived`, deleted or missing          | `list_orphaned_in_review_revision_chains` | Each revision moves to `done`; the status ledger records `settle_orphaned_revisions_pr_merged` or `..._pr_closed_unmerged` for it |
 
 The first is the review hold. A row whose implementation finished stays
@@ -113,6 +113,14 @@ without this watch a PR merged during the hold left the row `active` for
 good. Review work that is queued, running or held never keeps the row off the
 list; an unfinished run of a kind that writes the PR branch does, because
 that run's own completion reads the PR's state.
+
+When the PR ends, the pass retires every review still pending for it, with the
+merge or close as the recorded reason: queued review guides, single-reviewer
+`pr_review` executions (the pipeline used while review-batch fan-out is off)
+of the row and its revisions, and live pre-merge review batches. A batch is
+failed with the abandon cause `review_batch_pr_ended` and files no
+`pr_review_batch_stale` attention, since a merge during a review is not
+something a human has to decide. Post-merge review batches are left alone.
 
 The second exists because a revision is settled by its root's merged or
 closed transition. A root moved to `done` or `archived` by hand, or deleted,
