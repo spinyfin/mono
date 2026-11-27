@@ -446,4 +446,21 @@ impl ServerState {
             }
         })
     }
+
+    /// Push a Boothby pass lifecycle change on the `boothby.activity` topic.
+    /// Called by [`crate::boothby_scheduler::spawn_loop`] via the
+    /// [`crate::boothby_scheduler::BoothbyActivitySink`] impl below.
+    pub async fn broadcast_boothby_activity(&self, pass: boss_protocol::BoothbyPass) {
+        let envelope = FrontendEventEnvelope::push(FrontendEvent::BoothbyActivity { pass });
+        self.topic_broker.publish(TOPIC_BOOTHBY_ACTIVITY, envelope).await;
+    }
+}
+
+#[async_trait::async_trait]
+impl boss_engine_runtime::external_tracker::reconcile::WorkInvalidationPublisher for ServerState {
+    async fn publish_work_item_invalidated(&self, product_id: &str, work_item_id: &str, reason: &str) {
+        self.publisher
+            .publish_work_item_changed(product_id, work_item_id, reason)
+            .await;
+    }
 }

@@ -13,8 +13,8 @@
 //!
 //! A `boothby_actions` row needs a `verb`, a `rationale` and a
 //! `reversibility` — all `NOT NULL`, and none of them knowable from a
-//! column delta. They come from the executor's verb catalogue (task 2 of
-//! the design's breakdown). Rather than thread them through `update_task`,
+//! column delta. They come from the executor's verb catalogue (design
+//! §"Action catalogue"). Rather than thread them through `update_task`,
 //! `delete_work_item` and every future mutation, the executor *arms* a
 //! [`BoothbyActionContext`] on the `WorkDb` ([`WorkDb::arm_boothby_action`])
 //! and then calls the ordinary actor-attributed path. The mutation layer
@@ -95,7 +95,7 @@ impl WorkDb {
     /// Arm the journal for the actor-boothby mutations made while the
     /// returned guard is alive. Disarms on drop.
     ///
-    /// Intended for the executor (task 2). Arming does not itself mutate
+    /// Intended for the guarded action executor. Arming does not itself mutate
     /// anything; a mutation with a different actor ignores the context
     /// entirely.
     pub fn arm_boothby_action(&self, context: BoothbyActionContext) -> Result<BoothbyActionGuard<'_>> {
@@ -114,6 +114,40 @@ impl WorkDb {
             .lock()
             .map_err(|_| anyhow::anyhow!("boothby action context lock poisoned"))?
             .clone())
+    }
+
+    /// Register the event-trigger queue [`WorkDb::create_attention_item`]
+    /// arms on a Boothby-trigger attention kind. Called once at boot
+    /// (`app.rs`), after both the `WorkDb` and the queue exist. Every
+    /// `WorkDb` clone shares the same queue (`Arc<Mutex<...>>>`), so
+    /// registering on one handle makes it visible from every other.
+    pub fn set_boothby_event_queue(&self, queue: Arc<crate::boothby_events::BoothbyEventQueue>) {
+        *self
+            .boothby_event_queue
+            .lock()
+            .expect("boothby event queue lock poisoned") = Some(queue);
+    }
+
+    /// Arm the registered event-trigger queue for `kind` if it is one of
+    /// [`crate::boothby_events::BOOTHBY_TRIGGER_ATTENTION_KINDS`] and a
+    /// queue is registered. Inert (no-op) otherwise — an unregistered queue
+    /// or a non-trigger kind are both the common case, not an error.
+    pub(crate) fn maybe_arm_boothby_for_attention_kind(&self, kind: &str) {
+        if !crate::boothby_events::BOOTHBY_TRIGGER_ATTENTION_KINDS.contains(&kind) {
+            return;
+        }
+        let queue = self
+            .boothby_event_queue
+            .lock()
+            .expect("boothby event queue lock poisoned")
+            .clone();
+        if let Some(queue) = queue {
+            let now = boss_engine_utils::epoch_time::now_epoch_secs();
+            queue.arm(
+                now,
+                &format!("{}{kind}", crate::boothby_events::BOOTHBY_EVENT_TRIGGER_PREFIX),
+            );
+        }
     }
 }
 
@@ -302,7 +336,7 @@ fn record_action_in_tx(
 
     let id = next_id("ba");
     // `undo_state` is deliberately left off this INSERT and lands on the DDL
-    // default 'none': promoting it to 'undoable' is task 2's job (the undo
+    // default 'none': promoting it to 'undoable' is the executor's job (the undo
     // engine owns the `undo_state` lifecycle), not this pre/post-image
     // capture layer. See `boothby_action_records_rationale_and_reversibility_from_the_context`,
     // which asserts this.
