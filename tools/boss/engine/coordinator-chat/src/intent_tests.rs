@@ -1,8 +1,6 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use boss_acp_client::schema::RequestId;
 
@@ -12,32 +10,9 @@ use crate::intent::{
 };
 use crate::queue::{PromptImageRef, PromptOrigin};
 
-static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TestDir(PathBuf);
-
-impl TestDir {
-    fn new(label: &str) -> Self {
-        let id = DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("boss-coord-chat-intent-{label}-{}-{id}", std::process::id()));
-        std::fs::create_dir_all(&path).expect("create temp test dir");
-        Self(path)
-    }
-
-    fn path(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 #[test]
 fn creates_private_0600_file_and_round_trips_queued_sent_and_withdrawn_records() {
-    let dir = TestDir::new("roundtrip");
+    let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("intent.jsonl");
     assert!(read_intent_file_if_exists(&path).unwrap().is_empty());
 
@@ -102,7 +77,7 @@ fn creates_private_0600_file_and_round_trips_queued_sent_and_withdrawn_records()
 
 #[test]
 fn reopen_continues_sequence_and_truncates_torn_final_line() {
-    let dir = TestDir::new("reopen");
+    let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("intent.jsonl");
 
     let first = {
@@ -141,8 +116,86 @@ fn reopen_continues_sequence_and_truncates_torn_final_line() {
 }
 
 #[test]
+fn reopen_repairs_complete_unterminated_final_record_and_allows_subsequent_appends() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("intent.jsonl");
+
+    let first_two = {
+        let mut log = IntentLog::open(&path).unwrap();
+        let a = log
+            .append_queued_at(10, PromptOrigin::Operator, "first", Some("c1".to_owned()), Vec::new())
+            .unwrap();
+        let b = log.append_sent_at(11, a.intent_id(), RequestId::Number(3)).unwrap();
+        vec![a, b]
+    };
+
+    // Append a complete JSON record without its trailing newline.
+    let unterminated = br#"{"seq":3,"ts_ms":12,"type":"queued","intent_id":2,"origin":"engine","text":"unterminated"}"#;
+    {
+        let mut raw = OpenOptions::new().append(true).open(&path).unwrap();
+        raw.write_all(unterminated).unwrap();
+    }
+
+    let mut reopened = IntentLog::open(&path).unwrap();
+    assert_eq!(reopened.next_seq(), 4);
+    assert_eq!(reopened.next_intent_id(), 3);
+
+    let d = reopened.append_sent_at(20, 2, RequestId::Number(4)).unwrap();
+    assert_eq!(d.seq, 4);
+
+    let all = read_intent_file(&path).unwrap();
+    assert_eq!(all.len(), 4);
+    assert_eq!(all[0..2], first_two[..]);
+    assert_eq!(all[2].seq, 3);
+    assert_eq!(all[2].intent_id(), 2);
+    assert_eq!(all[3], d);
+}
+
+#[test]
+fn torn_mid_utf8_final_record_is_tolerated_while_interior_invalid_utf8_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("intent.jsonl");
+
+    let valid = {
+        let mut log = IntentLog::open(&path).unwrap();
+        let a = log
+            .append_queued_at(10, PromptOrigin::Operator, "hello", Some("c1".to_owned()), Vec::new())
+            .unwrap();
+        vec![a]
+    };
+
+    // Append a final record truncated inside a 4-byte UTF-8 emoji (`🚀` = F0 9F 9A 80).
+    {
+        let mut raw = OpenOptions::new().append(true).open(&path).unwrap();
+        raw.write_all(br#"{"seq":2,"ts_ms":11,"type":"queued","intent_id":2,"origin":"operator","text":"launch "#)
+            .unwrap();
+        raw.write_all(&[0xF0, 0x9F]).unwrap();
+    }
+
+    assert_eq!(read_intent_file(&path).unwrap(), valid);
+
+    // Reopening truncates the torn UTF-8 tail cleanly.
+    let mut reopened = IntentLog::open(&path).unwrap();
+    assert_eq!(reopened.next_seq(), 2);
+    let next = reopened
+        .append_queued_at(20, PromptOrigin::Operator, "clean", None, Vec::new())
+        .unwrap();
+    assert_eq!(read_intent_file(&path).unwrap(), vec![valid[0].clone(), next]);
+
+    // Interior invalid UTF-8 (followed by a subsequent line) must still fail.
+    let mut interior_bad = Vec::new();
+    interior_bad.extend_from_slice(br#"{"seq":1,"ts_ms":1,"type":"queued","intent_id":1,"origin":"operator","text":""#);
+    interior_bad.extend_from_slice(&[0xF0, 0x9F]);
+    interior_bad.extend_from_slice(b"\"}\n");
+    interior_bad.extend_from_slice(br#"{"seq":2,"ts_ms":2,"type":"withdrawn","intent_id":1,"reason":"timeout"}"#);
+    interior_bad.push(b'\n');
+    let err = read_intent_records(interior_bad.as_slice()).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
 fn corrupt_record_before_end_is_an_error() {
-    let dir = TestDir::new("corrupt");
+    let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("intent.jsonl");
     std::fs::write(
         &path,
@@ -156,7 +209,7 @@ fn corrupt_record_before_end_is_an_error() {
 
 #[test]
 fn reads_lines_larger_than_spike_maximum_and_default_bufreader() {
-    let dir = TestDir::new("large");
+    let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("intent.jsonl");
     // Larger than both the spike's 27,587-byte max line and REPLAY_READ_BUFFER_BYTES.
     let huge_text = "x".repeat(REPLAY_READ_BUFFER_BYTES + 16_384);

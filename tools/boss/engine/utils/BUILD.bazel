@@ -18,6 +18,7 @@ rust_library(
         "//tools/boss/engine/automation-schedule:__pkg__",
         "//tools/boss/engine/comment-classifier:__pkg__",
         "//tools/boss/engine/completion:__pkg__",
+        "//tools/boss/engine/coordinator-chat:__pkg__",
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/day-rotated-log:__pkg__",
         "//tools/boss/engine/design-docs:__pkg__",

@@ -18,6 +18,7 @@ rust_library(
     deps = [
         "//tools/boss/acp_client",
         "//tools/boss/agent-host:agent_host",
+        "//tools/boss/engine/utils",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
 )
@@ -35,7 +36,9 @@ rust_test(
     deps = [
         "//tools/boss/acp_client",
         "//tools/boss/agent-host:agent_host",
+        "//tools/boss/engine/utils",
         "//tools/boss/protocol",
+        "@mono_crates//:tempfile",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,

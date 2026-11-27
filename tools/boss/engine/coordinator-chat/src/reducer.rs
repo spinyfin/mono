@@ -2,10 +2,11 @@
 //! coordinator chat vocabulary.
 //!
 //! The reducer is a pure state machine: feeding the same sequence of
-//! [`WireRecord`]s (and optional intent-log [`PromptIntent`] entries) always
-//! yields the exact same [`CoordinatorChatConnectionState`], ordered
-//! [`CoordinatorChatItem`] list, and [`CoordinatorChatInProgressMessage`]
-//! snapshot. It runs identically on live traffic and on journal replay.
+//! [`WireRecord`]s joined with the engine's append-only [`IntentRecord`] log
+//! always yields the exact same [`CoordinatorChatConnectionState`], ordered
+//! [`CoordinatorChatItem`] list, [`CoordinatorChatInProgressMessage`]
+//! snapshot, and [`TurnQueue`] state. It runs identically on live traffic and
+//! on journal replay.
 
 use std::collections::HashMap;
 use std::io::{self, BufRead};
@@ -40,28 +41,8 @@ use crate::redact::{CredentialRedactor, StreamingRedactor, StreamingRedactorSnap
 /// point cannot leak in part.
 pub const DEFAULT_TOOL_TEXT_LIMIT: usize = 4_000;
 
-/// An operator- or engine-authored prompt supplied from the engine's intent log.
-///
-/// The ACP adapter does not echo prompts back as `user_message_chunk` updates
-/// on live turns, so operator and engine message items come from the intent log
-/// rather than from the wire journal.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PromptIntent {
-    /// Journal sequence number associated with this prompt (used for stable id
-    /// derivation and ordering).
-    pub seq: u64,
-    /// Wall-clock milliseconds when the prompt was recorded.
-    pub ts_ms: u64,
-    /// Who authored the prompt (`Operator` or `Engine`).
-    pub role: CoordinatorChatMessageRole,
-    /// Raw prompt text; redacted before becoming a chat item.
-    pub text: String,
-    /// Optional client-assigned id for correlating pending composer messages.
-    pub client_message_id: Option<String>,
-}
-
 /// Summary of what a single [`ConversationReducer::apply_record`] or
-/// [`ConversationReducer::apply_intent_message`] call changed.
+/// [`ConversationReducer::apply_intent_record`] call changed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReduceDelta {
     /// Item ids created or mutated by this step, in order.
@@ -319,40 +300,6 @@ impl ConversationReducer {
         self.items.items.iter().find(|item| item.id == id)
     }
 
-    /// Records a prompt message from the engine's intent log as a chat item.
-    ///
-    /// The text is redacted before being stored. An intent never finalizes an
-    /// open streaming message or thought: stream boundaries come only from wire
-    /// records, so live application and [`replay_with_intents`] (which applies a
-    /// tied intent before its record) agree on message boundaries, ids and
-    /// redaction. Finalized streams are inserted at their started `seq`, so the
-    /// intent lands at its `seq` position ahead of wire-record items with the
-    /// same `seq`.
-    pub fn apply_intent_message(&mut self, intent: PromptIntent) -> ReduceDelta {
-        let mut delta = ReduceDelta::default();
-        let item_id = format!("prompt-{}", intent.seq);
-        let mut item = CoordinatorChatItem {
-            id: item_id.clone(),
-            seq: intent.seq,
-            updated_seq: intent.seq,
-            ts_ms: intent.ts_ms,
-            kind: CoordinatorChatItemKind::Message(CoordinatorChatMessageItem {
-                role: intent.role,
-                text: self.redactor.redact_str(&intent.text),
-                client_message_id: intent.client_message_id,
-                message_id: None,
-                sender: None,
-            }),
-        };
-        self.redactor.redact_item(&mut item);
-        let idx = self.items.items.partition_point(|existing| {
-            existing.seq < intent.seq || (existing.seq == intent.seq && existing.id.starts_with("prompt-"))
-        });
-        self.insert_item_at(item, idx);
-        delta.upserted_item_ids.push(item_id);
-        delta
-    }
-
     /// Inserts `item` into `self.items.items` in non-decreasing `seq` order,
     /// shifting any stored item indices at or after the insertion point.
     fn insert_item(&mut self, item: CoordinatorChatItem) -> usize {
@@ -419,13 +366,24 @@ impl ConversationReducer {
         delta
     }
 
+    fn has_active_wire_turn(&self) -> bool {
+        !self.wire.open_agent_turns.is_empty()
+            || self
+                .wire
+                .pending_client_requests
+                .values()
+                .any(|req| req.method == "session/prompt")
+    }
+
     fn handle_to_agent(&mut self, record: &WireRecord, message: &Map<String, Value>, delta: &mut ReduceDelta) {
         let id = parse_request_id(message.get("id"));
         if let Some(method) = message.get("method").and_then(Value::as_str) {
             if let Some(id) = id {
                 self.handle_client_request(record, &id, method, message.get("params"), delta);
             } else if method == "session/cancel" {
-                self.state.cancel_requested = true;
+                if self.has_active_wire_turn() {
+                    self.state.cancel_requested = true;
+                }
                 self.queue_state.queue.note_wire_cancel_sent();
             }
         } else if let Some(id) = id
@@ -1695,28 +1653,6 @@ pub fn replay_records<'a>(
     reducer
 }
 
-/// Replays wire records and intent-log prompts merged by `seq` through a fresh
-/// reducer. Both inputs must already be ordered by `seq`; on a tie the intent is
-/// applied first.
-pub fn replay_with_intents<'a>(
-    records: impl IntoIterator<Item = &'a WireRecord>,
-    intents: impl IntoIterator<Item = PromptIntent>,
-    redactor: CredentialRedactor,
-) -> ConversationReducer {
-    let mut reducer = ConversationReducer::new(redactor);
-    let mut intents = intents.into_iter().peekable();
-    for record in records {
-        while let Some(intent) = intents.next_if(|intent| intent.seq <= record.seq) {
-            reducer.apply_intent_message(intent);
-        }
-        reducer.apply_record(record);
-    }
-    for intent in intents {
-        reducer.apply_intent_message(intent);
-    }
-    reducer
-}
-
 /// Replays a wire journal joined with an append-only intent log through a
 /// fresh reducer, recovering both conversation items (with prompt origins and
 /// redacted prompt text) and the turn queue state.
@@ -1725,7 +1661,9 @@ pub fn replay_with_intents<'a>(
 /// `session/prompt` joins with its matching `IntentRecord::Sent` by
 /// `request_id` (FIFO per id). After all wire records have been applied, any
 /// `Sent` intent that never appeared on the wire journal is returned to the
-/// queue via [`ConversationReducer::reconcile_unsent_dispatches`].
+/// queue via [`ConversationReducer::reconcile_unsent_dispatches`]; only use
+/// this helper on complete/offline logs that already reach the host's live
+/// boundary.
 pub fn replay_with_intent_log<'a>(
     records: impl IntoIterator<Item = &'a WireRecord>,
     intent_records: impl IntoIterator<Item = &'a IntentRecord>,

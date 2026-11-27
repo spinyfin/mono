@@ -35,11 +35,10 @@ pub use intent::{
 pub use queue::{InFlightPrompt, PromptContent, PromptImageRef, PromptOrigin, QueuedPrompt, StopOutcome, TurnQueue};
 pub use redact::{CredentialRedactor, REDACTED_PLACEHOLDER, StreamingRedactor};
 pub use reducer::{
-    ConversationReducer, DEFAULT_TOOL_TEXT_LIMIT, PromptIntent, ReduceDelta, replay_reader, replay_records,
-    replay_with_intent_log, replay_with_intents,
+    ConversationReducer, DEFAULT_TOOL_TEXT_LIMIT, ReduceDelta, replay_reader, replay_records, replay_with_intent_log,
 };
 pub use snapshot::{
     DEFAULT_SNAPSHOT_INTERVAL_RECORDS, RecoveryResult, ReducerSnapshot, SNAPSHOT_SCHEMA_VERSION, SnapshotCursor,
-    SnapshotLoad, SnapshotLoadStatus, SnapshotProjection, load_snapshot, load_snapshot_bytes, read_wire_file_if_exists,
-    recover_from_files, recover_from_slices, recover_from_snapshot_and_tail, save_snapshot,
+    SnapshotLoad, SnapshotLoadStatus, SnapshotProjection, UnsentDispatchPolicy, load_snapshot, load_snapshot_bytes,
+    read_wire_file_if_exists, recover_from_files, recover_from_slices, recover_from_snapshot_and_tail, save_snapshot,
 };

@@ -303,3 +303,34 @@ fn request_id_matching_distinguishes_numeric_from_string_ids() {
     assert!(queue.on_wire_prompt_finished(&RequestId::Str("7".into())).is_none());
     assert!(queue.on_wire_prompt_finished(&RequestId::Number(7)).is_some());
 }
+
+#[test]
+fn stray_or_late_wire_cancel_does_not_suppress_next_turn_stop() {
+    let mut queue = TurnQueue::new();
+
+    // A stray `session/cancel` observed while idle must not arm `cancel_requested`.
+    queue.note_wire_cancel_sent();
+    assert!(!queue.cancel_requested());
+
+    // Starting a prompt turn afterwards still allows Stop to send `session/cancel`.
+    queue.enqueue(prompt(1, PromptOrigin::Operator, "next turn"));
+    queue.mark_intent_sent(1, RequestId::Number(10), 100);
+    // Even if a late cancel arrives while awaiting wire echo (before the turn is active),
+    // it must not suppress Stop once the prompt reaches the wire.
+    queue.note_wire_cancel_sent();
+    assert!(!queue.cancel_requested());
+
+    queue.on_wire_prompt_sent(&RequestId::Number(10), 1);
+    assert!(queue.plan_stop().send_cancel);
+    assert!(queue.request_stop().send_cancel);
+    assert!(queue.cancel_requested());
+    queue.on_wire_prompt_finished(&RequestId::Number(10));
+    assert!(!queue.cancel_requested());
+
+    // A late cancel arriving right after the turn closed must not suppress Stop
+    // on a subsequent agent-started turn either.
+    queue.note_wire_cancel_sent();
+    assert!(!queue.cancel_requested());
+    queue.on_agent_turn_started("autonomous-turn-1");
+    assert!(queue.request_stop().send_cancel);
+}

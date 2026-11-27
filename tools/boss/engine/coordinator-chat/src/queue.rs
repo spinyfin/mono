@@ -268,6 +268,7 @@ impl TurnQueue {
             sent_ts_ms,
             wire_seq: None,
         };
+        self.cancel_requested = false;
         self.in_flight = Some(entry.clone());
         Some(entry)
     }
@@ -279,14 +280,27 @@ impl TurnQueue {
     /// all intent records before (or interleaved with) wire records while still
     /// keeping live dispatch strictly single-flight (`is_busy()` is true while
     /// any entry awaits its wire echo).
+    ///
+    /// If `intent_id` is already in `dispatched_awaiting_wire`, the new `Sent`
+    /// record supersedes the abandoned earlier dispatch attempt (for example
+    /// when a previous engine crashed before the host journalled the first
+    /// attempt and a restarted engine retried the same intent under a new
+    /// `request_id`).
     pub fn mark_intent_sent(
         &mut self,
         intent_id: u64,
         request_id: RequestId,
         sent_ts_ms: u64,
     ) -> Option<InFlightPrompt> {
-        let pos = self.queued.iter().position(|entry| entry.intent_id == intent_id)?;
-        let prompt = self.queued.remove(pos);
+        let prompt = if let Some(pos) = self.queued.iter().position(|entry| entry.intent_id == intent_id) {
+            self.queued.remove(pos)
+        } else {
+            let pos = self
+                .dispatched_awaiting_wire
+                .iter()
+                .position(|entry| entry.prompt.intent_id == intent_id)?;
+            self.dispatched_awaiting_wire.remove(pos).prompt
+        };
         let entry = InFlightPrompt {
             prompt,
             request_id,
@@ -310,8 +324,12 @@ impl TurnQueue {
             .iter()
             .position(|entry| request_ids_equal(&entry.request_id, request_id))
         {
+            let was_idle = !self.has_active_turn();
             let mut entry = self.dispatched_awaiting_wire.remove(pos);
             entry.wire_seq = Some(wire_seq);
+            if was_idle {
+                self.cancel_requested = false;
+            }
             self.in_flight = Some(entry.clone());
             return Some(entry);
         }
@@ -349,6 +367,9 @@ impl TurnQueue {
     pub fn on_agent_turn_started(&mut self, task_id: impl Into<String>) {
         let task_id = task_id.into();
         if !self.open_agent_turns.iter().any(|existing| existing == &task_id) {
+            if !self.has_active_turn() {
+                self.cancel_requested = false;
+            }
             self.open_agent_turns.push(task_id);
         }
     }
@@ -459,8 +480,14 @@ impl TurnQueue {
     }
 
     /// Records that `session/cancel` was observed going out on the wire.
+    ///
+    /// Ignored when no turn is currently active so a stray or late cancel
+    /// (for example racing a turn's completion) cannot suppress Stop on the
+    /// next turn.
     pub fn note_wire_cancel_sent(&mut self) {
-        self.cancel_requested = true;
+        if self.has_active_turn() {
+            self.cancel_requested = true;
+        }
     }
 
     /// Re-queues any prompts whose `IntentRecord::Sent` was logged before an
