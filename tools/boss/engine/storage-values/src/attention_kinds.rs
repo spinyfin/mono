@@ -203,6 +203,10 @@ pub const ANSWER_AGENT_READY_AGE_ATTENTION_KIND: &str = "answer_agent_ready_age"
 /// keeps the surface simple; the overrun specifics live in the title/body.
 pub const ENVELOPE_OVERRUN_ATTENTION_KIND: &str = "envelope_overrun";
 
+/// `kind` of the attention item filed once per execution when a live run
+/// passes the token or round budget (signal only, never a stop).
+pub const RUN_BUDGET_OVERRUN_ATTENTION_KIND: &str = "run_budget_overrun";
+
 pub const EXECUTION_BOOKMARK_RECOVERY_FAILED_ATTENTION_KIND: &str = "execution_bookmark_recovery_failed";
 
 /// Filed when a recorded preserved tip cannot be restaged into a new lease.

@@ -48,6 +48,10 @@ Both apply the same rule, so the sweep is never doing anything the inline path w
 | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
 | `hung_worker`       | Progress resumed or no hung worker remains for the owner; persisted warnings are reconciled after restart while in-flight executions awaiting adoption remain protected | Live-worker activity sweep, every ten seconds |
 
+## Run-budget alarm
+
+`run_budget_overrun` (`engine/core/src/run_budget_watch.rs`) is `HumanDecision`, mirroring `envelope_overrun`. The 60-second budget watch reads the tailed cost snapshot on `work_runs` for live runs (gated by `run_budget_alarm`, default on) and files at most one `run_budget_overrun` attention item per execution when total tokens pass 25,000,000 or rounds pass 150. It is an informational signal only and never stops the worker; a later cheap run does not un-spend the overrun, so only human resolution lowers it.
+
 ## The fleet-level spawn-failure streak alert is not an attention item
 
 Attention items are scoped to one execution or one work item. A failure pattern that only exists _across_ executions has no row to live on, so it is raised as an engine-health issue instead.

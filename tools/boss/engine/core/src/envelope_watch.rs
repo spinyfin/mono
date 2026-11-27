@@ -618,16 +618,32 @@ fn effort_for_work_item(work_db: &WorkDb, work_item_id: &str) -> Option<EffortLe
 /// execution — the per-execution idempotency guard. On a lookup error we
 /// assume "already signalled" so a transient failure never double-files.
 fn execution_already_signaled(work_db: &WorkDb, execution_id: &str) -> bool {
+    execution_has_attention(
+        work_db,
+        execution_id,
+        ENVELOPE_OVERRUN_ATTENTION_KIND,
+        true,
+        "envelope-watch: attention lookup failed; skipping signal this pass",
+    )
+}
+
+/// Shared per-execution attention-item idempotency check. When `open_only` is
+/// `true`, only open items count; when `false`, any item of `kind` counts
+/// (strictly one item per execution even if resolved). On a lookup error we
+/// assume "already signalled" so a transient failure never double-files.
+pub(crate) fn execution_has_attention(
+    work_db: &WorkDb,
+    execution_id: &str,
+    kind: &str,
+    open_only: bool,
+    warn_context: &str,
+) -> bool {
     match work_db.list_attention_items(execution_id) {
         Ok(items) => items
             .iter()
-            .any(|item| item.kind == ENVELOPE_OVERRUN_ATTENTION_KIND && item.status == "open"),
+            .any(|item| item.kind == kind && (!open_only || item.status == "open")),
         Err(err) => {
-            tracing::warn!(
-                execution_id,
-                ?err,
-                "envelope-watch: attention lookup failed; skipping signal this pass"
-            );
+            tracing::warn!(execution_id, ?err, "{warn_context}");
             true
         }
     }

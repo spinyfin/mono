@@ -308,6 +308,14 @@ fn recurring_reads() -> Vec<Read> {
         ("PR binding repair", "600 s", READ_BUDGET_PAGES, |db| {
             db.list_pr_binding_repair_candidates().unwrap();
         }),
+        (
+            "run budget watch: live cost snapshots",
+            "60 s",
+            READ_BUDGET_PAGES,
+            |db| {
+                db.live_run_cost_snapshots(&["exec_running_sample".to_owned()]).unwrap();
+            },
+        ),
         ("proposal expiry", "3600 s", READ_BUDGET_PAGES, |db| {
             db.expire_stale_in_flight_proposals().unwrap();
         }),

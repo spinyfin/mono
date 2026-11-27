@@ -592,6 +592,11 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
         "A cost record. The overrun happened; a later cheap run does not un-spend it.",
     ),
     entry(
+        RUN_BUDGET_OVERRUN_ATTENTION_KIND,
+        ClearedBy::HumanDecision,
+        "A cost record. The token or round budget overrun happened; a later cheap run does not un-spend it.",
+    ),
+    entry(
         UNOBSERVED_COMMAND_ATTENTION_KIND,
         ClearedBy::HumanDecision,
         "An audit record of a command that already ran outside the observed surface. Auto-resolving \

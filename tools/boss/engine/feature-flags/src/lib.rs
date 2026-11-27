@@ -114,6 +114,16 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         capability_id: None,
     },
     FeatureFlagSpec {
+        name: "run_budget_alarm",
+        description: "File a one-time `run_budget_overrun` attention item per execution when a live \
+             run passes 25 million tokens or 150 rounds, read from the tailed cost snapshot. \
+             Informational signal only — never stops the worker. DEFAULT ON; set false as a kill \
+             switch to disable budget-alarm checks immediately.",
+        category: "completion",
+        default_enabled: true,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
         name: "editorial_controls",
         description: "Enable editorial controls for agent-authored PRs and GitHub comments: injects the \
              [editorial-rules] block into worker prompts, and gates the PreToolUse \

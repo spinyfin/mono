@@ -1799,6 +1799,88 @@ impl WorkDb {
         }
         query_run(&conn, run_id).require("run", run_id)
     }
+
+    /// Batched cost-snapshot lookup for live (non-terminal) executions, keyed
+    /// by `execution_id`. Uses [`HOOK_RUN_ORDER_BY`] precedence so pre-start
+    /// failure siblings never mask the live agent-session run, and filters
+    /// `work_executions` to non-terminal statuses so a completion racing the
+    /// sweep is excluded.
+    ///
+    /// Queries by `execution_id IN (...)` (chunked at 500) so SQLite seeks via
+    /// `work_runs_execution_idx` and `work_executions`'s primary key instead of
+    /// scanning either table.
+    pub fn live_run_cost_snapshots(&self, execution_ids: &[String]) -> Result<Vec<LiveRunCostSnapshot>> {
+        if execution_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        const IN_CHUNK: usize = 500;
+        let conn = self.connect()?;
+        let mut out = Vec::with_capacity(execution_ids.len());
+        for chunk in execution_ids.chunks(IN_CHUNK) {
+            let placeholders = (1..=chunk.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT r.execution_id,
+                        e.work_item_id,
+                        r.input_tokens,
+                        r.output_tokens,
+                        r.cache_creation_tokens,
+                        r.cache_read_tokens,
+                        r.rounds
+                 FROM (
+                     SELECT execution_id,
+                            input_tokens,
+                            output_tokens,
+                            cache_creation_tokens,
+                            cache_read_tokens,
+                            rounds,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY execution_id
+                                ORDER BY {HOOK_RUN_ORDER_BY}
+                            ) AS rn
+                     FROM work_runs
+                     WHERE execution_id IN ({placeholders})
+                 ) r
+                 JOIN work_executions e ON e.id = r.execution_id
+                 WHERE r.rn = 1
+                   AND e.status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |row| {
+                let execution_id: String = row.get(0)?;
+                let work_item_id: String = row.get(1)?;
+                let input_tokens: Option<i64> = row.get(2)?;
+                let output_tokens: Option<i64> = row.get(3)?;
+                let cache_creation_tokens: Option<i64> = row.get(4)?;
+                let cache_read_tokens: Option<i64> = row.get(5)?;
+                let rounds: Option<i64> = row.get(6)?;
+                let total_tokens = if input_tokens.is_some()
+                    || output_tokens.is_some()
+                    || cache_creation_tokens.is_some()
+                    || cache_read_tokens.is_some()
+                {
+                    Some(
+                        input_tokens
+                            .unwrap_or(0)
+                            .saturating_add(output_tokens.unwrap_or(0))
+                            .saturating_add(cache_creation_tokens.unwrap_or(0))
+                            .saturating_add(cache_read_tokens.unwrap_or(0)),
+                    )
+                } else {
+                    None
+                };
+                Ok(LiveRunCostSnapshot {
+                    execution_id,
+                    work_item_id,
+                    total_tokens,
+                    rounds,
+                })
+            })?;
+            for row in rows {
+                out.push(row?);
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Pick the `work_runs` row that hook-driven writes (transcript path,
