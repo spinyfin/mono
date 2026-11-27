@@ -121,7 +121,11 @@ impl<F: Fn(&str, PricedTokens) -> Option<f64>> UsdEstimator for F {
 
 /// One run with everything the builders derive from it.
 #[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub(crate) struct RunFacts<'a> {
+    pub experiment_arms: Option<boss_feature_flags::ExperimentArmSet>,
+    pub experiment_arm: String,
+    pub pipeline_stage: &'static str,
     pub rec: &'a UsageRunRecord,
     pub coverage: RunCoverage,
     pub convention: InputConvention,
@@ -134,6 +138,13 @@ pub(crate) struct RunFacts<'a> {
 }
 
 impl RunFacts<'_> {
+    pub(crate) fn select_experiment(mut self, experiment: Option<&str>) -> Self {
+        if let Some(key) = experiment {
+            self.experiment_arm = crate::dimensions::arm_value(self.experiment_arms.as_ref(), key).to_owned();
+        }
+        self
+    }
+
     /// This run as the shared accumulator sees it.
     pub(crate) fn sample(&self) -> RunSample<'_> {
         RunSample {
@@ -175,7 +186,18 @@ pub(crate) fn classify<'a>(rec: &'a UsageRunRecord, task: Option<&'a UsageTaskRe
     let driver = rec.driver.slug();
     let coverage = run_coverage(rec);
     let convention = input_convention(driver);
+    let arms = rec
+        .experiment_arms
+        .as_deref()
+        .and_then(|s| boss_feature_flags::ExperimentArmSet::decode(s).ok());
     RunFacts::builder()
+        .experiment_arm(arms.as_ref().map_or_else(|| "not_recorded".to_owned(), |a| a.encode()))
+        .maybe_experiment_arms(arms)
+        .pipeline_stage(crate::dimensions::pipeline_stage(
+            &rec.execution_kind,
+            rec.review_member_role.as_deref(),
+            task,
+        ))
         .rec(rec)
         .coverage(coverage)
         .convention(convention)
@@ -429,6 +451,8 @@ pub(crate) fn model_label(rec: &UsageRunRecord) -> String {
 /// run), so group keys and labels cannot drift across those grains.
 #[derive(Clone, Copy, bon::Builder)]
 pub(crate) struct DimensionSource<'a> {
+    pub experiment_arm: Option<&'a str>,
+    pub pipeline_stage: Option<&'a str>,
     pub task: Option<&'a UsageTaskRecord>,
     pub execution_kind: Option<&'a str>,
     pub execution_status: Option<&'a str>,
@@ -445,6 +469,8 @@ pub(crate) struct DimensionSource<'a> {
 impl<'a> DimensionSource<'a> {
     pub(crate) fn from_run(facts: &'a RunFacts<'a>) -> Self {
         Self {
+            experiment_arm: Some(&facts.experiment_arm),
+            pipeline_stage: Some(facts.pipeline_stage),
             task: facts.task,
             execution_kind: Some(facts.rec.execution_kind.as_str()),
             execution_status: Some(facts.rec.execution_status.as_str()),
@@ -519,6 +545,8 @@ pub(crate) fn dimension_value_of<'a>(src: &DimensionSource<'a>, dimension: Usage
         UsageDimension::Coverage => src
             .coverage
             .map_or_else(|| none("(no runs)"), |coverage| same(coverage.as_str())),
+        UsageDimension::ExperimentArm => same(src.experiment_arm.unwrap_or("not_recorded")),
+        UsageDimension::PipelineStage => same(src.pipeline_stage.unwrap_or("unclassified")),
         UsageDimension::Host => src.host_id.map_or_else(|| none("(none)"), same),
     }
 }
@@ -528,6 +556,8 @@ pub(crate) fn dimension_value_of<'a>(src: &DimensionSource<'a>, dimension: Usage
 /// written on the execution row, not later resolution.
 pub(crate) fn has_recorded_dimension(src: &DimensionSource<'_>, dimension: UsageDimension) -> bool {
     match dimension {
+        UsageDimension::ExperimentArm => src.experiment_arm.is_some_and(|arm| arm != "not_recorded"),
+        UsageDimension::PipelineStage => src.pipeline_stage.is_some_and(|stage| stage != "unclassified"),
         UsageDimension::Driver => src.driver_source == DriverSource::LaunchTuple,
         UsageDimension::Model => src.run_model.is_some() || src.execution_model.is_some(),
         UsageDimension::Effort => src.execution_effort.is_some(),

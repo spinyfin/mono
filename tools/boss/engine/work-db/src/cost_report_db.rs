@@ -122,7 +122,9 @@ const USAGE_RUN_COLUMNS: &str = "
     wr.first_call_context_tokens,
     wr.first_call_cache_write_tokens,
     wr.peak_context_tokens,
-    wr.compactions
+    wr.compactions,
+    we.experiment_arms,
+    (SELECT role FROM pr_review_batch_members WHERE execution_id = we.id)
 ";
 
 fn map_usage_run_record(row: &Row) -> rusqlite::Result<UsageRunRecord> {
@@ -163,7 +165,28 @@ fn map_usage_run_record(row: &Row) -> rusqlite::Result<UsageRunRecord> {
         first_call_cache_write_tokens: row.get(29)?,
         peak_context_tokens: row.get(30)?,
         compactions: row.get(31)?,
+        experiment_arms: row.get(32)?,
+        review_member_role: row.get(33)?,
+        experiment_family_id: None,
     })
+}
+
+/// Review guides use a comparison id rather than a task id. Resolve each
+/// distinct guide once in the same snapshot, using the launch assignment rule.
+fn fill_review_guide_families(conn: &Connection, runs: &mut [UsageRunRecord]) -> Result<()> {
+    let mut families = HashMap::new();
+    for run in runs.iter_mut().filter(|r| r.execution_kind == "pr_review_guide") {
+        let family = match families.entry(run.work_item_id.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(chain_helpers::experiment_family_root(
+                conn,
+                &boss_protocol::ExecutionKind::PrReviewGuide,
+                &run.work_item_id,
+            )?),
+        };
+        run.experiment_family_id = Some(family.clone());
+    }
+    Ok(())
 }
 
 /// Fill a NULL launch tuple from [`WorkDb::get_execution_driver_slugs_lenient`],
@@ -246,7 +269,9 @@ const USAGE_EXECUTION_COLUMNS: &str = "
     we.host_id,
     we.driver,
     we.model,
-    we.effort_level
+    we.effort_level,
+    we.experiment_arms,
+    (SELECT role FROM pr_review_batch_members WHERE execution_id = we.id)
 ";
 
 fn map_usage_execution_record(row: &Row) -> rusqlite::Result<UsageExecutionRecord> {
@@ -267,6 +292,8 @@ fn map_usage_execution_record(row: &Row) -> rusqlite::Result<UsageExecutionRecor
         driver,
         execution_model: row.get(10)?,
         execution_effort: row.get(11)?,
+        experiment_arms: row.get(12)?,
+        review_member_role: row.get(13)?,
     })
 }
 
@@ -286,7 +313,8 @@ const USAGE_SERIES_TASK_COLUMNS: &str = "
     CAST(t.completed_at AS INTEGER),
     t.reasoning,
     t.effort_level,
-    0
+    0,
+    t.created_via
 ";
 
 /// Task columns of [`UsageTaskRecord`] in field order of [`map_usage_task_record`],
@@ -308,13 +336,15 @@ const USAGE_TASK_COLUMNS: &str = "
     (SELECT COUNT(*)
        FROM work_executions we
        JOIN work_runs wr ON wr.execution_id = we.id
-      WHERE we.work_item_id = t.id)
+      WHERE we.work_item_id = t.id),
+    t.created_via
 ";
 
 fn map_usage_task_record(row: &Row, roots: &HashMap<String, String>) -> rusqlite::Result<UsageTaskRecord> {
     let task_id: String = row.get(0)?;
     let chain_root_id = roots.get(&task_id).cloned().unwrap_or_else(|| task_id.clone());
     Ok(UsageTaskRecord {
+        created_via: row.get(14)?,
         name: row.get(1)?,
         kind: row.get(2)?,
         status: row.get(3)?,
@@ -480,6 +510,7 @@ impl WorkDb {
                     map_usage_task_record(row, &roots)
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+            fill_review_guide_families(&tx, &mut runs)?;
             tx.commit()?;
         }
         fill_resolved_drivers(self, &mut runs);
@@ -715,6 +746,7 @@ impl WorkDb {
                     map_usage_task_record(row, &roots)
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+            fill_review_guide_families(&tx, &mut runs)?;
             tx.commit()?;
         }
         let mut resolved: HashMap<String, Option<String>> = HashMap::new();
@@ -1436,6 +1468,42 @@ mod tests {
         };
         let priced = |model: &str, _tokens: boss_usage_report::PricedTokens| model.contains("claude").then_some(1.0);
         let report = build_usage_rows_report(&query(0), &records, Some(&priced));
+
+        let experiment = report
+            .observed_experiments
+            .iter()
+            .find(|e| e.experiment == "batched_search")
+            .unwrap();
+        let treatment = experiment.arms.iter().find(|a| a.arm == "treatment").unwrap();
+        assert_eq!((treatment.runs, treatment.families), (4, 1));
+        let stages = report
+            .dimension_values
+            .iter()
+            .find(|d| d.dimension == UsageDimension::PipelineStage)
+            .unwrap();
+        for stage in [
+            "filed_work",
+            "review_finding_revision",
+            "ci_fix_revision",
+            "conflict_revision",
+            "progression_minted_work",
+            "post_merge_follow_up",
+            "review_supervisor",
+            "review_guide",
+        ] {
+            assert!(stages.values.iter().any(|v| v.value == stage), "missing {stage}");
+        }
+        let series_records = db.usage_series_records_for_window(0, now + 86_400).unwrap();
+        let supervisor = series_records
+            .finished_executions
+            .iter()
+            .find(|e| e.execution_id == "exec_seed_a2")
+            .unwrap();
+        assert_eq!(supervisor.review_member_role.as_deref(), Some("supervisor"));
+        assert_eq!(
+            supervisor.experiment_arms.as_deref(),
+            Some(r#"{"batched_search":"control"}"#)
+        );
 
         let coverage = &report.coverage;
         assert_eq!(

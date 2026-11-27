@@ -2,6 +2,35 @@ import XCTest
 @testable import Boss
 
 final class TokenUsageTreeBuilderTests: XCTestCase {
+    func testCacheDurationClassesDecodeFromEngineWireKeys() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let data = Data(#"{"cache_creation_5m": 123, "cache_creation_1h": 456}"#.utf8)
+        let tokens = try decoder.decode(TokenClasses.self, from: data)
+        XCTAssertEqual(tokens.cacheCreation5m, 123)
+        XCTAssertEqual(tokens.cacheCreation1h, 456)
+    }
+
+    func testUnknownDimensionsDoNotDropTheReply() throws {
+        let original = sampleReport(tasks: [sampleChainRoot()])
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: encoder.encode(original)) as? [String: Any])
+        json["dimension_values"] = [
+            ["dimension": "future_dimension", "values": [["future_shape": true]]],
+            ["dimension": "driver", "values": [["value": "claude", "label": "Claude", "runs": 1]]],
+            ["dimension": "experiment_arm", "values": []],
+        ]
+        json["group_by"] = ["future_dimension", "driver"]
+        let report = try XCTUnwrap(TokenUsageRowsReport.parse(json))
+        XCTAssertEqual(report.dimensionValues.map(\.dimension), [.driver])
+        XCTAssertEqual(report.groupBy, [.driver])
+        XCTAssertEqual(report.tasks, original.tasks)
+        XCTAssertEqual(report.overall, original.overall)
+        json["dimension_values"] = [["dimension": "driver", "values": [["runs": "broken"]]]]
+        XCTAssertNil(TokenUsageRowsReport.parse(json), "known malformed data must still fail")
+    }
+
     func testUngroupedTreeNestsRevisionsUnderTheRootAndTasklessUnderOverhead() {
         let root = sampleChainRoot()
         let report = sampleReport(tasks: [root], taskless: [sampleTasklessExecution()])

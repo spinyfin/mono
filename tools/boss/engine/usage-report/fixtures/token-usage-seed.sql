@@ -176,4 +176,31 @@ INSERT INTO coordinator_usage_slices (
     (SELECT now FROM seed_clock)
   );
 
+-- Recorded experiments: overlapping sets, both arms, stopped, an empty set,
+-- and legacy NULL. Revisions retain their family's assignment.
+UPDATE work_executions SET experiment_arms = '{"batched_search":"treatment","worker_autocompact":"control"}'
+ WHERE id IN ('exec_seed_b0', 'exec_seed_b1', 'exec_seed_b2', 'exec_seed_t2');
+UPDATE work_executions SET experiment_arms = '{"batched_search":"control"}'
+ WHERE id IN ('exec_seed_a1', 'exec_seed_a2');
+UPDATE work_executions SET experiment_arms = '{"batched_search":"stopped"}'
+ WHERE id IN ('exec_seed_c0', 'exec_seed_c1');
+UPDATE work_executions SET experiment_arms = '{}' WHERE id = 'exec_seed_d1';
+UPDATE tasks SET created_via = 'pr_review:seed_review' WHERE id = 'task_seed_b_rev1';
+UPDATE tasks SET created_via = 'ci-fix:seed_attempt' WHERE id = 'task_seed_b_rev2';
+UPDATE tasks SET created_via = 'merge-conflict:seed_attempt' WHERE id = 'task_seed_c_ghost_rev';
+UPDATE tasks SET created_via = 'progression:seed_execution' WHERE id = 'task_seed_e_grok';
+UPDATE tasks SET created_via = 'pr_review:post_merge:seed_proposal' WHERE id = 'task_seed_f_agy';
+
+-- A completed supervisor batch, so the role is exercised by the SQL projection.
+INSERT INTO pr_review_batches (id, cycle_root_id, base_sha, classification_json, created_at, phase, pr_number, pr_url, status, target_sha, updated_at)
+ VALUES ('batch_seed', 'task_seed_a_claude', 'seed_base', '{}', '1784000000', 'pre_merge', 101, 'https://github.com/example/boss/pull/101', 'completed', 'seed_head', '1784000000');
+INSERT INTO pr_review_batch_members (id, batch_id, attempt, created_at, provider_effort, requested_driver, resolved_model, role, status, updated_at, execution_id)
+ VALUES ('member_seed', 'batch_seed', 1, '1784000000', 'medium', 'claude', 'sonnet', 'supervisor', 'reported', '1784000000', 'exec_seed_a2');
+
+-- A guide's work item is its comparison, but its experiment family is the PR root.
+INSERT INTO pr_review_guide_source_series (id, root_task_id, canonical_pr_url, created_at, updated_at)
+ VALUES ('series_seed', 'task_seed_b_chain_root', 'https://github.com/example/boss/pull/102', '1784000000', '1784000000');
+INSERT INTO pr_review_guide_source_comparisons (id, series_id, observation_sequence, observed_base_sha, merge_base_sha, head_sha, trigger, packet_hash, complete, omission_count, captured_at)
+ VALUES ('comparison_seed_1', 'series_seed', 1, 'seed_base', 'seed_base', 'seed_head', 'seed', 'seed_hash', 1, 0, '1784000000');
+
 DROP TABLE seed_clock;

@@ -49,6 +49,11 @@ impl RecordedDriver {
 #[derive(Debug, Clone, PartialEq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct UsageRunRecord {
+    /// Resolved launch family for taskless review guides.
+    pub experiment_family_id: Option<String>,
+    /// Canonical arm set from the launch record; NULL means not recorded.
+    pub experiment_arms: Option<String>,
+    pub review_member_role: Option<String>,
     pub run_id: String,
     pub run_status: String,
     /// `work_runs.created_at` as epoch seconds: the column the window is half-open on.
@@ -106,6 +111,7 @@ pub struct UsageRunRecord {
 #[derive(Debug, Clone, PartialEq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct UsageTaskRecord {
+    pub created_via: Option<String>,
     pub task_id: String,
     pub name: String,
     pub kind: String,
@@ -148,6 +154,9 @@ pub struct UsageWindowRecords {
 #[derive(Debug, Clone, PartialEq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct UsageExecutionRecord {
+    /// Canonical arm set from the launch record; NULL means not recorded.
+    pub experiment_arms: Option<String>,
+    pub review_member_role: Option<String>,
     pub execution_id: String,
     pub work_item_id: String,
     pub execution_kind: String,

@@ -9,9 +9,10 @@ Every experiment ships **inert**: its flag is off, and a build that contains it 
 The mechanism and its first experiment are in the engine. The things that make an experiment readable are not:
 
 - **Landed:** the experiment registry and flags, the arm assigned to every launch, the `experiment_arms` column in the launch record, and the `pane_spawned` dispatch event carrying the arm set.
-- **Not landed:** the usage-rows dimension `experiment_arm` (so `boss cost rows --experiment <key> --group-by experiment_arm` does not exist yet), the per-family outcomes report, and the Token Usage window picker.
+- **Landed:** usage rows and series accept `--experiment <key>` and the `experiment_arm` and `pipeline_stage` dimensions. Replies list observed experiments with run and family counts per arm.
+- **Not landed:** the per-family outcomes report and the Token Usage window picker.
 
-**Do not switch an experiment on until the usage dimension and the outcomes report have landed.** Until then nothing in the Token Usage window can tell the two arms apart, and an experiment running for a month without a reader is a month of data nobody can use. The recorded arms are durable, so work launched in the meantime is still readable afterwards; but the experiment's treatment is live for its treated half the whole time.
+**Do not switch an experiment on until the family outcomes report has landed.** The CLI can now compare recorded token usage by arm, but evaluating savings also needs the family outcomes and guardrails. The Token Usage window picker is still pending. Recorded arms are durable, so work launched in the meantime is readable afterwards; the experiment's treatment is live for its treated half the whole time.
 
 ## Starting, splitting and stopping
 
@@ -98,7 +99,7 @@ Run at most four experiments at once. The fall-back read for a surprising result
 | Guardrail             | Review findings per PR, from the outcomes report.                                                                                                                                                                                                                                                                          |
 | Stop early when       | A treated run cannot start, or ends in a state the engine cannot classify. No other condition beyond the general rules below.                                                                                                                                                                                              |
 
-To run it: switch `batched_search` on (a half-and-half split starts), switch `batched_search_ab_split` off to treat every family, switch `batched_search` off to stop. To read it, once the usage dimension lands: `boss cost rows --experiment batched_search --group-by experiment_arm`.
+To run it: switch `batched_search` on (a half-and-half split starts), switch `batched_search_ab_split` off to treat every family, switch `batched_search` off to stop. To read it, `boss cost rows --experiment batched_search --group-by experiment_arm`.
 
 ### `worker_autocompact`
 
@@ -116,7 +117,7 @@ To run it: switch `batched_search` on (a half-and-half split starts), switch `ba
 | Guardrail             | End-status mix of compacted runs, and the share that ended without a done declaration.                                                                                                                                                                                |
 | Stop early when       | A compacted run loses its task or its done declaration, or the undeclared rate is twice control. Also the general rule below.                                                                                                                                         |
 
-To run it: switch `worker_autocompact` on (a half-and-half split starts), switch `worker_autocompact_ab_split` off to treat every family, switch `worker_autocompact` off to stop. To read it, once the usage dimension lands: `boss cost rows --experiment worker_autocompact --group-by experiment_arm --filter driver=claude`.
+To run it: switch `worker_autocompact` on (a half-and-half split starts), switch `worker_autocompact_ab_split` off to treat every family, switch `worker_autocompact` off to stop. To read it, `boss cost rows --experiment worker_autocompact --group-by experiment_arm --filter driver=claude`.
 
 ## Rules for every experiment
 
@@ -132,3 +133,15 @@ To run it: switch `worker_autocompact` on (a half-and-half split starts), switch
 2. Register its flags in `REGISTRY` in `tools/boss/engine/feature-flags/src/lib.rs`, category `experiments`: `<key>` off by default and, when it splits, `<key>_ab_split` on by default. A test fails if the two registries disagree.
 3. Read the arm where the behaviour is decided. A prompt or launch change reads it from the arm set the runner resolved before composing, and turns it into a plain option, so the composer and the drivers never see an experiment key. A policy decision (skip a review, admit a post-merge review) resolves the family's arm with the same function and the same family id.
 4. Add a section to this page: what it changes, how its effect is read, its guardrail, and when to stop it early. Say in the pull request that it ships inert and which flag makes it live.
+
+### Reading experiment arms and pipeline stages
+
+`boss cost rows --since 14d --experiment batched_search --group-by experiment_arm,pipeline_stage` compares recorded assignments. Filter to the stage or driver the experiment changes, for example `--filter pipeline_stage=filed_work --filter driver=claude`. `boss cost series --since 14d --experiment batched_search --group-by experiment_arm` uses the same selector and filters.
+
+With `--experiment`, the dimension values are `treatment`, `control`, `stopped`, `not_enrolled` (a recorded set without the key), and `not_recorded` (NULL or unreadable launch data). Without it, the value is the entire canonical JSON arm set: overlapping experiments remain distinct combinations, and `{}` differs from `not_recorded`. An entire set can be filtered as one quoted JSON value, for example `--filter 'experiment_arm={"batched_search":"treatment","worker_autocompact":"control"}'`.
+
+The reply's `observed_experiments` lists keys found in launch records in the requested window, including retired keys. Its arm counts cover the window before filters or the row cap. Families are distinct within each arm: revisions share their chain root, review guides use the family of the PR they explain, and other taskless work uses its work-item id. A family with changed recorded assignments can appear in more than one arm, so summing arm family counts is not a distinct-family total. These are observations, not a causal comparison or an outcomes report.
+
+Rows keep at most 5,000 matching runs, newest first. A capped experiment read carries an `experiment_comparison_capped` coverage note: its token comparison covers only retained runs, whereas the observed-experiment counts cover the whole window. Narrow the window or filter to the stage being compared before drawing conclusions.
+
+Pipeline stages use the execution kind first. Reviews use their recorded batch-member role (`pre_merge_review`, `review_supervisor`, `post_merge_review`); an older review with no batch member is `pre_merge_review`. Implementation runs use task provenance to distinguish `filed_work`, `review_finding_revision`, `ci_fix_revision`, `conflict_revision`, `progression_minted_work`, and `post_merge_follow_up`. Review guides are `review_guide`; progression is `progression`; the remaining known kinds keep their names. Unrecognized kinds, roles or provenance are `unclassified`. A review of a CI fix remains a review, rather than inheriting the fix's stage.

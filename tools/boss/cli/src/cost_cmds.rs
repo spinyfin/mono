@@ -46,6 +46,16 @@ pub(crate) fn parse_usage_filter(input: &str) -> Result<boss_protocol::UsageFilt
     let (dimension, values) = input
         .split_once('=')
         .ok_or_else(|| format!("expected DIMENSION=VALUE[,VALUE…], got {input:?}"))?;
+    let dimension: boss_protocol::UsageDimension = dimension.trim().parse()?;
+    // An entire arm set is one dimension value, even when it contains commas.
+    if dimension == boss_protocol::UsageDimension::ExperimentArm && values.trim_start().starts_with('{') {
+        let arms: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(values).map_err(|error| format!("invalid experiment arm set: {error}"))?;
+        return Ok(boss_protocol::UsageFilter {
+            dimension,
+            values: vec![serde_json::to_string(&arms).map_err(|e| e.to_string())?],
+        });
+    }
     let values: Vec<String> = values
         .split(',')
         .map(str::trim)
@@ -55,10 +65,7 @@ pub(crate) fn parse_usage_filter(input: &str) -> Result<boss_protocol::UsageFilt
     if values.is_empty() {
         return Err(format!("--filter {dimension} needs at least one value"));
     }
-    Ok(boss_protocol::UsageFilter {
-        dimension: dimension.trim().parse()?,
-        values,
-    })
+    Ok(boss_protocol::UsageFilter { dimension, values })
 }
 
 #[derive(Debug, Clone, Args)]
@@ -141,6 +148,12 @@ pub(crate) struct CostTopArgs {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct CostRowsArgs {
+    /// Select the experiment for experiment_arm grouping and filters. Without
+    /// this option the dimension is the whole recorded arm set. Selected values:
+    /// treatment, control, stopped, not_enrolled, not_recorded.
+    #[arg(long, value_name = "KEY")]
+    pub(crate) experiment: Option<String>,
+
     /// Start of the window: an RFC3339 timestamp (e.g.
     /// `2026-07-01T00:00:00Z`) or a relative duration ago (`24h`, `7d`,
     /// `2w`).
@@ -155,7 +168,7 @@ pub(crate) struct CostRowsArgs {
     /// Group runs by up to two dimensions, outermost first (e.g.
     /// `driver,model`). Dimensions: product, project, task_kind,
     /// execution_kind, spend_class, driver, model, effort, reasoning,
-    /// task_status, execution_status, coverage, host. Reasoning is the task's
+    /// task_status, execution_status, coverage, host, experiment_arm, pipeline_stage. Reasoning is the task's
     /// current setting; the launch tuple does not record it.
     #[arg(long, value_delimiter = ',', value_name = "DIMENSION")]
     pub(crate) group_by: Vec<boss_protocol::UsageDimension>,
@@ -191,6 +204,12 @@ pub(crate) struct CostRowsArgs {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct CostSeriesArgs {
+    /// Select the experiment for experiment_arm grouping and filters. Without
+    /// this option the dimension is the whole recorded arm set. Selected values:
+    /// treatment, control, stopped, not_enrolled, not_recorded.
+    #[arg(long, value_name = "KEY")]
+    pub(crate) experiment: Option<String>,
+
     /// Start of the window: an RFC3339 timestamp (e.g.
     /// `2026-07-01T00:00:00Z`) or a relative duration ago (`24h`, `7d`,
     /// `90d`).
@@ -208,7 +227,8 @@ pub(crate) struct CostSeriesArgs {
     #[arg(long, value_name = "WIDTH")]
     pub(crate) bucket: Option<boss_protocol::UsageBucketWidth>,
 
-    /// Group series cells by one dimension (e.g. `driver`, `model`, `effort`).
+    /// Group series cells by one dimension (e.g. `driver`, `model`,
+    /// `experiment_arm`, `pipeline_stage`).
     #[arg(long, value_name = "DIMENSION")]
     pub(crate) group_by: Option<boss_protocol::UsageDimension>,
 
@@ -323,6 +343,7 @@ pub(crate) async fn run_cost_command(command: CostCommand, ctx: &RunContext) -> 
                         since_epoch_s,
                         until_epoch_s,
                         filters: args.filters.clone(),
+                        experiment: args.experiment.clone(),
                         group_by: args.group_by.clone(),
                         roll_up_revisions: !args.no_roll_up,
                         estimate_usd: args.usd,
@@ -350,6 +371,7 @@ pub(crate) async fn run_cost_command(command: CostCommand, ctx: &RunContext) -> 
                         since_epoch_s,
                         until_epoch_s,
                         bucket: args.bucket,
+                        experiment: args.experiment.clone(),
                         group_by: args.group_by,
                         filters: args.filters.clone(),
                         estimate_usd: args.usd,
@@ -1293,6 +1315,58 @@ mod tests {
     fn resolve_window_rejects_empty_or_reversed_ranges() {
         let err = resolve_window("0h", Some("0h")).unwrap_err();
         assert!(err.to_string().contains("--until must be after --since"));
+    }
+
+    #[test]
+    fn experiment_and_pipeline_dimensions_parse_in_cli_requests() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Rows {
+            #[command(flatten)]
+            args: CostRowsArgs,
+        }
+        let rows = Rows::try_parse_from([
+            "rows",
+            "--since",
+            "14d",
+            "--experiment",
+            "batched_search",
+            "--group-by",
+            "experiment_arm,pipeline_stage",
+            "--filter",
+            "pipeline_stage=ci_fix_revision",
+            "--filter",
+            "experiment_arm=treatment,control",
+        ])
+        .unwrap();
+        assert_eq!(rows.args.experiment.as_deref(), Some("batched_search"));
+        assert_eq!(
+            rows.args.group_by,
+            vec![
+                boss_protocol::UsageDimension::ExperimentArm,
+                boss_protocol::UsageDimension::PipelineStage
+            ]
+        );
+        assert_eq!(rows.args.filters[1].values, ["treatment", "control"]);
+        #[derive(Parser)]
+        struct Series {
+            #[command(flatten)]
+            args: CostSeriesArgs,
+        }
+        let series = Series::try_parse_from([
+            "series",
+            "--since",
+            "14d",
+            "--experiment",
+            "batched_search",
+            "--group-by",
+            "experiment_arm",
+        ])
+        .unwrap();
+        assert_eq!(series.args.experiment.as_deref(), Some("batched_search"));
+        assert_eq!(series.args.group_by, Some(boss_protocol::UsageDimension::ExperimentArm));
+        let set = parse_usage_filter(r#"experiment_arm={"zeta":"control","alpha":"treatment"}"#).unwrap();
+        assert_eq!(set.values, [r#"{"alpha":"treatment","zeta":"control"}"#]);
     }
 
     #[test]

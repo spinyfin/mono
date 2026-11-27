@@ -63,7 +63,9 @@ pub mod note {
 /// What a rows request asks for, plus the engine constants the report
 /// depends on (so this crate owns none of them).
 #[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub struct UsageRowsQuery {
+    pub experiment: Option<String>,
     pub since_epoch_s: i64,
     pub until_epoch_s: i64,
     pub generated_at_epoch_s: i64,
@@ -124,8 +126,12 @@ pub fn build_usage_rows_report(
         .filter(|run| {
             run.run_created_at_epoch_s >= query.since_epoch_s && run.run_created_at_epoch_s < query.until_epoch_s
         })
-        .map(|run| classify(run, tasks.get(run.work_item_id.as_str()).copied()))
+        .map(|run| {
+            classify(run, tasks.get(run.work_item_id.as_str()).copied()).select_experiment(query.experiment.as_deref())
+        })
         .collect();
+
+    let observed_experiments = crate::dimensions::observed_experiments(in_window.iter());
 
     let mut in_window_per_task: HashMap<&str, u32> = HashMap::new();
     for facts in &in_window {
@@ -162,7 +168,20 @@ pub fn build_usage_rows_report(
     let overall_calls = call_stats(&kept);
     let coordinator_measurement = coordinator_measure(&kept);
     let gaps = pricing_gaps(&kept);
-    let coverage = coverage(query, &kept, &gaps, want_usd);
+    let mut coverage = coverage(query, &kept, &gaps, want_usd);
+    if truncated
+        && (query.experiment.is_some()
+            || query.group_by.contains(&UsageDimension::ExperimentArm)
+            || query
+                .filters
+                .iter()
+                .any(|f| f.dimension == UsageDimension::ExperimentArm))
+    {
+        coverage.notes.push(UsageNote {
+            code: "experiment_comparison_capped".into(),
+            detail: "Arm comparisons cover only the most recent matching runs retained by the reply cap; observed experiment counts cover the whole window before filters. Narrow the window or filter to the pipeline stage being compared.".into(),
+        });
+    }
 
     // 5. The tree.
     let ctx = TreeCtx {
@@ -178,6 +197,7 @@ pub fn build_usage_rows_report(
     };
 
     TokenUsageRowsReport::builder()
+        .observed_experiments(observed_experiments)
         .capture_start_epoch_s(query.capture_start_epoch_s)
         .coverage(coverage)
         .generated_at_epoch_s(query.generated_at_epoch_s)

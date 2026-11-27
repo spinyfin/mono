@@ -1639,3 +1639,6 @@ fn coordinator_runs_are_included_in_totals_grouped_as_coordinator_and_omit_subag
     assert!(filtered.tasks.is_empty());
     assert_eq!(filtered.taskless.len(), 1);
 }
+
+#[path = "dimension_tests.rs"]
+mod dimensions;
