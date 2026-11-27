@@ -1866,10 +1866,13 @@ pub(crate) async fn stage_remote_agent_rules(
 ) -> Result<()> {
     let path = driver.agent_rules_destination(&input.workspace_path, &input.run_id);
     let parent = path.parent().context("remote agent rules have no parent directory")?;
+    // The engine cannot read a remote workspace's REPOBIN.toml and exports
+    // no CHECKLEFT_BIN there, so a remote worker keeps the repo-neutral
+    // checkleft instruction.
     let descriptor = driver.descriptor();
     let rules = crate::worker_setup::render_claude_md_with_invocation(
         input,
-        driver.agent_rules_preamble(),
+        &driver.agent_rules_preamble(false),
         descriptor.config_dir,
         crate::worker_setup::worker_boss_invocation(descriptor.name, &input.worker_kind),
     );

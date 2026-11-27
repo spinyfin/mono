@@ -400,7 +400,7 @@ static CODEX_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
 /// The block says nothing to discourage backgrounding: a job deliberately left
 /// running is covered by the engine-wide `propose wait` rule, which the block
 /// points at in one sentence.
-const CODEX_AGENT_RULES_PREAMBLE: &str = agent_rules_preamble!(
+const CODEX_AGENT_RULES_PREAMBLE_TEMPLATE: &str = agent_rules_preamble!(
     "via the Codex rollout JSONL file in this run's isolated CODEX_HOME.",
     "\n\
      \n\
@@ -2346,8 +2346,8 @@ impl AgentDriver for CodexDriver {
         })
     }
 
-    fn agent_rules_preamble(&self) -> &'static str {
-        CODEX_AGENT_RULES_PREAMBLE
+    fn agent_rules_preamble(&self, checkleft_pinned: bool) -> String {
+        CODEX_AGENT_RULES_PREAMBLE_TEMPLATE.replace("{checkleft}", crate::checkleft_preamble_sentence(checkleft_pinned))
     }
 
     /// Codex does not read `.codex/AGENTS.md` at all (verified with `codex

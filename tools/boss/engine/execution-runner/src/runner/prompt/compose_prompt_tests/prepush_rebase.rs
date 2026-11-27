@@ -66,7 +66,11 @@ fn every_pr_producing_brief_and_driver_rules_require_fresh_base_before_each_push
                     .execution_kind(kind.as_str())
                     .worker_kind(worker_kind_for_execution(&kind))
                     .build();
-                let rules = render_claude_md(&input, driver.agent_rules_preamble(), driver.descriptor().config_dir);
+                let rules = render_claude_md(
+                    &input,
+                    &driver.agent_rules_preamble(true),
+                    driver.descriptor().config_dir,
+                );
                 assert_prepush_rebase(&rules, driver_name);
             }
         }
@@ -141,7 +145,11 @@ fn revision_ci_and_conflict_workers_keep_the_existing_rebase_flow_only() {
                 .execution_kind(kind.as_str())
                 .worker_kind(worker_kind_for_execution(&kind))
                 .build();
-            let rules = render_claude_md(&input, driver.agent_rules_preamble(), driver.descriptor().config_dir);
+            let rules = render_claude_md(
+                &input,
+                &driver.agent_rules_preamble(true),
+                driver.descriptor().config_dir,
+            );
             assert!(!rules.contains("### Before every PR branch push"));
             assert!(!rules.contains("local-rebase --base"));
         }

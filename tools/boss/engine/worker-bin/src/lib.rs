@@ -75,6 +75,12 @@ const BOSS_AGENT_HOST_BASENAME: &str = "boss-agent-host";
 /// [`is_build_from_source_shim`].
 const REPOBIN_NAME: &str = "repobin";
 
+/// Basename of the optional `checkleft` launcher. Written only when the
+/// workspace's `REPOBIN.toml` declares `checkleft`
+/// ([`environment::sync_checkleft_launcher`]); it dispatches through the
+/// engine-owned repobin and never falls back to a PATH copy.
+const CHECKLEFT_LAUNCHER_NAME: &str = "checkleft";
+
 /// Workspace-relative path of the `boss` CLI under runfiles / bazel-bin.
 const BOSS_CLI_RUNFILES_REL: &str = "tools/boss/cli/boss";
 
@@ -103,6 +109,11 @@ pub const BOSS_BIN_ENV: &str = "BOSS_BIN";
 /// Env var carrying the absolute path of this workspace's `cube` launcher.
 /// Same contract as [`BOSS_BIN_ENV`]: name the binary, not a PATH entry.
 pub const CUBE_BIN_ENV: &str = "CUBE_BIN";
+
+/// Env var carrying the absolute path of this workspace's `checkleft`
+/// launcher. Same contract as [`BOSS_BIN_ENV`]: name the binary, not a PATH
+/// entry that a driver shell may reorder.
+pub const CHECKLEFT_BIN_ENV: &str = "CHECKLEFT_BIN";
 
 /// Shell token workers are taught to run instead of a PATH-resolved `boss`.
 pub const WORKER_BOSS_INVOCATION: &str = r#""$BOSS_BIN""#;
@@ -135,8 +146,9 @@ const CUBE_CLI_RUNFILES_REL: &str = "tools/cube/cube";
 /// Every executable name the engine may write into the launcher directory.
 /// `boss` and `cube` are always thin execs of the bundled CLIs.
 /// `checkleft` is written only when the workspace `REPOBIN.toml` declares it,
-/// and then dispatches through the engine-owned repobin.
-/// No entry exposes the Boss-tier `bossctl` control surface.
+/// and then dispatches through the engine-owned repobin (see [`environment`]).
+/// A repo that does not declare checkleft keeps PATH behaviour for the bare
+/// word. No entry exposes the Boss-tier `bossctl` control surface.
 ///
 /// The engine deliberately keeps `bossctl` off the worker `PATH`: it is
 /// the Boss-tier control surface (host registry, agent fleet, engine
@@ -145,7 +157,7 @@ const CUBE_CLI_RUNFILES_REL: &str = "tools/cube/cube";
 /// distinction; a launcher dir can, and this constant is what the test
 /// suite pins it to.
 pub fn launcher_names() -> &'static [&'static str] {
-    &[BOSS_LAUNCHER_NAME, CUBE_LAUNCHER_NAME, "checkleft"]
+    &[BOSS_LAUNCHER_NAME, CUBE_LAUNCHER_NAME, CHECKLEFT_LAUNCHER_NAME]
 }
 
 /// Path / env inputs shared by every engine-binary resolution.
@@ -435,12 +447,19 @@ pub fn resolve_boss_event_binary(
 /// excludes it, and guessing would only add a way to reject a
 /// legitimate binary.
 pub fn is_build_from_source_shim(path: &Path) -> bool {
-    if path.file_name().is_some_and(|name| name == REPOBIN_NAME) {
+    if path
+        .file_name()
+        .is_some_and(|name| name == REPOBIN_NAME || name == "repobin-shim.sh")
+    {
         return true;
     }
     std::fs::canonicalize(path)
         .ok()
-        .and_then(|target| target.file_name().map(|name| name == REPOBIN_NAME))
+        .and_then(|target| {
+            target
+                .file_name()
+                .map(|name| name == REPOBIN_NAME || name == "repobin-shim.sh")
+        })
         .unwrap_or(false)
 }
 
@@ -597,6 +616,12 @@ pub fn boss_bin_in(dir: &Path) -> PathBuf {
 /// Absolute path of the `cube` launcher inside `dir`.
 pub fn cube_bin_in(dir: &Path) -> PathBuf {
     dir.join(CUBE_LAUNCHER_NAME)
+}
+
+/// Absolute path of the `checkleft` launcher inside `dir` (present only
+/// when [`environment::sync_checkleft_launcher`] wrote one).
+pub fn checkleft_bin_in(dir: &Path) -> PathBuf {
+    dir.join(CHECKLEFT_LAUNCHER_NAME)
 }
 
 fn write_launcher(dir: &Path, launcher_name: &str, script: &str) -> io::Result<PathBuf> {
@@ -1015,6 +1040,11 @@ mod tests {
     #[test]
     fn a_path_literally_named_repobin_is_a_shim() {
         assert!(is_build_from_source_shim(Path::new("/anywhere/repobin")));
+    }
+
+    #[test]
+    fn a_path_literally_named_repobin_workspace_shim_is_a_shim() {
+        assert!(is_build_from_source_shim(Path::new("/anywhere/repobin-shim.sh")));
     }
 
     #[test]

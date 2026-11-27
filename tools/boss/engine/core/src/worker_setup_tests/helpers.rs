@@ -17,7 +17,7 @@ pub(crate) use crate::driver::ClaudeDriver;
 pub(crate) fn claude_md_for(input: &WorkerSetupInput) -> String {
     render_claude_md(
         input,
-        ClaudeDriver.agent_rules_preamble(),
+        &ClaudeDriver.agent_rules_preamble(true),
         ClaudeDriver.descriptor().config_dir,
     )
 }

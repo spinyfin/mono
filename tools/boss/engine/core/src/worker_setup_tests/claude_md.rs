@@ -575,7 +575,7 @@ fn grok_restricted_kinds_are_taught_the_bare_boss_spelling() {
         input.worker_kind = kind.clone();
         let rendered = render_claude_md_with_invocation(
             &input,
-            ClaudeDriver.agent_rules_preamble(),
+            &ClaudeDriver.agent_rules_preamble(false),
             ClaudeDriver.descriptor().config_dir,
             worker_boss_invocation("grok", &kind),
         );
