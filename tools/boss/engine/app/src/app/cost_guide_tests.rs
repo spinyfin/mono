@@ -26,11 +26,12 @@ const SEED: &str = "
          packet_hash, complete, captured_at)
       VALUES ('prgc_1', 'series_1', 1, 'base', 'base', 'head', 'creation', 'hash', 1, '2000');
     INSERT INTO work_executions
-        (id, work_item_id, kind, status, repo_remote_url, created_at, finished_at, driver, model, effort_level)
-      VALUES ('e_impl', 'task_owner', 'chore_implementation', 'completed', 'u', '2000', '2400', 'claude', 'opus', 'medium'),
-             ('e_guide', 'prgc_1', 'pr_review_guide', 'completed', 'u', '2500', '2600', 'codex', 'gpt-6-astra', 'high'),
-             ('e_guide_failed', 'prgc_1', 'pr_review_guide', 'failed', 'u', '2700', '2800', 'codex', 'gpt-6-astra', 'high'),
-             ('e_answer', 'comment_1', 'answer_agent', 'completed', 'u', '2900', '3000', 'claude', 'sonnet', 'medium');
+        (id, work_item_id, kind, status, repo_remote_url, created_at, finished_at, driver, model, effort_level,
+         owner_task_id)
+      VALUES ('e_impl', 'task_owner', 'chore_implementation', 'completed', 'u', '2000', '2400', 'claude', 'opus', 'medium', NULL),
+             ('e_guide', 'prgc_1', 'pr_review_guide', 'completed', 'u', '2500', '2600', 'codex', 'gpt-6-astra', 'high', 'task_owner'),
+             ('e_guide_failed', 'prgc_1', 'pr_review_guide', 'failed', 'u', '2700', '2800', 'codex', 'gpt-6-astra', 'high', 'task_owner'),
+             ('e_answer', 'comment_1', 'answer_agent', 'completed', 'u', '2900', '3000', 'claude', 'sonnet', 'medium', NULL);
     INSERT INTO work_runs
         (id, execution_id, agent_id, status, created_at, model, input_tokens, output_tokens,
          cache_creation_tokens, cache_read_tokens)
@@ -161,6 +162,14 @@ async fn the_top_report_ranks_review_guide_runs_against_their_owning_task() {
     assert_eq!(
         report.excluded_unmeasured_count, 1,
         "the unmeasured guide run cannot be ranked and is counted as excluded"
+    );
+    assert_eq!(
+        report.excluded_unmeasured_by_kind,
+        [boss_protocol::UnmeasuredKindCount {
+            kind: "pr_review_guide".into(),
+            count: 1
+        }],
+        "the excluded run is still identifiable as a review guide"
     );
 }
 

@@ -453,6 +453,7 @@ pub fn build_top_cost_report(
     let mut gaps: BTreeSet<String> = BTreeSet::new();
     let mut excluded_unmeasured_count = 0u32;
     let mut unmeasured_coordinator: BTreeMap<&str, CostUnmeasuredCoordinatorRow> = BTreeMap::new();
+    let mut excluded_by_kind: BTreeMap<&str, u32> = BTreeMap::new();
     let mut rows: Vec<CostTopRow> = Vec::new();
     let measured_sessions: BTreeSet<&str> = records
         .iter()
@@ -479,6 +480,7 @@ pub fn build_top_cost_report(
                             .build()
                     });
             }
+            *excluded_by_kind.entry(record.execution_kind.as_str()).or_default() += 1;
             continue;
         }
         let total_tokens = run_tokens(record).known_total();
@@ -536,6 +538,15 @@ pub fn build_top_cost_report(
         .rows(rows)
         .excluded_unmeasured_count(excluded_unmeasured_count)
         .unmeasured_coordinator(unmeasured_coordinator.into_values().collect())
+        .excluded_unmeasured_by_kind(
+            excluded_by_kind
+                .into_iter()
+                .map(|(kind, count)| boss_protocol::UnmeasuredKindCount {
+                    kind: kind.to_owned(),
+                    count,
+                })
+                .collect(),
+        )
         .generated_at_epoch_s(generated_at_epoch_s)
         .limit(limit)
         .pricing_gaps(gaps.into_iter().collect())

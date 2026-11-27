@@ -1208,6 +1208,12 @@ mod floor_tests {
             }),
         ));
         steps.push((
+            super::super::cost_report_db::OWNER_TASK_MIGRATION_ID,
+            Box::new(|c| {
+                super::super::cost_report_db::migrate_execution_owner_task(c).unwrap();
+            }),
+        ));
+        steps.push((
             "20261127_2050_execution_experiment_arms",
             Box::new(|c| {
                 c.execute_batch("ALTER TABLE work_executions ADD COLUMN experiment_arms TEXT")

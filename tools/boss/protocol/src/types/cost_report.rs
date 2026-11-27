@@ -221,6 +221,13 @@ pub struct CostUnmeasuredCoordinatorRow {
     pub reason: Option<String>,
 }
 
+/// How many unmeasured runs of one execution kind a `boss cost top` window
+/// excluded from its ranking.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnmeasuredKindCount {
+    pub kind: String,
+    pub count: u32,
+}
 /// Output shape for `boss cost top` — the highest-token-cost runs
 /// recorded in `[since_epoch_s, until_epoch_s)`, ranked descending by
 /// `total_tokens`.
@@ -239,6 +246,12 @@ pub struct TopCostReport {
     #[serde(default)]
     #[builder(default)]
     pub unmeasured_coordinator: Vec<CostUnmeasuredCoordinatorRow>,
+    /// `excluded_unmeasured_count` broken down by execution kind, so an
+    /// unmeasured run (a review guide, say) is still identifiable by kind.
+    /// Sorted by kind; counts sum to `excluded_unmeasured_count`.
+    #[serde(default)]
+    #[builder(default)]
+    pub excluded_unmeasured_by_kind: Vec<UnmeasuredKindCount>,
     pub generated_at_epoch_s: i64,
     pub limit: u32,
     pub pricing_gaps: Vec<String>,

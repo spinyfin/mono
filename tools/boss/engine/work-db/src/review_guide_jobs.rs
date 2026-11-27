@@ -1305,8 +1305,12 @@ fn insert_review_guide_execution(
                 id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at, prefer_is_soft, pr_url, worker_branch_prefix,
-                allow_dirty, branch_naming
-             ) VALUES (?1, ?2, ?3, 'ready', ?4, NULL, NULL, NULL, NULL, 0, NULL, ?5, NULL, NULL, 0, NULL, NULL, 0, ?6)",
+                allow_dirty, branch_naming, owner_task_id
+             ) VALUES (?1, ?2, ?3, 'ready', ?4, NULL, NULL, NULL, NULL, 0, NULL, ?5, NULL, NULL, 0, NULL, NULL, 0, ?6,
+                (SELECT gs.root_task_id
+                   FROM pr_review_guide_source_comparisons gc
+                   JOIN pr_review_guide_source_series gs ON gs.id = gc.series_id
+                  WHERE gc.id = ?2))",
         params![
             id,
             comparison_id,

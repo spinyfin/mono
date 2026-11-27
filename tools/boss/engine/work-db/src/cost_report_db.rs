@@ -15,21 +15,21 @@
 //! Three execution kinds do not bind to a `tasks` row: `answer_agent` (a
 //! comment id), `automation_triage` (an automation id) and `pr_review_guide`
 //! (a `pr_review_guide_source_comparisons.id`). Their runs record tokens like
-//! any other, so no fetch here may inner-join `tasks`: that join is what once
-//! dropped them from `boss cost window` and `boss cost top`.
+//! any other, so every fetch here left-joins `tasks`: an inner join would drop
+//! every run of these kinds from the window, top and task reports.
 //!
 //! A review guide is generated for one PR, and that PR belongs to a task, so
-//! its spend is attributed to that task: comparison → series →
-//! `pr_review_guide_source_series.root_task_id` (see [`GUIDE_OWNER_JOINS`];
-//! the same ownership relation `WorkDb::list_executions` uses). The other two
-//! kinds have no task and stay task-less. Queries that start from a task
-//! instead of a run use [`owned_work_item_ids_sql`] for the same relation in
-//! the other direction.
-//!
-//! The owner is looked up, not stored on the execution. Source retention
-//! (`review_guide_source_retention`) deletes comparison rows it no longer
-//! needs, and a task can be deleted; a guide run whose owner can no longer be
-//! resolved is still fetched and counted, as a run with no task.
+//! its spend is attributed to that task through `work_executions.owner_task_id`,
+//! which the guide's execution records when it is created (the series'
+//! `root_task_id`). The column belongs to the execution, so the attribution
+//! lasts as long as the run does: source retention
+//! (`review_guide_source_retention`) deleting the comparison row later does
+//! not move the run's spend. [`execution_owned_by_any_sql`] and
+//! [`execution_owned_by_sql`] are the one place that says which executions a
+//! task owns. The other two kinds have no owner and stay task-less. A guide
+//! execution whose owner was never recorded (a comparison already pruned
+//! before the column existed) is still fetched and counted, as a run with no
+//! task.
 //!
 //! The Sol comparison below is the exception: it compares the two arms of
 //! implementation work on a PR family and keeps its own task-rooted join, so
@@ -42,52 +42,38 @@ use boss_usage_report::{
     RecordedDriver, UsageExecutionRecord, UsageRunRecord, UsageSeriesRecords, UsageTaskRecord, UsageWindowRecords,
 };
 
-/// Resolves a `pr_review_guide` execution to the series of the PR it
-/// explains. `gs.root_task_id` is then the task that owns that PR, and NULL
-/// for every other kind. Both joins are primary-key lookups, taken only for
-/// guide executions. Requires the `we` alias for `work_executions`.
-const GUIDE_OWNER_JOINS: &str = "
-    LEFT JOIN pr_review_guide_source_comparisons gc
-           ON we.kind = 'pr_review_guide' AND gc.id = we.work_item_id
-    LEFT JOIN pr_review_guide_source_series gs ON gs.id = gc.series_id";
-
-/// Every `work_executions.work_item_id` whose spend belongs to one of the
-/// tasks in the JSON id array bound to `task_ids_param` (for example `?1`):
-/// the task ids themselves, plus the comparison ids of every review guide
-/// series those tasks own. The reverse of [`GUIDE_OWNER_JOINS`]; both arms
-/// seek an index (`pr_review_guide_source_series_observation_idx` leads with
-/// `root_task_id`, the comparisons' unique key with `series_id`).
-fn owned_work_item_ids_sql(task_ids_param: &str) -> String {
+/// The executions whose spend belongs to the tasks in the JSON id array bound
+/// to `task_ids_param` (for example `?1`): their own executions, plus the
+/// review guides generated for their PRs (`owner_task_id`). Requires the `we`
+/// alias; each arm seeks an index (`work_executions.work_item_id`, and
+/// `work_executions_owner_task_idx`).
+fn execution_owned_by_any_sql(task_ids_param: &str) -> String {
     format!(
-        "SELECT value FROM json_each({task_ids_param})
-         UNION ALL
-         SELECT owned_gc.id
-           FROM pr_review_guide_source_series owned_gs
-           JOIN pr_review_guide_source_comparisons owned_gc ON owned_gc.series_id = owned_gs.id
-          WHERE owned_gs.root_task_id IN (SELECT value FROM json_each({task_ids_param}))"
+        "(we.work_item_id IN (SELECT value FROM json_each({task_ids_param}))
+          OR we.owner_task_id IN (SELECT value FROM json_each({task_ids_param})))"
     )
+}
+
+/// [`execution_owned_by_any_sql`] for one task id expression (a bound
+/// parameter or a column such as `t.id`).
+fn execution_owned_by_sql(task_id_expr: &str) -> String {
+    format!("(we.work_item_id = {task_id_expr} OR we.owner_task_id = {task_id_expr})")
 }
 
 /// `FROM` clause of the `boss cost` fetches: every run with its execution,
 /// and the task its spend belongs to when there is one (`t` is NULL for a run
 /// with no task, which is kept).
-fn cost_record_source() -> String {
-    format!(
-        "work_runs wr
-         JOIN work_executions we ON we.id = wr.execution_id
-         {GUIDE_OWNER_JOINS}
-         LEFT JOIN tasks t ON t.id = COALESCE(gs.root_task_id, we.work_item_id)"
-    )
+fn cost_record_source() -> &'static str {
+    "work_runs wr
+     JOIN work_executions we ON we.id = wr.execution_id
+     LEFT JOIN tasks t ON t.id = COALESCE(we.owner_task_id, we.work_item_id)"
 }
 
-/// `FROM` clause of the usage fetches: every run with its execution and, for
-/// a review guide, the series that names its owning task.
-fn usage_run_source() -> String {
-    format!(
-        "work_runs wr
-         JOIN work_executions we ON we.id = wr.execution_id
-         {GUIDE_OWNER_JOINS}"
-    )
+/// `FROM` clause of the usage fetches: every run with its execution, which
+/// names the owning task of a review guide.
+fn usage_run_source() -> &'static str {
+    "work_runs wr
+     JOIN work_executions we ON we.id = wr.execution_id"
 }
 
 const COST_RECORD_COLUMNS: &str = "
@@ -159,6 +145,32 @@ pub(super) fn migrate_usage_window_index(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Migration id for [`migrate_execution_owner_task`].
+pub(super) const OWNER_TASK_MIGRATION_ID: &str = "20261127_2130_execution_owner_task";
+
+/// Adds `work_executions.owner_task_id`, the task a `pr_review_guide`
+/// execution's spend belongs to (NULL for every other kind), and fills it for
+/// the guide executions whose comparison still exists. A guide execution whose
+/// comparison source retention already deleted keeps NULL: nothing records its
+/// owner any more. Idempotent: a database that already has the column keeps it.
+pub(super) fn migrate_execution_owner_task(conn: &Connection) -> Result<()> {
+    if !crate::schema_init::table_has_column(conn, "work_executions", "owner_task_id")? {
+        conn.execute_batch("ALTER TABLE work_executions ADD COLUMN owner_task_id TEXT")?;
+    }
+    conn.execute_batch(
+        "UPDATE work_executions
+            SET owner_task_id = (
+                SELECT gs.root_task_id
+                  FROM pr_review_guide_source_comparisons gc
+                  JOIN pr_review_guide_source_series gs ON gs.id = gc.series_id
+                 WHERE gc.id = work_executions.work_item_id)
+          WHERE kind = 'pr_review_guide' AND owner_task_id IS NULL;
+         CREATE INDEX IF NOT EXISTS work_executions_owner_task_idx
+             ON work_executions(owner_task_id) WHERE owner_task_id IS NOT NULL;",
+    )?;
+    Ok(())
+}
+
 /// Run, execution and launch-tuple columns of [`UsageRunRecord`], in field
 /// order of [`map_usage_run_record`]. Timestamps are cast in the projection
 /// only, so the `WHERE` below matches the index expression.
@@ -195,7 +207,7 @@ const USAGE_RUN_COLUMNS: &str = "
     wr.first_call_cache_write_tokens,
     wr.peak_context_tokens,
     wr.compactions,
-    gs.root_task_id
+    we.owner_task_id
 ";
 
 fn map_usage_run_record(row: &Row) -> rusqlite::Result<UsageRunRecord> {
@@ -321,7 +333,7 @@ const USAGE_EXECUTION_COLUMNS: &str = "
     we.driver,
     we.model,
     we.effort_level,
-    gs.root_task_id
+    we.owner_task_id
 ";
 
 fn map_usage_execution_record(row: &Row) -> rusqlite::Result<UsageExecutionRecord> {
@@ -369,7 +381,10 @@ const USAGE_SERIES_TASK_COLUMNS: &str = "
 /// ending with the task's all-time run count. The count covers the same runs
 /// the window attributes to the task: its own executions' and those of the
 /// review guides generated for its PR.
-const USAGE_TASK_COLUMNS: &str = "
+fn usage_task_columns() -> String {
+    let owned_by_task = execution_owned_by_sql("t.id");
+    format!(
+        "
     t.id,
     t.name,
     t.kind,
@@ -386,14 +401,10 @@ const USAGE_TASK_COLUMNS: &str = "
     (SELECT COUNT(*)
        FROM work_executions we
        JOIN work_runs wr ON wr.execution_id = we.id
-      WHERE we.work_item_id IN (
-            SELECT t.id
-            UNION ALL
-            SELECT owned_gc.id
-              FROM pr_review_guide_source_series owned_gs
-              JOIN pr_review_guide_source_comparisons owned_gc ON owned_gc.series_id = owned_gs.id
-             WHERE owned_gs.root_task_id = t.id))
-";
+      WHERE {owned_by_task})
+"
+    )
+}
 
 fn map_usage_task_record(row: &Row, roots: &HashMap<String, String>) -> rusqlite::Result<UsageTaskRecord> {
     let task_id: String = row.get(0)?;
@@ -489,11 +500,11 @@ impl WorkDb {
     pub fn cost_records_for_work_item(&self, work_item_id: &str) -> Result<Vec<CostRunRecord>> {
         let conn = self.connect()?;
         let source = cost_record_source();
-        let owned = owned_work_item_ids_sql("?1");
+        let owned = execution_owned_by_any_sql("?1");
         let sql = format!(
             "SELECT {COST_RECORD_COLUMNS}
              FROM {source}
-             WHERE we.work_item_id IN ({owned})
+             WHERE {owned}
              ORDER BY wr.created_at ASC, wr.id ASC"
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -552,8 +563,9 @@ impl WorkDb {
             task_ids.sort_unstable();
             task_ids.dedup();
 
+            let task_columns = usage_task_columns();
             let sql = format!(
-                "SELECT {USAGE_TASK_COLUMNS}
+                "SELECT {task_columns}
                  FROM tasks t
                  LEFT JOIN products p ON p.id = t.product_id
                  LEFT JOIN projects pr ON pr.id = t.project_id
@@ -622,7 +634,6 @@ impl WorkDb {
             let exec_sql = format!(
                 "SELECT {USAGE_EXECUTION_COLUMNS}
                  FROM work_executions we
-                 {GUIDE_OWNER_JOINS}
                  WHERE we.finished_at IS NOT NULL
                    AND CAST(we.finished_at AS INTEGER) >= ?1
                    AND CAST(we.finished_at AS INTEGER) < ?2
@@ -733,11 +744,11 @@ impl WorkDb {
                 chain_task_ids.sort_unstable();
                 chain_task_ids.dedup();
                 if !chain_task_ids.is_empty() {
-                    let owned = owned_work_item_ids_sql("?1");
+                    let owned = execution_owned_by_any_sql("?1");
                     let extra_run_sql = format!(
                         "SELECT {USAGE_RUN_COLUMNS}
                          FROM {run_source}
-                         WHERE we.work_item_id IN ({owned})
+                         WHERE {owned}
                            AND (CAST(wr.created_at AS INTEGER) < ?2 OR CAST(wr.created_at AS INTEGER) >= ?3)
                          ORDER BY CAST(wr.created_at AS INTEGER) ASC, wr.id ASC"
                     );
@@ -1065,13 +1076,13 @@ fn late_usage_runs(
     work_item_ids: &[&str],
 ) -> Result<Vec<UsageRunRecord>> {
     let run_source = usage_run_source();
-    let owned = owned_work_item_ids_sql("?3");
+    let owned = execution_owned_by_any_sql("?3");
     let sql = format!(
         "SELECT {USAGE_RUN_COLUMNS}
          FROM {run_source}
          WHERE CAST(wr.created_at AS INTEGER) >= ?1
            AND (wr.execution_id IN (SELECT value FROM json_each(?2))
-                OR we.work_item_id IN ({owned}))
+                OR {owned})
          ORDER BY CAST(wr.created_at AS INTEGER) ASC, wr.id ASC"
     );
     Ok(tx

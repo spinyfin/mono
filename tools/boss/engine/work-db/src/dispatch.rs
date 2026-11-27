@@ -1997,9 +1997,7 @@ impl WorkDb {
 
 // Shared ownership relation for task-scoped execution rows and host metadata.
 const REVIEW_GUIDE_EXECUTIONS_FOR_TASK_FROM: &str = "FROM work_executions we
-         JOIN pr_review_guide_source_comparisons c ON c.id = we.work_item_id
-         JOIN pr_review_guide_source_series s ON s.id = c.series_id
-         WHERE we.kind = 'pr_review_guide' AND s.root_task_id = ?1";
+         WHERE we.kind = 'pr_review_guide' AND we.owner_task_id = ?1";
 
 /// Executions whose `kind` is `pr_review_guide` and whose comparison
 /// belongs to a review-guide series rooted at `task_id` — joined via

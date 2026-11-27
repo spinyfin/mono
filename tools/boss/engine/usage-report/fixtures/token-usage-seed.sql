@@ -99,13 +99,16 @@ INSERT INTO work_executions (id, work_item_id, kind, status, repo_remote_url, cr
 
 -- The review guide's source comparison and the series that names the task
 -- owning the PR: `exec_seed_t2` -> `comparison_seed_1` -> `series_seed_1` ->
--- `task_seed_a_claude`. No generation attempt is seeded, so the engine has
+-- `task_seed_a_claude`; the execution records that owner itself, as the engine
+-- does when it creates a guide execution. No generation attempt is seeded, so the engine has
 -- nothing to dispatch for it.
 INSERT INTO pr_review_guide_source_series (id, root_task_id, canonical_pr_url, latest_observation_sequence, created_at, updated_at) VALUES
   ('series_seed_1', 'task_seed_a_claude', 'https://github.com/example/boss/pull/101', 1, (SELECT now - 2 * 3600 FROM seed_clock), (SELECT now - 2 * 3600 FROM seed_clock));
 
 INSERT INTO pr_review_guide_source_comparisons (id, series_id, observation_sequence, observed_base_sha, merge_base_sha, head_sha, trigger, packet_hash, complete, captured_at) VALUES
   ('comparison_seed_1', 'series_seed_1', 1, 'seedbase', 'seedbase', 'seedhead', 'creation', 'seedpackethash', 1, (SELECT now - 2 * 3600 FROM seed_clock));
+
+UPDATE work_executions SET owner_task_id = 'task_seed_a_claude' WHERE id = 'exec_seed_t2';
 
 -- Runs. Token columns follow what each driver's capture records:
 --   * Claude: every class, with the 5m/1h cache-write split when the provider

@@ -324,9 +324,78 @@ fn usage_series_records_pull_a_completed_tasks_review_guide_runs_from_outside_th
     assert!(records.tasks.iter().any(|t| t.task_id == task));
 }
 
+/// The owning task is stored on the guide's execution, so deleting the
+/// comparison (what source retention does to aged and surplus comparisons)
+/// must not move the run's spend.
+#[test]
+fn a_review_guide_runs_task_attribution_survives_source_retention() {
+    let (_dir, db) = open_db();
+    let (task, comparison) = task_with_guide_series(&db, "Fix cursor flicker");
+    let (_, run) = completed_guide_run(&db, &comparison, Some(guide_usage()));
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'done', completed_at = '1000' WHERE id = ?1",
+            params![task],
+        )
+        .unwrap();
+    let before_cost = db.cost_records_for_work_item(&task).unwrap();
+    let before_usage = db.usage_records_for_window(0, i64::MAX).unwrap();
+    assert_eq!(before_cost.len(), 1);
+
+    // Source retention at its most aggressive: the comparison row is gone.
+    {
+        let conn = db.connect().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        conn.execute(
+            "DELETE FROM pr_review_guide_source_comparisons WHERE id = ?1",
+            params![comparison],
+        )
+        .unwrap();
+    }
+
+    assert_eq!(db.cost_records_for_work_item(&task).unwrap(), before_cost);
+    let after_usage = db.usage_records_for_window(0, i64::MAX).unwrap();
+    assert_eq!(after_usage.runs, before_usage.runs);
+    assert_eq!(after_usage.runs[0].run_id, run);
+    assert_eq!(after_usage.runs[0].owning_task_id.as_deref(), Some(task.as_str()));
+    assert_eq!(after_usage.tasks[0].run_count_all_time, 1);
+    let series = db.usage_series_records_for_window(0, i64::MAX).unwrap();
+    assert!(
+        series
+            .runs
+            .iter()
+            .any(|r| r.run_id == run && r.owning_task_id.as_deref() == Some(task.as_str()))
+    );
+}
+
+/// A database from before the column: the migration fills the owner for
+/// guide executions whose comparison still exists.
+#[test]
+fn the_owner_migration_backfills_guide_executions_from_their_comparisons() {
+    let (_dir, db) = open_db();
+    let (task, comparison) = task_with_guide_series(&db, "Fix cursor flicker");
+    let (execution, _) = completed_guide_run(&db, &comparison, Some(guide_usage()));
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE work_executions SET owner_task_id = NULL WHERE id = ?1",
+        params![execution],
+    )
+    .unwrap();
+    migrate_execution_owner_task(&conn).unwrap();
+    let owner: Option<String> = conn
+        .query_row(
+            "SELECT owner_task_id FROM work_executions WHERE id = ?1",
+            params![execution],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(owner.as_deref(), Some(task.as_str()));
+}
+
 /// Plan lines that walk a whole base table, by the aliases the fetches use.
 fn full_table_scans(plan: &str) -> Vec<&str> {
-    const ALIASES: [&str; 7] = ["we", "wr", "t", "gc", "gs", "owned_gc", "owned_gs"];
+    const ALIASES: [&str; 3] = ["we", "wr", "t"];
     plan.lines()
         .map(str::trim)
         .filter(|line| {
@@ -356,15 +425,16 @@ fn the_guide_owner_joins_and_the_per_task_fetches_seek_indexes() {
         "the window read must use the expression index, plan was:\n{window}"
     );
 
-    let owned = owned_work_item_ids_sql("'[\"t\"]'");
+    let owned = execution_owned_by_any_sql("'[\"t\"]'");
     let for_task = query_plan(
         &db,
-        &format!("SELECT {COST_RECORD_COLUMNS} FROM {source} WHERE we.work_item_id IN ({owned})"),
+        &format!("SELECT {COST_RECORD_COLUMNS} FROM {source} WHERE {owned}"),
     );
+    let task_columns = usage_task_columns();
     let task_run_count = query_plan(
         &db,
         &format!(
-            "SELECT {USAGE_TASK_COLUMNS} FROM tasks t LEFT JOIN products p ON p.id = t.product_id LEFT JOIN projects pr ON pr.id = t.project_id WHERE t.id = 't'"
+            "SELECT {task_columns} FROM tasks t LEFT JOIN products p ON p.id = t.product_id LEFT JOIN projects pr ON pr.id = t.project_id WHERE t.id = 't'"
         ),
     );
     for (name, plan) in [
