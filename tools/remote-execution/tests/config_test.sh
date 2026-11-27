@@ -339,16 +339,18 @@ if [[ -z "$version" || -z "$commit" ]]; then
   fail "build-worker.sh must pin NATIVELINK_VERSION and NATIVELINK_COMMIT"
 fi
 
-# The lines of build-worker.sh's PATCHES list: "<file> <marker> <platforms>".
+# The lines of build-worker.sh's PATCHES list:
+# "<file> <marker> <platforms> <role>".
 # In a file: the test sandbox does not let bash create the temporary file a
 # here-string needs.
 patch_list="${TEST_TMPDIR:?}/patches.list"
-sed -n -E 's/^  "([a-z0-9-]+\.patch) ([a-z-]+) ((Darwin|Linux)(,(Darwin|Linux))*)"$/\1 \2 \3/p' "$build" > "$patch_list"
-# reported_version <platform>: what a worker binary built on it reports, which
-# is the release and the marker of every patch the platform takes.
+sed -n -E 's/^  "([a-z0-9-]+\.patch) ([a-z-]+) ((Darwin|Linux)(,(Darwin|Linux))*) (worker|hub)"$/\1 \2 \3 \7/p' "$build" > "$patch_list"
+# reported_version <role> <platform>: what the binary of that role built on
+# that platform reports, which is the release and the marker of every patch it
+# takes.
 reported_version() {
   local markers
-  markers="$(awk -v p="$1" '("," $3 ",") ~ ("," p ",") { s = s (s == "" ? "" : ".") $2 } END { print s }' "$patch_list")"
+  markers="$(awk -v r="$1" -v p="$2" '$4 == r && ("," $3 ",") ~ ("," p ",") { s = s (s == "" ? "" : ".") $2 } END { print s }' "$patch_list")"
   [[ -n "$markers" ]] && echo "${version}+${markers}"
 }
 
@@ -369,11 +371,13 @@ while read -r name _; do
   [[ -f "${patches_dir}/${name}" ]] ||
     fail "build-worker.sh lists ${name}, which is not in patches/"
 done < "$patch_list"
-for platform in Darwin Linux; do
-  reported="$(reported_version "$platform")" ||
-    fail "no patch in build-worker.sh applies to ${platform}"
+for role_platform in worker:Darwin worker:Linux hub:Linux; do
+  role="${role_platform%%:*}"
+  platform="${role_platform##*:}"
+  reported="$(reported_version "$role" "$platform")" ||
+    fail "no patch in build-worker.sh applies to a ${role} on ${platform}"
   grep -q -F "nativelink ${reported}" "$readme" ||
-    fail "README.md does not name the version a ${platform} worker reports (nativelink ${reported})"
+    fail "README.md does not name the version a ${platform} ${role} reports (nativelink ${reported})"
 done
 grep -q -F "$commit" "$readme" ||
   fail "README.md does not name the pinned commit ${commit}"

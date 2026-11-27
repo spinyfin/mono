@@ -35,8 +35,9 @@ sh_test(
 # Pins what the files promise each other: every scheduler timeout and the
 # arithmetic between the hub's and the workers', the variables the configs
 # expand against the units that set them, the pinned NativeLink version across
-# the build script, the patches and the runbook, the hub restart and CAS
-# exporters, and that no address is written into any of them.
+# the build script, the patches and the runbook (with the version each binary,
+# worker or hub, reports), the hub restart and CAS exporters, and that no
+# address is written into any of them.
 sh_test(
     name = "config_test",
     size = "small",
@@ -59,6 +60,7 @@ sh_test(
         "nativelink/nativelink-macos-hub-health.service",
         "nativelink/nativelink-macos-hub-health.timer",
         "nativelink/nativelink-worker-slots-exporter.service",
+        "nativelink/patches/compressed-upload-restart.patch",
         "nativelink/patches/macos-clonefile-executables.patch",
         "nativelink/patches/stale-entry-recovery.patch",
         "nativelink/worker-macos.json5",

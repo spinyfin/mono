@@ -20,7 +20,7 @@ What decides whether a build executes remotely is elsewhere: [`.buildkite/README
 | `nativelink/com.brianduff.nativelink.plist`              | `~/Library/LaunchAgents/` on each Mac                        | Starts the worker and sets what differs per Mac.                                                                                                                         |
 | `nativelink/action-env.sh`                               | `~/nativelink/action-env.sh` on each Mac                     | Wraps every action: picks the Xcode and SDK the action asks for.                                                                                                         |
 | `nativelink/headcrash-worker/`                           | `~/nativelink/` and `~/.config/systemd/user/` on `headcrash` | The Linux worker on the hub's host: `worker.json5`, its user unit and the `memory.conf` and `60-v1.8.conf` drop-ins. Other Linux workers differ (see the Linux runbook). |
-| `nativelink/build-worker.sh` and `nativelink/patches/`   | run on one Mac, and on one Linux worker host                 | Builds the worker binary: the pinned release plus the patches.                                                                                                           |
+| `nativelink/build-worker.sh` and `nativelink/patches/`   | run on one Mac, and on the Linux hosts that need a binary    | Builds the worker binary, or with `--role hub` the hub's: the pinned release plus the patches.                                                                           |
 
 ## Hosts
 
@@ -74,17 +74,20 @@ Measured on 2026-11-22 against a hub with this `hub.json5` and three workers on 
 
 Every host runs NativeLink **1.8.6** (`37f3b206a8e6d55613abae2b18a0665fff24e096`), and the hub and the workers are upgraded together: an older binary rejects fields these configs use, and an older worker does not acknowledge a dispatch, which `dispatch_ack_timeout_s` relies on.
 
-- **The hub** runs the upstream release, `nativelink-1.8.6-x86_64-unknown-linux-musl.tar.gz` from the [v1.8.6 release](https://github.com/TraceMachina/nativelink/releases/tag/v1.8.6), sha256 `9bad10aa1c11a00fb1544ddd28a5a5ab892cfa42817e96a6cf18f169df7f0472`. `nativelink --version` prints `nativelink 1.8.6`.
+- **The hub** runs that release with one patch, `compressed-upload-restart.patch`, built by `build-worker.sh --role hub` on the hub's own host (the Linux binary links the host's libc). `nativelink --version` prints `nativelink 1.8.6+compressed-restart`. The workers' two patches are not in it: the hub stages no inputs and has no store to go stale. The upstream release the hub ran until 2026-11-23 is `nativelink-1.8.6-x86_64-unknown-linux-musl.tar.gz` from the [v1.8.6 release](https://github.com/TraceMachina/nativelink/releases/tag/v1.8.6), sha256 `9bad10aa1c11a00fb1544ddd28a5a5ab892cfa42817e96a6cf18f169df7f0472`, which prints `nativelink 1.8.6`; it is what to put back to take the patch out ("Updating the hub's binary").
 - **The workers** run that release with the patches in [`nativelink/patches/`](nativelink/patches/), built from source by `build-worker.sh` on a host of the worker's platform. The script's `PATCHES` list says which patch goes into which platform's binary, and stamps the version from it: a macOS worker reports `nativelink 1.8.6+macos-clonefile.stale-entry` and a Linux worker `nativelink 1.8.6+stale-entry`, so a worker that was given an upstream binary by mistake, or one that is a patch behind, can be told apart. Every worker of a platform runs the same file: compare its sha256 after copying it.
 
 | Patch                                                                                       | Workers         | Why                                                                                                                                       |
 | ------------------------------------------------------------------------------------------- | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | [`macos-clonefile-executables.patch`](nativelink/patches/macos-clonefile-executables.patch) | macOS           | Upstream stages an executable as a hardlink out of the worker's store, and `rustc` then cannot load its own library.                      |
 | [`stale-entry-recovery.patch`](nativelink/patches/stale-entry-recovery.patch)               | macOS and Linux | A store entry whose file is gone is never fetched again, and every action that needs the blob fails on that worker until it is restarted. |
+| [`compressed-upload-restart.patch`](nativelink/patches/compressed-upload-restart.patch)     | the hub         | A compressed upload that is cut off fails the client's build instead of restarting.                                                       |
 
 **The clone patch.** Upstream stages an executable input as a hardlink out of the worker's store. On macOS dyld resolves `@loader_path` from whichever name of that inode the kernel reports, finds the store, and `rustc` fails with `Library not loaded: @rpath/librustc_driver-<hash>.dylib`. The patch stages executables with `clonefile(2)` instead, which gives each its own inode. It is the commit the workers already ran on 1.6.6 (`brianduff/nativelink` `3125a4fd`), carried forward; the patch file's header lists what changed on the way. It is not upstream: [issue #3137](https://github.com/TraceMachina/nativelink/issues/3137) is open, and so are the two pull requests that address it differently (#3138, #3191). Do not turn on `directory_cache` in the worker config: it stages inputs by another path, which the patch does not touch.
 
 **The stale-entry patch.** A worker's store answers "do you have this blob" from its index. If an entry's file is no longer on disk, the store still says yes, nothing fetches the blob, and every action that stages it fails: `executable-variant copy failed: … NotFound … Resolving executable variant for <digest>` for an executable input, `Could not make hardlink … file was likely evicted from cache` for a plain one. The failure is immediate, so the worker is free again at once and is handed the retries; one such entry for an input every test shares fails every test in the pool. This happened on a Linux worker on 2026-11-20, on 1.6.6, where a race in eviction left the entry behind. 1.8.6 closes that race and drops a stale entry when a blob is read through the store, but not on the two paths a worker stages inputs by; the patch covers those, so the blob is fetched again and the action runs. It is not upstream.
+
+**The compressed-upload patch.** With `--remote_cache_compression` Bazel uploads a large blob as a compressed ByteStream write. When that stream is cut off (the likely cause is the `--remote_timeout` deadline on a big upload), Bazel resumes the standard way: `QueryWriteStatus`, then a new `Write` at `write_offset = committed_size`. 1.8.6 answers with the compressed bytes received so far, and then refuses any compressed `Write` that does not start at 0: `INVALID_ARGUMENT: Received out of order compressed data. Got N, expected 0 : In ByteStreamServer::write_compressed`. Bazel does not retry that, the upload fails, and the action result that needed it is never cached. The remote execution API makes the first offset of a compressed write an uncompressed one, so a non-zero resume is legal, and a server that cannot resume should answer 0 so that the client sends the blob again. The patch does that for an upload that is still in progress; an interrupted compressed upload costs a resend of the whole blob. It is [pull request #2891](https://github.com/TraceMachina/nativelink/pull/2891), unmerged, carried unchanged, and `main` and 1.8.6 have the same code, so a later release does not help until it is merged. The same bug in uncompressed uploads was fixed in [#2889](https://github.com/TraceMachina/nativelink/pull/2889) (1.8.0). Compression stays on: turning it off is not the remedy. The pull request's own test is the regression test: `build-worker.sh --role hub` runs it, and it fails on 1.8.6 at the `QueryWriteStatus` check.
 
 Why 1.8.6 and not the 1.6.6 it replaces: on 2026-11-18 the 1.6.6 scheduler timed out operations on live workers after 5 s, evicted the workers, and went round again for hours while every client waited. The fixes, by the release that first had them:
 
@@ -100,7 +103,7 @@ Why 1.8.6 and not the 1.6.6 it replaces: on 2026-11-18 the 1.6.6 scheduler timed
 
 The "Worker ids do not match" error that ended each round of the loop is gone as well: evicting a worker now skips an action that has already moved to another.
 
-To move to a later release: change the pins at the top of `build-worker.sh`, refresh each patch against the new tag (or delete one, and its line in `PATCHES`, once a release does what it does), run `build-worker.sh` on a Mac and on a Linux worker host, which runs the tests that cover the patches, and update the version in this file and in the two configs. `config_test` fails until they agree.
+To move to a later release: change the pins at the top of `build-worker.sh`, refresh each patch against the new tag (or delete one, and its line in `PATCHES`, once a release does what it does), run `build-worker.sh` on a Mac, on a Linux worker host and, with `--role hub`, on the hub's host, which runs the tests that cover the patches, and update the version in this file and in the two configs. `config_test` fails until they agree.
 
 ## Timeouts
 
@@ -304,6 +307,30 @@ sudo systemctl enable --now nativelink-hub-textfile.timer
 
 On a Mac worker the same helper applies to files that are installed unmodified (`worker-macos.json5`, `action-env.sh`). The launchd plist is edited after the first copy (placeholders for this Mac), so a later `cmp` against the repository file will differ; do not overwrite it from the repository.
 
+### Updating the hub's binary
+
+The hub runs `~/nativelink-macos-hub/nativelink`, built from source with its patch ("Version and patches"). Build it on the hub's host, in a directory of its own, and never in the hub's data directory:
+
+```sh
+BUILD=<a directory with room for a bazel build>
+nice -n 15 ionice -c3 $REPO/build-worker.sh --role hub --src $BUILD/src --out $BUILD/out
+```
+
+It fetches the pinned commit, applies the patch, runs the ByteStream server's tests, and prints the binary's version and sha256. A reused `--src` is refused unless it is that commit plus exactly that patch. The install is a restart, so it is a deliberate step, not part of a copy: do it when no CI build is running (`bk build list --state running`), because the restart ends the cache traffic and every action in flight ("Recovery" says what the clients see).
+
+```sh
+cd ~/nativelink-macos-hub
+backup=nativelink.bak-$(date +%Y%m%d-%H%M)
+cp -p nativelink "$backup"
+install -m 755 $BUILD/out/nativelink nativelink.new
+mv nativelink.new nativelink    # a rename: the running process keeps its old file
+./nativelink --version          # nativelink 1.8.6+compressed-restart
+sudo systemctl restart nativelink-macos-hub.service
+sleep 60 && ./hub-health.sh --journal-unit nativelink-macos-hub.service
+```
+
+The health check must report a healthy hub with every worker connected. If it does not, put the backup back and restart once more: `mv "$backup" nativelink && sudo systemctl restart nativelink-macos-hub.service`. Do not change `hub.json5`, `hub.env` or the stores in the same step. The upstream release is in `~/nativelink-macos-hub/nativelink-1.8.6-x86_64-unknown-linux-musl.tar.gz`; `tar xzf` it to get the unpatched binary back.
+
 ### The hub unit and the host's memory
 
 The hub is a system unit with `OOMScoreAdjust=-900`, `MemoryLow=4G` and `MemorySwapMax=0`. Under the user manager it ran at `oom_score_adj` 200, and the kernel's OOM killer took it first when the Linux worker's compiles and links filled RAM. The Linux worker on the same host (`headcrash-worker/`) is capped inside its own cgroup (`MemoryHigh=16G`, `MemoryMax=18G`, `OOMScoreAdjust=300`), so a burst of compiles is killed there, not the hub.
@@ -361,7 +388,7 @@ It fetches the pinned commit, applies the patches, runs the tests that cover the
 ```sh
 mkdir -p ~/nativelink-macos-hub && cd ~/nativelink-macos-hub
 # the release tarball named under "Version and patches"; check its sha256 before unpacking
-tar xzf nativelink-1.8.6-x86_64-unknown-linux-musl.tar.gz nativelink
+tar xzf nativelink-1.8.6-x86_64-unknown-linux-musl.tar.gz nativelink   # since 2026-11-23 the hub runs its patched build instead ("Updating the hub's binary")
 # copy_if_changed: identical content is a no-op (see "Installing or updating hub files")
 REPO=<checkout>/tools/remote-execution/nativelink
 copy_if_changed() {
