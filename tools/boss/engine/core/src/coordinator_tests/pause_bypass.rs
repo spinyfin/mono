@@ -839,3 +839,103 @@ async fn drain_records_force_launch_when_admitting_operator_forced_work() {
     );
     assert!(!db.execution_has_operator_forced_admission(&execution.id).unwrap());
 }
+
+#[tokio::test]
+async fn forced_and_board_dispatch_fail_visibly_when_no_funded_driver_is_eligible() {
+    for board in [false, true] {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = create_test_product(&db);
+        db.set_driver_traffic_split(boss_protocol::DriverTrafficSplit::new(100, 0, 0, 0))
+            .unwrap();
+        let chore = create_test_chore(&db, product.id.clone(), "Queued before share change");
+        db.reconcile_product_executions(&product.id).unwrap();
+        let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+        // Restrict the queued chore to Claude, then put Claude at 0% so no
+        // eligible driver holds a share.
+        db.update_work_item(
+            &chore.id,
+            boss_protocol::WorkItemPatch {
+                model_override: Some("opus".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.set_driver_traffic_split(boss_protocol::DriverTrafficSplit::new(0, 0, 100, 0))
+            .unwrap();
+
+        let runner = Arc::new(FakeExecutionRunner::default());
+        let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+        let publisher = Arc::new(crate::test_support::RecordingPublisher::default());
+        let coordinator = Arc::new(
+            ExecutionCoordinator::with_publisher(
+                db.clone(),
+                WorkerPool::new(1),
+                Arc::new(FakeCubeClient::default()),
+                runner.clone(),
+                publisher.clone(),
+            )
+            .with_dispatch_events(recording.clone()),
+        );
+        let err = if board {
+            coordinator
+                .launch_from_board_move(
+                    RequestExecutionInput::builder().work_item_id(&chore.id).build(),
+                    live_states(),
+                )
+                .await
+                .unwrap_err()
+        } else {
+            coordinator
+                .force_dispatch(&execution.id, DispatchAdmission::OperatorForced)
+                .await
+                .unwrap_err()
+        };
+        assert!(
+            err.downcast_ref::<crate::work::DriverAllocationRefused>().is_some(),
+            "{err:#}"
+        );
+        assert_eq!(coordinator.worker_pool().occupancy().await.working, 0);
+
+        let failed = db.get_execution(&execution.id).unwrap();
+        assert_eq!(failed.status, ExecutionStatus::Failed);
+        assert!(
+            failed
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("claude excluded: 0% share")),
+            "{:?}",
+            failed.last_error
+        );
+        assert!(
+            failed.last_error.as_deref().is_some_and(|e| e.contains("0 share")),
+            "{:?}",
+            failed.last_error
+        );
+        assert_eq!(runner.calls.lock().await.len(), 0, "no worker may spawn");
+        let attention = db.list_attention_items(&execution.id).unwrap();
+        assert!(
+            attention
+                .iter()
+                .any(|item| item.kind == crate::work::DRIVER_ALLOCATION_REFUSED_ATTENTION_KIND),
+            "{attention:?}"
+        );
+        let refusal_attention = attention
+            .iter()
+            .find(|item| item.kind == crate::work::DRIVER_ALLOCATION_REFUSED_ATTENTION_KIND)
+            .unwrap();
+        assert!(
+            refusal_attention
+                .body_markdown
+                .contains("bossctl dispatch traffic-split"),
+            "{refusal_attention:?}"
+        );
+        let boss_protocol::WorkItem::Chore(task) = db.get_work_item(&chore.id).unwrap() else {
+            panic!("expected a chore");
+        };
+        assert_eq!(
+            task.dispatch_failed_reason.as_deref(),
+            Some(crate::work::DRIVER_ALLOCATION_REFUSED_ATTENTION_KIND)
+        );
+    }
+}

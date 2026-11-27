@@ -552,8 +552,8 @@ impl ExecutionCoordinator {
             return Err(anyhow!("{hold}"));
         }
         // Durable spawn-window claim. The drain loop usually already won
-        // this CAS; `AlreadyHeld` is that case. `force_dispatch` and any
-        // path that skipped the drain pickup claim it here. Rejected means
+        // this CAS; forced dispatch also claims before reserving the item.
+        // `AlreadyHeld` covers both paths. Other callers claim here. Rejected means
         // the reconciler (or another writer) moved the row off `ready`
         // before we took the window — fail closed rather than leasing a
         // workspace we cannot start.

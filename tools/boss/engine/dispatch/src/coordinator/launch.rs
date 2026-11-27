@@ -37,6 +37,8 @@ use crate::work::CancelExecutionOpts;
 pub enum ForcedDispatchRefusal {
     /// Another dispatch holds an incompatible reservation for this item.
     ReservationConflict { execution_id: String },
+    /// The drain already owns the durable claim; this launch lost the race.
+    AlreadyStarting,
     /// The execution changed state before the durable claim could be taken.
     ClaimRejected { execution_id: String },
     /// A startup preflight is still blocking local dispatch.
@@ -69,6 +71,7 @@ impl ForcedDispatchRefusal {
             Self::ReservationConflict { .. } => {
                 "another worker is being set up for this item; try again when setup finishes".to_owned()
             }
+            Self::AlreadyStarting => "a worker is already being started for this item".to_owned(),
             Self::ClaimRejected { .. } => {
                 "the item is no longer ready to start; try again after its dependencies clear".to_owned()
             }
@@ -91,6 +94,7 @@ impl std::fmt::Display for ForcedDispatchRefusal {
                 f,
                 "execution {execution_id} (or another execution for its work item) is already being dispatched — cannot force-dispatch"
             ),
+            Self::AlreadyStarting => f.write_str("a worker is already being started for this item"),
             Self::ClaimRejected { execution_id } => {
                 write!(f, "execution {execution_id} could not be claimed for dispatch")
             }
@@ -143,6 +147,12 @@ pub struct BoardLaunchOutcome {
 }
 
 impl ExecutionCoordinator {
+    fn record_live_board_launch(&self, work_item_id: &str) {
+        if let Err(err) = self.work_db.record_explicit_launch(work_item_id) {
+            tracing::warn!(%work_item_id, ?err, "failed to record launch intent for an active worker");
+        }
+    }
+
     /// Hold a dispatch at the handoff boundary in integration fixtures.
     #[cfg(any(test, feature = "test-support"))]
     pub fn reserve_board_dispatch_for_test(&self, execution: &WorkExecution) -> DispatchReservation {
@@ -188,7 +198,7 @@ impl ExecutionCoordinator {
     /// the auto-dispatcher in a race, terminal, or unknown), when the
     /// active pause does not admit `admission`, or when the target pool is
     /// already at its hard cap with no idle slot.
-    /// `try_reserve` stays before the first `.await` (`claim_worker_force`);
+    /// On admission, `try_reserve` precedes the first `.await` (`claim_worker_force`);
     /// the operator-answer first poll of [`Self::launch_answered_work`] depends on it.
     pub async fn force_dispatch(self: &Arc<Self>, execution_id: &str, admission: DispatchAdmission) -> Result<String> {
         let claim = self.claim_forced_dispatch(execution_id, admission).await?;
@@ -196,7 +206,7 @@ impl ExecutionCoordinator {
     }
 
     /// The decision half of a forced dispatch: everything that can refuse it
-    /// before a cube lease is taken. No `.await` precedes `try_reserve`.
+    /// before a cube lease is taken. Successful claims reserve before yielding.
     async fn claim_forced_dispatch(
         self: &Arc<Self>,
         execution_id: &str,
@@ -226,17 +236,23 @@ impl ExecutionCoordinator {
             }
             .into());
         }
-        // `ready` is necessary but not sufficient: the auto-dispatcher may
-        // already have handed this row (or a duplicate of it) off, and it
-        // sits in `claimed` until its run starts. Force-dispatching over
-        // the top would claim a second slot and spawn a second worker for
-        // one work item. A non-`ready` status (including `claimed`) is
-        // refused above.
-        //
-        // Claimed BEFORE the worker, and via the atomic `try_reserve` rather
-        // than a check-then-reserve pair: a concurrent `drain_ready_queue`
-        // could otherwise slip in during the `claim_worker_force` await, and
-        // both paths would believe they own the dispatch.
+        // Take the durable claim before the reservation. If the drain won,
+        // it must remain free to reserve the item and finish its dispatch.
+        match self.work_db.claim_execution_for_dispatch(&execution.id) {
+            Ok(DispatchClaimOutcome::Won) => {}
+            Ok(DispatchClaimOutcome::AlreadyHeld) => return Err(ForcedDispatchRefusal::AlreadyStarting.into()),
+            Ok(DispatchClaimOutcome::Rejected) => {
+                return Err(ForcedDispatchRefusal::ClaimRejected {
+                    execution_id: execution_id.to_owned(),
+                }
+                .into());
+            }
+            Err(err) => {
+                self.fail_execution_if_allocation_refused(&execution, &err).await;
+                return Err(err);
+            }
+        }
+        let mut durable_claim = DrainDispatchClaim::already_held(Arc::clone(&self.work_db), execution.id.clone());
         let Some(reservation) = self.inflight_dispatches.try_reserve(&execution, &self.work_db) else {
             return Err(ForcedDispatchRefusal::ReservationConflict {
                 execution_id: execution_id.to_owned(),
@@ -275,20 +291,7 @@ impl ExecutionCoordinator {
                 hard_cap: pool.hard_cap(),
                 execution_id: execution_id.to_owned(),
             })?;
-        // Hold the durable spawn window before acknowledging the launch. The
-        // same request can reconcile the product as soon as we return.
-        let durable_claim = match self.work_db.claim_execution_for_dispatch(&execution.id) {
-            Ok(DispatchClaimOutcome::Won) => Ok(()),
-            Ok(_) => Err(anyhow!(ForcedDispatchRefusal::ClaimRejected {
-                execution_id: execution_id.to_owned()
-            })),
-            Err(err) => Err(err),
-        };
-        if let Err(err) = durable_claim {
-            pool.release_worker_if_execution(&worker_id, &execution.id, execution.preferred_workspace_id.as_deref())
-                .await;
-            return Err(err);
-        }
+        durable_claim.disarm();
         Ok(ForcedDispatchClaim {
             execution,
             worker_id,
@@ -381,10 +384,11 @@ impl ExecutionCoordinator {
     /// is [`Self::dispatch_with_pause_bypass`]. A `critical` item keeps the
     /// exemption the drain gives it from a default-scope operator pause.
     ///
-    /// A refusal leaves no trace of the gesture: an execution this request
-    /// created is cancelled and no launch is recorded, so nothing starts
-    /// later by surprise. An execution that was already queued is left as it
-    /// was. The caller owns reverting the status move.
+    /// A refusal records no launch intent. A newly created execution is
+    /// cancelled unless allocation refusal already failed it visibly. A
+    /// reused queued execution retains its prior queue state. The caller
+    /// owns reverting the status move. For an already-active worker, an
+    /// intent-write failure is logged without refusing the move.
     pub async fn launch_from_board_move(
         self: &Arc<Self>,
         input: RequestExecutionInput,
@@ -431,7 +435,7 @@ impl ExecutionCoordinator {
             // The item already has a worker, or one being started: there is
             // no second worker to launch. The owner still asked for it by
             // name, so the launch is recorded.
-            self.work_db.record_explicit_launch(&work_item_id)?;
+            self.record_live_board_launch(&work_item_id);
             return Ok(BoardLaunchOutcome {
                 execution,
                 launched: false,
@@ -451,16 +455,21 @@ impl ExecutionCoordinator {
                     ExecutionStatus::Claimed | ExecutionStatus::Running | ExecutionStatus::WaitingHuman
                 ) || self.inflight_dispatches.try_is_execution_dispatching(&refreshed.id)
                     == Some(true);
-                if dispatching {
-                    self.work_db.record_explicit_launch(&work_item_id)?;
+                if dispatching
+                    || matches!(
+                        err.downcast_ref::<ForcedDispatchRefusal>(),
+                        Some(ForcedDispatchRefusal::AlreadyStarting)
+                    )
+                {
+                    self.record_live_board_launch(&work_item_id);
                     return Ok(BoardLaunchOutcome {
                         execution: refreshed,
                         launched: false,
                     });
                 }
                 if pre_existing.get(&refreshed.id) == Some(&ExecutionStatus::WaitingDependency) {
-                    self.work_db.downgrade_ready_to_waiting_dependency(&refreshed.id)?;
-                } else if !pre_existing.contains_key(&refreshed.id) {
+                    self.work_db.restore_ready_to_waiting_dependency(&refreshed.id)?;
+                } else if !pre_existing.contains_key(&refreshed.id) && !refreshed.status.is_terminal() {
                     self.work_db.cancel_execution_with(
                         &refreshed.id,
                         CancelExecutionOpts {

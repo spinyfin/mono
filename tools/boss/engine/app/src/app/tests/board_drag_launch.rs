@@ -691,3 +691,86 @@ async fn a_rejected_durable_claim_refuses_before_replying_and_releases_the_slot(
         ExecutionStatus::Cancelled
     );
 }
+
+#[tokio::test]
+async fn a_live_worker_keeps_the_card_in_doing_when_intent_cannot_be_written() {
+    for status in [ExecutionStatus::Claimed, ExecutionStatus::Running] {
+        let (state, _dir) = test_server_state_with_fakes();
+        let seeded = seed(&state);
+        let live = state
+            .work_db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(&seeded.task.id)
+                    .kind(ExecutionKind::TaskImplementation)
+                    .status(status)
+                    .build(),
+            )
+            .unwrap();
+        // The reservation models a worker whose pane is still being created.
+        let _reservation = state.execution_coordinator.reserve_board_dispatch_for_test(&live);
+        state
+            .work_db
+            .connect()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_live_launch BEFORE UPDATE OF explicitly_launched ON tasks
+             BEGIN SELECT RAISE(ABORT, 'launch intent unavailable'); END;",
+            )
+            .unwrap();
+        assert_moved_to_active(drop_on_doing(&state, &seeded.task.id).await);
+        assert_eq!(current_task(&state, &seeded.task.id).status, TaskStatus::Active);
+    }
+}
+
+#[tokio::test]
+async fn a_drain_winning_the_claim_keeps_the_move_and_can_reserve_the_item() {
+    let (state, _dir) = test_server_state_with_fakes();
+    let seeded = seed(&state);
+    // Model the drain taking the durable claim after the ready read.
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER drain_wins BEFORE UPDATE OF status ON work_executions
+         WHEN NEW.status = 'claimed'
+         BEGIN UPDATE work_executions SET status = 'claimed' WHERE id = OLD.id;
+         SELECT RAISE(IGNORE); END;",
+        )
+        .unwrap();
+    let before = state.execution_coordinator.worker_pool().occupancy().await.working;
+    assert_moved_to_active(drop_on_doing(&state, &seeded.task.id).await);
+    let claimed = executions(&state, &seeded.task.id).pop().unwrap();
+    assert_eq!(claimed.status, ExecutionStatus::Claimed);
+    assert_eq!(
+        state.execution_coordinator.worker_pool().occupancy().await.working,
+        before
+    );
+    let _reservation = state.execution_coordinator.reserve_board_dispatch_for_test(&claimed);
+}
+
+#[tokio::test]
+async fn a_racing_worker_keeps_the_move_when_intent_cannot_be_written() {
+    let (state, _dir) = test_server_state_with_fakes();
+    let seeded = seed(&state);
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER worker_starts BEFORE UPDATE OF status ON work_executions
+         WHEN NEW.status = 'claimed'
+         BEGIN UPDATE work_executions SET status = 'running' WHERE id = OLD.id;
+         SELECT RAISE(IGNORE); END;
+         CREATE TRIGGER refuse_racing_launch BEFORE UPDATE OF explicitly_launched ON tasks
+         BEGIN SELECT RAISE(ABORT, 'launch intent unavailable'); END;",
+        )
+        .unwrap();
+    assert_moved_to_active(drop_on_doing(&state, &seeded.task.id).await);
+    assert_eq!(current_task(&state, &seeded.task.id).status, TaskStatus::Active);
+    assert_eq!(
+        executions(&state, &seeded.task.id).pop().unwrap().status,
+        ExecutionStatus::Running
+    );
+}

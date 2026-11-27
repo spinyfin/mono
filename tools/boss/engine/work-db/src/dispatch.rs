@@ -1805,6 +1805,16 @@ impl WorkDb {
         Ok(affected > 0)
     }
 
+    /// Restore a refused board launch only while it is still queued. A
+    /// concurrent drain's claimed row must retain its spawn window.
+    pub fn restore_ready_to_waiting_dependency(&self, execution_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        Ok(conn.execute(
+            "UPDATE work_executions SET status = 'waiting_dependency' WHERE id = ?1 AND status = 'ready'",
+            rusqlite::params![execution_id],
+        )? > 0)
+    }
+
     /// Record `reason` as this `ready` execution's current dispatch-wait
     /// defer reason (`chain_serialized`, `pool_exhausted`, ...), mirroring
     /// the reason already logged to `dispatch_events` at the same call
