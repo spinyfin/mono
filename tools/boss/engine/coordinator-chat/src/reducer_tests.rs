@@ -1087,3 +1087,878 @@ fn truncated_fenced_tool_output_closes_the_fence_before_the_notice() {
     let bounded = crate::reducer::bound_text(&text, 50);
     assert!(bounded.contains("\n```\n… truncated"), "{bounded}");
 }
+
+mod restart_and_snapshot_tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    use boss_acp_client::schema::RequestId;
+    use boss_agent_host::journal::{Direction, WireRecord, read_records};
+    use boss_protocol::{
+        CoordinatorChatConnectionPhase, CoordinatorChatItemKind, CoordinatorChatMessageRole, CoordinatorChatTurnOrigin,
+    };
+    use serde_json::json;
+
+    use crate::intent::{IntentLog, IntentRecord, IntentRecordKind, WithdrawReason};
+    use crate::queue::{PromptImageRef, PromptOrigin};
+    use crate::redact::{CredentialRedactor, REDACTED_PLACEHOLDER};
+    use crate::reducer::{ConversationReducer, replay_with_intent_log};
+    use crate::snapshot::{
+        SNAPSHOT_SCHEMA_VERSION, SnapshotLoad, SnapshotLoadStatus, load_snapshot, load_snapshot_bytes,
+        recover_from_files, recover_from_slices, recover_from_snapshot_and_tail, save_snapshot,
+    };
+
+    const RESTART_FIXTURE: &str = include_str!("../testdata/restart_mid_turn_with_queue.jsonl");
+    const TEST_SECRET: &str = "handoff-write-secret-0123456789abcdef";
+
+    static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let id = DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("boss-coord-chat-snap-{label}-{}-{id}", std::process::id()));
+            std::fs::create_dir_all(&path).expect("create temp test dir");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn wire(seq: u64, dir: Direction, payload: serde_json::Value) -> WireRecord {
+        WireRecord {
+            seq,
+            ts_ms: 1_795_720_000_000 + seq * 10,
+            dir,
+            line: payload.to_string(),
+            invalid: None,
+        }
+    }
+
+    fn write_wire_file(path: &std::path::Path, records: &[WireRecord]) {
+        let mut bytes = Vec::new();
+        for rec in records {
+            serde_json::to_writer(&mut bytes, rec).unwrap();
+            bytes.push(b'\n');
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn build_restart_intents(dir: &std::path::Path) -> (PathBuf, Vec<IntentRecord>) {
+        let intent_path = dir.join("intent.jsonl");
+        let mut log = IntentLog::open(&intent_path).unwrap();
+
+        // Turn 1: engine brief containing the handoff write credential.
+        let i1 = log
+            .append_queued_at(
+                1_795_720_000_315,
+                PromptOrigin::Engine,
+                format!("Session brief with auth {TEST_SECRET}"),
+                None,
+                Vec::new(),
+            )
+            .unwrap();
+        let s1 = log
+            .append_sent_at(1_795_720_000_318, i1.intent_id(), RequestId::Number(3))
+            .unwrap();
+
+        // Turn 2: operator prompt.
+        let i2 = log
+            .append_queued_at(
+                1_795_720_000_990,
+                PromptOrigin::Operator,
+                "Check coordinator status",
+                Some("op-msg-2".to_owned()),
+                Vec::new(),
+            )
+            .unwrap();
+        let s2 = log
+            .append_sent_at(1_795_720_000_995, i2.intent_id(), RequestId::Number(4))
+            .unwrap();
+
+        // Turn 3: operator prompt that is still streaming at seq 21 when the engine restarts.
+        let i3 = log
+            .append_queued_at(
+                1_795_720_002_990,
+                PromptOrigin::Operator,
+                "Handle the third request",
+                Some("op-msg-3".to_owned()),
+                Vec::new(),
+            )
+            .unwrap();
+        let s3 = log
+            .append_sent_at(1_795_720_002_995, i3.intent_id(), RequestId::Number(5))
+            .unwrap();
+
+        // While Turn 3 is in flight: an operator prompt is queued and withdrawn,
+        // another operator prompt with an image stays queued, and an engine
+        // prompt is queued (which must take priority over the queued operator prompt).
+        let i4_withdrawn = log
+            .append_queued_at(
+                1_795_720_003_110,
+                PromptOrigin::Operator,
+                "Never mind this one",
+                Some("op-msg-withdrawn".to_owned()),
+                Vec::new(),
+            )
+            .unwrap();
+        let w4 = log
+            .append_withdrawn_at(
+                1_795_720_003_120,
+                i4_withdrawn.intent_id(),
+                WithdrawReason::CallerWithdrawn,
+            )
+            .unwrap();
+
+        let i5_queued_op = log
+            .append_queued_at(
+                1_795_720_003_130,
+                PromptOrigin::Operator,
+                "Queued operator message with screenshot",
+                Some("op-msg-queued".to_owned()),
+                vec![PromptImageRef {
+                    path: "images/shot-1.png".to_owned(),
+                    mime_type: "image/png".to_owned(),
+                    filename: Some("shot-1.png".to_owned()),
+                    byte_len: Some(2048),
+                }],
+            )
+            .unwrap();
+
+        let i6_queued_eng = log
+            .append_queued_at(
+                1_795_720_003_140,
+                PromptOrigin::Engine,
+                "Prompt-changed nudge",
+                None,
+                Vec::new(),
+            )
+            .unwrap();
+
+        (
+            intent_path,
+            vec![i1, s1, i2, s2, i3, s3, i4_withdrawn, w4, i5_queued_op, i6_queued_eng],
+        )
+    }
+
+    #[test]
+    fn queued_message_and_prompt_origins_survive_simulated_engine_restart() {
+        let dir = TestDir::new("restart-survival");
+        let wire_records = read_records(RESTART_FIXTURE.as_bytes()).expect("restart fixture must parse");
+        assert_eq!(wire_records.len(), 24);
+        let (intent_path, intents) = build_restart_intents(dir.path());
+        let redactor = CredentialRedactor::new(TEST_SECRET);
+
+        // Process 1 runs live up through seq 21 (mid-Turn-3 streaming), taking
+        // a snapshot at seq 14 (after Turn 2, intent seq 4) before crashing at seq 21.
+        let mut live = ConversationReducer::new(redactor.clone());
+        // Apply intents 0..4 and wire 0..14 (through Turn 2).
+        for intent in &intents[..4] {
+            live.apply_intent_record(intent);
+        }
+        for rec in &wire_records[..14] {
+            live.apply_record(rec);
+        }
+        let snapshot_path = dir.path().join("snapshot.json");
+        save_snapshot(&snapshot_path, &live.snapshot()).unwrap();
+        let snap_mode = std::fs::metadata(&snapshot_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(snap_mode, 0o600, "snapshot must be private 0600");
+
+        // Continue live through agent-started turn (seq 15..18) and mid-Turn-3 (seq 19..21).
+        for rec in &wire_records[14..18] {
+            live.apply_record(rec);
+            if rec.seq == 15 || rec.seq == 16 {
+                assert!(
+                    !live.queue().open_agent_turns().is_empty(),
+                    "seq {} must keep agent turn open in queue",
+                    rec.seq
+                );
+            }
+        }
+        assert!(live.queue().open_agent_turns().is_empty());
+        for intent in &intents[4..] {
+            live.apply_intent_record(intent);
+        }
+        for rec in &wire_records[18..21] {
+            live.apply_record(rec);
+        }
+
+        // Write wire journal up to crash point (seq 21) and simulate Process 2 restarting.
+        let wire_path = dir.path().join("wire.jsonl");
+        write_wire_file(&wire_path, &wire_records[..21]);
+
+        let recovered = recover_from_files(&wire_path, Some(&intent_path), Some(&snapshot_path), redactor.clone())
+            .expect("recovery must succeed");
+        assert_eq!(
+            recovered.snapshot_status,
+            SnapshotLoadStatus::Hit {
+                wire_seq: 14,
+                intent_seq: 4
+            }
+        );
+        assert_eq!(recovered.wire_records_replayed, 7);
+        assert_eq!(recovered.intent_records_replayed, 6);
+        assert!(recovered.recovered_unsent_intents.is_empty());
+
+        // Snapshot + tail replay must match live AND full replay from scratch.
+        let full = replay_with_intent_log(&wire_records[..21], &intents, redactor.clone());
+        for candidate in [&recovered.reducer, &full] {
+            assert_eq!(candidate.state(), live.state());
+            assert_eq!(candidate.items(), live.items());
+            assert_eq!(candidate.in_progress_message(), live.in_progress_message());
+            assert_eq!(candidate.queue(), live.queue());
+            assert_eq!(candidate.pending_client_request_ids(), vec![RequestId::Number(5)]);
+        }
+
+        // Verify Turn 1 engine brief was redacted and pinned turn origin to Engine
+        // despite Claude Code's usage_update claiming `human`.
+        let items = recovered.reducer.items();
+        let items_json = serde_json::to_string(items).unwrap();
+        assert!(!items_json.contains(TEST_SECRET), "secret leaked: {items_json}");
+
+        let prompt_1 = recovered.reducer.item_by_id("prompt-5").expect("Turn 1 prompt item");
+        match &prompt_1.kind {
+            CoordinatorChatItemKind::Message(msg) => {
+                assert_eq!(msg.role, CoordinatorChatMessageRole::Engine);
+                assert_eq!(msg.text, format!("Session brief with auth {REDACTED_PLACEHOLDER}"));
+            }
+            other => panic!("expected Engine message, got {other:?}"),
+        }
+        let turn_1 = recovered.reducer.item_by_id("turn-8").expect("Turn 1 boundary");
+        match &turn_1.kind {
+            CoordinatorChatItemKind::TurnBoundary(b) => {
+                assert_eq!(b.origin, Some(CoordinatorChatTurnOrigin::Engine));
+            }
+            other => panic!("expected TurnBoundary, got {other:?}"),
+        }
+
+        // Verify Turn 2 operator prompt preserved client_message_id and Human origin.
+        let prompt_2 = recovered.reducer.item_by_id("prompt-9").expect("Turn 2 prompt item");
+        match &prompt_2.kind {
+            CoordinatorChatItemKind::Message(msg) => {
+                assert_eq!(msg.role, CoordinatorChatMessageRole::Operator);
+                assert_eq!(msg.client_message_id.as_deref(), Some("op-msg-2"));
+            }
+            other => panic!("expected Operator message, got {other:?}"),
+        }
+
+        // Verify Turn 3 is in flight, partial stream survived, and queued prompts
+        // survived in priority order (Engine ahead of Operator, withdrawn absent).
+        let queue = recovered.reducer.queue();
+        assert_eq!(queue.in_flight().unwrap().request_id, RequestId::Number(5));
+        assert_eq!(queue.in_flight().unwrap().wire_seq, Some(19));
+        assert_eq!(
+            recovered.reducer.in_progress_message().unwrap().text,
+            "Working on your third request "
+        );
+        assert_eq!(queue.queued_len(), 2);
+        assert_eq!(queue.queued()[0].origin, PromptOrigin::Engine);
+        assert_eq!(queue.queued()[0].text(), "Prompt-changed nudge");
+        assert_eq!(queue.queued()[1].origin, PromptOrigin::Operator);
+        assert_eq!(queue.queued()[1].client_message_id.as_deref(), Some("op-msg-queued"));
+        assert_eq!(queue.queued()[1].images().len(), 1);
+        assert_eq!(queue.queued()[1].images()[0].path, "images/shot-1.png");
+
+        // Now feed the remaining live wire records (seq 22..24) after restart.
+        let mut resumed = recovered.reducer;
+        for rec in &wire_records[21..] {
+            resumed.apply_record(rec);
+        }
+        assert_eq!(resumed.state().phase, CoordinatorChatConnectionPhase::Idle);
+        assert!(resumed.in_progress_message().is_none());
+        assert!(resumed.queue().can_send());
+        assert_eq!(
+            resumed.queue().peek_next_dispatchable().unwrap().origin,
+            PromptOrigin::Engine
+        );
+
+        let completed_turn_3 = resumed.item_by_id("msg-20").expect("Turn 3 finalized message");
+        match &completed_turn_3.kind {
+            CoordinatorChatItemKind::Message(msg) => {
+                assert_eq!(msg.text, "Working on your third request after restart.");
+            }
+            other => panic!("expected Message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_preserves_split_credential_redaction_holdback_across_restart() {
+        let redactor = CredentialRedactor::new(TEST_SECRET);
+        let (first_half, second_half) = TEST_SECRET.split_at(TEST_SECRET.len() / 2);
+
+        let wire_records = [
+            wire(
+                1,
+                Direction::ToAgent,
+                json!({"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s","prompt":[]}}),
+            ),
+            wire(
+                2,
+                Direction::FromAgent,
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "s",
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "messageId": "m1",
+                            "content": {"type": "text", "text": format!("auth={first_half}")}
+                        }
+                    }
+                }),
+            ),
+            wire(
+                3,
+                Direction::FromAgent,
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "s",
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "messageId": "m1",
+                            "content": {"type": "text", "text": format!("{second_half} ok")}
+                        }
+                    }
+                }),
+            ),
+            wire(
+                4,
+                Direction::FromAgent,
+                json!({"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}),
+            ),
+        ];
+
+        // Take snapshot right after seq 2 while `first_half` is held back.
+        let mut pre_restart = ConversationReducer::new(redactor.clone());
+        pre_restart.apply_record(&wire_records[0]);
+        pre_restart.apply_record(&wire_records[1]);
+        assert_eq!(pre_restart.in_progress_message().unwrap().text, "auth=");
+
+        let snap_bytes = serde_json::to_vec(&pre_restart.snapshot()).unwrap();
+        // The secret list itself is never stored in the snapshot; only the
+        // held-back chunk fragment is present in the 0600 cache.
+        assert!(!String::from_utf8_lossy(&snap_bytes).contains(TEST_SECRET));
+
+        let recovered = recover_from_slices(&wire_records, &[], Some(&snap_bytes), redactor);
+        assert_eq!(
+            recovered.snapshot_status,
+            SnapshotLoadStatus::Hit {
+                wire_seq: 2,
+                intent_seq: 0
+            }
+        );
+        let msg = recovered.reducer.item_by_id("msg-2").expect("finalized message");
+        match &msg.kind {
+            CoordinatorChatItemKind::Message(m) => {
+                assert_eq!(m.text, format!("auth={REDACTED_PLACEHOLDER} ok"));
+            }
+            other => panic!("expected Message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_corrupt_version_mismatched_and_stale_snapshots_fall_back_to_full_replay() {
+        let dir = TestDir::new("cache-fallback");
+        let wire_records = read_records(RESTART_FIXTURE.as_bytes()).unwrap();
+        let wire_path = dir.path().join("wire.jsonl");
+        write_wire_file(&wire_path, &wire_records);
+        let (intent_path, intents) = build_restart_intents(dir.path());
+        let redactor = CredentialRedactor::new(TEST_SECRET);
+        let baseline = replay_with_intent_log(&wire_records, &intents, redactor.clone());
+
+        // 1. Missing snapshot.
+        let missing_path = dir.path().join("does-not-exist.json");
+        assert_eq!(load_snapshot(&missing_path), SnapshotLoad::Missing);
+        let res = recover_from_files(&wire_path, Some(&intent_path), Some(&missing_path), redactor.clone()).unwrap();
+        assert_eq!(res.snapshot_status, SnapshotLoadStatus::Missing);
+        assert_eq!(res.wire_records_replayed, wire_records.len());
+        assert_eq!(res.reducer.items(), baseline.items());
+        assert_eq!(res.reducer.queue(), baseline.queue());
+
+        // 2. Corrupt JSON snapshot (truncated / garbage).
+        let corrupt_path = dir.path().join("corrupt.json");
+        std::fs::write(&corrupt_path, b"{\"schema_version\":1,\"wire_seq\":").unwrap();
+        assert!(matches!(load_snapshot(&corrupt_path), SnapshotLoad::Corrupt { .. }));
+        let res = recover_from_files(&wire_path, Some(&intent_path), Some(&corrupt_path), redactor.clone()).unwrap();
+        assert!(matches!(res.snapshot_status, SnapshotLoadStatus::Corrupt { .. }));
+        assert_eq!(res.wire_records_replayed, wire_records.len());
+        assert_eq!(res.reducer.items(), baseline.items());
+
+        // 3. Structurally corrupt snapshot (valid JSON, out-of-bounds index).
+        let mut bad_snap = baseline.snapshot();
+        bad_snap.projection.compaction_indices.insert("fake".to_owned(), 9999);
+        let bad_index_path = dir.path().join("bad-index.json");
+        save_snapshot(&bad_index_path, &bad_snap).unwrap();
+        let res = recover_from_files(&wire_path, Some(&intent_path), Some(&bad_index_path), redactor.clone()).unwrap();
+        assert!(matches!(res.snapshot_status, SnapshotLoadStatus::Corrupt { .. }));
+        assert_eq!(res.wire_records_replayed, wire_records.len());
+        assert_eq!(res.reducer.items(), baseline.items());
+
+        // 4. Version-mismatched snapshot with an unfamiliar future body layout.
+        let future_bytes = br#"{"schema_version":999,"completely_different_field":true}"#;
+        assert_eq!(
+            load_snapshot_bytes(future_bytes),
+            SnapshotLoad::VersionMismatch {
+                found: 999,
+                expected: SNAPSHOT_SCHEMA_VERSION,
+            }
+        );
+        let mismatch_path = dir.path().join("future.json");
+        std::fs::write(&mismatch_path, future_bytes).unwrap();
+        let res = recover_from_files(&wire_path, Some(&intent_path), Some(&mismatch_path), redactor.clone()).unwrap();
+        assert_eq!(
+            res.snapshot_status,
+            SnapshotLoadStatus::VersionMismatch {
+                found: 999,
+                expected: SNAPSHOT_SCHEMA_VERSION,
+            }
+        );
+        assert_eq!(res.wire_records_replayed, wire_records.len());
+        assert_eq!(res.reducer.items(), baseline.items());
+
+        // 5. Stale snapshot whose wire_seq is ahead of the journal.
+        let mut ahead = baseline.snapshot();
+        ahead.cursor.wire_seq = 9_999;
+        ahead.projection.state.last_seq = 9_999;
+        let ahead_path = dir.path().join("ahead.json");
+        save_snapshot(&ahead_path, &ahead).unwrap();
+        let res = recover_from_files(&wire_path, Some(&intent_path), Some(&ahead_path), redactor.clone()).unwrap();
+        assert!(matches!(
+            res.snapshot_status,
+            SnapshotLoadStatus::StaleAheadOfJournal {
+                snapshot_wire_seq: 9_999,
+                ..
+            }
+        ));
+        assert_eq!(res.wire_records_replayed, wire_records.len());
+        assert_eq!(res.reducer.items(), baseline.items());
+    }
+
+    #[test]
+    fn sent_intent_missing_from_wire_is_requeued_and_reused_request_ids_match_fifo() {
+        let intents = vec![
+            IntentRecord {
+                seq: 1,
+                ts_ms: 1,
+                kind: IntentRecordKind::Queued {
+                    intent_id: 1,
+                    origin: PromptOrigin::Engine,
+                    text: "first turn engine".to_owned(),
+                    client_message_id: None,
+                    images: Vec::new(),
+                },
+            },
+            IntentRecord {
+                seq: 2,
+                ts_ms: 2,
+                kind: IntentRecordKind::Sent {
+                    intent_id: 1,
+                    request_id: RequestId::Number(4),
+                },
+            },
+            // Suppose a fresh connection after restart reused numeric id 4.
+            IntentRecord {
+                seq: 3,
+                ts_ms: 3,
+                kind: IntentRecordKind::Queued {
+                    intent_id: 2,
+                    origin: PromptOrigin::Operator,
+                    text: "second turn operator".to_owned(),
+                    client_message_id: Some("cm-2".to_owned()),
+                    images: Vec::new(),
+                },
+            },
+            IntentRecord {
+                seq: 4,
+                ts_ms: 4,
+                kind: IntentRecordKind::Sent {
+                    intent_id: 2,
+                    request_id: RequestId::Number(4),
+                },
+            },
+            // Third prompt was marked Sent right before crash and never hit the wire.
+            IntentRecord {
+                seq: 5,
+                ts_ms: 5,
+                kind: IntentRecordKind::Queued {
+                    intent_id: 3,
+                    origin: PromptOrigin::Operator,
+                    text: "crashed before host journalled".to_owned(),
+                    client_message_id: Some("cm-3".to_owned()),
+                    images: Vec::new(),
+                },
+            },
+            IntentRecord {
+                seq: 6,
+                ts_ms: 6,
+                kind: IntentRecordKind::Sent {
+                    intent_id: 3,
+                    request_id: RequestId::Number(5),
+                },
+            },
+        ];
+
+        let wire_records = vec![
+            wire(
+                1,
+                Direction::ToAgent,
+                json!({"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":"s","prompt":[]}}),
+            ),
+            wire(
+                2,
+                Direction::FromAgent,
+                json!({"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}),
+            ),
+            wire(
+                3,
+                Direction::ToAgent,
+                json!({"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":"s","prompt":[]}}),
+            ),
+            wire(
+                4,
+                Direction::FromAgent,
+                json!({"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}),
+            ),
+        ];
+
+        let recovered = recover_from_slices(&wire_records, &intents, None, CredentialRedactor::none());
+        assert_eq!(recovered.recovered_unsent_intents.len(), 1);
+        assert_eq!(recovered.recovered_unsent_intents[0].intent_id, 3);
+        assert_eq!(recovered.reducer.queue().queued_len(), 1);
+        assert_eq!(recovered.reducer.queue().queued()[0].intent_id, 3);
+
+        // First prompt-1 is Engine, second prompt-3 is Operator.
+        match &recovered.reducer.item_by_id("prompt-1").unwrap().kind {
+            CoordinatorChatItemKind::Message(m) => {
+                assert_eq!(m.role, CoordinatorChatMessageRole::Engine);
+                assert_eq!(m.text, "first turn engine");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match &recovered.reducer.item_by_id("prompt-3").unwrap().kind {
+            CoordinatorChatItemKind::Message(m) => {
+                assert_eq!(m.role, CoordinatorChatMessageRole::Operator);
+                assert_eq!(m.text, "second turn operator");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// Generates a synthetic wire journal + intent log sized from the spike's
+    /// real per-turn profile (mono#3922):
+    /// - 27,587-byte `available_commands_update` lines (the spike's measured
+    ///   maximum line size)
+    /// - ~25–30 wire records per turn: prompt, tool call + fenced output,
+    ///   18–24 streaming `agent_message_chunk`s, `usage_update`, prompt
+    ///   response, plus periodic agent-started background turns.
+    fn build_synthetic_spike_journal(turns: usize) -> (Vec<WireRecord>, Vec<IntentRecord>) {
+        let mut wire_records = Vec::with_capacity(turns * 28 + 10);
+        let mut intents = Vec::with_capacity(turns * 2);
+        let mut seq: u64 = 0;
+        let mut intent_seq: u64 = 0;
+        let mut intent_id: u64 = 0;
+        let mut req_id: i64 = 0;
+
+        let mut push_wire = |dir: Direction, line: String| {
+            seq += 1;
+            wire_records.push(WireRecord {
+                seq,
+                ts_ms: 1_795_720_000_000 + seq * 50,
+                dir,
+                line,
+                invalid: None,
+            });
+        };
+
+        // Session handshake + a real-sized 27,587-byte `available_commands_update`.
+        req_id += 1;
+        push_wire(
+            Direction::ToAgent,
+            json!({"jsonrpc":"2.0","id":req_id,"method":"initialize","params":{"protocolVersion":1}}).to_string(),
+        );
+        push_wire(
+            Direction::FromAgent,
+            json!({
+                "jsonrpc":"2.0",
+                "id":req_id,
+                "result":{
+                    "protocolVersion":1,
+                    "agentInfo":{"name":"@agentclientprotocol/claude-agent-acp","version":"0.110.0"},
+                    "_meta":{"jetbrains":{"air":{"version":1,"capabilities":["asyncTasks","backgroundSubagents"]}}}
+                }
+            })
+            .to_string(),
+        );
+        req_id += 1;
+        push_wire(
+            Direction::ToAgent,
+            json!({"jsonrpc":"2.0","id":req_id,"method":"session/new","params":{"cwd":"/tmp/session","mcpServers":[]}})
+                .to_string(),
+        );
+        push_wire(
+            Direction::FromAgent,
+            json!({
+                "jsonrpc":"2.0",
+                "id":req_id,
+                "result":{"sessionId":"synthetic-bench","modes":{"currentModeId":"auto"},"configOptions":[{"id":"model","currentValue":"opus"}]}
+            })
+            .to_string(),
+        );
+
+        // Build an `available_commands_update` whose JSON line is >= 27,587 bytes.
+        let mut commands = Vec::new();
+        for idx in 0..71 {
+            commands.push(json!({
+                "name": format!("command_{idx:02}"),
+                "description": format!("Synthetic command {idx:02}: {}", "d".repeat(320)),
+                "input": {"hint": "<optional arguments>"}
+            }));
+        }
+        let big_commands_line = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "synthetic-bench",
+                "update": {
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": commands
+                }
+            }
+        })
+        .to_string();
+        assert!(
+            big_commands_line.len() >= 27_587,
+            "expected >= 27,587-byte commands line, got {}",
+            big_commands_line.len()
+        );
+        push_wire(Direction::FromAgent, big_commands_line.clone());
+
+        for turn in 0..turns {
+            if turn > 0 && turn % 50 == 0 {
+                push_wire(Direction::FromAgent, big_commands_line.clone());
+            }
+            intent_id += 1;
+            req_id += 1;
+            let origin = if turn == 0 || turn % 25 == 0 {
+                PromptOrigin::Engine
+            } else {
+                PromptOrigin::Operator
+            };
+            let turn_ts_ms = 1_795_720_000_000 + turn as u64 * 2_000;
+            intent_seq += 1;
+            intents.push(IntentRecord {
+                seq: intent_seq,
+                ts_ms: turn_ts_ms,
+                kind: IntentRecordKind::Queued {
+                    intent_id,
+                    origin,
+                    text: format!("Turn {turn} prompt text describing coordinator work item status."),
+                    client_message_id: (origin == PromptOrigin::Operator).then(|| format!("cm-{turn}")),
+                    images: Vec::new(),
+                },
+            });
+            intent_seq += 1;
+            intents.push(IntentRecord {
+                seq: intent_seq,
+                ts_ms: turn_ts_ms + 1,
+                kind: IntentRecordKind::Sent {
+                    intent_id,
+                    request_id: RequestId::Number(req_id),
+                },
+            });
+
+            push_wire(
+                Direction::ToAgent,
+                json!({
+                    "jsonrpc":"2.0",
+                    "id":req_id,
+                    "method":"session/prompt",
+                    "params":{"sessionId":"synthetic-bench","prompt":[{"type":"text","text":"prompt"}]}
+                })
+                .to_string(),
+            );
+
+            // One tool call + completion with realistic fenced markdown output.
+            let tool_id = format!("toolu_synth_{turn}");
+            push_wire(
+                Direction::FromAgent,
+                json!({
+                    "jsonrpc":"2.0",
+                    "method":"session/update",
+                    "params":{
+                        "sessionId":"synthetic-bench",
+                        "update":{
+                            "sessionUpdate":"tool_call",
+                            "toolCallId":tool_id,
+                            "name":"Bash",
+                            "title":format!("boss task list --turn {turn}"),
+                            "kind":"execute",
+                            "status":"in_progress",
+                            "rawInput":{"command":format!("boss task list --turn {turn}")}
+                        }
+                    }
+                })
+                .to_string(),
+            );
+            push_wire(
+                Direction::FromAgent,
+                json!({
+                    "jsonrpc":"2.0",
+                    "method":"session/update",
+                    "params":{
+                        "sessionId":"synthetic-bench",
+                        "update":{
+                            "sessionUpdate":"tool_call_update",
+                            "toolCallId":format!("toolu_synth_{turn}"),
+                            "status":"completed",
+                            "content":[{"type":"content","content":{"type":"text","text":format!("```json\n{{\"turn\":{turn},\"items\":[\"alpha\",\"beta\",\"gamma\"],\"pad\":\"{}\"}}\n```", "p".repeat(300))}}]
+                        }
+                    }
+                })
+                .to_string(),
+            );
+
+            // 20 streaming chunks (~300-400 chars per answer, similar to spike median delta size).
+            let msg_id = format!("msg_synth_{turn}");
+            for chunk_idx in 0..20 {
+                push_wire(
+                    Direction::FromAgent,
+                    json!({
+                        "jsonrpc":"2.0",
+                        "method":"session/update",
+                        "params":{
+                            "sessionId":"synthetic-bench",
+                            "update":{
+                                "sessionUpdate":"agent_message_chunk",
+                                "messageId":msg_id,
+                                "content":{"type":"text","text":format!("Chunk {chunk_idx} for turn {turn}. ")}
+                            }
+                        }
+                    })
+                    .to_string(),
+                );
+            }
+
+            push_wire(
+                Direction::FromAgent,
+                json!({
+                    "jsonrpc":"2.0",
+                    "method":"session/update",
+                    "params":{
+                        "sessionId":"synthetic-bench",
+                        "update":{
+                            "sessionUpdate":"usage_update",
+                            "used":20_000 + turn as u64 * 150,
+                            "size":1_000_000,
+                            "cost":{"amount":0.015,"currency":"USD"},
+                            "_meta":{"_claude/origin":{"kind":"human"},"_claude/model":"claude-opus-5-5"}
+                        }
+                    }
+                })
+                .to_string(),
+            );
+            push_wire(
+                Direction::FromAgent,
+                json!({"jsonrpc":"2.0","id":req_id,"result":{"stopReason":"end_turn"}}).to_string(),
+            );
+        }
+
+        (wire_records, intents)
+    }
+
+    #[test]
+    fn measure_synthetic_spike_sized_journal_replay() {
+        let dir = TestDir::new("replay-bench");
+        let turns = 250;
+        let (wire_records, intents) = build_synthetic_spike_journal(turns);
+        let wire_path = dir.path().join("wire.jsonl");
+        write_wire_file(&wire_path, &wire_records);
+        let intent_path = dir.path().join("intent.jsonl");
+        {
+            let mut bytes = Vec::new();
+            for rec in &intents {
+                serde_json::to_writer(&mut bytes, rec).unwrap();
+                bytes.push(b'\n');
+            }
+            std::fs::write(&intent_path, bytes).unwrap();
+        }
+
+        let wire_bytes = std::fs::metadata(&wire_path).unwrap().len();
+        let intent_bytes = std::fs::metadata(&intent_path).unwrap().len();
+        let max_line_bytes = wire_records.iter().map(|r| r.line.len()).max().unwrap_or(0);
+        assert!(max_line_bytes >= 27_587);
+
+        let redactor = CredentialRedactor::new(TEST_SECRET);
+
+        // Full replay from disk (no snapshot).
+        let full_start = Instant::now();
+        let full = recover_from_files(&wire_path, Some(&intent_path), None, redactor.clone()).unwrap();
+        let full_elapsed = full_start.elapsed();
+
+        // Build snapshot covering 96% of the journal (240 turns), leaving a 10-turn tail.
+        let tail_wire_records = 10 * 25;
+        let snap_wire_cut = wire_records.len() - tail_wire_records;
+        let snap_intent_cut = intents.len() - 20;
+        let pre_snap = replay_with_intent_log(
+            &wire_records[..snap_wire_cut],
+            &intents[..snap_intent_cut],
+            redactor.clone(),
+        );
+        let snapshot_path = dir.path().join("snapshot.json");
+        let save_start = Instant::now();
+        save_snapshot(&snapshot_path, &pre_snap.snapshot()).unwrap();
+        let save_elapsed = save_start.elapsed();
+        let snap_bytes = std::fs::metadata(&snapshot_path).unwrap().len();
+
+        // Snapshot + 10-turn tail replay from disk (reading full files).
+        let tail_start = Instant::now();
+        let tailed =
+            recover_from_files(&wire_path, Some(&intent_path), Some(&snapshot_path), redactor.clone()).unwrap();
+        let tail_elapsed = tail_start.elapsed();
+
+        // Snapshot load + host-seeked 10-turn tail (the live agent-host reconnect path).
+        let snap_disk_bytes = std::fs::read(&snapshot_path).unwrap();
+        let host_tail_start = Instant::now();
+        let host_tailed = recover_from_snapshot_and_tail(
+            &snap_disk_bytes,
+            &wire_records[snap_wire_cut..],
+            &intents[snap_intent_cut..],
+            redactor.clone(),
+        )
+        .unwrap();
+        let host_tail_elapsed = host_tail_start.elapsed();
+
+        assert!(matches!(tailed.snapshot_status, SnapshotLoadStatus::Hit { .. }));
+        assert_eq!(tailed.wire_records_replayed, tail_wire_records);
+        assert_eq!(tailed.intent_records_replayed, 20);
+        for candidate in [&tailed.reducer, &host_tailed.reducer] {
+            assert_eq!(candidate.state(), full.reducer.state());
+            assert_eq!(candidate.items(), full.reducer.items());
+            assert_eq!(candidate.queue(), full.reducer.queue());
+        }
+
+        eprintln!(
+            "REPLAY_BENCH: turns={turns} wire_records={} wire_bytes={wire_bytes} intent_records={} intent_bytes={intent_bytes} max_line_bytes={max_line_bytes} full_replay_ms={:.2} snapshot_bytes={snap_bytes} snapshot_save_ms={:.2} file_tail_replay_ms={:.2} host_tail_replay_ms={:.2} tail_wire_records={tail_wire_records}",
+            wire_records.len(),
+            intents.len(),
+            full_elapsed.as_secs_f64() * 1000.0,
+            save_elapsed.as_secs_f64() * 1000.0,
+            tail_elapsed.as_secs_f64() * 1000.0,
+            host_tail_elapsed.as_secs_f64() * 1000.0,
+        );
+    }
+}
