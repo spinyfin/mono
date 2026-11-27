@@ -12,10 +12,12 @@ What decides whether a build executes remotely is elsewhere: [`.buildkite/README
 | `nativelink/nativelink-macos-hub.service`                | `/etc/systemd/system/` on the hub (root)                     | Starts the hub, as a system unit (`User=bduff`).                                                                                                                         |
 | `nativelink/hub-health.sh`                               | `~/nativelink-macos-hub/hub-health.sh` on the hub            | The health check.                                                                                                                                                        |
 | `nativelink/nativelink-macos-hub-health.{service,timer}` | `~/.config/systemd/user/` on the hub                         | Runs the health check every minute.                                                                                                                                      |
-| `nativelink/hub-textfile-metrics.sh`                     | `~/nativelink-macos-hub/hub-textfile-metrics.sh`             | Hub restart state for node_exporter's textfile collector.                                                                                                                |
+| `nativelink/hub-textfile-metrics.sh`                     | `~/nativelink-macos-hub/hub-textfile-metrics.sh`             | Hub restart state and cgroup memory for node_exporter's textfile collector.                                                                                              |
 | `nativelink/nativelink-hub-textfile.{service,timer}`     | `/etc/systemd/system/` on the hub (root)                     | Runs the restart exporter every 30 s.                                                                                                                                    |
-| `nativelink/worker-slots-exporter.py`                    | `~/nativelink-macos-hub/worker-slots-exporter.py`            | Per-worker slots and CAS eviction figures, on 127.0.0.1:9108.                                                                                                            |
-| `nativelink/nativelink-worker-slots-exporter.service`    | `~/.config/systemd/user/` on the hub                         | Starts the slots and CAS exporter.                                                                                                                                       |
+| `nativelink/worker-slots-exporter.py`                    | `~/nativelink-macos-hub/worker-slots-exporter.py`            | Per-worker slots, connected worker count, loopback `/status` probe, hub journal fault counters, and CAS eviction figures, on 127.0.0.1:9108.                             |
+| `nativelink/nativelink-worker-slots-exporter.service`    | `~/.config/systemd/user/` on the hub                         | Starts the slots, health and CAS exporter.                                                                                                                               |
+| `grafana/dashboards/nativelink-overview.json`            | `/var/lib/grafana/dashboards/` on the hub (root)             | NativeLink Overview Grafana dashboard (file-provisioned via `/etc/grafana/provisioning/dashboards/nativelink.yaml`).                                                     |
+| `grafana/alerting/nativelink-hub.yaml`                   | `/etc/grafana/provisioning/alerting/` on the hub (root)      | Grafana Unified Alerting rules for store health timeouts, `/status`, connected workers, timeouts/kills, decoded-size errors, and `/mnt/cache` fullness.                  |
 | `nativelink/worker-macos.json5`                          | `~/nativelink/worker-macos.json5` on each Mac                | The worker. The same file on every Mac.                                                                                                                                  |
 | `nativelink/com.brianduff.nativelink.plist`              | `~/Library/LaunchAgents/` on each Mac                        | Starts the worker and sets what differs per Mac.                                                                                                                         |
 | `nativelink/action-env.sh`                               | `~/nativelink/action-env.sh` on each Mac                     | Wraps every action: picks the Xcode and SDK the action asks for.                                                                                                         |
@@ -202,9 +204,13 @@ The check only reports. It does not restart the hub, and nothing else does on a 
 
 Two exporters run on the hub so Prometheus can see what NativeLink's own metrics omit: whether the hub has restarted (including an OOM kill), each worker's slots, and how the CAS is filling and evicting.
 
-**Restarts.** The hub is a system unit (`User=bduff`), so `systemctl show` reads it without `--user`. `hub-textfile-metrics.sh` runs as root every 30 s (`nativelink-hub-textfile.timer`) and writes `/var/lib/prometheus/node-exporter/nativelink_hub.prom` atomically. The figures are systemd's `NRestarts`, the current main process start time, whether the unit is active, the last `Result` (so an `oom-kill` is visible), and the last main-process exit status. The script only reads the unit; it never restarts it.
+**Restarts and hub memory.** The hub is a system unit (`User=bduff`), so `systemctl show` reads it without `--user`. `hub-textfile-metrics.sh` runs as root every 30 s (`nativelink-hub-textfile.timer`) and writes `/var/lib/prometheus/node-exporter/nativelink_hub.prom` atomically. The figures are systemd's `NRestarts`, the current main process start time, whether the unit is active, the last `Result` (so an `oom-kill` is visible), the last main-process exit status, and the unit's cgroup memory (`MemoryCurrent` and `MemoryPeak`, exported as `nativelink_hub_memory_current_bytes` and `nativelink_hub_memory_peak_bytes`). The script only reads the unit; it never restarts it.
 
-**Slots and CAS.** `worker-slots-exporter.py` listens on `127.0.0.1:9108/metrics`. On each scrape it asks the hub's admin API (loopback, `NL_HUB_ADMIN_LISTEN`) for each worker's slots and running actions. NativeLink 1.8.6 has no eviction counter, so inserts and evictions are counted from inotify: a rename into `cas-content/d2` is an insert, a rename into `cas-tmp/d2` is an eviction, and the size is in the file name. A walk of `cas-content/d2` every 15 minutes, at nice 19 and idle I/O priority, gives the entry count and content bytes; between walks those are kept current from the counters. The CAS cap it exports (`nativelink_hub_cache_cap_bytes`) is `NL_HUB_CAS_MAX_BYTES` from the _running_ hub process, so an edit of `hub.env` is not reported until the hub itself is restarted. The exporter only reads; it never changes the hub.
+**Slots, store health, journal events, and CAS.** `worker-slots-exporter.py` listens on `127.0.0.1:9108/metrics`. On each scrape it asks the hub's admin API (loopback, `NL_HUB_ADMIN_LISTEN`) for each worker's slots, running actions, and total/per-OS connected worker counts (`nativelink_hub_connected_workers`, `nativelink_hub_connected_workers_by_os`, plus `nativelink_hub_expected_workers` from `NL_HEALTH_EXPECTED_WORKERS`). A background thread probes `http://$NL_HUB_ADMIN_LISTEN/status` every 15 s (10 s timeout) so a stalled store health check never blocks `/metrics` scrapes, exporting `nativelink_hub_status_up`, `nativelink_hub_status_http_code`, `nativelink_hub_status_duration_seconds`, and `nativelink_hub_status_probes_total{outcome}`. A second background thread tails `journalctl --quiet --unit nativelink-macos-hub.service --output cat --follow --lines=0` and counts `FilesystemStore::check_health: stat timed out`, kill-ack and silence worker evictions, scheduler `Action.timeout` (`Timing out operation`), `Action ended by a kill`, `Command timed out on the worker`, and compressed-upload decoded-size errors, with every counter initialized to `0` on exporter start. NativeLink 1.8.6 has no eviction counter, so inserts and evictions are counted from inotify: a rename into `cas-content/d2` is an insert, a rename into `cas-tmp/d2` is an eviction, and the size is in the file name. A walk of `cas-content/d2` every 15 minutes, at nice 19 and idle I/O priority, gives the entry count and content bytes; between walks those are kept current from the counters. The CAS cap it exports (`nativelink_hub_cache_cap_bytes`) is `NL_HUB_CAS_MAX_BYTES` from the _running_ hub process, so an edit of `hub.env` is not reported until the hub itself is restarted. The exporter only reads; it never changes the hub.
+
+**Grafana dashboards and alerting.** Grafana on `headcrash` file-provisions dashboards from `/var/lib/grafana/dashboards` via `/etc/grafana/provisioning/dashboards/nativelink.yaml` (`updateIntervalSeconds: 30`) and Unified Alerting rules from `/etc/grafana/provisioning/alerting/` on startup/restart. Nothing in CI deploys them automatically: they live in `grafana/dashboards/nativelink-overview.json` and `grafana/alerting/nativelink-hub.yaml` and are copied onto `headcrash` by hand ("Installing or updating hub files"). Prometheus on `headcrash` has no Alertmanager configured and Grafana's default notification receiver is `empty`, so provisioned alert rules evaluate and surface in Grafana's Alerting UI immediately; external paging requires adding a Grafana contact point.
+
+**Client Mac watchdog stops.** `dev-remote-workspace-status.sh` writes watchdog stops only to local `$TMPDIR/dev-remote-watchdog.log` on each developer Mac. Developer laptops are not scraped by Prometheus on `headcrash`, run no exporter or log shipper, and `headcrash` runs no Loki or Pushgateway. Collecting client watchdog stops centrally would require either a lightweight local textfile/exporter on each Mac scraped over Tailscale, or a small push endpoint (Prometheus Pushgateway or Loki) on `headcrash` with a non-blocking log-shipper on each Mac.
 
 Neither exporter binds anything but loopback. Copying the files onto the host is in "Installing or updating hub files"; identical content is a no-op and does not restart the hub.
 
@@ -301,6 +307,26 @@ sudo systemctl daemon-reload
 systemctl --user enable --now nativelink-macos-hub-health.timer
 systemctl --user enable --now nativelink-worker-slots-exporter.service
 sudo systemctl enable --now nativelink-hub-textfile.timer
+
+# Grafana dashboard and Unified Alerting rules (not deployed by CI).
+GRAFANA_REPO=<checkout>/tools/remote-execution/grafana
+if sudo test -e /var/lib/grafana/dashboards/nativelink-overview.json &&
+   sudo cmp -s "$GRAFANA_REPO/dashboards/nativelink-overview.json" /var/lib/grafana/dashboards/nativelink-overview.json; then
+  :
+else
+  sudo install -o grafana -g grafana -m 644 \
+    "$GRAFANA_REPO/dashboards/nativelink-overview.json" \
+    /var/lib/grafana/dashboards/nativelink-overview.json
+fi
+if sudo test -e /etc/grafana/provisioning/alerting/nativelink-hub.yaml &&
+   sudo cmp -s "$GRAFANA_REPO/alerting/nativelink-hub.yaml" /etc/grafana/provisioning/alerting/nativelink-hub.yaml; then
+  :
+else
+  sudo install -o root -g grafana -m 640 \
+    "$GRAFANA_REPO/alerting/nativelink-hub.yaml" \
+    /etc/grafana/provisioning/alerting/nativelink-hub.yaml
+  sudo systemctl restart grafana-server.service
+fi
 ```
 
 `hub.env` stays on the host: it names listen addresses. Do not copy it from the repository.

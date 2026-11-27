@@ -32,12 +32,25 @@ sh_test(
     ],
 )
 
+# The hub's Prometheus exporters: worker-slots-exporter.py (connected workers,
+# loopback /status probe, hub journal event counters) and hub-textfile-metrics.sh
+# (restart state and cgroup memory).
+sh_test(
+    name = "hub_metrics_exporter_test",
+    size = "small",
+    srcs = ["tests/hub_metrics_exporter_test.sh"],
+    data = [
+        "nativelink/hub-textfile-metrics.sh",
+        "nativelink/worker-slots-exporter.py",
+    ],
+)
+
 # Pins what the files promise each other: every scheduler timeout and the
 # arithmetic between the hub's and the workers', the variables the configs
 # expand against the units that set them, the pinned NativeLink version across
 # the build script, the patches and the runbook (with the version each binary,
-# worker or hub, reports), the hub restart and CAS exporters, and that no
-# address is written into any of them.
+# worker or hub, reports), the hub restart and CAS exporters, the Grafana
+# dashboard and alerting rules, and that no address is written into any of them.
 sh_test(
     name = "config_test",
     size = "small",
@@ -45,6 +58,8 @@ sh_test(
     data = [
         "README.md",
         "dev-remote-workspace-status.sh",
+        "grafana/alerting/nativelink-hub.yaml",
+        "grafana/dashboards/nativelink-overview.json",
         "nativelink/build-worker.sh",
         "nativelink/com.brianduff.nativelink.plist",
         "nativelink/headcrash-worker/nativelink-worker.service",
