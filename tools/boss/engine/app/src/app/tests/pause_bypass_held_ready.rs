@@ -144,11 +144,13 @@ async fn board_drag_pause_bypass_dispatches_held_ready_execution() {
     );
 }
 
-/// Ordinary (no-bypass) drag must still skip when a non-terminal
-/// execution already owns the slot. The force path is the exception;
-/// `work_item_needs_dispatch` semantics for every other caller stay.
+/// A drag that did not carry the confirmed override must not get past the
+/// pause either way: the held `ready` row stays exactly as it was and no
+/// override is recorded. The move itself is refused with the pause's reason
+/// rather than flipping the status and leaving the card in Doing with nothing
+/// running.
 #[tokio::test]
-async fn board_drag_without_bypass_skips_when_ready_execution_exists() {
+async fn board_drag_without_bypass_is_refused_and_leaves_the_held_ready_execution() {
     let (server_state, _dir) = test_server_state();
     let product = create_test_product_with_repo(
         &server_state.work_db,
@@ -173,11 +175,25 @@ async fn board_drag_without_bypass_skips_when_ready_execution_exists() {
     )
     .await;
 
-    let response = sole_response(&sink).await;
-    assert!(
-        matches!(response, FrontendEvent::WorkItemUpdated { .. }),
-        "ordinary drag must still succeed (status flip) when a ready row exists, got: {response:?}"
-    );
+    match sole_response(&sink).await {
+        FrontendEvent::WorkItemRefused { id, code, message, .. } => {
+            assert_eq!(id, chore.id);
+            assert_eq!(code, boss_protocol::BoardRefusalCode::DispatchRefused);
+            assert!(
+                message.contains("dispatch is paused") && message.contains("test: operator pause holding a ready row"),
+                "the refusal must name the pause and its reason, got: {message}"
+            );
+        }
+        other => panic!("an unconfirmed drag under a pause must be refused, got: {other:?}"),
+    }
+    match server_state.work_db.get_work_item(&chore.id).expect("get chore") {
+        WorkItem::Task(task) | WorkItem::Chore(task) => assert_eq!(
+            task.status,
+            TaskStatus::Todo,
+            "the refused drag must leave the card where it was"
+        ),
+        other => panic!("expected a chore, got {other:?}"),
+    }
 
     let executions = server_state
         .work_db
@@ -188,7 +204,7 @@ async fn board_drag_without_bypass_skips_when_ready_execution_exists() {
     assert_eq!(
         executions[0].status,
         ExecutionStatus::Ready,
-        "ordinary drag must not force-dispatch the held ready row"
+        "an unconfirmed drag must not dispatch, or cancel, the held ready row"
     );
 
     let events = boss_dispatch_reader::read_current(&server_state.dispatch_event_root)
@@ -196,7 +212,7 @@ async fn board_drag_without_bypass_skips_when_ready_execution_exists() {
         .events;
     assert!(
         events.iter().all(|e| e.stage != "dispatch_pause_override"),
-        "ordinary drag must not record a pause override; got: {events:?}"
+        "an unconfirmed drag must not record a pause override; got: {events:?}"
     );
     let transition = events
         .iter()
@@ -205,7 +221,13 @@ async fn board_drag_without_bypass_skips_when_ready_execution_exists() {
     assert_eq!(
         transition.details.get("did_dispatch"),
         Some(&serde_json::Value::Bool(false)),
-        "ordinary skip must report did_dispatch=false; got {:?}",
+        "a refused drag must report did_dispatch=false; got {:?}",
+        transition.details
+    );
+    assert_eq!(
+        transition.details.get("status_reverted"),
+        Some(&serde_json::Value::Bool(true)),
+        "a refused drag must report the reverted move; got {:?}",
         transition.details
     );
     let skip = transition
@@ -214,12 +236,8 @@ async fn board_drag_without_bypass_skips_when_ready_execution_exists() {
         .and_then(|v| v.as_str())
         .unwrap_or("");
     assert!(
-        skip.contains("work_item_needs_dispatch=false"),
-        "ordinary skip reason must still name the needs_dispatch gate, got: {skip}"
-    );
-    assert!(
-        skip.contains("no pause-bypass requested"),
-        "ordinary skip reason must not imply a progressing worker when nothing was forced, got: {skip}"
+        skip.contains("dispatch is paused"),
+        "the refusal reason must name the pause, got: {skip}"
     );
 }
 

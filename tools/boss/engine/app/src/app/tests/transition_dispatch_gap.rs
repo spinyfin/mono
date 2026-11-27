@@ -1,5 +1,5 @@
-//! Regression: a card moved to Doing must be queued for a worker by the same
-//! request that reports it dispatched.
+//! Regression: a task moved to `active` must be started, or queued for a
+//! worker, by the same request that reports it dispatched.
 //!
 //! The move mints a `ready` execution, emits `status_transition` with
 //! `did_dispatch: true`, and then reconciles the product. For a later task of
@@ -8,9 +8,14 @@
 //! pass looks. No `request_recorded` followed; the card read "Queued — reason
 //! unknown" until the orphan sweep found an active item with nothing live and
 //! promoted the row, 90 s later.
+//!
+//! A card moved to Doing on the board is launched by the request itself, so
+//! its row is claimed before that reconcile runs. A status edit to `active`
+//! (the CLI, an agent) still queues the row and leaves it to the scheduler,
+//! which is where the row has to survive the reconcile.
 
 use super::*;
-use crate::app::work_items::handle_move_work_item_on_board;
+use crate::app::work_items::{handle_move_work_item_on_board, handle_update_work_item};
 use boss_engine_dispatch::coordinator::DispatchPauseOrigin;
 use boss_engine_runtime::test_support::{create_test_chore_manual, create_test_product_with_repo};
 use boss_protocol::{
@@ -91,21 +96,43 @@ fn seed_project(state: &Arc<ServerState>) -> (Task, Task) {
     (first, second)
 }
 
-/// Move `task` to Doing through the board-drop handler and return the
-/// execution its `status_transition` event reports as dispatched.
-async fn move_to_doing(state: &Arc<ServerState>, task: &Task) -> String {
+/// How a task is moved to `active`.
+enum Move {
+    /// The card is dropped on Doing: the owner's explicit start.
+    BoardDrop,
+    /// A status edit, as the CLI sends it: an ordinary queued start.
+    StatusEdit,
+}
+
+/// Move `task` to `active` and return the execution its `status_transition`
+/// event reports as dispatched.
+async fn move_to_active(state: &Arc<ServerState>, task: &Task, how: Move) -> String {
     let sink = make_session_sink();
-    handle_move_work_item_on_board(
-        dispatch(state, &sink),
-        FrontendRequest::MoveWorkItemOnBoard {
-            id: task.id.clone(),
-            target: BoardDropTarget::new(BoardColumn::Doing, None),
-            bypass_dispatch_pause: false,
-            observed_pause_since_epoch_s: None,
-            explicit_status: None,
-        },
-    )
-    .await;
+    match how {
+        Move::BoardDrop => {
+            handle_move_work_item_on_board(
+                dispatch(state, &sink),
+                FrontendRequest::MoveWorkItemOnBoard {
+                    id: task.id.clone(),
+                    target: BoardDropTarget::new(BoardColumn::Doing, None),
+                    bypass_dispatch_pause: false,
+                    observed_pause_since_epoch_s: None,
+                    explicit_status: None,
+                },
+            )
+            .await
+        }
+        Move::StatusEdit => {
+            handle_update_work_item(
+                dispatch(state, &sink),
+                FrontendRequest::UpdateWorkItem {
+                    id: task.id.clone(),
+                    patch: Box::new(WorkItemPatch::builder().status("active").build()),
+                },
+            )
+            .await
+        }
+    }
     sink.close();
     match sink.next().await.expect("handler must respond").payload {
         FrontendEvent::WorkItemUpdated { item } => {
@@ -133,14 +160,16 @@ fn dispatch_events(state: &ServerState) -> Vec<boss_dispatch_events::DispatchEve
         .events
 }
 
-/// Wait for the scheduler to record a request for `execution_id`. No sweep
-/// runs in these tests, so only the scheduler's own pass can produce it.
-async fn assert_requested_without_a_sweep(state: &ServerState, execution_id: &str) {
+/// Wait for `stage` to be recorded for `execution_id`: `request_recorded`
+/// when the scheduler picked a queued row up, `run_started` when a launch
+/// started its worker. No sweep runs in these tests, so only the request
+/// under test and the scheduler's own pass can produce either.
+async fn assert_reached_without_a_sweep(state: &ServerState, execution_id: &str, stage: &str) {
     let mut requested = false;
     for _ in 0..100 {
         requested = dispatch_events(state)
             .iter()
-            .any(|event| event.stage == "request_recorded" && event.execution_id == execution_id);
+            .any(|event| event.stage == stage && event.execution_id == execution_id);
         if requested {
             break;
         }
@@ -149,7 +178,7 @@ async fn assert_requested_without_a_sweep(state: &ServerState, execution_id: &st
     let events = dispatch_events(state);
     assert!(
         requested,
-        "no request_recorded for {execution_id} (status {:?}); stages seen: {:?}",
+        "no {stage} for {execution_id} (status {:?}); stages seen: {:?}",
         state
             .work_db
             .get_execution(execution_id)
@@ -177,15 +206,15 @@ fn assert_preconditions(state: &ServerState, first: &Task, second: &Task) {
     );
 }
 
-/// The move as it happens on an idle engine: the kick it issues reaches the
-/// scheduler, which records the request.
+/// A card dropped on Doing on an idle engine: the request launches the row
+/// itself, so its worker starts with no scheduler pass and no sweep.
 #[tokio::test]
-async fn a_later_project_task_moved_to_doing_is_requested_without_a_sweep() {
+async fn a_later_project_task_moved_to_doing_is_started_without_a_sweep() {
     let (server_state, _dir) = test_server_state_with_fakes();
     let (first, second) = seed_project(&server_state);
     assert_preconditions(&server_state, &first, &second);
 
-    let execution_id = move_to_doing(&server_state, &second).await;
+    let execution_id = move_to_active(&server_state, &second, Move::BoardDrop).await;
 
     assert_ne!(
         server_state
@@ -196,18 +225,44 @@ async fn a_later_project_task_moved_to_doing_is_requested_without_a_sweep() {
         ExecutionStatus::WaitingDependency,
         "the execution reported dispatched was parked off the ready queue by the same request"
     );
-    assert_requested_without_a_sweep(&server_state, &execution_id).await;
+    assert_reached_without_a_sweep(&server_state, &execution_id, "run_started").await;
 }
 
-/// The same move while the scheduler cannot take the row before the request
+/// A status edit to `active` on an idle engine: the kick it issues reaches
+/// the scheduler, which records the request.
+#[tokio::test]
+async fn a_later_project_task_set_active_is_requested_without_a_sweep() {
+    let (server_state, _dir) = test_server_state_with_fakes();
+    let (first, second) = seed_project(&server_state);
+    assert_preconditions(&server_state, &first, &second);
+
+    let execution_id = move_to_active(&server_state, &second, Move::StatusEdit).await;
+
+    assert_ne!(
+        server_state
+            .work_db
+            .get_execution(&execution_id)
+            .expect("get execution")
+            .status,
+        ExecutionStatus::WaitingDependency,
+        "the execution reported dispatched was parked off the ready queue by the same request"
+    );
+    assert_reached_without_a_sweep(&server_state, &execution_id, "request_recorded").await;
+}
+
+/// The status edit while the scheduler cannot take the row before the request
 /// finishes. On an idle test engine the scheduler's claim usually lands
 /// before the handler's reconcile, which hides the defect; an operator pause
 /// holds the row `ready` across the whole request, the ordering the incident
 /// had. The row must survive the reconcile as a queued request, name the
 /// pause as its reason, and be picked up by the scheduler's first pass after
 /// the pause lifts.
+///
+/// A card dropped on Doing under the same pause is not queued at all: the
+/// app asks before overriding a pause, and an unconfirmed drop is refused
+/// (see `board_drag_launch`).
 #[tokio::test]
-async fn a_task_moved_to_doing_while_the_scheduler_is_held_stays_queued() {
+async fn a_task_set_active_while_the_scheduler_is_held_stays_queued() {
     let (server_state, _dir) = test_server_state_with_fakes();
     let (first, second) = seed_project(&server_state);
     assert_preconditions(&server_state, &first, &second);
@@ -217,7 +272,7 @@ async fn a_task_moved_to_doing_while_the_scheduler_is_held_stays_queued() {
         PauseReason::new("test: hold the scheduler across the move").unwrap(),
     );
 
-    let execution_id = move_to_doing(&server_state, &second).await;
+    let execution_id = move_to_active(&server_state, &second, Move::StatusEdit).await;
 
     let db = &server_state.work_db;
     assert_eq!(
@@ -247,5 +302,5 @@ async fn a_task_moved_to_doing_while_the_scheduler_is_held_stays_queued() {
 
     server_state.execution_coordinator.resume_dispatch();
     server_state.execution_coordinator.kick();
-    assert_requested_without_a_sweep(&server_state, &execution_id).await;
+    assert_reached_without_a_sweep(&server_state, &execution_id, "request_recorded").await;
 }

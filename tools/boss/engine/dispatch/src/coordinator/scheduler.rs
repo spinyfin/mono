@@ -345,131 +345,6 @@ impl ExecutionCoordinator {
         }
     }
 
-    /// Skip-the-queue dispatch for `bossctl agents launch` and the
-    /// spawn-capability breaker's half-open recovery probe
-    /// (`spawn_health::maybe_admit_recovery_probe`). Looks the execution up
-    /// directly, classifies which pool it belongs to exactly as
-    /// `drain_ready_queue` does (via [`Self::pool_for_execution`]), claims a
-    /// worker from THAT pool via `WorkerPool::claim_worker_force` (which
-    /// grows the pool by one slot up to ITS OWN hard cap when every
-    /// configured slot is busy), and runs the same `schedule_execution` path
-    /// the auto-dispatcher uses. Returns the worker id we landed on so
-    /// callers can echo it back to the human.
-    ///
-    /// "Force" bypasses the interactive-pool concurrency cap outright, and
-    /// the dispatch pause only as far as the caller's [`DispatchAdmission`]
-    /// allows — it is NOT a blanket pause bypass. `bossctl agents launch`
-    /// passes [`DispatchAdmission::OperatorForced`] and does override the
-    /// pause; the breaker's recovery canary passes
-    /// [`DispatchAdmission::BreakerRecoveryProbe`], which
-    /// [`Self::dispatch_hold_for`] admits only under a Breaker-origin pause
-    /// and never for a `pr_review` row. Passing the admission down rather
-    /// than assuming one is what stopped this function from being a hole in
-    /// the pause. It never bypasses *pool
-    /// correctness*: a `pr_review` still claims a `review-` worker id (so it
-    /// resolves the pinned Opus reviewer policy via
-    /// [`pool_dispatch_policy_for_worker_id`] and never counts against the
-    /// interactive pool's `busy_count`), and an automation-sourced row still
-    /// claims an `auto-worker-` id, exactly as the normal path would.
-    ///
-    /// When the execution's home pool has no free slot, force-dispatch grows
-    /// THAT pool by one slot (bounded by its own hard cap) rather than
-    /// falling back to a different pool — the same policy the main pool
-    /// already used for `bossctl agents launch`, now applied uniformly so
-    /// the forced worker always keeps its pool's dispatch policy.
-    ///
-    /// Errors when the execution is not in `ready` (already claimed by
-    /// the auto-dispatcher in a race, terminal, or unknown), when the
-    /// active pause does not admit `admission`, or when the target pool is
-    /// already at its hard cap with no idle slot.
-    /// `try_reserve` stays before the first `.await` (`claim_worker_force`);
-    /// the operator-answer first poll of [`Self::launch_answered_work`] depends on it.
-    pub async fn force_dispatch(self: &Arc<Self>, execution_id: &str, admission: DispatchAdmission) -> Result<String> {
-        if let Some(reason) = self.dispatch_preflight_block_reason() {
-            return Err(anyhow!("local dispatch is unavailable: {reason}"));
-        }
-        let execution = self
-            .work_db
-            .get_execution(execution_id)
-            .with_context(|| format!("failed to look up execution {execution_id}"))?;
-        if execution.status != ExecutionStatus::Ready {
-            return Err(anyhow!(
-                "execution {execution_id} is in status {status:?}, not ready — cannot force-dispatch",
-                status = execution.status,
-            ));
-        }
-        // Refuse before claiming a slot, so a held force-dispatch never has
-        // to hand a worker back. `schedule_execution` re-checks — it is the
-        // chokepoint and owns the guarantee — but answering here keeps the
-        // error the caller sees precise and costs nothing.
-        if let Some(hold) = self.dispatch_hold_for(&execution, admission) {
-            return Err(anyhow!("{hold}"));
-        }
-        // `ready` is necessary but not sufficient: the auto-dispatcher may
-        // already have handed this row (or a duplicate of it) off, and it
-        // sits in `claimed` until its run starts. Force-dispatching over
-        // the top would claim a second slot and spawn a second worker for
-        // one work item. A non-`ready` status (including `claimed`) is
-        // refused above.
-        //
-        // Claimed BEFORE the worker, and via the atomic `try_reserve` rather
-        // than a check-then-reserve pair: a concurrent `drain_ready_queue`
-        // could otherwise slip in during the `claim_worker_force` await, and
-        // both paths would believe they own the dispatch.
-        let Some(_reservation) = self.inflight_dispatches.try_reserve(&execution, &self.work_db) else {
-            return Err(anyhow!(
-                "execution {execution_id} (or another execution for its work item) is already \
-                 being dispatched — cannot force-dispatch"
-            ));
-        };
-        // A forced launch overrides the interactive cap, not the per-repo
-        // lease bound: extra concurrent leases on one repo only queue on
-        // cube's per-repo lock, so a forced launch during a lease storm
-        // would add timeouts rather than start sooner. A spoke lease the
-        // host has not answered is a retry of a stored command, not a new
-        // cube lease, and must not occupy that bound.
-        let _lease_attempt = if self.spoke_lease_retry_skips_repo_bound(&execution) {
-            None
-        } else {
-            let Some(guard) = self
-                .repo_lease_limiter
-                .try_begin(&execution.repo_remote_url, &execution.id)
-                .map(|guard| guard.with_kick(Arc::clone(self)))
-            else {
-                return Err(anyhow!(
-                    "{bound} cube workspace leases are already in flight for {repo}; \
-                     cannot force-dispatch {execution_id} until one finishes",
-                    bound = self.repo_lease_limiter_bound(),
-                    repo = execution.repo_remote_url,
-                ));
-            };
-            Some(guard)
-        };
-        let preferred_workspace_id = execution.preferred_workspace_id.clone();
-        let pool = self.pool_for_execution(&execution);
-        let pool_label = self.attributed_pool_label(&execution);
-        let worker_id = pool
-            .claim_worker_force(&execution.id, preferred_workspace_id.as_deref())
-            .await
-            .ok_or_else(|| {
-                anyhow!(boss_protocol::pool_hard_cap_refusal_message(
-                    pool_label,
-                    pool.hard_cap(),
-                    execution_id,
-                ))
-            })?;
-        let mut spawn_claim = DrainDispatchClaim::already_held(Arc::clone(&self.work_db), execution.id.clone());
-        if let Err(err) = self.schedule_execution(&execution, &worker_id, admission).await {
-            pool.release_worker_if_execution(&worker_id, &execution.id, preferred_workspace_id.as_deref())
-                .await;
-            self.recover_failed_dispatch(&execution, &worker_id, &err).await;
-            return Err(err);
-        }
-        spawn_claim.disarm();
-        self.consume_operator_forced_if_admitted(execution_id, admission);
-        Ok(worker_id)
-    }
-
     /// Launch the ready execution an operator's answer just created or resumed
     /// for `work_item_id`, the way `bossctl agents launch` would.
     ///
@@ -516,7 +391,7 @@ impl ExecutionCoordinator {
         }
     }
 
-    fn consume_operator_forced_if_admitted(&self, execution_id: &str, admission: DispatchAdmission) {
+    pub(super) fn consume_operator_forced_if_admitted(&self, execution_id: &str, admission: DispatchAdmission) {
         if admission != DispatchAdmission::OperatorForced {
             return;
         }
@@ -2585,7 +2460,7 @@ impl ExecutionCoordinator {
     /// Retries of a stored spoke lease the host has not answered are not
     /// new cube leases, so they must not occupy the per-repo bound. A spawn
     /// that is in doubt already holds a lease; that wait is not a lease retry.
-    fn spoke_lease_retry_skips_repo_bound(&self, execution: &WorkExecution) -> bool {
+    pub(super) fn spoke_lease_retry_skips_repo_bound(&self, execution: &WorkExecution) -> bool {
         match self.work_db.spoke_assignment_for_execution(&execution.id) {
             Ok(Some(assignment)) if assignment.lease_id.is_none() && !assignment.resolved => {
                 match self.work_db.spoke_execution_in_doubt(&execution.id) {
@@ -2612,7 +2487,7 @@ impl ExecutionCoordinator {
         }
     }
 
-    fn repo_lease_limiter_bound(&self) -> usize {
+    pub(super) fn repo_lease_limiter_bound(&self) -> usize {
         self.repo_lease_limiter.max()
     }
 
@@ -2932,7 +2807,7 @@ fn engine_rebase_pseudo_sibling(execution: &WorkExecution, rebased_item_id: &str
 /// RAII claim on a `ready` execution for the duration of one drain-loop
 /// consideration. Dropping while still armed reverts `claimed → ready` so a
 /// defer (chain hold, stagger, pool miss) does not leave the row stuck.
-struct DrainDispatchClaim {
+pub(super) struct DrainDispatchClaim {
     work_db: Arc<WorkDb>,
     execution_id: String,
     armed: bool,
@@ -2953,7 +2828,7 @@ impl DrainDispatchClaim {
     /// Wrap an already-won `claimed` row so Drop still reverts it. Used
     /// inside the detached spawn after the drain loop has disarmed its
     /// pickup guard.
-    fn already_held(work_db: Arc<WorkDb>, execution_id: String) -> Self {
+    pub(super) fn already_held(work_db: Arc<WorkDb>, execution_id: String) -> Self {
         Self {
             work_db,
             execution_id,
@@ -2961,7 +2836,7 @@ impl DrainDispatchClaim {
         }
     }
 
-    fn disarm(&mut self) {
+    pub(super) fn disarm(&mut self) {
         self.armed = false;
     }
 }

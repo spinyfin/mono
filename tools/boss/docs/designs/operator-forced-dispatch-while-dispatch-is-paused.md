@@ -60,7 +60,7 @@ Before a non-human-driven drag into Doing commits, the app calls `EvaluateDispat
 
 Evaluation order on the reply:
 
-1. **No active pause** — forward the drop through the ordinary board path with no alert. Hard blockers are _not_ bounced client-side here; the engine's ordinary `RequestExecution` path owns those refusals, as it did before this feature existed.
+1. **No active pause** — forward the drop through the ordinary board path with no alert. Hard blockers are _not_ bounced client-side here; the engine's ordinary `RequestExecution` path owns those refusals, as it did before this feature existed. The engine now starts such a drop as an explicit launch, and refuses an unconfirmed drop that reaches a paused engine instead of queueing it: see [Moving a card to Doing](../dispatch-focus-mode.md#moving-a-card-to-doing).
 2. **Pause active and hard blockers present** — bounce immediately; no confirmation that implies force will clear them.
 3. **Breaker (non-overridable) pause** — bounce with the stored pause reason.
 4. **Operator pause, no hard blockers** — confirmation naming the pause reason and any informational-only blockers (`autostart` / churn-guard). Confirm sends `MoveWorkItemOnBoard` with `bypass_dispatch_pause = true`, `entry_point = app_drag`, and the observed `paused_since_epoch_s`. Cancel bounces the optimistic card back.

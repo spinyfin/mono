@@ -15,7 +15,8 @@
 //! 1. its `project_id` is a focused project (a project's design seed task is
 //!    an ordinary task with `project_id` set, so it counts as the project);
 //! 2. its `product_id` is a focused product (any project, or none);
-//! 3. it was explicitly requested with `bossctl agents launch`;
+//! 3. it was explicitly started: `bossctl agents launch`, or its card moved
+//!    to Doing on the board;
 //! 4. its lineage roots in an in-scope item. A `revision` (including the
 //!    review, CI-fix and merge-conflict revisions the engine mints) resolves
 //!    through its parent chain; a `followup` (including a post-merge review
@@ -343,6 +344,15 @@ impl WorkDb {
         let execution = query_execution(&tx, &execution).require("execution", &execution)?;
         tx.commit()?;
         Ok(execution)
+    }
+
+    /// Record that the owner explicitly started `work_item_id`, the durable
+    /// fact scope rule 3 reads. `bossctl agents launch` writes it inside its
+    /// request transaction; a card moved to Doing writes it here once the
+    /// engine has admitted the start, so a refused move records nothing.
+    pub fn record_explicit_launch(&self, work_item_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        record_explicit_launch_on(&conn, work_item_id)
     }
 
     /// Persist the focus set. An inactive (empty) set is stored as such
