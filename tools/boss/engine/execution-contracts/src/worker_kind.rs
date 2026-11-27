@@ -84,6 +84,29 @@ impl WorkerKind {
 }
 
 impl WorkerKind {
+    /// Fail loudly when a launch command would run this kind without its
+    /// settings file. `fence_flag` is the driver's own spelling of the flag
+    /// that hands the worker its settings file (see
+    /// `AgentDriver::launch_fence_flag`), or `None` for a driver whose fence is
+    /// delivered by a different mechanism. For every kind other than
+    /// [`WorkerKind::Standard`] the settings file's deny rules and PreToolUse
+    /// hooks are the enforcement, whatever the permission mode (`--dangerously-
+    /// skip-permissions` and `--permission-mode auto` both leave unmatched
+    /// commands to run), so a command without the flag would run that kind
+    /// unfenced.
+    pub fn verify_launch_command_fenced(&self, fence_flag: Option<&str>, command: &str) -> Result<(), String> {
+        let Some(flag) = fence_flag else {
+            return Ok(());
+        };
+        if *self != WorkerKind::Standard && !command.contains(flag) {
+            return Err(format!(
+                "refusing to launch a {} worker without its settings file: its write/publish fence would be inert",
+                self.label()
+            ));
+        }
+        Ok(())
+    }
+
     /// Short display label for alerts and bossctl output.
     pub fn label(&self) -> &'static str {
         match self {

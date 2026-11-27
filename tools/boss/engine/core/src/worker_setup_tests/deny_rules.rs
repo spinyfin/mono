@@ -30,7 +30,9 @@ fn settings_json_denies_boss_state_dir_edits_and_emits_no_read_or_write_rule() {
     let deny = parsed["permissions"]["deny"].as_array().expect("deny array present");
     let deny_set: Vec<&str> = deny.iter().filter_map(|v| v.as_str()).collect();
     let boss_dir = "/Users/brianduff/Library/Application Support/Boss";
-    for rule in [format!("Edit({boss_dir})"), format!("Edit({boss_dir}/**)")] {
+    // Absolute `//` spelling: the single-slash form is project-relative and
+    // fences nothing.
+    for rule in [format!("Edit(/{boss_dir})"), format!("Edit(/{boss_dir}/**)")] {
         assert!(
             deny_set.iter().any(|r| *r == rule),
             "expected deny rule {rule} in {deny_set:?}",
@@ -135,7 +137,7 @@ fn reviewer_kind_adds_write_and_push_deny_rules_standard_does_not() {
         .parent()
         .unwrap_or(&rev_input.workspace_path)
         .display();
-    let critical = format!("Edit({fence}/**)");
+    let critical = format!("Edit(/{fence}/**)");
     assert!(
         rev_deny.contains(&critical.as_str()),
         "reviewer must deny workspaces-root-scoped {critical} (got {rev_deny:?})",
@@ -153,6 +155,226 @@ fn reviewer_kind_adds_write_and_push_deny_rules_standard_does_not() {
         !rev_deny.contains(&"Edit(**)"),
         "reviewer must NOT carry blanket Edit(**) (got {rev_deny:?})",
     );
+}
+
+#[test]
+fn reviewer_launches_keep_absolute_write_and_publish_denies_for_every_tier() {
+    use crate::driver::{AgentDriver, SpawnRequest};
+    use boss_protocol::ReviewModelTier;
+
+    let mut input = sample_input();
+    input.worker_kind = WorkerKind::Reviewer;
+    input.workspace_path = PathBuf::from("/worker checkouts/reviewer");
+    let settings = TempDir::new().unwrap();
+    let settings_path = settings.path().join("reviewer.json");
+    std::fs::write(&settings_path, render_settings_json(&input, &ClaudeDriver)).unwrap();
+    let policy: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+    let deny = policy["permissions"]["deny"].as_array().unwrap();
+
+    // These are the rule forms observed to reject Edit, Write, Bash redirects
+    // and publishing in real auto / skip-permissions Claude sessions. Pin the
+    // absolute spelling independently of the renderer: /worker checkouts/**
+    // is project-relative and allowed real writes in both launch modes.
+    assert!(deny.contains(&serde_json::json!("Edit(//worker checkouts/**)")));
+    assert!(!deny.contains(&serde_json::json!("Edit(/worker checkouts/**)")));
+    assert!(
+        !deny.contains(&serde_json::json!("Edit(**)")),
+        "artifact must remain writable"
+    );
+    for command in [
+        "git push",
+        "jj git push",
+        "gh pr create",
+        "gh pr merge",
+        "gh pr close",
+        "gh pr edit",
+        "gh pr comment",
+        "gh pr review",
+        "cube pr",
+    ] {
+        for suffix in ["", ":*"] {
+            assert!(deny.contains(&serde_json::json!(format!("Bash({command}{suffix})"))));
+        }
+    }
+
+    let menu = &ClaudeDriver.descriptor().model_menu;
+    const SKIP: &str = "--dangerously-skip-permissions";
+    const AUTO: &str = "--permission-mode auto";
+    let expected_modes = [
+        ((menu.review_model_for_tier)(ReviewModelTier::Fast), SKIP),
+        ((menu.review_model_for_tier)(ReviewModelTier::Balanced), SKIP),
+        ((menu.review_model_for_tier)(ReviewModelTier::Strong), AUTO),
+        ("fable", AUTO),
+    ];
+    for (model, base_mode) in expected_modes {
+        for non_opus_auto_mode in [false, true] {
+            let expected = if non_opus_auto_mode { AUTO } else { base_mode };
+            let plan = ClaudeDriver.spawn_invocation(SpawnRequest {
+                model,
+                effort: None,
+                settings_path: Some(&settings_path),
+                non_opus_auto_mode,
+                permission_mode_override: input.worker_kind.forced_permission_mode(),
+                run_id: Some(&input.run_id),
+            });
+            assert!(
+                plan.command
+                    .contains(&format!("--settings '{}'", settings_path.display()))
+            );
+            assert!(
+                plan.command.contains(expected),
+                "unverified reviewer mode: {}",
+                plan.command
+            );
+            // Fenced in every permission mode; and refused without settings
+            // in both skip-permissions and auto mode.
+            let gate = ClaudeDriver.launch_fence_flag();
+            input
+                .worker_kind
+                .verify_launch_command_fenced(gate, &plan.command)
+                .unwrap();
+            let unfenced = ClaudeDriver.spawn_invocation(SpawnRequest {
+                model,
+                effort: None,
+                settings_path: None,
+                non_opus_auto_mode,
+                permission_mode_override: input.worker_kind.forced_permission_mode(),
+                run_id: Some(&input.run_id),
+            });
+            assert!(unfenced.command.contains(expected));
+            assert!(
+                input
+                    .worker_kind
+                    .verify_launch_command_fenced(gate, &unfenced.command)
+                    .is_err(),
+                "reviewer without --settings must be refused: {}",
+                unfenced.command
+            );
+        }
+    }
+
+    // The real launch path always hands the reviewer its settings file: a
+    // skip-permissions reviewer with no `--settings` would be unfenced.
+    let workspace = TempDir::new().unwrap();
+    let mut real = sample_input();
+    real.worker_kind = WorkerKind::Reviewer;
+    real.workspace_path = workspace.path().to_path_buf();
+    let written = write_workspace_files(&real, &ClaudeDriver).unwrap();
+    let plan = ClaudeDriver.spawn_invocation(SpawnRequest {
+        model: (menu.review_model_for_tier)(ReviewModelTier::Fast),
+        effort: None,
+        settings_path: Some(&written.settings_path),
+        non_opus_auto_mode: false,
+        permission_mode_override: real.worker_kind.forced_permission_mode(),
+        run_id: Some(&real.run_id),
+    });
+    assert!(plan.command.contains("--dangerously-skip-permissions"));
+    assert!(plan.command.contains("--settings '"), "{}", plan.command);
+    // The launch builders' own gate accepts the fenced command and rejects the
+    // same skip-permissions command without a settings file.
+    let gate = ClaudeDriver.launch_fence_flag();
+    real.worker_kind
+        .verify_launch_command_fenced(gate, &plan.command)
+        .unwrap();
+    let unfenced = ClaudeDriver.spawn_invocation(SpawnRequest {
+        model: (menu.review_model_for_tier)(ReviewModelTier::Fast),
+        effort: None,
+        settings_path: None,
+        non_opus_auto_mode: false,
+        permission_mode_override: real.worker_kind.forced_permission_mode(),
+        run_id: Some(&real.run_id),
+    });
+    assert!(
+        real.worker_kind
+            .verify_launch_command_fenced(gate, &unfenced.command)
+            .is_err()
+    );
+    assert!(
+        WorkerKind::Triage
+            .verify_launch_command_fenced(gate, &unfenced.command)
+            .is_err()
+    );
+    WorkerKind::Standard
+        .verify_launch_command_fenced(gate, &unfenced.command)
+        .unwrap();
+    // The referenced settings file carries the write fence as well.
+    assert!(
+        written_deny_has_fence(&written.settings_path),
+        "reviewer settings must carry the absolute write fence"
+    );
+    // Publication is fenced by a PreToolUse guard, not only by prefix rules.
+    let written_settings: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&written.settings_path).unwrap()).unwrap();
+    assert!(
+        written_settings["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e.to_string().contains("Boss reviewer no-write/no-publish guard")),
+        "reviewer must carry the publication guard"
+    );
+}
+
+#[test]
+fn reviewer_publish_guard_blocks_global_option_and_absolute_path_forms() {
+    use std::io::Write as _;
+    let script = crate::driver::codex::codex_reviewer_publish_guard_script();
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("guard.py");
+    std::fs::write(&path, script).unwrap();
+    let decide = |command: &str| -> String {
+        let mut child = std::process::Command::new("python3")
+            .arg(&path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let payload = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}});
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        drop(child.stdin.take());
+        let out: serde_json::Value = serde_json::from_slice(&child.wait_with_output().unwrap().stdout).unwrap();
+        out["decision"].as_str().unwrap().to_owned()
+    };
+    for command in [
+        "jj -R /abs/ws git push",
+        "git -C /abs/ws push origin x",
+        "gh --repo spinyfin/mono pr edit 3705 --title x",
+        "gh -R spinyfin/mono pr comment 1 --body x",
+        "/opt/homebrew/bin/gh pr merge 1",
+        "/usr/bin/git push",
+        "\"$CUBE_BIN\" pr update --branch b",
+    ] {
+        assert_eq!(decide(command), "block", "{command} must be blocked");
+    }
+    for command in [
+        "jj -R /abs/ws log",
+        "git -C /abs/ws status",
+        "gh --repo spinyfin/mono pr view 1",
+        "gh pr diff 1",
+        "\"$BOSS_BIN\" propose review-guide --body x",
+    ] {
+        assert_eq!(decide(command), "approve", "{command} must be approved");
+    }
+}
+
+#[test]
+fn reviewer_root_workspace_fences_the_entire_filesystem() {
+    assert!(reviewer_deny_rules(Path::new("/")).contains(&"Edit(//**)".to_owned()));
+}
+
+#[test]
+fn reviewer_rejects_a_relative_workspace_with_a_typed_launch_error() {
+    let mut input = sample_input();
+    input.worker_kind = WorkerKind::Reviewer;
+    input.workspace_path = PathBuf::from("relative/reviewer");
+    let err = write_workspace_files(&input, &ClaudeDriver).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains("reviewer workspace must be absolute"));
 }
 
 #[test]
@@ -282,7 +504,7 @@ fn settings_json_carries_the_data_dir_globs_and_the_path_guard_hook_together() {
         .filter_map(|v| v.as_str())
         .collect();
     assert!(
-        deny.iter().any(|r| *r == format!("Edit({boss_dir}/**)")),
+        deny.iter().any(|r| *r == format!("Edit(/{boss_dir}/**)")),
         "expected the data-dir Edit glob: {deny:?}",
     );
 
@@ -555,4 +777,12 @@ fn review_guide_hook_chain_masks_literal_body_and_still_rejects_wrappers() {
             "{decision}"
         );
     }
+}
+
+fn written_deny_has_fence(path: &Path) -> bool {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    v["permissions"]["deny"].as_array().unwrap().iter().any(|r| {
+        r.as_str()
+            .is_some_and(|r| r.starts_with("Edit(//") && r.ends_with("/**)"))
+    })
 }

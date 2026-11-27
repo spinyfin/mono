@@ -2372,6 +2372,14 @@ pub trait AgentDriver: Send + Sync {
     /// naming the hook mechanism and the `.claude/`-style gitignore contract.
     fn agent_rules_preamble(&self) -> &'static str;
 
+    /// The spelling of the launch-command flag that hands a restricted worker
+    /// its rendered settings file (deny rules and PreToolUse hooks), or `None`
+    /// when the driver delivers its fence through a different mechanism. The
+    /// launch gate refuses a non-standard worker whose command lacks it.
+    fn launch_fence_flag(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Absolute path [`crate::worker_setup::write_workspace_files`] (in
     /// `engine/core`) must write the rendered agent-rules body to, so the
     /// driver's own agent actually reads it.

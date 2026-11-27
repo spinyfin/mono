@@ -196,8 +196,8 @@ fn golden_deny_rules_standard_worker() {
     // carried by the path-guard PreToolUse hook, which is stricter — it
     // canonicalises relative paths against the call's `cwd`.
     let expected = vec![
-        format!("Edit({boss_dir})"),
-        format!("Edit({boss_dir}/**)"),
+        format!("Edit(/{boss_dir})"),
+        format!("Edit(/{boss_dir}/**)"),
         "Bash(bossctl)".to_owned(),
         "Bash(bossctl:*)".to_owned(),
         "Bash(boss handoff:*)".to_owned(),

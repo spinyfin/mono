@@ -15,7 +15,8 @@ fn remote_settings_drop_data_dir_sandbox_but_keep_hooks_and_static_denies() {
         task_kind: Some("task".into()),
         ..sample_input()
     };
-    let parsed: serde_json::Value = serde_json::from_str(&render_remote_settings_json(&input, &ClaudeDriver)).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&render_remote_settings_json(&input, &ClaudeDriver).unwrap()).unwrap();
 
     // All seven boss-event hook events are still wired.
     let hooks = parsed.get("hooks").unwrap().as_object().unwrap();
@@ -72,7 +73,7 @@ fn spoke_replaces_hub_forwarders_without_removing_policy() {
     use boss_engine_driver::{ProgressIngress, ProgressObservationConfig, hook_settings};
     let input = sample_input();
     let mut settings: serde_json::Value =
-        serde_json::from_str(&render_remote_settings_json(&input, &ClaudeDriver)).unwrap();
+        serde_json::from_str(&render_remote_settings_json(&input, &ClaudeDriver).unwrap()).unwrap();
     let policy = settings["permissions"].clone();
     let config = ProgressObservationConfig {
         events_socket_path: "/tmp/spoke.sock".into(),
@@ -124,7 +125,7 @@ fn spoke_replaces_bare_hub_forwarder_for_bare_and_absolute_spoke_binaries() {
     };
     for binary in ["boss-event", "/spoke/bin/boss-event"] {
         let mut settings: serde_json::Value =
-            serde_json::from_str(&render_remote_settings_json(&input, &ClaudeDriver)).unwrap();
+            serde_json::from_str(&render_remote_settings_json(&input, &ClaudeDriver).unwrap()).unwrap();
         // A policy hook that merely mentions boss-event must survive.
         settings["hooks"]["PreToolUse"]
             .as_array_mut()
@@ -157,4 +158,15 @@ fn spoke_replaces_bare_hub_forwarder_for_bare_and_absolute_spoke_binaries() {
         assert!(pre[0]["hooks"][0]["command"].as_str().unwrap().contains("spoke-run"));
         assert!(pre.to_string().contains("echo audit boss-event"));
     }
+}
+
+#[test]
+fn remote_reviewer_settings_reject_a_relative_workspace() {
+    let mut input = sample_input();
+    input.worker_kind = WorkerKind::Reviewer;
+    input.workspace_path = PathBuf::from("relative/checkout");
+    let err = render_remote_settings_json(&input, &ClaudeDriver).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    input.workspace_path = PathBuf::from("/abs/checkout");
+    assert!(render_remote_settings_json(&input, &ClaudeDriver).is_ok());
 }

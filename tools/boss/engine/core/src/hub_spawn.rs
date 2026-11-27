@@ -220,10 +220,52 @@ pub async fn compose_remote_spawn(request: ComposeRemoteSpawn<'_>) -> Result<Spa
         ..Default::default()
     };
     require_launch_inputs(&mut spawn);
+    verify_spawn_settings_fenced(&settings_input, driver.as_ref(), &spawn.settings_json)?;
     spawn
         .validate()
         .map_err(|err: ValidationError| anyhow::anyhow!("spoke spawn: {err}"))?;
     Ok(spawn)
+}
+
+/// Refuse a spawn whose restricted worker would reach the spoke without its
+/// fence. The spoke composes the launch command from `settings_json`, so for a
+/// non-standard kind on a settings-fenced driver the payload must be non-empty
+/// and, for a reviewer, carry the workspace-specific Edit deny and the
+/// publication guard hook.
+fn verify_spawn_settings_fenced(
+    input: &WorkerSetupInput,
+    driver: &dyn crate::driver::AgentDriver,
+    settings_json: &[u8],
+) -> anyhow::Result<()> {
+    if input.worker_kind == crate::worker_setup::WorkerKind::Standard || driver.launch_fence_flag().is_none() {
+        return Ok(());
+    }
+    let label = input.worker_kind.label();
+    anyhow::ensure!(
+        !settings_json.is_empty(),
+        "spoke spawn: refusing to launch a {label} worker with empty settings: its fence would be inert"
+    );
+    if input.worker_kind == crate::worker_setup::WorkerKind::Reviewer {
+        let settings: serde_json::Value = serde_json::from_slice(settings_json)
+            .map_err(|err| anyhow::anyhow!("spoke spawn: reviewer settings are not valid JSON: {err}"))?;
+        let edit_fence = crate::worker_setup::claude_absolute_edit_rule(
+            input.workspace_path.parent().unwrap_or(&input.workspace_path),
+            true,
+        );
+        let has_edit_fence = settings["permissions"]["deny"]
+            .as_array()
+            .is_some_and(|deny| deny.iter().any(|rule| rule.as_str() == Some(edit_fence.as_str())));
+        let has_publish_guard = settings["hooks"]["PreToolUse"].as_array().is_some_and(|hooks| {
+            hooks
+                .iter()
+                .any(|hook| hook.to_string().contains("Boss reviewer no-write/no-publish guard"))
+        });
+        anyhow::ensure!(
+            has_edit_fence && has_publish_guard,
+            "spoke spawn: refusing to launch a reviewer without its workspace Edit fence and publication guard"
+        );
+    }
+    Ok(())
 }
 
 /// Peers that predate the launch-input fields would launch with default
@@ -339,7 +381,7 @@ pub(crate) fn prepare_remote_launch(input: RemoteLaunchInput<'_>) -> Result<Remo
         )
         .build();
     crate::host_adapter::reject_unobservable_remote_driver(driver.as_ref(), driver_slug, &settings_input, host)?;
-    let settings_json = render_remote_settings_json(&settings_input, driver.as_ref());
+    let settings_json = render_remote_settings_json(&settings_input, driver.as_ref())?;
 
     let structured_output_kind = embedded_output_path
         .and_then(|_| crate::runner::designated_output_kind(execution, item))
@@ -616,6 +658,20 @@ mod tests {
                 rendered.then_some("review-result")
             );
             assert!(!spawn.pr_url_output);
+            // The Spawn the spoke launches from carries the reviewer fence.
+            let settings: serde_json::Value = serde_json::from_slice(&spawn.settings_json).unwrap();
+            let fence = crate::worker_setup::claude_absolute_edit_rule(workspace.path().parent().unwrap(), true);
+            assert!(
+                settings["permissions"]["deny"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!(fence))
+            );
+            assert!(
+                settings["hooks"]["PreToolUse"]
+                    .to_string()
+                    .contains("Boss reviewer no-write/no-publish guard")
+            );
             assert_eq!(
                 String::from_utf8(spawn.prompt_utf8)
                     .unwrap()
@@ -691,6 +747,41 @@ mod tests {
             "credential or hub events env leaked: {:?}",
             spawn.env
         );
+    }
+
+    #[test]
+    fn spawn_settings_gate_requires_reviewer_fence_and_hook() {
+        use crate::driver::ClaudeDriver;
+        use crate::worker_setup::{WorkerKind, render_remote_settings_json};
+        let mut input = WorkerSetupInput {
+            run_id: "run-sample".into(),
+            lease_id: "lease-sample".into(),
+            workspace_path: PathBuf::from("/checkouts/reviewer"),
+            events_socket_path: PathBuf::from("/spoke/run/events.sock"),
+            boss_event_path: PathBuf::from("/spoke/bin/boss-event"),
+            draft_pr_mode: false,
+            execution_kind: "pr_review".into(),
+            task_kind: None,
+            worker_kind: WorkerKind::Reviewer,
+            automation_outcome_proposals_seam_enabled: false,
+            run_done_proposals_seam_enabled: false,
+            worker_signal_proposals_seam_enabled: false,
+            is_review_supervisor: false,
+            is_post_merge_reviewer: false,
+            checkout_positioned_on_pr_head: false,
+        };
+        let good = render_remote_settings_json(&input, &ClaudeDriver).unwrap().into_bytes();
+        verify_spawn_settings_fenced(&input, &ClaudeDriver, &good).unwrap();
+        // Absent, malformed, and fence-less settings are all refused.
+        assert!(verify_spawn_settings_fenced(&input, &ClaudeDriver, b"").is_err());
+        assert!(verify_spawn_settings_fenced(&input, &ClaudeDriver, b"{}").is_err());
+        assert!(verify_spawn_settings_fenced(&input, &ClaudeDriver, b"not json").is_err());
+        // A different restricted kind still needs a non-empty payload.
+        input.worker_kind = WorkerKind::Triage;
+        assert!(verify_spawn_settings_fenced(&input, &ClaudeDriver, b"").is_err());
+        // Standard workers are not gated.
+        input.worker_kind = WorkerKind::Standard;
+        verify_spawn_settings_fenced(&input, &ClaudeDriver, b"").unwrap();
     }
 
     #[test]

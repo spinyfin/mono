@@ -1192,6 +1192,9 @@ impl HostAdapter for SshHostAdapter {
             permission_mode_override: worker_kind.forced_permission_mode(),
             run_id: Some(&run_id),
         });
+        worker_kind
+            .verify_launch_command_fenced(driver.launch_fence_flag(), &driver_spawn_plan.command)
+            .map_err(|reason| anyhow::anyhow!(reason))?;
         let engine_socket = self.events_socket_path.display().to_string();
         let stage = async {
             stage_remote_agent_rules(&self.transport, &settings_input, driver.as_ref()).await?;
