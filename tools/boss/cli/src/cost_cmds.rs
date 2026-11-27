@@ -30,6 +30,15 @@ pub(crate) enum CostCommand {
     /// (tokens per run, per completed execution, per active hour, per
     /// completed task, per distinct PR) and range coverage notes.
     Series(CostSeriesArgs),
+    /// What automated reviews found in a time window and what came of it:
+    /// per review round and reviewer role, the findings by severity and
+    /// category, the verdicts that passed the revision gate (and those that
+    /// passed only on a low or medium finding in an always-on category), the
+    /// revisions and follow-ups minted and how many changed code and merged.
+    /// For Deep reviews, which criteria fired and, after merge, what each
+    /// yielded. Read-only; no tokens are involved. With `--experiment`, the
+    /// report is split by the arm recorded on each review's executions.
+    ReviewYield(CostReviewYieldArgs),
 }
 
 /// How deep `boss cost rows` prints the tree in text mode (`--json` is always
@@ -228,6 +237,30 @@ pub(crate) struct CostSeriesArgs {
     pub(crate) utc: bool,
 }
 
+#[derive(Debug, Clone, Args)]
+pub(crate) struct CostReviewYieldArgs {
+    /// Start of the window, by when each review batch was created: an RFC3339
+    /// timestamp (e.g. `2026-07-01T00:00:00Z`) or a relative duration ago
+    /// (`24h`, `7d`, `2w`).
+    #[arg(long)]
+    pub(crate) since: String,
+
+    /// End of the window, same accepted formats as `--since`. Defaults
+    /// to now.
+    #[arg(long)]
+    pub(crate) until: Option<String>,
+
+    /// Split the report by the arm this experiment recorded on each review's
+    /// executions (`treatment`, `control`, `stopped`, `mixed`, `not_enrolled`,
+    /// `not_recorded`), e.g. `post_merge_review_slim`.
+    #[arg(long, value_name = "KEY")]
+    pub(crate) experiment: Option<String>,
+
+    /// Print report timestamps in UTC instead of this host's local time.
+    #[arg(long)]
+    pub(crate) utc: bool,
+}
+
 pub(crate) async fn run_cost_command(command: CostCommand, ctx: &RunContext) -> Result<(), CliError> {
     let mut client = connect_for_work(ctx).await?;
     match command {
@@ -367,6 +400,30 @@ pub(crate) async fn run_cost_command(command: CostCommand, ctx: &RunContext) -> 
             let tz = resolve_display_tz(args.utc);
             print_entity(ctx, &serde_json::json!({ "report": report }), || {
                 print_usage_series_report(&report, args.usd, &tz)
+            })
+        }
+        CostCommand::ReviewYield(args) => {
+            let (since_epoch_s, until_epoch_s) = resolve_window(&args.since, args.until.as_deref())?;
+            let response = client
+                .send_request(&FrontendRequest::GetReviewYieldReport(
+                    boss_protocol::ReviewYieldRequest {
+                        since_epoch_s,
+                        until_epoch_s,
+                        experiment: args.experiment.clone(),
+                    },
+                ))
+                .await
+                .map_err(CliError::internal)?;
+            let report = match response {
+                FrontendEvent::ReviewYieldReport { report } => report,
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    return Err(CliError::application(message));
+                }
+                other => return Err(unexpected_event("cost review-yield", &other)),
+            };
+            let tz = resolve_display_tz(args.utc);
+            print_entity(ctx, &serde_json::json!({ "report": report }), || {
+                print_review_yield_report(&report, &tz)
             })
         }
         CostCommand::Top(args) => {
@@ -1082,6 +1139,289 @@ fn format_optional_average(value: Option<f64>) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
+// ── `boss cost review-yield` ──────────────────────────────────────────
+
+fn print_review_yield_report(report: &boss_protocol::ReviewYieldReport, tz: &DisplayTz) {
+    println!(
+        "Review yield from {} to {} ({})",
+        format_epoch(report.since_epoch_s, tz),
+        format_epoch(report.until_epoch_s, tz),
+        tz.label,
+    );
+    if let Some(key) = &report.experiment {
+        println!("Split by experiment `{key}`: each review batch is placed by the arm recorded on its executions.");
+    }
+    println!(
+        "Outcomes are read as of {}.",
+        format_epoch(report.generated_at_epoch_s, tz)
+    );
+    if report.arms.is_empty() {
+        println!();
+        println!("No review batches were created in this window.");
+    }
+    for arm in &report.arms {
+        print_review_yield_arm(arm);
+    }
+    if !report.notes.is_empty() {
+        println!();
+        for note in &report.notes {
+            println!("NOTE: {note}");
+        }
+    }
+}
+
+fn print_review_yield_arm(arm: &boss_protocol::ReviewYieldArmReport) {
+    println!();
+    match arm.arm {
+        Some(arm_name) => println!("=== Arm {arm_name}: {} review batch(es) ===", arm.batches),
+        None => println!("=== All reviews: {} review batch(es) ===", arm.batches),
+    }
+    for phase in &arm.phases {
+        println!();
+        println!(
+            "{}: {} batch(es), {} with no applied verdict",
+            review_yield_phase_label(phase.phase),
+            phase.batches,
+            phase.batches_without_verdict,
+        );
+        if phase.batches == 0 {
+            continue;
+        }
+        if !phase.roles.is_empty() {
+            let mut table = new_dynamic_table([
+                "ROLE",
+                "REVIEWS",
+                "FINDINGS",
+                "CRITICAL",
+                "HIGH",
+                "MEDIUM",
+                "LOW",
+                "PASS GATE",
+                "ON ALWAYS-ON ONLY",
+                "CATEGORIES",
+            ]);
+            for row in review_yield_role_rows(&phase.roles) {
+                table.add_row(row);
+            }
+            print_table(table);
+        }
+        for line in review_yield_decision_lines(&phase.decisions) {
+            println!("  {line}");
+        }
+    }
+
+    let deep = &arm.deep;
+    println!();
+    println!(
+        "Deep reviews: {} pre-merge, {} post-merge. Criteria are re-derived from each batch's stored inputs with \
+         the classifier's current thresholds; a batch can fire several.",
+        deep.pre_merge_batches, deep.post_merge_batches,
+    );
+    if deep.no_current_criterion > 0 {
+        println!(
+            "  {} Deep batch(es) fire no criterion under the current thresholds.",
+            deep.no_current_criterion
+        );
+    }
+    if deep.unreadable_classifications > 0 {
+        println!(
+            "  {} batch(es) have an unreadable classification and are in neither this table nor the next.",
+            deep.unreadable_classifications
+        );
+    }
+    let mut table = new_dynamic_table([
+        "CRITERION",
+        "RULE",
+        "PRE-MERGE",
+        "POST-MERGE",
+        "FINDINGS",
+        "CRIT/HIGH",
+        "PASSED GATE",
+        "FOLLOW-UPS",
+        "CHANGED CODE",
+        "MERGED",
+        "CRIT/HIGH FOLLOW-UPS MERGED",
+    ]);
+    for row in review_yield_deep_rows(deep) {
+        table.add_row(row);
+    }
+    print_table(table);
+
+    let eligibility = &arm.post_merge_eligibility;
+    println!();
+    println!(
+        "Post-merge batches by size eligibility (eligible when: {}).",
+        eligibility.rule
+    );
+    let mut table = new_dynamic_table([
+        "",
+        "BATCHES",
+        "VERDICTS",
+        "FINDINGS",
+        "CRIT/HIGH",
+        "PASSED GATE",
+        "FOLLOW-UPS",
+        "CHANGED CODE",
+        "MERGED",
+        "CRIT/HIGH FOLLOW-UPS MERGED",
+    ]);
+    for row in review_yield_eligibility_rows(eligibility) {
+        table.add_row(row);
+    }
+    print_table(table);
+}
+
+fn review_yield_phase_label(phase: boss_protocol::ReviewYieldPhase) -> &'static str {
+    match phase {
+        boss_protocol::ReviewYieldPhase::PreMergeRound1 => "Pre-merge, round 1",
+        boss_protocol::ReviewYieldPhase::PreMergeRound2 => "Pre-merge, round 2",
+        boss_protocol::ReviewYieldPhase::PreMergeRound3Plus => "Pre-merge, round 3 and later",
+        boss_protocol::ReviewYieldPhase::PostMerge => "Post-merge",
+    }
+}
+
+fn review_yield_counts(counts: &[boss_protocol::LabelCount]) -> String {
+    const SHOWN: usize = 5;
+    let mut shown: Vec<String> = counts
+        .iter()
+        .take(SHOWN)
+        .map(|count| format!("{} {}", count.label, count.count))
+        .collect();
+    if counts.len() > SHOWN {
+        shown.push(format!("+{} more", counts.len() - SHOWN));
+    }
+    if shown.is_empty() {
+        "—".to_owned()
+    } else {
+        shown.join(", ")
+    }
+}
+
+fn review_yield_role_rows(roles: &[boss_protocol::ReviewYieldRoleRow]) -> Vec<Vec<String>> {
+    roles
+        .iter()
+        .map(|row| {
+            let reviews = if row.unreadable_reports > 0 {
+                format!("{} ({} unreadable)", row.reviews, row.unreadable_reports)
+            } else {
+                row.reviews.to_string()
+            };
+            vec![
+                row.role.to_string(),
+                reviews,
+                row.findings.to_string(),
+                row.by_severity.critical.to_string(),
+                row.by_severity.high.to_string(),
+                row.by_severity.medium.to_string(),
+                row.by_severity.low.to_string(),
+                row.passing_gate.to_string(),
+                row.passing_on_always_on_category_only.to_string(),
+                review_yield_counts(&row.by_category),
+            ]
+        })
+        .collect()
+}
+
+fn review_yield_remediation_summary(remediation: &boss_protocol::RemediationYield) -> String {
+    if remediation.minted == 0 {
+        return "none minted".to_owned();
+    }
+    format!(
+        "{} minted; {} changed code, {} merged, {} changed code and merged; {} still open",
+        remediation.minted,
+        remediation.changed_code,
+        remediation.merged,
+        remediation.changed_code_and_merged,
+        remediation.still_open,
+    )
+}
+
+fn review_yield_decision_lines(decisions: &boss_protocol::ReviewYieldDecisions) -> Vec<String> {
+    let mut verdicts = format!(
+        "Verdicts: {}. Passed the revision gate: {} (on a critical or high finding {}; only on a low or medium \
+         finding in an always-on category {}).",
+        decisions.verdicts,
+        decisions.passed_gate,
+        decisions.passed_on_critical_or_high,
+        decisions.passed_on_always_on_category_only,
+    );
+    if decisions.unreadable_verdicts > 0 {
+        verdicts.push_str(&format!(
+            " {} verdict(s) have unreadable findings, so their gate basis is unknown.",
+            decisions.unreadable_verdicts
+        ));
+    }
+    let mut lines = vec![verdicts];
+    if !decisions.gate_outcomes.is_empty() {
+        lines.push(format!(
+            "Gate outcomes: {}",
+            review_yield_counts(&decisions.gate_outcomes)
+        ));
+    }
+    lines.push(format!(
+        "Revisions: {}",
+        review_yield_remediation_summary(&decisions.revisions)
+    ));
+    lines.push(format!(
+        "Follow-ups: {}",
+        review_yield_remediation_summary(&decisions.followups)
+    ));
+    lines.push(format!(
+        "Minted from critical or high verdicts: {}",
+        review_yield_remediation_summary(&decisions.from_critical_or_high)
+    ));
+    lines.push(format!(
+        "Minted from always-on-category-only verdicts: {}",
+        review_yield_remediation_summary(&decisions.from_always_on_category_only)
+    ));
+    lines
+}
+
+fn review_yield_post_merge_cells(yielded: &boss_protocol::PostMergeYield) -> Vec<String> {
+    vec![
+        yielded.verdicts.to_string(),
+        yielded.findings.to_string(),
+        yielded.critical_or_high_findings.to_string(),
+        yielded.passed_gate.to_string(),
+        yielded.remediation.minted.to_string(),
+        yielded.remediation.changed_code.to_string(),
+        yielded.remediation.merged.to_string(),
+        yielded.from_critical_or_high.merged.to_string(),
+    ]
+}
+
+fn review_yield_deep_rows(deep: &boss_protocol::ReviewYieldDeep) -> Vec<Vec<String>> {
+    deep.criteria
+        .iter()
+        .map(|row| {
+            let mut cells = vec![
+                row.criterion.to_string(),
+                row.rule.clone(),
+                row.pre_merge_batches.to_string(),
+                row.post_merge.batches.to_string(),
+            ];
+            // Drop the verdict count the eligibility table also shows; the
+            // criterion table carries batches in its own column.
+            cells.extend(review_yield_post_merge_cells(&row.post_merge).into_iter().skip(1));
+            cells
+        })
+        .collect()
+}
+
+fn review_yield_eligibility_rows(eligibility: &boss_protocol::ReviewYieldEligibility) -> Vec<Vec<String>> {
+    [
+        ("stays eligible", &eligibility.stays_eligible),
+        ("would be excluded", &eligibility.would_be_excluded),
+    ]
+    .into_iter()
+    .map(|(label, yielded)| {
+        let mut cells = vec![label.to_owned(), yielded.batches.to_string()];
+        cells.extend(review_yield_post_merge_cells(yielded));
+        cells
+    })
+    .collect()
+}
+
 // ── `boss cost series` ────────────────────────────────────────────────
 
 fn format_bucket_width(width: boss_protocol::UsageBucketWidth) -> &'static str {
@@ -1663,6 +2003,210 @@ mod tests {
         assert!(
             !grok.contains("| 0.0%"),
             "unmeasured group never gets 0.0% share: {grok}"
+        );
+    }
+
+    // ── `boss cost review-yield` ──
+
+    fn yield_remediation(
+        minted: u64,
+        changed: u64,
+        merged: u64,
+        both: u64,
+        open: u64,
+    ) -> boss_protocol::RemediationYield {
+        boss_protocol::RemediationYield {
+            minted,
+            still_open: open,
+            changed_code: changed,
+            merged,
+            changed_code_and_merged: both,
+        }
+    }
+
+    fn label(label: &str, count: u64) -> boss_protocol::LabelCount {
+        boss_protocol::LabelCount {
+            label: label.to_owned(),
+            count,
+        }
+    }
+
+    #[test]
+    fn review_yield_takes_a_window_and_an_optional_experiment() {
+        let cli = Cli::try_parse_from([
+            "boss",
+            "cost",
+            "review-yield",
+            "--since",
+            "7d",
+            "--experiment",
+            "post_merge_review_slim",
+        ])
+        .unwrap();
+        let Commands::Cost {
+            command: CostCommand::ReviewYield(args),
+        } = cli.command
+        else {
+            panic!("expected cost review-yield");
+        };
+        assert_eq!(args.since, "7d");
+        assert_eq!(args.experiment.as_deref(), Some("post_merge_review_slim"));
+        assert_eq!(args.until, None);
+        assert!(
+            Cli::try_parse_from(["boss", "cost", "review-yield"]).is_err(),
+            "--since is required"
+        );
+    }
+
+    #[test]
+    fn review_yield_role_rows_show_counts_unreadable_reports_and_a_bounded_category_list() {
+        let row = boss_protocol::ReviewYieldRoleRow::builder()
+            .role(boss_protocol::ReviewBatchMemberRole::ClaudeReviewer)
+            .reviews(9)
+            .unreadable_reports(2)
+            .findings(30)
+            .by_severity(boss_protocol::SeverityCounts {
+                critical: 1,
+                high: 4,
+                medium: 10,
+                low: 15,
+            })
+            .passing_gate(6)
+            .passing_on_always_on_category_only(2)
+            .by_category(vec![
+                label("correctness", 12),
+                label("tests", 8),
+                label("readability", 5),
+                label("architecture", 3),
+                label("edgecase", 1),
+                label("regression", 1),
+                label("agent_isms", 0),
+            ])
+            .build();
+        let empty = boss_protocol::ReviewYieldRoleRow::builder()
+            .role(boss_protocol::ReviewBatchMemberRole::Supervisor)
+            .reviews(1)
+            .build();
+        let rows = review_yield_role_rows(&[row, empty]);
+        assert_eq!(
+            rows[0][..9],
+            [
+                "claude_reviewer",
+                "9 (2 unreadable)",
+                "30",
+                "1",
+                "4",
+                "10",
+                "15",
+                "6",
+                "2"
+            ]
+        );
+        assert_eq!(
+            rows[0][9],
+            "correctness 12, tests 8, readability 5, architecture 3, edgecase 1, +2 more"
+        );
+        assert_eq!(rows[1][1], "1", "no unreadable suffix when every report read");
+        assert_eq!(rows[1][9], "—", "no categories prints a dash");
+    }
+
+    #[test]
+    fn review_yield_decision_lines_separate_the_gate_basis_and_say_when_nothing_was_minted() {
+        let decisions = boss_protocol::ReviewYieldDecisions::builder()
+            .verdicts(10)
+            .unreadable_verdicts(1)
+            .passed_gate(6)
+            .passed_on_critical_or_high(4)
+            .passed_on_always_on_category_only(1)
+            .gate_outcomes(vec![label("completed_with_findings", 5), label("stale_head", 1)])
+            .revisions(yield_remediation(5, 4, 3, 3, 1))
+            .from_critical_or_high(yield_remediation(4, 4, 3, 3, 0))
+            .build();
+        let lines = review_yield_decision_lines(&decisions);
+        assert_eq!(
+            lines[0],
+            "Verdicts: 10. Passed the revision gate: 6 (on a critical or high finding 4; only on a low or medium \
+             finding in an always-on category 1). 1 verdict(s) have unreadable findings, so their gate basis is unknown."
+        );
+        assert_eq!(lines[1], "Gate outcomes: completed_with_findings 5, stale_head 1");
+        assert_eq!(
+            lines[2],
+            "Revisions: 5 minted; 4 changed code, 3 merged, 3 changed code and merged; 1 still open"
+        );
+        assert_eq!(lines[3], "Follow-ups: none minted");
+        assert!(lines[4].starts_with("Minted from critical or high verdicts: 4 minted"));
+        assert_eq!(lines[5], "Minted from always-on-category-only verdicts: none minted");
+    }
+
+    #[test]
+    fn review_yield_tables_have_one_cell_per_header() {
+        let yielded = boss_protocol::PostMergeYield::builder()
+            .batches(3)
+            .verdicts(3)
+            .findings(7)
+            .critical_or_high_findings(2)
+            .passed_gate(2)
+            .remediation(yield_remediation(2, 2, 1, 1, 0))
+            .from_critical_or_high(yield_remediation(1, 1, 1, 1, 0))
+            .build();
+        let deep = boss_protocol::ReviewYieldDeep::builder()
+            .criteria(vec![
+                boss_protocol::DeepCriterionRow::builder()
+                    .criterion(boss_protocol::DeepCriterion::ChangedLines)
+                    .rule("more than 1000 changed lines")
+                    .pre_merge_batches(5)
+                    .post_merge(yielded)
+                    .build(),
+            ])
+            .build();
+        let rows = review_yield_deep_rows(&deep);
+        // CRITERION, RULE, PRE-MERGE, POST-MERGE, FINDINGS, CRIT/HIGH, PASSED GATE,
+        // FOLLOW-UPS, CHANGED CODE, MERGED, CRIT/HIGH FOLLOW-UPS MERGED.
+        assert_eq!(rows[0].len(), 11);
+        assert_eq!(
+            rows[0],
+            [
+                "changed_lines",
+                "more than 1000 changed lines",
+                "5",
+                "3",
+                "7",
+                "2",
+                "2",
+                "2",
+                "2",
+                "1",
+                "1"
+            ]
+        );
+
+        let eligibility = boss_protocol::ReviewYieldEligibility::builder()
+            .rule("a rule")
+            .stays_eligible(yielded)
+            .build();
+        let rows = review_yield_eligibility_rows(&eligibility);
+        // blank, BATCHES, VERDICTS, FINDINGS, CRIT/HIGH, PASSED GATE, FOLLOW-UPS,
+        // CHANGED CODE, MERGED, CRIT/HIGH FOLLOW-UPS MERGED.
+        assert!(rows.iter().all(|row| row.len() == 10));
+        assert_eq!(rows[0], ["stays eligible", "3", "3", "7", "2", "2", "2", "2", "1", "1"]);
+        assert_eq!(rows[1][0], "would be excluded");
+        assert_eq!(rows[1][1], "0");
+    }
+
+    #[test]
+    fn review_yield_phases_are_labelled_in_words() {
+        let labels: Vec<_> = boss_protocol::ReviewYieldPhase::ALL
+            .into_iter()
+            .map(review_yield_phase_label)
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "Pre-merge, round 1",
+                "Pre-merge, round 2",
+                "Pre-merge, round 3 and later",
+                "Post-merge"
+            ]
         );
     }
 }

@@ -993,6 +993,7 @@ mod review_guide_submission;
 mod review_section;
 mod review_verdict_apply;
 mod review_verdicts;
+mod review_yield_db;
 mod revise_doc;
 mod revision_helpers;
 pub mod revision_sequencing;

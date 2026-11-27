@@ -8,7 +8,7 @@ Every experiment ships **inert**: its flag is off, and a build that contains it 
 
 The mechanism and its first experiment are in the engine. The things that make an experiment readable are not:
 
-- **Landed:** the experiment registry and flags, the arm assigned to every launch, the `experiment_arms` column in the launch record, and the `pane_spawned` dispatch event carrying the arm set.
+- **Landed:** the experiment registry and flags, the arm assigned to every launch, the `experiment_arms` column in the launch record, the `pane_spawned` dispatch event carrying the arm set, and the review yield report (`boss cost review-yield`, below).
 - **Not landed:** the usage-rows dimension `experiment_arm` (so `boss cost rows --experiment <key> --group-by experiment_arm` does not exist yet), the per-family outcomes report, and the Token Usage window picker.
 
 **Do not switch an experiment on until the usage dimension and the outcomes report have landed.** Until then nothing in the Token Usage window can tell the two arms apart, and an experiment running for a month without a reader is a month of data nobody can use. The recorded arms are durable, so work launched in the meantime is still readable afterwards; but the experiment's treatment is live for its treated half the whole time.
@@ -117,6 +117,28 @@ To run it: switch `batched_search` on (a half-and-half split starts), switch `ba
 | Stop early when       | A compacted run loses its task or its done declaration, or the undeclared rate is twice control. Also the general rule below.                                                                                                                                         |
 
 To run it: switch `worker_autocompact` on (a half-and-half split starts), switch `worker_autocompact_ab_split` off to treat every family, switch `worker_autocompact` off to stop. To read it, once the usage dimension lands: `boss cost rows --experiment worker_autocompact --group-by experiment_arm --filter driver=claude`.
+
+## Reading review yield
+
+`boss cost review-yield --since <t> [--until <t>] [--experiment <key>] [--json]` reports what the automated reviews in a window found and what became of it. It is the guardrail for every review experiment, and the "pull yield first" step before changing review rounds or the post-merge review. It is read-only, spends no tokens, and captures nothing new: it reads the accepted reports and verdicts, the classification frozen on each batch, and the remediation task each verdict minted.
+
+The window is by when a review batch was created. Without `--experiment` there is one report for the window. With it, each batch is placed in the arm its members' executions recorded for that key, and the report repeats per arm: `treatment`, `control`, `stopped`, `mixed` (members that recorded arms disagree), `not_enrolled` (a set was recorded and the experiment was not running) and `not_recorded` (no arm set to read). A member with no recorded set has no arm of its own, so it does not make a batch `mixed`.
+
+**Phases.** Pre-merge round 1, round 2, round 3 and later, and post-merge. A round is the number of earlier pre-merge verdicts on the same PR, other than stale-head ones, plus one: it counts reviews that produced a decision, which is what the review-cycle cap counts, so a batch that failed without a verdict does not advance it. It looks back past the start of the window.
+
+**Roles.** Per phase, one row for each reviewer role that reported: reviews, findings, findings by severity, and the most frequent categories. The supervisor's row counts the consolidated findings of its verdict; the post-merge reviewer's row counts its own. Each row also says how many of its reports would pass the revision gate on their own findings, and how many of those only on an always-on category: a leaf reviewer does not decide, so this is what its report would have done alone. A report that cannot be read is counted as unreadable, never as zero findings.
+
+**Decisions.** Per phase, from each batch's deciding review (the supervisor before merge, the sole reviewer after):
+
+- _Passed the revision gate_ is the engine's recorded answer. It is split into verdicts that passed on a critical or high finding and verdicts that passed **only** on a low or medium finding in one of the four always-on categories (regression, duplication, deferred scope, agent-isms). The split comes from the same gate function the engine applies, so the two cannot drift.
+- _Gate outcomes_ show how many passed verdicts minted nothing (`stale_head`, `dropped_duplicate_head`).
+- _Revisions_ and _follow-ups_ minted, and for each how many **changed code**, how many **merged**, and how many did both. A revision changed code when one of its executions recorded a different PR head after than before; a follow-up when it opened a PR. A revision is merged when the PR it was pushed to is recorded as merged; a follow-up when its own PR is. These are positive evidence only, and merges come from the confirmed-merge journal, so a merge from before the journal began reads as not merged.
+- Remediation that has not finished is counted as _still open_, not as unmerged, so for a recent window `changed code` and `merged` are floors. The report adds a note when any is open.
+- The same counts are repeated for remediation minted from critical-or-high verdicts and from always-on-only verdicts: the second is what a severity bar on follow-ups would have suppressed.
+
+**Deep reviews.** For every batch stored as Deep, which criteria fired: more than 1000 changed lines, more than 25 changed files, 4 or more subsystems, 3 or more production languages, 2 or more complexity flags. A batch can fire several, so the rows do not sum to the batch count. They are re-derived from the batch's stored classification inputs with the classifier's current thresholds, from one definition (`deep_criteria` in `tools/boss/engine/pr-review/src/parsing.rs`) that the classifier itself selects the profile with; a test pins the two to agree on every fixture. A Deep batch in which no criterion fires today (the thresholds changed since) is counted apart. For post-merge batches each criterion row also carries the yield: findings, critical and high findings, verdicts that passed, follow-ups minted, how many changed code and merged, and how many critical-or-high follow-ups merged.
+
+**Size eligibility.** Every post-merge batch is also split by whether the post-merge size-eligibility rule (more than 1000 changed lines or 25 changed files, or 2 or more complexity flags and at least 400 changed lines) would still admit it. In the control arm, the _critical-or-high follow-ups merged_ in the `would be excluded` row is the guardrail for that rule: fixes it would have given up.
 
 ## Rules for every experiment
 

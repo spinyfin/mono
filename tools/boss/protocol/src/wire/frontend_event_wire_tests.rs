@@ -432,6 +432,14 @@ fn token_usage_rows_report() -> crate::TokenUsageRowsReport {
         .build()
 }
 
+fn review_yield_report() -> crate::ReviewYieldReport {
+    crate::ReviewYieldReport::builder()
+        .generated_at_epoch_s(1_747_000_000)
+        .since_epoch_s(1_746_000_000)
+        .until_epoch_s(1_747_000_000)
+        .build()
+}
+
 fn token_usage_series_report() -> crate::TokenUsageSeriesReport {
     crate::TokenUsageSeriesReport::builder()
         .bucket_secs(86_400)
@@ -1538,6 +1546,13 @@ fn tag_cases() -> Vec<TagCase> {
             },
             expected_tag: "token_usage_series",
         },
+        TagCase {
+            label: "ReviewYieldReport",
+            event: FrontendEvent::ReviewYieldReport {
+                report: review_yield_report(),
+            },
+            expected_tag: "review_yield_report",
+        },
         // --- Planner / project lifecycle ---
         TagCase {
             label: "PlannerRunsList",
@@ -2509,6 +2524,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::TopCostConsumers { .. }
         | FrontendEvent::TokenUsageRows { .. }
         | FrontendEvent::TokenUsageSeries { .. }
+        | FrontendEvent::ReviewYieldReport { .. }
         | FrontendEvent::PlannerRunsList { .. }
         | FrontendEvent::PlanProjectResult { .. }
         | FrontendEvent::ReleaseProjectResult { .. }

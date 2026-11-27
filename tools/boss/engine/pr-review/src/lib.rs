@@ -39,6 +39,7 @@ mod brief;
 mod parsing;
 mod post_merge_render;
 mod render;
+mod review_yield;
 mod supervisor_render;
 mod supervisor_types;
 mod types;
@@ -49,14 +50,22 @@ pub use brief::{
     locate_design_section_with_breakdown, render_brief_conformance_rubric, render_brief_packet_block,
 };
 pub use parsing::{
-    PrReviewMetadata, classify_changed_files, classify_pr_review_metadata, extract_review_result,
-    extract_review_result_verbose, passes_severity_gate, review_result_from_candidates,
+    DEEP_CHANGED_FILES_OVER, DEEP_CHANGED_LINES_OVER, DEEP_COMPLEXITY_FLAGS_AT_LEAST,
+    DEEP_PRODUCTION_LANGUAGES_AT_LEAST, DEEP_SUBSYSTEMS_AT_LEAST, DeepInputs, GateBasis,
+    POST_MERGE_FLAGGED_MIN_CHANGED_LINES, PrReviewMetadata, classify_changed_files, classify_pr_review_metadata,
+    deep_criteria, deep_criteria_for, deep_criterion_rule, extract_review_result, extract_review_result_verbose,
+    finding_passes_gate, gate_basis, is_always_on_category, is_critical_or_high, passes_severity_gate,
+    post_merge_size_eligibility_rule, post_merge_size_eligible, review_result_from_candidates,
 };
 pub use post_merge_render::{render_post_merge_reviewer_claude_md, render_post_merge_reviewer_initial_prompt};
 pub use render::{
     REVISION_CLOSE_SENTENCE, REVISION_HARD_RULE_HEADING, ReviewOrigin, ReviewerReportDestination,
     render_batch_reviewer_initial_prompt, render_post_merge_followup_provenance, render_post_merge_followup_title,
     render_reviewer_claude_md, render_reviewer_initial_prompt, render_revision_instructions, render_revision_title,
+};
+pub use review_yield::{
+    RemediationKind, YieldBatch, YieldFinding, YieldMember, YieldRemediation, YieldVerdict, build_review_yield_report,
+    findings_from_report_payload, findings_from_verdict_payload,
 };
 pub use supervisor_render::{SupervisorReportInput, render_supervisor_claude_md, render_supervisor_initial_prompt};
 pub use supervisor_types::{

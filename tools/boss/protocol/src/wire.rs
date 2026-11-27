@@ -930,6 +930,11 @@ pub enum FrontendRequest {
         series_id: Option<String>,
     },
 
+    /// What automated reviews found in a time window and what became of it,
+    /// optionally split by an experiment's recorded arm. Read-only; backs
+    /// `boss cost review-yield`. Replies with [`FrontendEvent::ReviewYieldReport`].
+    GetReviewYieldReport(crate::ReviewYieldRequest),
+
     GetRun {
         id: String,
     },

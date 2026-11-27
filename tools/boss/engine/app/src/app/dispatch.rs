@@ -177,6 +177,7 @@ async fn dispatch_attributed(mut ctx: Dispatch, request: FrontendRequest, bulk_r
         r @ FrontendRequest::GetReviewGuideSummary { .. } => {
             Box::pin(review_guide::handle_get_review_guide_summary(ctx, r))
         }
+        r @ FrontendRequest::GetReviewYieldReport(_) => Box::pin(cost::handle_get_review_yield_report(ctx, r)),
         r @ FrontendRequest::GetRun { .. } => Box::pin(executions::handle_get_run(ctx, r)),
         r @ FrontendRequest::GetSelectedProduct => Box::pin(selected_product::handle_get_selected_product(ctx, r)),
         r @ FrontendRequest::GetSettings => Box::pin(engine_meta::handle_get_settings(ctx, r)),

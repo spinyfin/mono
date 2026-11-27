@@ -4,7 +4,7 @@
 
 use boss_engine_structured_output::fallback::{FallbackCandidate, json_object_candidates};
 use boss_protocol::{
-    ReviewClassification, ReviewComplexityFlag, ReviewLanguageBucket, ReviewMetadataField, ReviewProfile,
+    DeepCriterion, ReviewClassification, ReviewComplexityFlag, ReviewLanguageBucket, ReviewMetadataField, ReviewProfile,
 };
 
 use crate::types::*;
@@ -55,20 +55,21 @@ pub fn classify_pr_review_metadata(metadata: &PrReviewMetadata) -> ReviewClassif
     let profile = if !metadata_missing.is_empty() {
         ReviewProfile::Standard
     } else {
-        let changed_lines = metadata.additions.unwrap_or_default() + metadata.deletions.unwrap_or_default();
-        let changed_file_count = changed_files.len();
+        let deep_inputs = DeepInputs {
+            changed_lines: metadata.additions.unwrap_or_default() + metadata.deletions.unwrap_or_default(),
+            changed_files: changed_files.len(),
+            subsystems: subsystem_buckets.len(),
+            production_languages: production_languages.len(),
+            complexity_flags: complexity_flags.len(),
+        };
         let light_line_limit = if docs_or_test_only { 400 } else { 200 };
         let light_file_limit = if docs_or_test_only { 10 } else { 5 };
-        let is_light = changed_lines <= light_line_limit
-            && changed_file_count <= light_file_limit
-            && subsystem_buckets.len() <= 1
-            && production_languages.len() <= 1
-            && complexity_flags.is_empty();
-        let is_deep = changed_lines > 1_000
-            || changed_file_count > 25
-            || subsystem_buckets.len() >= 4
-            || production_languages.len() >= 3
-            || complexity_flags.len() >= 2;
+        let is_light = deep_inputs.changed_lines <= light_line_limit
+            && deep_inputs.changed_files <= light_file_limit
+            && deep_inputs.subsystems <= 1
+            && deep_inputs.production_languages <= 1
+            && deep_inputs.complexity_flags == 0;
+        let is_deep = !deep_criteria(&deep_inputs).is_empty();
 
         if is_light {
             ReviewProfile::Light
@@ -90,6 +91,112 @@ pub fn classify_pr_review_metadata(metadata: &PrReviewMetadata) -> ReviewClassif
         .maybe_additions(metadata.additions)
         .maybe_deletions(metadata.deletions)
         .build()
+}
+
+/// A PR is Deep when more than this many lines changed (additions plus
+/// deletions).
+pub const DEEP_CHANGED_LINES_OVER: i64 = 1_000;
+/// A PR is Deep when it changed more than this many files.
+pub const DEEP_CHANGED_FILES_OVER: usize = 25;
+/// A PR is Deep when it touches at least this many subsystem buckets.
+pub const DEEP_SUBSYSTEMS_AT_LEAST: usize = 4;
+/// A PR is Deep when its production files span at least this many languages.
+pub const DEEP_PRODUCTION_LANGUAGES_AT_LEAST: usize = 3;
+/// A PR is Deep when it raises at least this many complexity flags.
+pub const DEEP_COMPLEXITY_FLAGS_AT_LEAST: usize = 2;
+
+/// The measurements the Deep criteria read, taken from PR metadata by the
+/// classifier or from a stored [`ReviewClassification`] by a report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeepInputs {
+    pub changed_lines: i64,
+    pub changed_files: usize,
+    pub subsystems: usize,
+    pub production_languages: usize,
+    pub complexity_flags: usize,
+}
+
+impl DeepInputs {
+    /// The measurements a stored classification carries. They are the same
+    /// values the classifier measured: the stored lists are the ones it
+    /// counted, so nothing is re-measured from the PR.
+    pub fn from_classification(classification: &ReviewClassification) -> Self {
+        Self {
+            changed_lines: classification.additions.unwrap_or_default() + classification.deletions.unwrap_or_default(),
+            changed_files: classification.changed_files.len(),
+            subsystems: classification.subsystem_buckets.len(),
+            production_languages: classification.production_languages.len(),
+            complexity_flags: classification.complexity_flags.len(),
+        }
+    }
+}
+
+/// Every Deep criterion that fires for `inputs`, in [`DeepCriterion::ALL`]
+/// order. The classifier selects the Deep profile exactly when this is
+/// non-empty, so it is the one definition of the thresholds; reports that
+/// break Deep down by criterion call it rather than restating them.
+pub fn deep_criteria(inputs: &DeepInputs) -> Vec<DeepCriterion> {
+    DeepCriterion::ALL
+        .into_iter()
+        .filter(|criterion| match criterion {
+            DeepCriterion::ChangedLines => inputs.changed_lines > DEEP_CHANGED_LINES_OVER,
+            DeepCriterion::ChangedFiles => inputs.changed_files > DEEP_CHANGED_FILES_OVER,
+            DeepCriterion::Subsystems => inputs.subsystems >= DEEP_SUBSYSTEMS_AT_LEAST,
+            DeepCriterion::ProductionLanguages => inputs.production_languages >= DEEP_PRODUCTION_LANGUAGES_AT_LEAST,
+            DeepCriterion::ComplexityFlags => inputs.complexity_flags >= DEEP_COMPLEXITY_FLAGS_AT_LEAST,
+        })
+        .collect()
+}
+
+/// The Deep criteria that fire for a stored classification, re-derived with
+/// the current thresholds. Empty when the classification was made with
+/// missing metadata: the classifier does not evaluate Deep then, and neither
+/// does this.
+pub fn deep_criteria_for(classification: &ReviewClassification) -> Vec<DeepCriterion> {
+    if !classification.metadata_missing.is_empty() {
+        return Vec::new();
+    }
+    deep_criteria(&DeepInputs::from_classification(classification))
+}
+
+/// `criterion`'s rule in words, with the thresholds [`deep_criteria`] applies.
+pub fn deep_criterion_rule(criterion: DeepCriterion) -> String {
+    match criterion {
+        DeepCriterion::ChangedLines => format!("more than {DEEP_CHANGED_LINES_OVER} changed lines"),
+        DeepCriterion::ChangedFiles => format!("more than {DEEP_CHANGED_FILES_OVER} changed files"),
+        DeepCriterion::Subsystems => format!("{DEEP_SUBSYSTEMS_AT_LEAST} or more subsystems"),
+        DeepCriterion::ProductionLanguages => {
+            format!("{DEEP_PRODUCTION_LANGUAGES_AT_LEAST} or more production languages")
+        }
+        DeepCriterion::ComplexityFlags => format!("{DEEP_COMPLEXITY_FLAGS_AT_LEAST} or more complexity flags"),
+    }
+}
+
+/// With complexity flags, a PR must have changed at least this many lines to
+/// stay eligible for a post-merge review on size.
+pub const POST_MERGE_FLAGGED_MIN_CHANGED_LINES: i64 = 400;
+
+/// Whether a merged PR stays eligible for a post-merge review when
+/// eligibility is decided by size: it changed more than
+/// [`DEEP_CHANGED_LINES_OVER`] lines or [`DEEP_CHANGED_FILES_OVER`] files, or
+/// it raised at least [`DEEP_COMPLEXITY_FLAGS_AT_LEAST`] complexity flags and
+/// changed at least [`POST_MERGE_FLAGGED_MIN_CHANGED_LINES`] lines. A path
+/// word on its own (one flag, or the subsystem and language spread) does not
+/// qualify.
+pub fn post_merge_size_eligible(inputs: &DeepInputs) -> bool {
+    inputs.changed_lines > DEEP_CHANGED_LINES_OVER
+        || inputs.changed_files > DEEP_CHANGED_FILES_OVER
+        || (inputs.complexity_flags >= DEEP_COMPLEXITY_FLAGS_AT_LEAST
+            && inputs.changed_lines >= POST_MERGE_FLAGGED_MIN_CHANGED_LINES)
+}
+
+/// [`post_merge_size_eligible`] in words, with its thresholds.
+pub fn post_merge_size_eligibility_rule() -> String {
+    format!(
+        "more than {DEEP_CHANGED_LINES_OVER} changed lines or {DEEP_CHANGED_FILES_OVER} changed files, or \
+         {DEEP_COMPLEXITY_FLAGS_AT_LEAST} or more complexity flags and at least \
+         {POST_MERGE_FLAGGED_MIN_CHANGED_LINES} changed lines"
+    )
 }
 
 fn sorted_unique<T: Ord>(values: impl IntoIterator<Item = T>) -> Vec<T> {
@@ -353,24 +460,73 @@ pub fn review_result_from_candidates(candidates: &[FallbackCandidate]) -> (Optio
 /// `revision_warranted = false` in the `ReviewResult` does not suppress the
 /// gate — the engine's own threshold governs.
 pub fn passes_severity_gate(result: &ReviewResult) -> bool {
-    result.findings.iter().any(|f| {
-        matches!(
-            f.severity,
-            ReviewFindingSeverity::Critical | ReviewFindingSeverity::High
-        ) || matches!(
-            f.category,
-            ReviewFindingCategory::Regression
-                | ReviewFindingCategory::Duplication
-                | ReviewFindingCategory::DeferredScope
-                | ReviewFindingCategory::AgentIsms
-        )
-    })
+    result
+        .findings
+        .iter()
+        .any(|f| finding_passes_gate(&f.severity, &f.category))
+}
+
+/// Whether `severity` is one the gate passes on its own.
+pub fn is_critical_or_high(severity: &ReviewFindingSeverity) -> bool {
+    matches!(severity, ReviewFindingSeverity::Critical | ReviewFindingSeverity::High)
+}
+
+/// The four always-on categories: a finding in one passes the gate whatever
+/// its severity. See [`passes_severity_gate`] for why each is on the list.
+pub fn is_always_on_category(category: &ReviewFindingCategory) -> bool {
+    matches!(
+        category,
+        ReviewFindingCategory::Regression
+            | ReviewFindingCategory::Duplication
+            | ReviewFindingCategory::DeferredScope
+            | ReviewFindingCategory::AgentIsms
+    )
+}
+
+/// Whether one finding passes the engine severity gate by itself.
+/// [`passes_severity_gate`] is "any finding does".
+pub fn finding_passes_gate(severity: &ReviewFindingSeverity, category: &ReviewFindingCategory) -> bool {
+    is_critical_or_high(severity) || is_always_on_category(category)
+}
+
+/// Why a set of findings passes the severity gate, or that it does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateBasis {
+    /// At least one finding is critical or high.
+    CriticalOrHigh,
+    /// No finding is critical or high; a low or medium finding in an
+    /// always-on category carries the gate.
+    AlwaysOnCategoryOnly,
+    /// No finding passes the gate.
+    NotPassed,
+}
+
+/// The [`GateBasis`] of `findings`, each given as `(severity, category)`.
+/// A critical regression is [`GateBasis::CriticalOrHigh`]: severity is
+/// checked first, so the always-on basis means the gate would not have
+/// passed without the category rule.
+pub fn gate_basis<'a>(
+    findings: impl IntoIterator<Item = (&'a ReviewFindingSeverity, &'a ReviewFindingCategory)>,
+) -> GateBasis {
+    let mut basis = GateBasis::NotPassed;
+    for (severity, category) in findings {
+        if is_critical_or_high(severity) {
+            return GateBasis::CriticalOrHigh;
+        }
+        if is_always_on_category(category) {
+            basis = GateBasis::AlwaysOnCategoryOnly;
+        }
+    }
+    basis
 }
 
 #[cfg(test)]
 mod tests {
     use crate::*;
-    use boss_protocol::{ReviewComplexityFlag, ReviewLanguageBucket, ReviewMetadataField, ReviewProfile};
+    use boss_protocol::{
+        DeepCriterion, ReviewClassification, ReviewComplexityFlag, ReviewLanguageBucket, ReviewMetadataField,
+        ReviewProfile,
+    };
 
     fn metadata(additions: Option<i64>, deletions: Option<i64>, files: &[&str]) -> PrReviewMetadata {
         PrReviewMetadata {
@@ -1095,5 +1251,341 @@ mod tests {
             !passes_severity_gate(&result),
             "an innocent PR with no duplication/regression/critical findings must not force a revision"
         );
+    }
+
+    // ── Deep criteria: one definition shared by the classifier and reports ──
+
+    fn numbered_paths(count: usize) -> Vec<String> {
+        (0..count).map(|index| format!("src/core/file_{index}.rs")).collect()
+    }
+
+    fn fixture_metadata(additions: i64, deletions: i64, files: Vec<String>) -> PrReviewMetadata {
+        PrReviewMetadata {
+            additions: Some(additions),
+            changed_files: Some(files),
+            deletions: Some(deletions),
+        }
+    }
+
+    fn owned(paths: &[&str]) -> Vec<String> {
+        paths.iter().map(|path| (*path).to_owned()).collect()
+    }
+
+    /// Each fixture names the Deep criteria that must fire for it. Pairs of
+    /// fixtures sit either side of one threshold.
+    fn deep_fixtures() -> Vec<(&'static str, PrReviewMetadata, Vec<DeepCriterion>)> {
+        use DeepCriterion::{ChangedFiles, ChangedLines, ComplexityFlags, ProductionLanguages, Subsystems};
+        let mut everything = numbered_paths(26);
+        everything.extend(owned(&[
+            "a/b/x.rs",
+            "c/d/y.swift",
+            "e/f/z.sh",
+            "g/auth/w.rs",
+            "g/schema/v.rs",
+        ]));
+        vec![
+            ("light", fixture_metadata(10, 0, owned(&["src/lib.rs"])), vec![]),
+            (
+                "standard by size",
+                fixture_metadata(201, 0, owned(&["src/lib.rs"])),
+                vec![],
+            ),
+            ("1000 lines", fixture_metadata(600, 400, owned(&["src/lib.rs"])), vec![]),
+            (
+                "1001 lines",
+                fixture_metadata(601, 400, owned(&["src/lib.rs"])),
+                vec![ChangedLines],
+            ),
+            ("25 files", fixture_metadata(100, 0, numbered_paths(25)), vec![]),
+            (
+                "26 files",
+                fixture_metadata(100, 0, numbered_paths(26)),
+                vec![ChangedFiles],
+            ),
+            (
+                "3 subsystems",
+                fixture_metadata(20, 0, owned(&["a/b/x.rs", "c/d/x.rs", "e/f/x.rs"])),
+                vec![],
+            ),
+            (
+                "4 subsystems",
+                fixture_metadata(20, 0, owned(&["a/b/x.rs", "c/d/x.rs", "e/f/x.rs", "g/h/x.rs"])),
+                vec![Subsystems],
+            ),
+            (
+                "2 languages",
+                fixture_metadata(20, 0, owned(&["src/a.rs", "src/b.swift"])),
+                vec![],
+            ),
+            (
+                "3 languages",
+                fixture_metadata(20, 0, owned(&["src/a.rs", "src/b.swift", "src/c.sh"])),
+                vec![ProductionLanguages],
+            ),
+            (
+                "1 complexity flag",
+                fixture_metadata(20, 0, owned(&["src/auth/x.rs"])),
+                vec![],
+            ),
+            (
+                "2 complexity flags",
+                fixture_metadata(20, 0, owned(&["src/auth/x.rs", "src/schema/y.rs"])),
+                vec![ComplexityFlags],
+            ),
+            (
+                "every criterion at once",
+                fixture_metadata(1_500, 500, everything),
+                DeepCriterion::ALL.to_vec(),
+            ),
+            (
+                "docs only, over the line limit",
+                fixture_metadata(3_000, 0, owned(&["docs/design.md"])),
+                vec![ChangedLines],
+            ),
+            (
+                "docs spread over four subsystems",
+                fixture_metadata(
+                    10,
+                    0,
+                    owned(&["a/docs/x.md", "b/docs/y.md", "c/docs/z.md", "d/docs/w.md"]),
+                ),
+                vec![Subsystems],
+            ),
+            (
+                "missing additions",
+                PrReviewMetadata {
+                    additions: None,
+                    changed_files: Some(numbered_paths(40)),
+                    deletions: Some(5_000),
+                },
+                vec![],
+            ),
+            (
+                "missing changed files",
+                PrReviewMetadata {
+                    additions: Some(5_000),
+                    changed_files: None,
+                    deletions: Some(0),
+                },
+                vec![],
+            ),
+            ("empty changed files", fixture_metadata(5_000, 0, vec![]), vec![]),
+        ]
+    }
+
+    /// The pin: the criteria a report derives and the profile the classifier
+    /// picked agree on every fixture, in both directions. A threshold edited
+    /// in only one place fails here.
+    #[test]
+    fn deep_criteria_agree_with_the_classifier_on_every_fixture() {
+        for (label, metadata, expected) in deep_fixtures() {
+            let classification = classify_pr_review_metadata(&metadata);
+            let derived = deep_criteria_for(&classification);
+            assert_eq!(derived, expected, "criteria for fixture `{label}`");
+            assert_eq!(
+                classification.profile == ReviewProfile::Deep,
+                !derived.is_empty(),
+                "the classifier and the criteria disagree on fixture `{label}`"
+            );
+        }
+    }
+
+    #[test]
+    fn deep_criteria_re_derive_from_a_classification_as_stored() {
+        for (label, metadata, expected) in deep_fixtures() {
+            let stored = serde_json::to_string(&classify_pr_review_metadata(&metadata)).unwrap();
+            let read: ReviewClassification = serde_json::from_str(&stored).unwrap();
+            assert_eq!(deep_criteria_for(&read), expected, "stored fixture `{label}`");
+        }
+    }
+
+    #[test]
+    fn every_deep_threshold_flips_exactly_at_its_boundary() {
+        let base = DeepInputs {
+            changed_lines: 0,
+            changed_files: 0,
+            subsystems: 0,
+            production_languages: 0,
+            complexity_flags: 0,
+        };
+        let fires = |inputs: DeepInputs, criterion| deep_criteria(&inputs).contains(&criterion);
+        let at = |over: i64| DeepInputs {
+            changed_lines: over,
+            ..base
+        };
+        assert!(!fires(at(DEEP_CHANGED_LINES_OVER), DeepCriterion::ChangedLines));
+        assert!(fires(at(DEEP_CHANGED_LINES_OVER + 1), DeepCriterion::ChangedLines));
+        let files = |count| DeepInputs {
+            changed_files: count,
+            ..base
+        };
+        assert!(!fires(files(DEEP_CHANGED_FILES_OVER), DeepCriterion::ChangedFiles));
+        assert!(fires(files(DEEP_CHANGED_FILES_OVER + 1), DeepCriterion::ChangedFiles));
+        let subsystems = |count| DeepInputs {
+            subsystems: count,
+            ..base
+        };
+        assert!(!fires(
+            subsystems(DEEP_SUBSYSTEMS_AT_LEAST - 1),
+            DeepCriterion::Subsystems
+        ));
+        assert!(fires(subsystems(DEEP_SUBSYSTEMS_AT_LEAST), DeepCriterion::Subsystems));
+        let languages = |count| DeepInputs {
+            production_languages: count,
+            ..base
+        };
+        assert!(!fires(
+            languages(DEEP_PRODUCTION_LANGUAGES_AT_LEAST - 1),
+            DeepCriterion::ProductionLanguages
+        ));
+        assert!(fires(
+            languages(DEEP_PRODUCTION_LANGUAGES_AT_LEAST),
+            DeepCriterion::ProductionLanguages
+        ));
+        let flags = |count| DeepInputs {
+            complexity_flags: count,
+            ..base
+        };
+        assert!(!fires(
+            flags(DEEP_COMPLEXITY_FLAGS_AT_LEAST - 1),
+            DeepCriterion::ComplexityFlags
+        ));
+        assert!(fires(
+            flags(DEEP_COMPLEXITY_FLAGS_AT_LEAST),
+            DeepCriterion::ComplexityFlags
+        ));
+        assert!(deep_criteria(&base).is_empty());
+    }
+
+    #[test]
+    fn the_stated_rules_carry_the_thresholds_the_criteria_apply() {
+        assert_eq!(
+            deep_criterion_rule(DeepCriterion::ChangedLines),
+            "more than 1000 changed lines"
+        );
+        assert_eq!(
+            deep_criterion_rule(DeepCriterion::ChangedFiles),
+            "more than 25 changed files"
+        );
+        assert_eq!(deep_criterion_rule(DeepCriterion::Subsystems), "4 or more subsystems");
+        assert_eq!(
+            deep_criterion_rule(DeepCriterion::ProductionLanguages),
+            "3 or more production languages"
+        );
+        assert_eq!(
+            deep_criterion_rule(DeepCriterion::ComplexityFlags),
+            "2 or more complexity flags"
+        );
+        assert_eq!(
+            post_merge_size_eligibility_rule(),
+            "more than 1000 changed lines or 25 changed files, or 2 or more complexity flags and at least 400 changed lines"
+        );
+    }
+
+    // ── Post-merge size eligibility ──
+
+    #[test]
+    fn size_eligibility_keeps_large_prs_and_flagged_prs_above_the_floor() {
+        let inputs = |changed_lines, changed_files, complexity_flags| DeepInputs {
+            changed_lines,
+            changed_files,
+            subsystems: 0,
+            production_languages: 0,
+            complexity_flags,
+        };
+        assert!(!post_merge_size_eligible(&inputs(1_000, 25, 0)));
+        assert!(post_merge_size_eligible(&inputs(1_001, 1, 0)));
+        assert!(post_merge_size_eligible(&inputs(10, 26, 0)));
+        // Flags alone do not qualify; they need the line floor too.
+        assert!(!post_merge_size_eligible(&inputs(399, 3, 2)));
+        assert!(post_merge_size_eligible(&inputs(400, 3, 2)));
+        assert!(!post_merge_size_eligible(&inputs(999, 3, 1)));
+        // Breadth alone (subsystems, languages) is a Deep criterion but not a size.
+        let broad = DeepInputs {
+            changed_lines: 50,
+            changed_files: 3,
+            subsystems: 6,
+            production_languages: 4,
+            complexity_flags: 0,
+        };
+        assert!(!deep_criteria(&broad).is_empty());
+        assert!(!post_merge_size_eligible(&broad));
+    }
+
+    // ── Severity gate: the shared pieces ──
+
+    fn result_with(findings: Vec<ReviewFinding>) -> ReviewResult {
+        ReviewResult {
+            pr_url: "https://github.com/org/repo/pull/1".to_owned(),
+            head_sha: String::new(),
+            summary: String::new(),
+            revision_warranted: false,
+            findings,
+            regression_check: RegressionCheck::default(),
+        }
+    }
+
+    const ALL_SEVERITIES: [ReviewFindingSeverity; 4] = [
+        ReviewFindingSeverity::Critical,
+        ReviewFindingSeverity::High,
+        ReviewFindingSeverity::Medium,
+        ReviewFindingSeverity::Low,
+    ];
+
+    const ALL_CATEGORIES: [ReviewFindingCategory; 9] = [
+        ReviewFindingCategory::Correctness,
+        ReviewFindingCategory::Regression,
+        ReviewFindingCategory::Architecture,
+        ReviewFindingCategory::Readability,
+        ReviewFindingCategory::Tests,
+        ReviewFindingCategory::EdgeCase,
+        ReviewFindingCategory::Duplication,
+        ReviewFindingCategory::DeferredScope,
+        ReviewFindingCategory::AgentIsms,
+    ];
+
+    #[test]
+    fn the_gate_is_critical_or_high_or_one_of_four_always_on_categories() {
+        for severity in &ALL_SEVERITIES {
+            for category in &ALL_CATEGORIES {
+                let expected = matches!(severity, ReviewFindingSeverity::Critical | ReviewFindingSeverity::High)
+                    || matches!(
+                        category,
+                        ReviewFindingCategory::Regression
+                            | ReviewFindingCategory::Duplication
+                            | ReviewFindingCategory::DeferredScope
+                            | ReviewFindingCategory::AgentIsms
+                    );
+                let result = result_with(vec![make_finding(severity.clone(), category.clone())]);
+                assert_eq!(passes_severity_gate(&result), expected, "{severity:?} {category:?}");
+                assert_eq!(
+                    finding_passes_gate(severity, category),
+                    expected,
+                    "{severity:?} {category:?}"
+                );
+            }
+        }
+        assert_eq!(ALL_CATEGORIES.iter().filter(|c| is_always_on_category(c)).count(), 4);
+    }
+
+    #[test]
+    fn gate_basis_names_what_carried_the_gate() {
+        use ReviewFindingCategory::{Correctness, Readability, Regression};
+        use ReviewFindingSeverity::{Critical, High, Low, Medium};
+        assert_eq!(gate_basis([]), GateBasis::NotPassed);
+        assert_eq!(gate_basis([(&Medium, &Correctness)]), GateBasis::NotPassed);
+        assert_eq!(gate_basis([(&High, &Readability)]), GateBasis::CriticalOrHigh);
+        assert_eq!(gate_basis([(&Low, &Regression)]), GateBasis::AlwaysOnCategoryOnly);
+        assert_eq!(
+            gate_basis([(&Medium, &Correctness), (&Low, &Regression)]),
+            GateBasis::AlwaysOnCategoryOnly
+        );
+        // Severity is read first, wherever the finding sits in the list.
+        assert_eq!(
+            gate_basis([(&Low, &Regression), (&Critical, &Correctness)]),
+            GateBasis::CriticalOrHigh
+        );
+        // A critical regression passes on severity, not on the category rule.
+        assert_eq!(gate_basis([(&Critical, &Regression)]), GateBasis::CriticalOrHigh);
     }
 }
