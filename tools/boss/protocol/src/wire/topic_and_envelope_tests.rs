@@ -41,6 +41,11 @@ fn editorial_actions_topic_pins_grammar() {
 }
 
 #[test]
+fn coordinator_chat_topic_pins_grammar() {
+    assert_eq!(TOPIC_COORDINATOR_CHAT, "coordinator.chat");
+}
+
+#[test]
 fn pane_capture_topic_pins_grammar_and_round_trips() {
     assert_eq!(pane_capture_topic("exec_1"), "pane_capture.exec_1");
     assert_eq!(pane_capture_topic_run("pane_capture.exec_1"), Some("exec_1"));

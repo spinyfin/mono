@@ -94,6 +94,7 @@ async fn dispatch_attributed(mut ctx: Dispatch, request: FrontendRequest, bulk_r
         r @ FrontendRequest::CommentsSetIntent { .. } => Box::pin(comments::handle_comments_set_intent(ctx, r)),
         r @ FrontendRequest::CommentsSetStatus { .. } => Box::pin(comments::handle_comments_set_status(ctx, r)),
         r @ FrontendRequest::CommentsUpdateAnchor { .. } => Box::pin(comments::handle_comments_update_anchor(ctx, r)),
+        r @ FrontendRequest::CoordinatorChat { .. } => Box::pin(coordinator_chat::handle_coordinator_chat(ctx, r)),
         r @ FrontendRequest::CreateAttention { .. } => Box::pin(attentions::handle_create_attention(ctx, r)),
         r @ FrontendRequest::CreateAttentionItem { .. } => Box::pin(attentions::handle_create_attention_item(ctx, r)),
         r @ FrontendRequest::CreateAutomation { .. } => Box::pin(automations::handle_create_automation(ctx, r)),

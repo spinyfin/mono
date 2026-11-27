@@ -1,6 +1,7 @@
 use super::*;
 use crate::{
-    CreateChoreInput, CreateInvestigationInput, CreateProjectInput, CreateTaskInput, ProposalKind, WorkItemPatch,
+    CoordinatorChatOperation, CreateChoreInput, CreateInvestigationInput, CreateProjectInput, CreateTaskInput,
+    ProposalKind, WorkItemPatch,
 };
 
 fn replay_admission(request: &FrontendRequest) -> (ReplayContract, AdmissionLane) {
@@ -182,6 +183,42 @@ fn handoff_redelivery_is_not_replayable() {
             worker_progression(&handoff(redeliver)),
             (WorkerAccess::Coordinator, ProgressionAccess::Deny),
             "redeliver={redeliver}"
+        );
+    }
+}
+
+#[test]
+fn coordinator_chat_fetch_is_a_read_and_mutating_ops_are_not_replayable() {
+    let fetch = FrontendRequest::CoordinatorChat {
+        operation: CoordinatorChatOperation::Fetch { after_seq: 0 },
+    };
+    assert_eq!(replay_admission(&fetch), (ReplayContract::Always, AdmissionLane::Bulk));
+    assert_eq!(
+        worker_progression(&fetch),
+        (WorkerAccess::Coordinator, ProgressionAccess::Deny)
+    );
+    for operation in [
+        CoordinatorChatOperation::Send {
+            text: "hi".into(),
+            client_message_id: "c1".into(),
+            attachments: vec![],
+        },
+        CoordinatorChatOperation::Cancel,
+        CoordinatorChatOperation::AnswerPermission {
+            request_id: "0".into(),
+            option_id: "allow-once".into(),
+        },
+    ] {
+        let request = FrontendRequest::CoordinatorChat { operation };
+        assert_eq!(
+            replay_admission(&request),
+            (ReplayContract::Never, AdmissionLane::Ordered),
+            "{request:?}"
+        );
+        assert_eq!(
+            worker_progression(&request),
+            (WorkerAccess::Coordinator, ProgressionAccess::Deny),
+            "{request:?}"
         );
     }
 }

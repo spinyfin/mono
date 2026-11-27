@@ -1202,6 +1202,9 @@ pub enum FrontendEvent {
     /// as Boss snapshotted it at the start of this execution's run.
     #[worker(passthrough)]
     PrBodyResult { body: PrBodyView },
+    /// Reply for [`FrontendRequest::CoordinatorChat`].
+    #[worker(passthrough)]
+    CoordinatorChatResult { outcome: CoordinatorChatOutcome },
     /// Reply for [`FrontendRequest::GetCoordinatorHandoff`]. `handoff` is
     /// `None` only when no coordinator session has ever written one; a
     /// stored-but-undecodable handoff is reported as `WorkError` instead.

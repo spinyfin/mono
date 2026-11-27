@@ -246,6 +246,7 @@ fn seed(variant: &str) -> serde_json::Value {
             "trigger": {"kind": "schedule", "cron": "0 0 * * *", "timezone": "UTC"},
         }),
         "EngineResponse" => json!({"type": tag, "response": {"kind": "focus_worker_pane", "result": {"Ok": {}}}}),
+        "CoordinatorChat" => json!({"type": tag, "op": "fetch", "after_seq": 0}),
         _ => json!({ "type": tag }),
     }
 }

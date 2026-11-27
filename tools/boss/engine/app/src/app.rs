@@ -83,6 +83,7 @@ mod ci_remediation;
 mod comments;
 mod conflict_resolution;
 mod context;
+mod coordinator_chat;
 mod coordinator_guidance;
 mod coordinator_handoff;
 mod cost;

@@ -362,6 +362,16 @@ pub enum FrontendRequest {
         plain_text_projection_version: i64,
     },
 
+    /// App-only coordinator chat: send a message, cancel the in-flight turn,
+    /// answer a permission request, or fetch items after a sequence number.
+    /// The operation sits flat beside `type` under `op`; see
+    /// [`CoordinatorChatOperation`]. Replies with
+    /// [`FrontendEvent::CoordinatorChatResult`].
+    CoordinatorChat {
+        #[serde(flatten)]
+        operation: CoordinatorChatOperation,
+    },
+
     /// Create a new attention (question or followup member). The engine
     /// finds or creates the owning group based on the association and
     /// source fields in the input. Replies with
@@ -2910,6 +2920,14 @@ pub enum FrontendRequest {
     /// the engine's own knowledge of which leases back which executions.
     WorkspacePoolSummary,
 }
+
+mod coordinator_chat;
+pub use coordinator_chat::{
+    CoordinatorChatFetchOutcome, CoordinatorChatOperation, CoordinatorChatOutcome, CoordinatorChatSendAttachment,
+    CoordinatorChatTopicUpdate,
+};
+#[cfg(test)]
+mod coordinator_chat_tests;
 
 mod coordinator_recreate;
 pub use coordinator_recreate::CoordinatorRecreateReason;

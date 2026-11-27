@@ -9,7 +9,8 @@
 //! [`request_contract`] is a single exhaustive `match` with no catch-all, so a
 //! new `FrontendRequest` variant does not compile until someone deliberately
 //! chooses every answer for it. Requests whose answers depend on their payload
-//! (`force_duplicate`, `redeliver`, `refresh`, `UpdateWorkItem` patch fields)
+//! (`force_duplicate`, `redeliver`, `refresh`, `UpdateWorkItem` patch fields,
+//! `CoordinatorChat` operation)
 //! are classified by the branch that applies. This crate only states the
 //! contract; the client turns [`ReplayContract`] into replay windows, the
 //! engine turns [`AdmissionLane`] into queueing behavior, and worker-policy
@@ -35,7 +36,7 @@
 //!     `FindWorkItemsByPr`, `WorkerPoolSummary`, `WorkspacePoolSummary`,
 //!     `TrunkStatus`, `GitHubAuthStatus`, `ProbeStatus`, `MetricsListLive`,
 //!     `MetricsShowLive`, `DebugLiveStatusPipeline`,
-//!     `VerifyCoordinatorResetRequest`).
+//!     `VerifyCoordinatorResetRequest`, `CoordinatorChat` fetch).
 //!   * *Declarative setters*: every `Set*` request writes an absolute value, so
 //!     repeating it leaves the same state.
 //!   * *Documented idempotent writes* (each is called out as idempotent in its
@@ -106,6 +107,7 @@
 //! An independent Allow/Deny for every variant. Progression may read the work
 //! taxonomy and submit proposals; worker-only sanctioned writes stay denied.
 
+use crate::CoordinatorChatOperation;
 use crate::FrontendRequest;
 use crate::FrontendRequest as R;
 use crate::WorkItemPatch;
@@ -326,6 +328,19 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
             ProgressionAccess::Deny,
         ),
         R::VerifyCoordinatorResetRequest { .. } => bulk_read(WorkerAccess::Coordinator, ProgressionAccess::Deny),
+        // Fetch reads the conversation projection. Send, cancel and permission
+        // answers are app-only mutations and must not be replayed. The tier
+        // only excludes worker tiers; the handler enforces app-only.
+        R::CoordinatorChat { operation } => match operation {
+            CoordinatorChatOperation::Fetch { .. } => {
+                bulk_read(WorkerAccess::Coordinator, ProgressionAccess::Deny)
+            }
+            CoordinatorChatOperation::Send { .. }
+            | CoordinatorChatOperation::Cancel
+            | CoordinatorChatOperation::AnswerPermission { .. } => {
+                ordered_unreplayable(WorkerAccess::Coordinator, ProgressionAccess::Deny)
+            }
+        },
         // Payload-dependent: a refresh probe must not hold a bulk slot.
         // Own-PR reads use peer pid → execution → work item, with a run_id
         // cross-check, just like GetWorkerContext/GetPrBody. Refresh stays on
