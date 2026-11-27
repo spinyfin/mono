@@ -91,8 +91,14 @@ fn provision_creates_private_tree_and_keychain_bridge() {
     let runtime = provision_agy_home(&workspace, "hello prompt", "run-prov-1").unwrap();
     assert!(runtime.process_home.starts_with(&homes));
     assert_ne!(runtime.process_home, real_home);
+    // The scoped rc imports the host one, so its settings still apply.
+    let scoped_rc = fs::read_to_string(runtime.process_home.join(".bazelrc")).unwrap();
+    assert!(
+        scoped_rc.contains(&format!("try-import {}", real_home.join(".bazelrc").display())),
+        "{scoped_rc}"
+    );
     assert_eq!(
-        fs::read_to_string(runtime.process_home.join(".bazelrc")).unwrap(),
+        fs::read_to_string(real_home.join(".bazelrc")).unwrap(),
         "build --announce_rc\n"
     );
 

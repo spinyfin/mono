@@ -500,19 +500,15 @@ mod tests {
                     host_home.join(".cache/bazelisk")
                 },
             ),
-            (
-                "TEST_TMPDIR",
-                if cfg!(target_os = "macos") {
-                    host_home.join("Library/Caches/bazel")
-                } else {
-                    host_home.join(".cache/bazel")
-                },
-            ),
         ] {
             assert!(directives.iter().any(
                 |directive| matches!(directive, EnvDirective::Set(actual_key, value) if actual_key == key && value == &expected.display().to_string())
             ));
         }
+        // TEST_TMPDIR would put the Bazel client in test mode.
+        assert!(!directives.iter().any(
+            |directive| matches!(directive, EnvDirective::Set(key, _) | EnvDirective::Unset(key) if key == "TEST_TMPDIR")
+        ));
         assert!(directives.iter().any(
             |directive| matches!(directive, EnvDirective::Set(key, value) if key == GROK_AUTH_PATH_ENV && value == "/host/auth.json")
         ));

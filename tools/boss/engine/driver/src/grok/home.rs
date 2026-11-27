@@ -1305,8 +1305,14 @@ mod tests {
                 .unwrap();
         environment.provision_home_delegates().unwrap();
         assert_eq!(fs::read_link(process_home.join(".cache/bazelcache")).unwrap(), cache);
+        // The scoped rc imports the host one, so its settings still apply.
+        let scoped_rc = fs::read_to_string(process_home.join(".bazelrc")).unwrap();
+        assert!(
+            scoped_rc.contains(&format!("try-import {}", host.join(".bazelrc").display())),
+            "{scoped_rc}"
+        );
         assert_eq!(
-            fs::read_to_string(process_home.join(".bazelrc")).unwrap(),
+            fs::read_to_string(host.join(".bazelrc")).unwrap(),
             "build --announce_rc\n"
         );
     }
