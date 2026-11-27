@@ -37,6 +37,10 @@
 //!    fixture-side pins carry the contract everywhere else. Authenticated
 //!    probes (rules discovery) are the non-test `agy_rules_probe` binary,
 //!    not tests under the mandatory sandbox.
+//!    Claude Code is pinned for lean-environment flag acceptance at
+//!    `MIN_QUALIFIED_CLAUDE_LEAN_VERSION` (`2.1.332`). Live checks soft-skip
+//!    when `claude` is absent unless `BOSS_REQUIRE_CLAUDE_CLI=1` is set (also
+//!    exercised under Bazel by the opt-in `claude_cli_flags_live_test` twin).
 //! 5. **Native-dialect transcript normalize** — every registry slug has a
 //!    fixture in that driver's on-disk dialect, and normalizing it surfaces a
 //!    `[blocked]` marker. Fails closed when a driver is registered without a
@@ -116,6 +120,26 @@ fn require_grok_cli() -> bool {
 
 fn require_agy_cli() -> bool {
     truthy_env("BOSS_REQUIRE_AGY_CLI")
+}
+
+/// Optional explicit Claude binary override for live conformance pins (used by
+/// the opt-in `claude_cli_flags_live_test` twin under Bazel).
+const BOSS_CLAUDE_BIN_ENV: &str = "BOSS_CLAUDE_BIN";
+
+fn require_claude_cli() -> bool {
+    truthy_env("BOSS_REQUIRE_CLAUDE_CLI") || std::env::var_os(BOSS_CLAUDE_BIN_ENV).is_some_and(|v| !v.is_empty())
+}
+
+/// Resolve the Claude CLI the live flag pin exercises: `BOSS_CLAUDE_BIN` first
+/// (canonicalised so runfiles-relative paths survive a `current_dir` change),
+/// else `claude` on `PATH`. `None` is the caller's soft-skip case when no
+/// Claude binary is declared or installed.
+fn claude_cli_binary() -> Option<std::path::PathBuf> {
+    if let Some(raw) = std::env::var_os(BOSS_CLAUDE_BIN_ENV).filter(|v| !v.is_empty()) {
+        let path = std::path::PathBuf::from(raw);
+        return Some(path.canonicalize().unwrap_or(path));
+    }
+    which("claude")
 }
 
 /// Resolve the agy CLI the live pin exercises: `BOSS_AGY_BIN` first (the

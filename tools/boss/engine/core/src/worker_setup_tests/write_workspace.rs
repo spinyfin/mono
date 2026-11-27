@@ -103,6 +103,7 @@ fn write_workspace_files_with_autocompact_adds_compact_instructions() {
     };
     let options = crate::driver::LaunchOptions {
         auto_compact_window: Some(crate::driver::CLAUDE_WORKER_AUTO_COMPACT_WINDOW),
+        ..crate::driver::LaunchOptions::default()
     };
 
     let untreated = write_workspace_files(&input, &ClaudeDriver).unwrap();

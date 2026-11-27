@@ -712,6 +712,96 @@ pub const REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND: &str = python_command_guard!(
 /// `boss_engine::worker_setup::render_claude_md`.
 const CLAUDE_AGENT_RULES_PREAMBLE: &str = agent_rules_preamble!("via claude hooks.", "");
 
+/// Built-in tools removed from every Claude worker launch.
+pub const CLAUDE_BASE_DISALLOWED_TOOLS: &[&str] = &["AskUserQuestion"];
+
+/// Additional built-in tools removed when [`LaunchOptions::lean_environment`]
+/// is enabled (token-consumption investigation R3 step 1).
+pub const CLAUDE_LEAN_EXTRA_DISALLOWED_TOOLS: &[&str] = &[
+    "Artifact",
+    "Workflow",
+    "ScheduleWakeup",
+    "SendFeedback",
+    "ReportFindings",
+];
+
+/// Setting sources loaded under [`LaunchOptions::lean_environment`].
+/// Excludes `user` (the operator's `~/.claude/CLAUDE.md` and personal settings)
+/// while keeping repository `CLAUDE.md`, `.claude/CLAUDE.md` worker rules, and
+/// the `--settings` file carrying Boss's hooks and permissions.
+/// Verified against Claude Code 2.1.332.
+pub const CLAUDE_LEAN_SETTING_SOURCES: &str = "project,local";
+
+/// Build the argv passed to `claude` for a worker launch.
+///
+/// Shared between [`ClaudeDriver::spawn_invocation_with_options`] and the
+/// conformance CLI flag-acceptance check so the exact production arguments are
+/// validated against the installed Claude binary without drifting.
+pub fn claude_spawn_args(request: SpawnRequest<'_>, options: &LaunchOptions) -> Vec<String> {
+    let SpawnRequest {
+        model,
+        effort,
+        settings_path,
+        non_opus_auto_mode,
+        permission_mode_override,
+        run_id: _,
+    } = request;
+    let mut args = vec!["--model".to_owned(), model.to_owned()];
+    if let Some(e) = effort {
+        args.push("--effort".to_owned());
+        args.push(e.to_owned());
+    }
+    // `AskUserQuestion` opens a mid-turn interactive prompt: the turn
+    // never ends, so none of Boss's Stop-boundary machinery (the
+    // `WaitingForInput` transition, `bossctl probe`) ever runs, and the
+    // worker just sits holding its slot until a human happens to be
+    // watching. It is not a permission-gated tool, so neither
+    // `--permission-mode` nor the settings-file `deny` rules touch it —
+    // this flag is the only lever that actually removes it from the
+    // worker's tool surface. A worker that is genuinely blocked already
+    // has the right channel: stop and summarize (a real Stop boundary).
+    // Equals form (`--disallowedTools=...`), not the space-separated
+    // variadic form: the CLI takes `<tools...>` until the next option,
+    // so a space-separated value would swallow any positional argument
+    // appended after it as a second tool name.
+    let mut disallowed: Vec<&str> = CLAUDE_BASE_DISALLOWED_TOOLS.to_vec();
+    if options.lean_environment {
+        disallowed.extend_from_slice(CLAUDE_LEAN_EXTRA_DISALLOWED_TOOLS);
+    }
+    args.push(format!("--disallowedTools={}", disallowed.join(",")));
+    if let Some(mode) = permission_mode_override {
+        // Forced mode (e.g. `dontAsk` for the capability-restricted answer
+        // agent). Suppresses BOTH the `auto` and `--dangerously-skip-permissions`
+        // branches — the latter would bypass the settings allow/deny rules
+        // entirely, defeating the allowlist. The CLI flag wins over the
+        // settings-file `defaultMode`, so this is the authoritative mode.
+        args.push("--permission-mode".to_owned());
+        args.push(mode.to_owned());
+    } else if claude_model_requires_auto_permissions(model) || non_opus_auto_mode {
+        args.push("--permission-mode".to_owned());
+        args.push("auto".to_owned());
+    } else {
+        args.push("--dangerously-skip-permissions".to_owned());
+    }
+    if let Some(settings) = settings_path {
+        args.push("--settings".to_owned());
+        args.push(settings.display().to_string());
+    }
+    if options.lean_environment {
+        // `--bare` and `--safe-mode` are deliberately avoided: both skip
+        // hooks or project CLAUDE.md discovery that Boss relies on.
+        args.push("--disable-slash-commands".to_owned());
+        args.push("--strict-mcp-config".to_owned());
+        args.push("--setting-sources".to_owned());
+        args.push(CLAUDE_LEAN_SETTING_SOURCES.to_owned());
+    }
+    if let Some(window) = options.auto_compact_window {
+        args.push("--autocompact".to_owned());
+        args.push(window.to_owned());
+    }
+    args
+}
+
 /// Reference implementation of [`AgentDriver`] for Claude Code.
 ///
 /// Declares all capabilities (Claude is the full-fidelity reference driver).
@@ -815,55 +905,23 @@ impl AgentDriver for ClaudeDriver {
     }
 
     fn spawn_invocation_with_options(&self, request: SpawnRequest<'_>, options: &LaunchOptions) -> SpawnPlan {
-        let SpawnRequest {
-            model,
-            effort,
-            settings_path,
-            non_opus_auto_mode,
-            permission_mode_override,
-            run_id: _,
-        } = request;
-        let mut cmd = format!("claude --model {model}");
-        if let Some(e) = effort {
-            cmd.push_str(" --effort ");
-            cmd.push_str(e);
-        }
-        // `AskUserQuestion` opens a mid-turn interactive prompt: the turn
-        // never ends, so none of Boss's Stop-boundary machinery (the
-        // `WaitingForInput` transition, `bossctl probe`) ever runs, and the
-        // worker just sits holding its slot until a human happens to be
-        // watching. It is not a permission-gated tool, so neither
-        // `--permission-mode` nor the settings-file `deny` rules touch it —
-        // this flag is the only lever that actually removes it from the
-        // worker's tool surface. A worker that is genuinely blocked already
-        // has the right channel: stop and summarize (a real Stop boundary).
-        // Equals form (`--disallowedTools=AskUserQuestion`), not the
-        // space-separated variadic form: the CLI takes `<tools...>` until the
-        // next option, so a space-separated value would swallow any
-        // positional argument appended after it as a second tool name.
-        cmd.push_str(" --disallowedTools=AskUserQuestion");
-        if let Some(mode) = permission_mode_override {
-            // Forced mode (e.g. `dontAsk` for the capability-restricted answer
-            // agent). Suppresses BOTH the `auto` and `--dangerously-skip-permissions`
-            // branches — the latter would bypass the settings allow/deny rules
-            // entirely, defeating the allowlist. The CLI flag wins over the
-            // settings-file `defaultMode`, so this is the authoritative mode.
-            cmd.push_str(" --permission-mode ");
-            cmd.push_str(mode);
-        } else if claude_model_requires_auto_permissions(model) || non_opus_auto_mode {
-            cmd.push_str(" --permission-mode auto");
-        } else {
-            cmd.push_str(" --dangerously-skip-permissions");
-        }
-        if let Some(settings) = settings_path {
-            // Single-quote the path so a `$TMPDIR` with spaces survives
-            // the pane's shell. Worker settings paths never contain a
-            // single quote, so naive single-quoting is sufficient.
-            cmd.push_str(&format!(" --settings '{}'", settings.display()));
-        }
-        if let Some(window) = options.auto_compact_window {
-            cmd.push_str(" --autocompact ");
-            cmd.push_str(window);
+        let args = claude_spawn_args(request, options);
+        let mut cmd = String::from("claude");
+        let mut quote_next = false;
+        for arg in args {
+            cmd.push(' ');
+            if quote_next {
+                // Single-quote the `--settings` path so a `$TMPDIR` with spaces
+                // survives the pane's shell. Worker settings paths never contain
+                // a single quote, so naive single-quoting is sufficient.
+                cmd.push('\'');
+                cmd.push_str(&arg);
+                cmd.push('\'');
+                quote_next = false;
+            } else {
+                quote_next = arg == "--settings";
+                cmd.push_str(&arg);
+            }
         }
         cmd.push('\n');
         let cmd = super::initial_prompt::launcher_command(CLAUDE_DESCRIPTOR.config_dir, &cmd);
@@ -2423,11 +2481,69 @@ mod tests {
             spawn_request("sonnet"),
             &LaunchOptions {
                 auto_compact_window: Some(crate::CLAUDE_WORKER_AUTO_COMPACT_WINDOW),
+                ..LaunchOptions::default()
             },
         );
         let expected = control.command.trim_end_matches('\n').to_owned() + " --autocompact 200k\n";
         assert_eq!(treated.command, expected);
         assert_eq!(treated.env, control.env);
+    }
+
+    #[test]
+    fn spawn_invocation_with_lean_environment_adds_lean_flags_and_preserves_settings() {
+        let settings = PathBuf::from("/tmp/boss-worker-settings/worker-lean.json");
+        let req = SpawnRequest {
+            model: "sonnet",
+            effort: Some("high"),
+            settings_path: Some(settings.as_path()),
+            non_opus_auto_mode: false,
+            permission_mode_override: None,
+            run_id: None,
+        };
+        let control = ClaudeDriver.spawn_invocation(req);
+        assert!(!control.command.contains("--disable-slash-commands"));
+        assert!(!control.command.contains("--strict-mcp-config"));
+        assert!(!control.command.contains("--setting-sources"));
+
+        let treated = ClaudeDriver.spawn_invocation_with_options(
+            req,
+            &LaunchOptions {
+                lean_environment: true,
+                ..LaunchOptions::default()
+            },
+        );
+        assert!(
+            treated.command.contains(
+                "--disallowedTools=AskUserQuestion,Artifact,Workflow,ScheduleWakeup,SendFeedback,ReportFindings"
+            ),
+            "lean launch must disallow AskUserQuestion and unused built-in tools; got: {}",
+            treated.command
+        );
+        assert!(treated.command.contains("--disable-slash-commands"));
+        assert!(treated.command.contains("--strict-mcp-config"));
+        assert!(treated.command.contains("--setting-sources project,local"));
+        assert!(
+            treated
+                .command
+                .contains("--settings '/tmp/boss-worker-settings/worker-lean.json'"),
+            "lean launch must keep --settings for Boss hooks; got: {}",
+            treated.command
+        );
+        assert!(!treated.command.contains("--bare"));
+        assert!(!treated.command.contains("--safe-mode"));
+        assert_eq!(treated.env, control.env);
+
+        let both = ClaudeDriver.spawn_invocation_with_options(
+            req,
+            &LaunchOptions {
+                auto_compact_window: Some(crate::CLAUDE_WORKER_AUTO_COMPACT_WINDOW),
+                lean_environment: true,
+            },
+        );
+        assert_eq!(
+            both.command,
+            treated.command.trim_end_matches('\n').to_owned() + " --autocompact 200k\n"
+        );
     }
 
     #[test]

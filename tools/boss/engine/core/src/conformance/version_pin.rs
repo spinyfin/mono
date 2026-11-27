@@ -27,7 +27,10 @@ use crate::conformance::fixtures::{
     AGY_HOOK_SESSION_JSONL, CODEX_STDOUT_SESSION_JSONL, PINNED_CODEX_CLI_VERSION, PINNED_CODEX_ITEM_ID_BASE,
     assert_codex_spawn_contract, codex_shaped_driver, decode_jsonl,
 };
-use crate::conformance::{agy_cli_binary, codex_cli_binary, require_agy_cli, require_codex_cli, require_grok_cli};
+use crate::conformance::{
+    agy_cli_binary, claude_cli_binary, codex_cli_binary, require_agy_cli, require_claude_cli, require_codex_cli,
+    require_grok_cli,
+};
 use crate::driver::agy::{
     AGY_VERSION_TIMEOUT, DISABLE_AUTO_UPDATE_ENV, DISABLE_AUTO_UPDATE_VALUE, MIN_QUALIFIED_AGY_VERSION,
     parse_agy_version, run_agy_bounded, version_at_least,
@@ -843,4 +846,533 @@ fn agy_fixture_stream_carries_required_1_5_7_envelope_fields() {
     }
     assert!(saw_session_start, "fixture must include SessionStart");
     assert!(saw_idle_stop, "fixture must include a fullyIdle=true Stop");
+}
+
+// ─── Claude Code lean-environment flag pin ──────────────────────────────────
+//
+// Claude Code auto-updates on developer machines and is not shipped as a
+// checksum-pinned Bazel archive inside `engine_lib_test`, so this follows the
+// `agy` / `grok` convention:
+//   - Always-on contract + probe-classifier tests pin the production argv
+//     emitted by `ClaudeDriver::spawn_invocation_with_options` and guarantee
+//     that the live probe fails closed on any rejected flag.
+//   - Live CLI checks soft-skip when `claude` is absent, unless
+//     `BOSS_REQUIRE_CLAUDE_CLI=1` or `BOSS_CLAUDE_BIN` is set (wired by the
+//     opt-in `//tools/boss/engine/core:claude_cli_flags_live_test` twin).
+//
+// Note: Commander.js short-circuits on `--help` before rejecting unknown
+// options (`claude --bogus --help` exits 0 on 2.1.332). The live flag check
+// therefore invokes `claude <exact production args> -p ""` with `/dev/null`
+// stdin: Commander parses every option, validates `--setting-sources` and
+// `--autocompact`, loads `--settings`, and only then exits with the empty-input
+// error — network-free, credential-free, and fail-loud on any removed or
+// renamed flag.
+
+/// Claude Code version on which the `claude_lean_environment` launch flags
+/// (`--disable-slash-commands`, `--strict-mcp-config`, `--setting-sources
+/// project,local`, `--disallowedTools=...`) and `--autocompact 200k` were
+/// verified to parse, exclude user `CLAUDE.md`/skills/MCP/tools, and keep
+/// project instructions and `--settings` hooks active.
+const MIN_QUALIFIED_CLAUDE_LEAN_VERSION: &str = "2.1.332";
+
+/// Parse `2.1.332 (Claude Code)` stdout from `claude --version`.
+fn parse_claude_cli_version(stdout: &str) -> Option<String> {
+    let token = stdout.lines().next()?.split_whitespace().next()?;
+    let trimmed = token.strip_prefix('v').unwrap_or(token);
+    let parts: Vec<_> = trimmed.split('.').collect();
+    if parts.len() >= 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    {
+        Some(trimmed.to_owned())
+    } else {
+        None
+    }
+}
+
+/// Sentinel stderr emitted by Claude Code when every CLI flag and `--settings`
+/// file parsed cleanly under `-p ""` with empty stdin.
+const CLAUDE_EMPTY_PRINT_INPUT_ERROR: &str =
+    "Input must be provided either through stdin or as a prompt argument when using --print";
+
+/// Classify the result of `claude <args> -p ""` (stdin `/dev/null`).
+///
+/// Fails closed: returns `Ok(())` ONLY when Claude rejected the empty prompt
+/// *after* accepting every flag and loading `--settings`. Any unknown option,
+/// invalid `--setting-sources`, invalid `--autocompact`, missing settings
+/// file, or unrecognised output returns `Err` so flag drift fails loudly.
+fn classify_claude_flag_probe_output(
+    status: std::process::ExitStatus,
+    stdout: &str,
+    stderr: &str,
+) -> Result<(), String> {
+    let combined = format!("{stdout}\n{stderr}");
+    for rejected in [
+        "unknown option",
+        "unexpected argument",
+        "unrecognized",
+        "Error processing",
+        "Settings file not found",
+        "argument '",
+    ] {
+        if combined.contains(rejected) {
+            return Err(format!(
+                "claude rejected a launch flag or option value (matched {rejected:?}, status={status}): stderr={stderr:?} stdout={stdout:?}"
+            ));
+        }
+    }
+    if stderr.contains(CLAUDE_EMPTY_PRINT_INPUT_ERROR) {
+        Ok(())
+    } else {
+        Err(format!(
+            "claude flag probe did not reach the expected post-parse empty-input check (status={status}): stderr={stderr:?} stdout={stdout:?}"
+        ))
+    }
+}
+
+#[test]
+fn claude_lean_spawn_satisfies_flag_contract() {
+    use crate::driver::claude::{
+        CLAUDE_BASE_DISALLOWED_TOOLS, CLAUDE_LEAN_EXTRA_DISALLOWED_TOOLS, CLAUDE_LEAN_SETTING_SOURCES,
+        claude_spawn_args,
+    };
+    use crate::driver::{CLAUDE_WORKER_AUTO_COMPACT_WINDOW, ClaudeDriver, LaunchOptions, SpawnRequest};
+    use std::path::Path;
+
+    let settings = Path::new("/tmp/boss-worker-settings/contract.json");
+    let req = SpawnRequest {
+        model: "opus",
+        effort: Some("high"),
+        settings_path: Some(settings),
+        non_opus_auto_mode: false,
+        permission_mode_override: None,
+        run_id: None,
+    };
+    let options = LaunchOptions {
+        auto_compact_window: Some(CLAUDE_WORKER_AUTO_COMPACT_WINDOW),
+        lean_environment: true,
+    };
+    let args = claude_spawn_args(req, &options);
+    let plan = ClaudeDriver.spawn_invocation_with_options(req, &options);
+
+    assert!(args.iter().any(|a| a == "--disable-slash-commands"));
+    assert!(args.iter().any(|a| a == "--strict-mcp-config"));
+    assert!(
+        args.windows(2)
+            .any(|w| w[0] == "--setting-sources" && w[1] == CLAUDE_LEAN_SETTING_SOURCES),
+        "expected --setting-sources {CLAUDE_LEAN_SETTING_SOURCES}; got {args:?}"
+    );
+    assert!(
+        args.windows(2)
+            .any(|w| w[0] == "--settings" && w[1] == "/tmp/boss-worker-settings/contract.json"),
+        "hook settings file must remain wired under lean_environment; got {args:?}"
+    );
+
+    let disallowed_arg = args
+        .iter()
+        .find(|a| a.starts_with("--disallowedTools="))
+        .expect("expected --disallowedTools=...");
+    for tool in CLAUDE_BASE_DISALLOWED_TOOLS
+        .iter()
+        .chain(CLAUDE_LEAN_EXTRA_DISALLOWED_TOOLS.iter())
+    {
+        assert!(
+            disallowed_arg.contains(tool),
+            "lean launch must disallow {tool}; got {disallowed_arg}"
+        );
+    }
+
+    for forbidden in ["--bare", "--safe-mode"] {
+        assert!(
+            !args.iter().any(|a| a == forbidden) && !plan.command.contains(forbidden),
+            "lean launch must never use {forbidden}; got {args:?} / {}",
+            plan.command
+        );
+    }
+}
+
+#[test]
+fn claude_flag_probe_classifier_fails_loudly_on_rejected_flags() {
+    use std::os::unix::process::ExitStatusExt;
+    let fail_status = std::process::ExitStatus::from_raw(1 << 8);
+
+    assert_eq!(
+        parse_claude_cli_version("2.1.332 (Claude Code)\n").as_deref(),
+        Some("2.1.332")
+    );
+    assert!(version_at_least("2.1.332", MIN_QUALIFIED_CLAUDE_LEAN_VERSION));
+    assert!(!version_at_least("2.1.300", MIN_QUALIFIED_CLAUDE_LEAN_VERSION));
+
+    assert!(
+        classify_claude_flag_probe_output(
+            fail_status,
+            "",
+            "Error: Input must be provided either through stdin or as a prompt argument when using --print\n"
+        )
+        .is_ok()
+    );
+    for bad_stderr in [
+        "error: unknown option '--disable-slash-commands'\n",
+        "Error processing --setting-sources: Invalid setting source: bogus. Valid options are: user, project, local\n",
+        "error: option '--autocompact <auto|tokens>' argument 'bogus' is invalid.\n",
+        "Error: Settings file not found: /tmp/missing.json\n",
+        "something completely unexpected\n",
+        "",
+    ] {
+        assert!(
+            classify_claude_flag_probe_output(fail_status, "", bad_stderr).is_err(),
+            "classifier must fail loudly on {bad_stderr:?}"
+        );
+    }
+}
+
+#[test]
+fn installed_claude_accepts_lean_launch_flags_when_present() {
+    use crate::driver::claude::claude_spawn_args;
+    use crate::driver::{CLAUDE_WORKER_AUTO_COMPACT_WINDOW, LaunchOptions, SpawnRequest};
+    use std::process::Stdio;
+
+    let require = require_claude_cli();
+    let Some(claude_bin) = claude_cli_binary() else {
+        if require {
+            panic!("BOSS_REQUIRE_CLAUDE_CLI/BOSS_CLAUDE_BIN is set but claude is unavailable");
+        }
+        eprintln!(
+            "claude not on PATH; skipping live lean-flag check \
+             (set BOSS_REQUIRE_CLAUDE_CLI=1 or run //tools/boss/engine/core:claude_cli_flags_live_test)"
+        );
+        return;
+    };
+
+    let version_out = Command::new(&claude_bin)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run `{}` --version: {err}", claude_bin.display()));
+    assert!(
+        version_out.status.success(),
+        "`claude --version` failed (status {}): stderr={}",
+        version_out.status,
+        String::from_utf8_lossy(&version_out.stderr),
+    );
+    let version_stdout = String::from_utf8_lossy(&version_out.stdout);
+    let version = parse_claude_cli_version(&version_stdout)
+        .unwrap_or_else(|| panic!("could not parse `claude --version` from {version_stdout:?}"));
+    assert!(
+        version_at_least(&version, MIN_QUALIFIED_CLAUDE_LEAN_VERSION),
+        "installed Claude Code is {version}, below the verified lean-environment floor {MIN_QUALIFIED_CLAUDE_LEAN_VERSION}"
+    );
+
+    let tmp = tempfile::TempDir::new().expect("tempdir for claude flag probe");
+    let cfg_dir = tmp.path().join("claude-cfg");
+    std::fs::create_dir_all(&cfg_dir).expect("create claude cfg dir");
+    let settings_path = tmp.path().join("settings.json");
+    std::fs::write(&settings_path, "{}\n").expect("write empty settings.json");
+
+    let run_probe = |extra_args: &[String]| -> std::process::Output {
+        let mut cmd = Command::new(&claude_bin);
+        cmd.current_dir(tmp.path())
+            .env("HOME", tmp.path())
+            .env("CLAUDE_CONFIG_DIR", &cfg_dir)
+            .env("CLAUDE_CODE_TMPDIR", tmp.path())
+            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+            .env_remove("ANTHROPIC_AUTH_TOKEN")
+            .env_remove("BOSS_EVENTS_SOCKET")
+            .stdin(Stdio::null())
+            .args(extra_args)
+            .args(["-p", ""]);
+        cmd.output()
+            .unwrap_or_else(|err| panic!("failed to spawn claude flag probe: {err}"))
+    };
+
+    let cases = [
+        (
+            "lean_only_opus_auto",
+            SpawnRequest {
+                model: "opus",
+                effort: None,
+                settings_path: Some(settings_path.as_path()),
+                non_opus_auto_mode: false,
+                permission_mode_override: None,
+                run_id: None,
+            },
+            LaunchOptions {
+                lean_environment: true,
+                ..LaunchOptions::default()
+            },
+        ),
+        (
+            "lean_and_autocompact_sonnet_bypass",
+            SpawnRequest {
+                model: "sonnet",
+                effort: Some("high"),
+                settings_path: Some(settings_path.as_path()),
+                non_opus_auto_mode: false,
+                permission_mode_override: None,
+                run_id: None,
+            },
+            LaunchOptions {
+                auto_compact_window: Some(CLAUDE_WORKER_AUTO_COMPACT_WINDOW),
+                lean_environment: true,
+            },
+        ),
+    ];
+
+    for (label, req, opts) in cases {
+        let args = claude_spawn_args(req, &opts);
+        let out = run_probe(&args);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if let Err(err) = classify_claude_flag_probe_output(out.status, &stdout, &stderr) {
+            panic!("Claude Code {version} rejected production lean launch flags for {label} ({args:?}): {err}");
+        }
+    }
+
+    // Negative control: an unknown flag must be rejected loudly so this test
+    // can never silently false-pass the way `--help` would.
+    let bogus_args = vec!["--boss-nonexistent-flag-probe".to_owned()];
+    let bogus_out = run_probe(&bogus_args);
+    let bogus_stdout = String::from_utf8_lossy(&bogus_out.stdout);
+    let bogus_stderr = String::from_utf8_lossy(&bogus_out.stderr);
+    let err = classify_claude_flag_probe_output(bogus_out.status, &bogus_stdout, &bogus_stderr)
+        .expect_err("unknown flag must be rejected loudly by Claude CLI");
+    assert!(
+        err.contains("unknown option"),
+        "expected unknown-option rejection for negative control, got: {err}"
+    );
+}
+
+#[test]
+fn installed_claude_lean_flags_exclude_user_env_and_keep_hooks_when_present() {
+    use crate::driver::claude::{CLAUDE_BASE_DISALLOWED_TOOLS, CLAUDE_LEAN_EXTRA_DISALLOWED_TOOLS, claude_spawn_args};
+    use crate::driver::{LaunchOptions, SpawnRequest};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::process::Stdio;
+    use std::sync::{Arc, Mutex};
+
+    let require = require_claude_cli();
+    let Some(claude_bin) = claude_cli_binary() else {
+        if require {
+            panic!("BOSS_REQUIRE_CLAUDE_CLI/BOSS_CLAUDE_BIN is set but claude is unavailable");
+        }
+        eprintln!(
+            "claude not on PATH; skipping live lean-environment loopback check \
+             (set BOSS_REQUIRE_CLAUDE_CLI=1 or run //tools/boss/engine/core:claude_cli_flags_live_test)"
+        );
+        return;
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback mock API");
+    let addr = listener.local_addr().expect("local_addr");
+    let captured_bodies: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_clone = Arc::clone(&captured_bodies);
+    let server = std::thread::spawn(move || {
+        while let Ok((stream, _)) = listener.accept() {
+            let mut reader = BufReader::new(stream);
+            let mut req_line = String::new();
+            if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
+                continue;
+            }
+            let mut content_length = 0usize;
+            let mut header = String::new();
+            loop {
+                header.clear();
+                if reader.read_line(&mut header).unwrap_or(0) == 0 || header == "\r\n" {
+                    break;
+                }
+                if let Some(val) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = val.trim().parse::<usize>().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            let _ = reader.read_exact(&mut body);
+            let body_str = String::from_utf8_lossy(&body).into_owned();
+            let is_shutdown = req_line.contains("/__shutdown");
+            if !is_shutdown {
+                captured_clone
+                    .lock()
+                    .expect("captured lock")
+                    .push((req_line.clone(), body_str));
+            }
+            let (content_type, resp_body) = if req_line.contains("count_tokens") {
+                ("application/json", r#"{"input_tokens":1}"#.to_owned())
+            } else if is_shutdown {
+                ("text/plain", "bye".to_owned())
+            } else {
+                let sse = concat!(
+                    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-5\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+                    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+                    "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                    "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}\n\n",
+                    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                );
+                ("text/event-stream", sse.to_owned())
+            };
+            let mut stream = reader.into_inner();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                resp_body.len()
+            );
+            let _ = stream.flush();
+            if is_shutdown {
+                break;
+            }
+        }
+    });
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let fake_home = tmp.path().join("home");
+    let user_claude = fake_home.join(".claude");
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(user_claude.join("skills/fake-skill")).expect("create fake skill dir");
+    std::fs::create_dir_all(ws.join(".claude")).expect("create ws .claude");
+
+    let user_sentinel = "USER_GLOBAL_CLAUDE_MD_SENTINEL_417";
+    let skill_sentinel = "USER_SKILL_DESC_SENTINEL_528";
+    let repo_sentinel = "REPO_ROOT_CLAUDE_MD_SENTINEL_639";
+    let worker_rules_sentinel = "WORKER_RULES_CLAUDE_MD_SENTINEL_740";
+    let mcp_sentinel = "fake_user_mcp_server_851";
+
+    std::fs::write(user_claude.join("CLAUDE.md"), format!("{user_sentinel}\n")).expect("write user CLAUDE.md");
+    std::fs::write(
+        user_claude.join("skills/fake-skill/SKILL.md"),
+        format!("---\nname: fake-skill\ndescription: {skill_sentinel}\n---\nBody\n"),
+    )
+    .expect("write fake skill");
+    std::fs::write(
+        fake_home.join(".claude.json"),
+        serde_json::json!({
+            "mcpServers": {
+                mcp_sentinel: { "command": "/bin/echo", "args": ["hello"] }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write .claude.json");
+    std::fs::write(ws.join("CLAUDE.md"), format!("{repo_sentinel}\n")).expect("write repo CLAUDE.md");
+    std::fs::write(ws.join(".claude/CLAUDE.md"), format!("{worker_rules_sentinel}\n"))
+        .expect("write worker rules CLAUDE.md");
+
+    let hook_marker = tmp.path().join("session-start-fired.txt");
+    let settings_path = tmp.path().join("worker-settings.json");
+    std::fs::write(
+        &settings_path,
+        serde_json::json!({
+            "hooks": {
+                "SessionStart": [{
+                    "matcher": "*",
+                    "hooks": [{
+                        "type": "command",
+                        "command": format!("printf fired > '{}'", hook_marker.display()),
+                    }]
+                }]
+            }
+        })
+        .to_string(),
+    )
+    .expect("write settings.json");
+
+    let args = claude_spawn_args(
+        SpawnRequest {
+            model: "sonnet",
+            effort: None,
+            settings_path: Some(settings_path.as_path()),
+            non_opus_auto_mode: false,
+            permission_mode_override: None,
+            run_id: None,
+        },
+        &LaunchOptions {
+            lean_environment: true,
+            ..LaunchOptions::default()
+        },
+    );
+
+    let out = Command::new(&claude_bin)
+        .current_dir(&ws)
+        .env("HOME", &fake_home)
+        .env("CLAUDE_CODE_TMPDIR", tmp.path())
+        .env("ANTHROPIC_BASE_URL", format!("http://{addr}"))
+        .env("ANTHROPIC_API_KEY", "sk-ant-test-fixture-not-a-real-key")
+        .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env_remove("BOSS_EVENTS_SOCKET")
+        .stdin(Stdio::null())
+        .args(&args)
+        .args(["-p", "say hi"])
+        .output()
+        .expect("spawn claude loopback probe");
+
+    // Wake and stop the loopback listener cleanly.
+    if let Ok(mut conn) = std::net::TcpStream::connect(addr) {
+        let _ = write!(conn, "POST /__shutdown HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+    }
+    let _ = server.join();
+
+    assert!(
+        out.status.success(),
+        "lean claude loopback run must succeed; status={} stdout={} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        hook_marker.exists(),
+        "SessionStart hook from --settings must still fire under lean flags"
+    );
+
+    let bodies = captured_bodies.lock().expect("captured lock");
+    let (_, raw_msg) = bodies
+        .iter()
+        .find(|(req, _)| req.contains("messages") && !req.contains("count_tokens"))
+        .expect("loopback server must receive a /messages request");
+
+    assert!(
+        !raw_msg.contains(user_sentinel),
+        "user-level ~/.claude/CLAUDE.md must be excluded by --setting-sources project,local"
+    );
+    assert!(
+        !raw_msg.contains(skill_sentinel),
+        "user skills must be excluded by --disable-slash-commands"
+    );
+    assert!(
+        !raw_msg.contains(mcp_sentinel),
+        "inherited MCP servers must be excluded by --strict-mcp-config"
+    );
+    assert!(
+        raw_msg.contains(repo_sentinel),
+        "repository root CLAUDE.md must remain loaded"
+    );
+    assert!(
+        raw_msg.contains(worker_rules_sentinel),
+        "workspace .claude/CLAUDE.md worker rules must remain loaded"
+    );
+
+    let parsed: serde_json::Value = serde_json::from_str(raw_msg).expect("messages request must be JSON");
+    let tool_names: Vec<&str> = parsed["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    for removed in CLAUDE_BASE_DISALLOWED_TOOLS
+        .iter()
+        .chain(CLAUDE_LEAN_EXTRA_DISALLOWED_TOOLS.iter())
+    {
+        assert!(
+            !tool_names.contains(removed),
+            "disallowed built-in tool {removed} must be absent from tools; got {tool_names:?}"
+        );
+    }
+    assert!(
+        !tool_names.contains(&"Skill"),
+        "Skill tool must be absent when --disable-slash-commands is set; got {tool_names:?}"
+    );
 }

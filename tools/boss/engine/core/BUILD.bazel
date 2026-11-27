@@ -192,6 +192,26 @@ twin_test(
     shard_count = 7,
 )
 
+# Opt-in live CLI flag-acceptance and lean-environment check against the host
+# Claude Code binary (zero extra compilation; reuses :engine_lib_test). Tagged
+# manual because Linux CI runners do not install host `claude`.
+twin_test(
+    name = "claude_cli_flags_live_test",
+    size = "small",
+    timeout = "moderate",
+    args = ["conformance::version_pin::installed_claude_"],
+    binary = ":engine_lib_test",
+    data = ["@host_claude//:claude"],
+    env = {
+        "BOSS_CLAUDE_BIN": "$(rootpath @host_claude//:claude)",
+        "BOSS_REQUIRE_CLAUDE_CLI": "1",
+    },
+    tags = [
+        "manual",
+        "no-remote-exec",
+    ],
+)
+
 network_enabled_rust_test(
     name = "codex_guard_live_test",
     size = "small",
