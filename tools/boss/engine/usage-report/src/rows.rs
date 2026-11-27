@@ -358,7 +358,7 @@ fn coverage(query: &UsageRowsQuery, runs: &[&RunFacts<'_>], gaps: &BTreeSet<Stri
         .notes(notes)
         .maybe_runs_priceable(want_usd.then(|| {
             runs.iter()
-                .filter(|facts| matches!(facts.usd, UsdOutcome::Estimate(_)))
+                .filter(|facts| matches!(facts.usd, UsdOutcome::Estimate { .. }))
                 .count() as u32
         }))
         .build()
@@ -576,7 +576,7 @@ fn run_row(facts: &RunFacts<'_>) -> RunUsageRow {
         .collect();
     let (estimated_usd, unpriceable_cause) = match facts.usd {
         UsdOutcome::NotRequested => (None, None),
-        UsdOutcome::Estimate(usd) => (Some(usd), None),
+        UsdOutcome::Estimate { usd, .. } => (Some(usd), None),
         UsdOutcome::Unpriceable(cause) => (None, Some(cause.to_owned())),
     };
     RunUsageRow::builder()

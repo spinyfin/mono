@@ -21,7 +21,9 @@ pub mod record;
 pub mod rows;
 pub mod series;
 
-pub use classify::{PricedTokens, UsdEstimator, cause, caveat, input_convention, run_coverage, spend_class};
+pub use classify::{
+    PricedTokens, UsdEstimateResult, UsdEstimator, cause, caveat, input_convention, run_coverage, spend_class,
+};
 pub use fold::{RunFold, RunSample, RunTokens, UsdOutcome};
 pub use record::{
     RecordedDriver, UsageExecutionRecord, UsageRunRecord, UsageSeriesRecords, UsageTaskRecord, UsageWindowRecords,

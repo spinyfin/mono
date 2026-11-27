@@ -145,10 +145,24 @@ pub fn estimate_usd(
     )
 }
 
+/// Result of estimating one run's USD cost.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UsdEstimate {
+    pub usd: f64,
+    /// `true` when non-zero cache-write tokens were priced at the single
+    /// 5-minute `cache_write` rate rather than distinct 5m/1h rates — either
+    /// because the run recorded no 5m/1h split, or because the model entry
+    /// has `cache_write_1h: None` and fell back to `cache_write` for non-zero
+    /// 1-hour cache-write tokens.
+    pub used_unsplit_cache_write_rate: bool,
+}
+
 /// Estimated USD for one run's recorded token counts under `price`.
 /// When both `cache_creation_5m_tokens` and `cache_creation_1h_tokens` are
-/// present, each lifetime is priced at its own rate; otherwise
-/// `cache_creation_tokens` falls back to the single `cache_write` rate.
+/// present, each lifetime is priced at its own rate (falling back to
+/// `cache_write` for 1-hour tokens when `cache_write_1h` is `None` but
+/// `cache_write` is `Some`); otherwise `cache_creation_tokens` falls back to
+/// the single `cache_write` rate.
 pub fn estimate_usd_with_cache_split(
     price: ModelPriceUsdPerMillion,
     input_tokens: i64,
@@ -158,6 +172,29 @@ pub fn estimate_usd_with_cache_split(
     cache_creation_1h_tokens: Option<i64>,
     cache_read_tokens: i64,
 ) -> Option<f64> {
+    estimate_usd_detailed(
+        price,
+        input_tokens,
+        output_tokens,
+        cache_creation_tokens,
+        cache_creation_5m_tokens,
+        cache_creation_1h_tokens,
+        cache_read_tokens,
+    )
+    .map(|est| est.usd)
+}
+
+/// Detailed USD estimate for one run, also reporting whether non-zero
+/// cache-write tokens fell back to the single 5-minute `cache_write` rate.
+pub fn estimate_usd_detailed(
+    price: ModelPriceUsdPerMillion,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_creation_tokens: i64,
+    cache_creation_5m_tokens: Option<i64>,
+    cache_creation_1h_tokens: Option<i64>,
+    cache_read_tokens: i64,
+) -> Option<UsdEstimate> {
     const PER_MILLION: f64 = 1_000_000.0;
     let cache_cost = |tokens: i64, rate: Option<f64>| {
         if tokens == 0 {
@@ -166,19 +203,27 @@ pub fn estimate_usd_with_cache_split(
             rate.map(|rate| tokens as f64 * rate)
         }
     };
-    let cache_write_cost = match (cache_creation_5m_tokens, cache_creation_1h_tokens) {
+    let (cache_write_cost, used_unsplit_cache_write_rate) = match (cache_creation_5m_tokens, cache_creation_1h_tokens) {
         (Some(tokens_5m), Some(tokens_1h)) => {
-            cache_cost(tokens_5m, price.cache_write)? + cache_cost(tokens_1h, price.cache_write_1h)?
+            let rate_1h = price.cache_write_1h.or(price.cache_write);
+            let used_fallback = tokens_1h > 0 && price.cache_write_1h.is_none() && price.cache_write.is_some();
+            let cost = cache_cost(tokens_5m, price.cache_write)? + cache_cost(tokens_1h, rate_1h)?;
+            (cost, used_fallback)
         }
-        _ => cache_cost(cache_creation_tokens, price.cache_write)?,
+        _ => {
+            let cost = cache_cost(cache_creation_tokens, price.cache_write)?;
+            (cost, cache_creation_tokens > 0)
+        }
     };
-    Some(
-        (input_tokens as f64 * price.input
-            + output_tokens as f64 * price.output
-            + cache_write_cost
-            + cache_cost(cache_read_tokens, price.cache_read)?)
-            / PER_MILLION,
-    )
+    let usd = (input_tokens as f64 * price.input
+        + output_tokens as f64 * price.output
+        + cache_write_cost
+        + cache_cost(cache_read_tokens, price.cache_read)?)
+        / PER_MILLION;
+    Some(UsdEstimate {
+        usd,
+        used_unsplit_cache_write_rate,
+    })
 }
 
 #[cfg(test)]
@@ -231,6 +276,39 @@ mod tests {
     }
 
     #[test]
+    fn haiku_with_split_1h_cache_writes_falls_back_to_single_rate_and_labels_fallback() {
+        let haiku = price_for_model("claude-haiku-4-5-20251001").unwrap();
+        assert_eq!(haiku.cache_write, Some(1.0));
+        assert_eq!(haiku.cache_write_1h, None);
+
+        // Split present with nonzero 1h tokens: must remain priceable at the single
+        // cache_write rate and flag used_unsplit_cache_write_rate.
+        let est = estimate_usd_detailed(
+            haiku,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            Some(400_000),
+            Some(600_000),
+            1_000_000,
+        )
+        .expect("haiku with split 1h cache writes must remain priceable");
+        let expected = 0.80 + 4.0 + 1.0 + 0.08;
+        assert!((est.usd - expected).abs() < 1e-9, "usd={}", est.usd);
+        assert!(est.used_unsplit_cache_write_rate);
+
+        // Split present with zero 1h tokens: no fallback needed.
+        let est_5m_only = estimate_usd_detailed(haiku, 0, 0, 400_000, Some(400_000), Some(0), 0).unwrap();
+        assert!((est_5m_only.usd - 0.40).abs() < 1e-9);
+        assert!(!est_5m_only.used_unsplit_cache_write_rate);
+
+        // Zero cache writes without split: no fallback flag.
+        let est_zero = estimate_usd_detailed(haiku, 1_000_000, 0, 0, None, None, 0).unwrap();
+        assert!((est_zero.usd - 0.80).abs() < 1e-9);
+        assert!(!est_zero.used_unsplit_cache_write_rate);
+    }
+
+    #[test]
     fn gemini_families_match_all_thinking_suffixes_without_inventing_cache_prices() {
         for (family, input, output) in [("hydrogen", 1.5, 7.5), ("neon", 3.0, 15.0), ("carbon", 4.0, 20.0)] {
             for rung in ["low", "medium", "high", "xhigh"] {
@@ -239,6 +317,7 @@ mod tests {
                 assert_eq!(price.output, output);
                 assert_eq!(estimate_usd(price, 1_000_000, 1_000_000, 0, 0), Some(input + output));
                 assert_eq!(estimate_usd(price, 0, 0, 1, 0), None);
+                assert_eq!(estimate_usd_with_cache_split(price, 0, 0, 1, Some(0), Some(1), 0), None);
                 assert_eq!(estimate_usd(price, 0, 0, 0, 1), None);
             }
         }

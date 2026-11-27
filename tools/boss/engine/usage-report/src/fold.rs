@@ -15,7 +15,7 @@ use boss_protocol::{CostMeasurement, RunCoverage};
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UsdOutcome {
     NotRequested,
-    Estimate(f64),
+    Estimate { usd: f64, unsplit_cache_write: bool },
     Unpriceable(&'static str),
 }
 
@@ -93,6 +93,7 @@ pub struct RunFold {
     priced_runs: u32,
     priced_usd: f64,
     usd_partial: bool,
+    unsplit_cache_write_runs: u32,
 }
 
 impl RunFold {
@@ -127,9 +128,15 @@ impl RunFold {
         self.agent_active_ms += run.agent_active_ms.unwrap_or(0);
         match run.usd {
             UsdOutcome::NotRequested => {}
-            UsdOutcome::Estimate(usd) => {
+            UsdOutcome::Estimate {
+                usd,
+                unsplit_cache_write,
+            } => {
                 self.priced_runs += 1;
                 self.priced_usd += usd;
+                if unsplit_cache_write {
+                    self.unsplit_cache_write_runs += 1;
+                }
             }
             UsdOutcome::Unpriceable(cause) if cause == crate::classify::cause::SUBSCRIPTION_UNPRICED => {}
             UsdOutcome::Unpriceable(_) => self.usd_partial = true,
@@ -157,6 +164,7 @@ impl RunFold {
             .runs_zero(self.zero)
             .total_tokens(self.input + self.output + self.cache_creation + self.cache_read)
             .maybe_estimated_usd((self.priced_runs > 0).then_some(self.priced_usd))
+            .unsplit_cache_write_runs(self.unsplit_cache_write_runs)
             .build()
     }
 }
@@ -223,17 +231,30 @@ mod tests {
     #[test]
     fn usd_is_partial_when_any_measured_run_is_unpriceable() {
         let mut fold = RunFold::default();
-        fold.add(&sample(all(1), UsdOutcome::Estimate(1.5)));
+        fold.add(&sample(
+            all(1),
+            UsdOutcome::Estimate {
+                usd: 1.5,
+                unsplit_cache_write: false,
+            },
+        ));
         fold.add(&sample(all(1), UsdOutcome::Unpriceable("x")));
         let m = fold.finish();
         assert!(m.estimated_usd_partial);
         assert_eq!(m.estimated_usd, Some(1.5));
+        assert_eq!(m.unsplit_cache_write_runs, 0);
     }
 
     #[test]
     fn subscription_unpriced_does_not_mark_usd_partial() {
         let mut fold = RunFold::default();
-        fold.add(&sample(all(1), UsdOutcome::Estimate(1.5)));
+        fold.add(&sample(
+            all(1),
+            UsdOutcome::Estimate {
+                usd: 1.5,
+                unsplit_cache_write: true,
+            },
+        ));
         fold.add(&sample(
             all(1),
             UsdOutcome::Unpriceable(crate::classify::cause::SUBSCRIPTION_UNPRICED),
@@ -241,5 +262,6 @@ mod tests {
         let m = fold.finish();
         assert!(!m.estimated_usd_partial);
         assert_eq!(m.estimated_usd, Some(1.5));
+        assert_eq!(m.unsplit_cache_write_runs, 1);
     }
 }

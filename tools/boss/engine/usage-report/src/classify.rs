@@ -44,8 +44,9 @@ pub mod caveat {
     /// Attached to every run that carries a USD figure: it is an estimate
     /// against an uncited rate table, not billing truth.
     pub const ESTIMATE_ONLY: &str = "estimate_only";
-    /// The run carried a non-zero cache-write count without a 5m/1h split, so
-    /// its USD estimate priced all cache writes at the single 5m rate.
+    /// Non-zero cache-write tokens were priced at the single 5m `cache_write`
+    /// rate rather than distinct 5m/1h rates — either because the run recorded
+    /// no 5m/1h split, or because the model entry has no separate 1h rate.
     pub const UNSPLIT_CACHE_WRITE: &str = "unsplit_cache_write";
 }
 
@@ -83,11 +84,33 @@ pub struct PricedTokens {
     pub cache_read: i64,
 }
 
+/// One run's USD estimate plus whether non-zero cache-write tokens used the
+/// single 5-minute fallback rate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UsdEstimateResult {
+    pub usd: f64,
+    pub unsplit_cache_write: bool,
+}
+
 /// Prices one run. Implemented by the engine over its rate table; kept behind
 /// a trait so this crate does not depend on the (much larger) crate that owns
 /// the table. Returns `None` when the model has no complete price.
 pub trait UsdEstimator {
     fn estimate_usd(&self, model: &str, tokens: PricedTokens) -> Option<f64>;
+
+    /// Detailed estimate carrying whether non-zero cache-write tokens fell
+    /// back to the single 5-minute `cache_write` rate (either because the run
+    /// recorded no 5m/1h split or because the model entry has no separate 1h
+    /// rate).
+    fn estimate_usd_detailed(&self, model: &str, tokens: PricedTokens) -> Option<UsdEstimateResult> {
+        let usd = self.estimate_usd(model, tokens)?;
+        let unsplit_cache_write =
+            tokens.cache_creation > 0 && (tokens.cache_creation_5m.is_none() || tokens.cache_creation_1h.is_none());
+        Some(UsdEstimateResult {
+            usd,
+            unsplit_cache_write,
+        })
+    }
 }
 
 impl<F: Fn(&str, PricedTokens) -> Option<f64>> UsdEstimator for F {
@@ -263,7 +286,7 @@ fn price_run(
     let Some(model) = rec.run_model.as_deref() else {
         return UsdOutcome::Unpriceable(cause::UNKNOWN_MODEL);
     };
-    match pricer.estimate_usd(
+    match pricer.estimate_usd_detailed(
         model,
         PricedTokens {
             input,
@@ -274,7 +297,10 @@ fn price_run(
             cache_read,
         },
     ) {
-        Some(usd) => UsdOutcome::Estimate(usd),
+        Some(est) => UsdOutcome::Estimate {
+            usd: est.usd,
+            unsplit_cache_write: est.unsplit_cache_write,
+        },
         None => UsdOutcome::Unpriceable(cause::UNKNOWN_MODEL),
     }
 }
@@ -324,11 +350,11 @@ fn visit_caveats(
         visit(caveat::USAGE_UNAVAILABLE, &|| Some(reason.clone()));
     }
     match facts.usd {
-        UsdOutcome::Estimate(_) => {
+        UsdOutcome::Estimate {
+            unsplit_cache_write, ..
+        } => {
             visit(caveat::ESTIMATE_ONLY, &|| None);
-            if rec.cache_creation_tokens.is_some_and(|n| n > 0)
-                && (rec.cache_creation_5m_tokens.is_none() || rec.cache_creation_1h_tokens.is_none())
-            {
+            if unsplit_cache_write {
                 visit(caveat::UNSPLIT_CACHE_WRITE, &|| None);
             }
         }

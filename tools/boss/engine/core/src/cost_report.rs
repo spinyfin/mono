@@ -210,7 +210,10 @@ fn fold_record(fold: &mut RunFold, record: &CostRunRecord, want_usd: bool, gaps:
         UsdOutcome::NotRequested
     } else {
         match estimate_record_usd(record) {
-            Some(usd) => UsdOutcome::Estimate(usd),
+            Some(est) => UsdOutcome::Estimate {
+                usd: est.usd,
+                unsplit_cache_write: est.used_unsplit_cache_write_rate,
+            },
             None => {
                 gaps.insert(record.model.as_deref().unwrap_or(NO_MODEL_GAP_LABEL).to_owned());
                 UsdOutcome::Unpriceable(cause::UNKNOWN_MODEL)
@@ -225,9 +228,9 @@ fn fold_record(fold: &mut RunFold, record: &CostRunRecord, want_usd: bool, gaps:
     });
 }
 
-fn estimate_record_usd(record: &CostRunRecord) -> Option<f64> {
+fn estimate_record_usd(record: &CostRunRecord) -> Option<cost_pricing::UsdEstimate> {
     let price = price_for_record(record)?;
-    cost_pricing::estimate_usd_with_cache_split(
+    cost_pricing::estimate_usd_detailed(
         price,
         record.input_tokens?,
         record.output_tokens?,
@@ -455,10 +458,12 @@ pub fn build_top_cost_report(
         }
         let total_tokens = run_tokens(record).known_total();
 
-        let estimated_usd = want_usd.then(|| estimate_record_usd(record)).flatten();
-        if want_usd && estimated_usd.is_none() {
+        let estimate = want_usd.then(|| estimate_record_usd(record)).flatten();
+        if want_usd && estimate.is_none() {
             gaps.insert(record.model.as_deref().unwrap_or(NO_MODEL_GAP_LABEL).to_owned());
         }
+        let estimated_usd = estimate.map(|est| est.usd);
+        let unsplit_cache_write = estimate.is_some_and(|est| est.used_unsplit_cache_write_rate);
 
         rows.push(
             CostTopRow::builder()
@@ -486,6 +491,7 @@ pub fn build_top_cost_report(
                 )
                 .maybe_effort_level(record.effort_level.clone())
                 .maybe_estimated_usd(estimated_usd)
+                .unsplit_cache_write(unsplit_cache_write)
                 .maybe_model(record.model.clone())
                 .maybe_reasoning(record.reasoning.clone())
                 .maybe_started_at_epoch_s(record.started_at_epoch_s)
@@ -765,6 +771,62 @@ mod tests {
         let report = build_task_cost_report("task_1", None, "t", &[split], true, 0);
         // 0.4M * $10 + 0.6M * $16 = $4.00 + $9.60 = $13.60
         assert!((report.overall.estimated_usd.unwrap() - 13.60).abs() < 1e-9);
+        assert_eq!(report.overall.unsplit_cache_write_runs, 0);
+    }
+
+    #[test]
+    fn usd_reports_propagate_unsplit_cache_write_indicator_for_task_window_and_top() {
+        let mut split = measured(record("run_split", "exec_split"), 0, 0, 1_000_000, 0);
+        split.model = Some("claude-fable-5-2".to_owned());
+        split.cache_creation_5m_tokens = Some(400_000);
+        split.cache_creation_1h_tokens = Some(600_000);
+
+        let mut unsplit = measured(record("run_unsplit", "exec_unsplit"), 0, 0, 1_000_000, 0);
+        unsplit.model = Some("claude-fable-5-2".to_owned());
+
+        let mut zero_write = measured(record("run_zero", "exec_zero"), 1_000_000, 0, 0, 0);
+        zero_write.model = Some("claude-fable-5-2".to_owned());
+
+        let mut haiku_1h = measured(record("run_haiku", "exec_haiku"), 0, 0, 1_000_000, 0);
+        haiku_1h.model = Some("claude-haiku-4-5-20251001".to_owned());
+        haiku_1h.cache_creation_5m_tokens = Some(400_000);
+        haiku_1h.cache_creation_1h_tokens = Some(600_000);
+
+        let all = vec![split.clone(), unsplit.clone(), zero_write.clone(), haiku_1h.clone()];
+
+        let task = build_task_cost_report("task_1", None, "t", &all, true, 0);
+        assert_eq!(task.overall.unsplit_cache_write_runs, 2);
+        assert!(task.pricing_gaps.is_empty());
+        assert_eq!(task.by_execution[0].measurement.unsplit_cache_write_runs, 0);
+        assert_eq!(task.by_execution[1].measurement.unsplit_cache_write_runs, 1);
+        assert_eq!(task.by_execution[2].measurement.unsplit_cache_write_runs, 0);
+        assert_eq!(task.by_execution[3].measurement.unsplit_cache_write_runs, 1);
+
+        let window = build_window_cost_report(0, i64::MAX, &all, true, 0);
+        assert_eq!(window.overall.unsplit_cache_write_runs, 2);
+        let fable_bucket = window.by_model.iter().find(|b| b.label == "claude-fable-5-2").unwrap();
+        assert_eq!(fable_bucket.measurement.unsplit_cache_write_runs, 1);
+        let haiku_bucket = window
+            .by_model
+            .iter()
+            .find(|b| b.label == "claude-haiku-4-5-20251001")
+            .unwrap();
+        assert_eq!(haiku_bucket.measurement.unsplit_cache_write_runs, 1);
+
+        let top = build_top_cost_report(0, i64::MAX, 10, &all, true, 0);
+        assert!(top.pricing_gaps.is_empty());
+        let by_id = |id: &str| top.rows.iter().find(|r| r.run_id == id).unwrap();
+        assert!(!by_id("run_split").unsplit_cache_write);
+        assert!(by_id("run_unsplit").unsplit_cache_write);
+        assert!(!by_id("run_zero").unsplit_cache_write);
+        assert!(by_id("run_haiku").unsplit_cache_write);
+        assert!((by_id("run_haiku").estimated_usd.unwrap() - 1.0).abs() < 1e-9);
+
+        // When USD is not requested, no unsplit indicator is set.
+        let top_no_usd = build_top_cost_report(0, i64::MAX, 10, &all, false, 0);
+        assert!(top_no_usd.rows.iter().all(|r| !r.unsplit_cache_write));
+        let task_no_usd = build_task_cost_report("task_1", None, "t", &all, false, 0);
+        assert_eq!(task_no_usd.overall.unsplit_cache_write_runs, 0);
     }
 
     #[test]
