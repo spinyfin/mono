@@ -2415,11 +2415,34 @@ mod restart_and_snapshot_tests {
     }
 
     fn prompt_done_wire(seq: u64, id: i64, stop_reason: &str) -> WireRecord {
+        prompt_done_wire_json(seq, json!(id), stop_reason)
+    }
+
+    fn prompt_wire_json(seq: u64, id: serde_json::Value) -> WireRecord {
+        wire(
+            seq,
+            Direction::ToAgent,
+            json!({"jsonrpc":"2.0","id":id,"method":"session/prompt","params":{"sessionId":"s","prompt":[]}}),
+        )
+    }
+
+    fn prompt_done_wire_json(seq: u64, id: serde_json::Value, stop_reason: &str) -> WireRecord {
         wire(
             seq,
             Direction::FromAgent,
             json!({"jsonrpc":"2.0","id":id,"result":{"stopReason":stop_reason}}),
         )
+    }
+
+    fn remove_key_recursive(value: &mut serde_json::Value, key: &str) -> usize {
+        match value {
+            serde_json::Value::Object(map) => {
+                let own = usize::from(map.remove(key).is_some());
+                own + map.values_mut().map(|v| remove_key_recursive(v, key)).sum::<usize>()
+            }
+            serde_json::Value::Array(items) => items.iter_mut().map(|v| remove_key_recursive(v, key)).sum(),
+            _ => 0,
+        }
     }
 
     fn cancel_wire(seq: u64) -> WireRecord {
@@ -2542,6 +2565,58 @@ mod restart_and_snapshot_tests {
         reducer.apply_record(&prompt_done_wire(2, 9, "end_turn"));
         assert!(!reducer.queue().is_busy());
         assert!(reducer.queue().can_send());
+    }
+
+    #[test]
+    fn unbound_prompt_snapshot_round_trips_through_json_for_numeric_and_string_ids() {
+        for id in [json!(9), json!("req-9")] {
+            let dir = tempfile::tempdir().unwrap();
+            let intent_path = dir.path().join("intent.jsonl");
+            let wire_path = dir.path().join("wire.jsonl");
+            let snap_path = dir.path().join("snapshot.json");
+            let mut log = IntentLog::open(&intent_path).unwrap();
+            let queued_record = log
+                .append_queued_at(10, PromptOrigin::Operator, "waiting", None, Vec::new())
+                .unwrap();
+            let wire_records = vec![prompt_wire_json(1, id.clone())];
+            write_wire_file(&wire_path, &wire_records);
+
+            let mut reducer = ConversationReducer::new(CredentialRedactor::none());
+            reducer.apply_intent_record(&queued_record);
+            reducer.apply_record(&wire_records[0]);
+            assert!(reducer.queue().is_busy(), "id {id}");
+
+            save_snapshot(&snap_path, &reducer.snapshot()).unwrap();
+            let SnapshotLoad::Loaded(loaded) = load_snapshot(&snap_path) else {
+                panic!("snapshot with id {id} must load");
+            };
+            let restored = ConversationReducer::from_snapshot(*loaded, CredentialRedactor::none()).unwrap();
+            assert_eq!(restored.queue(), reducer.queue(), "id {id}");
+            assert!(restored.queue().is_busy(), "id {id}");
+            assert!(!restored.queue().can_send(), "id {id}");
+
+            let recovered = recover_from_files(
+                &wire_path,
+                Some(&intent_path),
+                Some(&snap_path),
+                CredentialRedactor::none(),
+                DEFAULT_TOOL_TEXT_LIMIT,
+                UnsentDispatchPolicy::ReconcileNow,
+            )
+            .unwrap();
+            assert!(
+                matches!(recovered.snapshot_status, SnapshotLoadStatus::Hit { .. }),
+                "id {id}"
+            );
+            assert_eq!(recovered.reducer.queue(), reducer.queue(), "id {id}");
+            assert!(recovered.reducer.queue().is_busy(), "id {id}");
+
+            // The response clears exactly the unbound prompt that was restored.
+            let mut after = recovered.reducer;
+            after.apply_record(&prompt_done_wire_json(2, id.clone(), "end_turn"));
+            assert!(!after.queue().is_busy(), "id {id}");
+            assert!(after.queue().can_send(), "id {id}");
+        }
     }
 
     #[test]
@@ -2670,42 +2745,84 @@ mod restart_and_snapshot_tests {
 
     #[test]
     fn version_one_snapshot_is_a_cache_miss_so_unbound_prompts_are_not_lost() {
-        // Written before unbound-prompt tracking existed: an in-flight unbound
-        // prompt lived only in the wire tracker, so the queue loaded as idle.
-        let old = br#"{"schema_version":1}"#;
+        let dir = tempfile::tempdir().unwrap();
+        let intent_path = dir.path().join("intent.jsonl");
+        let wire_path = dir.path().join("wire.jsonl");
+        let snap_path = dir.path().join("old.json");
+        let mut log = IntentLog::open(&intent_path).unwrap();
+        // An operator prompt is queued while an unbound prompt (no matching
+        // intent record) is outstanding on the wire.
+        let queued_record = log
+            .append_queued_at(10, PromptOrigin::Operator, "next", None, Vec::new())
+            .unwrap();
+        let mut wire_records = vec![prompt_wire(1, 5)];
+        write_wire_file(&wire_path, &wire_records);
+
+        // Build a snapshot in the version-1 shape: a mid-turn snapshot with the
+        // schema version rewound and the unbound-prompt field absent.
+        let mut live = ConversationReducer::new(CredentialRedactor::none());
+        live.apply_intent_record(&queued_record);
+        live.apply_record(&wire_records[0]);
+        let mut body = serde_json::to_value(live.snapshot()).unwrap();
+        body["schema_version"] = json!(1);
+        assert_eq!(remove_key_recursive(&mut body, "unbound_prompts"), 1);
+        let old = serde_json::to_vec(&body).unwrap();
+        std::fs::write(&snap_path, &old).unwrap();
         assert_eq!(
-            load_snapshot_bytes(old),
+            load_snapshot_bytes(&old),
             SnapshotLoad::VersionMismatch {
                 found: 1,
                 expected: SNAPSHOT_SCHEMA_VERSION,
             }
         );
-        let dir = tempfile::tempdir().unwrap();
-        let wire_path = dir.path().join("wire.jsonl");
-        let snap_path = dir.path().join("old.json");
-        std::fs::write(&snap_path, old).unwrap();
-        let wire_records = vec![prompt_wire(1, 5)];
-        write_wire_file(&wire_path, &wire_records);
-        let res = recover_from_files(
-            &wire_path,
-            None,
-            Some(&snap_path),
+
+        let recover = |wire_records: &[WireRecord]| {
+            write_wire_file(&wire_path, wire_records);
+            recover_from_files(
+                &wire_path,
+                Some(&intent_path),
+                Some(&snap_path),
+                CredentialRedactor::none(),
+                DEFAULT_TOOL_TEXT_LIMIT,
+                UnsentDispatchPolicy::ReconcileNow,
+            )
+            .unwrap()
+        };
+        let persisted = crate::intent::read_intent_file_if_exists(&intent_path).unwrap();
+
+        // Outstanding unbound prompt: the queued prompt is held back.
+        let res = recover(&wire_records);
+        let full = replay_with_intent_log(
+            &wire_records,
+            &persisted,
             CredentialRedactor::none(),
             DEFAULT_TOOL_TEXT_LIMIT,
-            UnsentDispatchPolicy::ReconcileNow,
-        )
-        .unwrap();
-        let full = replay_with_intent_log(&wire_records, &[], CredentialRedactor::none(), DEFAULT_TOOL_TEXT_LIMIT);
+        );
         assert!(matches!(
             res.snapshot_status,
-            SnapshotLoadStatus::VersionMismatch { .. }
+            SnapshotLoadStatus::VersionMismatch { found: 1, .. }
         ));
-        assert_eq!(res.reducer.queue(), full.queue());
+        assert_eq!(res.reducer.queue().queued_len(), 1);
         assert!(res.reducer.queue().is_busy());
-        assert!(
-            !res.reducer.queue().can_send(),
-            "unbound prompt blocks dispatch until its response"
+        assert!(!res.reducer.queue().can_send());
+        assert!(res.reducer.queue().peek_next_dispatchable().is_none());
+        assert_eq!(res.reducer.queue(), full.queue());
+
+        // Once the unbound prompt's response arrives, the queued prompt is released.
+        wire_records.push(prompt_done_wire(2, 5, "end_turn"));
+        let res = recover(&wire_records);
+        let full = replay_with_intent_log(
+            &wire_records,
+            &persisted,
+            CredentialRedactor::none(),
+            DEFAULT_TOOL_TEXT_LIMIT,
         );
+        assert!(res.reducer.queue().can_send());
+        assert_eq!(
+            res.reducer.queue().peek_next_dispatchable().unwrap().intent_id,
+            queued_record.intent_id()
+        );
+        assert_eq!(res.reducer.queue(), full.queue());
     }
 
     #[test]
