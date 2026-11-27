@@ -1673,6 +1673,15 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "pr_body_result",
         },
         TagCase {
+            label: "CoordinatorChatResult",
+            event: FrontendEvent::CoordinatorChatResult {
+                outcome: CoordinatorChatOutcome::BackendNotRunning {
+                    reason: "the chat backend is not running".into(),
+                },
+            },
+            expected_tag: "coordinator_chat_result",
+        },
+        TagCase {
             label: "CoordinatorHandoffResult",
             event: FrontendEvent::CoordinatorHandoffResult {
                 handoff: Some(coordinator_handoff()),
@@ -2511,6 +2520,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::WorkerContextResult { .. }
         | FrontendEvent::PrStatusResult { .. }
         | FrontendEvent::PrBodyResult { .. }
+        | FrontendEvent::CoordinatorChatResult { .. }
         | FrontendEvent::CoordinatorHandoffResult { .. }
         | FrontendEvent::CoordinatorHandoffSet { .. }
         | FrontendEvent::CoordinatorResetRequestStatus { .. }

@@ -19,6 +19,11 @@ pub const TOPIC_ENGINE_HEALTH: &str = "engine.health";
 /// Configured driver traffic split published after a successful `SetDriverTrafficSplit`.
 pub const TOPIC_DRIVER_TRAFFIC_SPLIT: &str = "driver.traffic_split";
 
+/// Global topic carrying coordinator-chat conversation pushes
+/// ([`crate::TopicEventPayload::CoordinatorChat`]). One generation at a time:
+/// item, streaming delta, or connection-state change, including a failed start.
+pub const TOPIC_COORDINATOR_CHAT: &str = "coordinator.chat";
+
 pub fn work_product_topic(product_id: &str) -> String {
     format!("work.product.{product_id}")
 }

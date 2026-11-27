@@ -11,9 +11,9 @@
 
 use super::*;
 use boss_protocol::{
-    BranchNaming, CoordinatorRecreateReason, CreateIdeaInput, ExecutionKind, ExecutionStatus, FrontendEvent,
-    FrontendRequest, Idea, IdeaGraduationKind, IdeaPatch, IdeaStatus, Product, ProposalKind, Task, TaskKind,
-    TaskStatus, WorkExecution, WorkItemDependencyDetail, WorkItemPatch, WorkRun, WorkerContextBundle,
+    BranchNaming, CoordinatorChatOperation, CoordinatorRecreateReason, CreateIdeaInput, ExecutionKind, ExecutionStatus,
+    FrontendEvent, FrontendRequest, Idea, IdeaGraduationKind, IdeaPatch, IdeaStatus, Product, ProposalKind, Task,
+    TaskKind, TaskStatus, WorkExecution, WorkItemDependencyDetail, WorkItemPatch, WorkRun, WorkerContextBundle,
     WorkerTierDenialReason,
 };
 use policy::variant_name;
@@ -373,6 +373,16 @@ fn coordinator_verbs_stay_closed() {
             force_without_handoff: false,
             expected_spawn_token: "token".into(),
             reason: CoordinatorRecreateReason::OperatorReset,
+        },
+        FrontendRequest::CoordinatorChat {
+            operation: CoordinatorChatOperation::Send {
+                text: "hi".into(),
+                client_message_id: "c1".into(),
+                attachments: vec![],
+            },
+        },
+        FrontendRequest::CoordinatorChat {
+            operation: CoordinatorChatOperation::Fetch { after_seq: 0 },
         },
         FrontendRequest::GetCoordinatorHandoff { redeliver: false },
         FrontendRequest::GetCoordinatorHandoff { redeliver: true },

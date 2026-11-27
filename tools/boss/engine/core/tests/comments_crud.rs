@@ -220,6 +220,9 @@ async fn comment_topic_invalidation_reaches_subscriber() -> Result<()> {
         TopicEventPayload::WorkerPaneCapture { .. } => {
             panic!("unexpected pane capture on comment topic")
         }
+        TopicEventPayload::CoordinatorChat { .. } => {
+            panic!("unexpected coordinator chat update on comment topic")
+        }
     }
 
     Ok(())

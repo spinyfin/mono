@@ -490,6 +490,9 @@ async fn second_client_receives_invalidation_from_first() -> Result<()> {
         TopicEventPayload::WorkerPaneCapture { .. } => {
             panic!("unexpected pane capture on work topic")
         }
+        TopicEventPayload::CoordinatorChat { .. } => {
+            panic!("unexpected coordinator chat update on work topic")
+        }
     }
 
     Ok(())
@@ -579,6 +582,9 @@ async fn cli_status_update_propagates_to_subscriber_within_one_second() -> Resul
         }
         TopicEventPayload::WorkerPaneCapture { .. } => {
             panic!("unexpected pane capture on work topic")
+        }
+        TopicEventPayload::CoordinatorChat { .. } => {
+            panic!("unexpected coordinator chat update on work topic")
         }
     }
 

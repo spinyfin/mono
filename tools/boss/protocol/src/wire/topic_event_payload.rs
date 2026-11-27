@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::InvalidationClass;
+use super::{CoordinatorChatTopicUpdate, InvalidationClass};
 use crate::types::EditorialAction;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +61,14 @@ pub enum TopicEventPayload {
         /// Plain words for a state other than `live`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+    },
+    /// A coordinator-chat conversation update, published on
+    /// [`crate::TOPIC_COORDINATOR_CHAT`]. `generation` names the coordinator
+    /// generation the update belongs to; `update` is an item, a streaming
+    /// delta, or a connection-state change (including a failed start).
+    CoordinatorChat {
+        generation: String,
+        update: CoordinatorChatTopicUpdate,
     },
 }
 
