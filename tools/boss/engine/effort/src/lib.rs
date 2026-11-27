@@ -326,6 +326,14 @@ pub struct SpawnConfig {
     /// Per-level prompt addendum to prepend to `.claude/initial-prompt.txt`.
     /// `None` when the level has no addendum (or no level is set).
     pub prompt_addendum: Option<&'static str>,
+    /// Canonical text of the experiment arm set this launch runs under
+    /// (`boss_feature_flags::ExperimentArmSet::encode`), carried to the dispatch
+    /// site that stamps the launch record and the `pane_spawned` event. It is
+    /// opaque here: this crate resolves the spawn knobs and never reads an arm.
+    /// `{}` records that nothing was running. `None` when the runner that
+    /// produced this config does not run experiments, which leaves the launch
+    /// record's arms "not recorded".
+    pub experiment_arms: Option<String>,
 }
 
 impl SpawnConfig {
@@ -735,6 +743,7 @@ pub fn resolve_spawn_config_in(
         driver,
         driver_source,
         prompt_addendum: effort_level.and_then(|l| (menu.prompt_addendum_for_level)(l)),
+        experiment_arms: None,
     })
 }
 
@@ -1502,6 +1511,7 @@ mod tests {
                     driver: ENGINE_DEFAULT_DRIVER.to_owned(),
                     driver_source: DriverResolutionSource::EngineDefault,
                     prompt_addendum: None,
+                    experiment_arms: None,
                 };
                 let inv = cfg.claude_invocation(non_opus_auto_mode, None);
                 assert!(
@@ -1529,6 +1539,7 @@ mod tests {
                 driver: ENGINE_DEFAULT_DRIVER.to_owned(),
                 driver_source: DriverResolutionSource::EngineDefault,
                 prompt_addendum: None,
+                experiment_arms: None,
             };
             let inv = cfg.claude_invocation(false, None);
             assert!(
@@ -1555,6 +1566,7 @@ mod tests {
                 driver: ENGINE_DEFAULT_DRIVER.to_owned(),
                 driver_source: DriverResolutionSource::EngineDefault,
                 prompt_addendum: None,
+                experiment_arms: None,
             };
             let inv = cfg.claude_invocation(true, None);
             assert!(
@@ -1615,6 +1627,7 @@ mod tests {
                     driver: "claude".to_owned(),
                     driver_source: DriverResolutionSource::EngineDefault,
                     prompt_addendum: None,
+                    experiment_arms: None,
                 };
                 let inv = cfg.claude_invocation(non_opus_auto_mode, None);
                 assert!(

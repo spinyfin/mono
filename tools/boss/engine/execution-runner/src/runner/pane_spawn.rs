@@ -16,6 +16,7 @@ use crate::work::{WorkDb, WorkExecution, WorkItem};
 use boss_execution_contracts::slot_id_from_worker_id;
 use boss_protocol::{ExecutionKind, ReviewBatchMemberRole, WorkItemBinding};
 
+use super::experiment_arms::resolve_launch_experiment_arms;
 use super::prompt::structured_output_env_vars;
 use super::spawn_confirmation::PromptSubmitPolicy;
 use super::work_item::{work_item_id, work_item_name, work_item_task_kind};
@@ -951,6 +952,9 @@ impl ExecutionRunner for PaneSpawnRunner {
         // taught to make would hold every run to the run-done backstop.
         let run_done_proposals_seam_enabled = self.feature_flags.is_enabled("worker_proposals")
             && self.feature_flags.is_enabled("run_done_proposals_seam");
+        // Resolved before composing, so the brief and the launch record the
+        // dispatch site writes come from one set; see `experiment_arms`.
+        let experiment_arms = resolve_launch_experiment_arms(&self.feature_flags, &self.work_db, execution);
         let compose_began = std::time::Instant::now();
         let ComposedWorkerSpawn {
             prompt_text,
@@ -974,6 +978,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 .review_batch_fanout_enabled(review_batch_fanout_enabled)
                 .run_done_proposals_seam_enabled(run_done_proposals_seam_enabled)
                 .maybe_repo_guidance(spawner.repo_guidance())
+                .experiment_arms(experiment_arms)
                 .build(),
         )
         .await

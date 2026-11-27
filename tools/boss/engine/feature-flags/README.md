@@ -83,7 +83,8 @@ release. The default-ON rule means:
   ON for everyone, available to be killed by hand.
 - A flag whose default is OFF is really a "manual opt-in" feature.
   Use sparingly; most things that are off-by-default should not be
-  in the codebase yet.
+  in the codebase yet. Experiment flags (below) are a deliberate case
+  of this: they ship off by design.
 
 **The flag is the kill switch, not the design.** Flags are for cases
 where you want a human-toggleable escape hatch from a behaviour that
@@ -91,6 +92,47 @@ is broadly correct but occasionally wrong. They are not for permanent
 configuration knobs (use the metadata KV or a config file for those)
 and they are not for hiding incomplete features (don't ship code
 that doesn't work yet).
+
+## Experiments
+
+A token-spend experiment is a change that half of PR families get and half
+do not, measured against each other and stopped in one click. It is built
+from the flags above rather than beside them:
+
+- **One registry entry.** `EXPERIMENTS` in `src/experiments.rs` lists each
+  experiment's `key`, optional `lane`, the flags it `requires`, and whether it
+  `splits`. Registration order is lane priority.
+- **Flags in the ordinary registry**, category `experiments`: `<key>` (default
+  **off**), `<key>_ab_split` (default **on**; only for experiments that
+  split) and one master switch, `token_experiments` (default **on**). Three
+  states result: off, split (half of families treated) and all (every family
+  treated). An experiment key is a manual opt-in by design, so the "default ON"
+  rule in the safety contract below does not apply to it: every experiment
+  ships inert.
+- **A pure assignment.** `experiment_state` turns flag values into a state
+  (applying the master switch, required flags and the lane rule: when two
+  experiments in one lane are on, the one registered first runs and the other
+  is held) and `assign_arm` turns a state and a bucket in `[0, 100)` into an
+  arm. The bucket is a hash of the PR family and the experiment key, computed
+  by the work database, so this crate takes no dependency on it. Below 50 is
+  treatment.
+- **A canonical record.** `ExperimentArmSet` is the arm of every experiment
+  that was running at a launch, encoded as a sorted JSON object
+  (`{"batched_search":"treatment"}`; `{}` when nothing ran). The engine writes
+  it into the execution's launch record and reuses it for later runs of the
+  same execution; see
+  [`tools/boss/docs/token-experiments.md`](../../docs/token-experiments.md).
+
+Consumers never read an experiment flag directly. The runner resolves the
+arm set once per launch (`FeatureFlagsStore::resolve_experiment_arms`), turns
+it into plain options for the prompt composer and the drivers, and passes the
+rest of the engine the recorded set.
+
+To add an experiment: append an `ExperimentSpec` to `EXPERIMENTS`, register its
+flags in `REGISTRY` with category `experiments` (a test fails if the two
+registries disagree), and add its section to the operator doc. A key names one
+treatment for its whole life: change a threshold under a new key, and never
+reuse a key.
 
 ## File format and race semantics
 

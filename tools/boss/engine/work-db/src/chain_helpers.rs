@@ -160,6 +160,25 @@ pub(crate) fn chain_roots<S: AsRef<str>>(conn: &Connection, ids: &[S]) -> Result
     Ok(roots)
 }
 
+/// The PR family an execution belongs to for experiment assignment: the chain
+/// root work item, so a work item and all of its revisions, reviews and CI or
+/// conflict fixes draw the same arm. This is the root the review cycle already
+/// counts on ([`chain_root`]) and the family `boss cost sol` enrols.
+///
+/// A work item with no task row (an answer agent's comment, an automation) is
+/// its own family, which [`chain_root`] already returns. A review guide's work
+/// item is its source comparison, so it takes the family of the PR it explains
+/// when that resolves, and is its own family when it does not.
+pub(crate) fn experiment_family_root(conn: &Connection, kind: &ExecutionKind, work_item_id: &str) -> Result<String> {
+    if *kind == ExecutionKind::PrReviewGuide {
+        return match crate::review_guide_sources::comparison_root_and_head_on(conn, work_item_id)? {
+            Some(comparison) => chain_root(conn, &comparison.root_task_id),
+            None => Ok(work_item_id.to_owned()),
+        };
+    }
+    chain_root(conn, work_item_id)
+}
+
 /// Flip every `in_review` revision whose chain root is `chain_root_id`
 /// to `done`.  Called from `mark_chore_pr_merged` so that when the
 /// parent PR merges all in-review revisions finish in the same

@@ -24,10 +24,13 @@ mod design;
 mod repo_gate;
 #[path = "prompt/revision_rebase.rs"]
 mod revision_rebase;
+#[path = "prompt/tool_use.rs"]
+mod tool_use;
 use block_boundary::block_boundary_fragment;
 use ci_monitoring::ci_monitoring_directive;
 use design::{compose_design_directive, compose_design_postmortem_directive};
 pub(super) use revision_rebase::revision_conflict_notice;
+use tool_use::{with_batched_search_directive, worker_wait_protocol_directive};
 
 #[derive(bon::Builder)]
 pub(super) struct ExecutionPromptParams<'a> {
@@ -126,6 +129,10 @@ pub(super) struct ExecutionPromptParams<'a> {
     bazel_workspace: Option<bool>,
     #[builder(default)]
     remote_workspace: bool,
+    /// Whether this run gets the batched-search rule: independent searches and
+    /// reads issued together in one turn. Applies to Standard workers only.
+    #[builder(default)]
+    batched_search: bool,
 }
 
 /// The structured-output payload this execution's prompt is built around —
@@ -204,7 +211,14 @@ pub(super) fn structured_output_env_vars(
 }
 
 pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
-    with_bazel_caching_rule(compose_execution_prompt_body(params))
+    let batched_search =
+        params.batched_search && worker_kind_for_execution(&params.execution.kind) == WorkerKind::Standard;
+    let prompt = with_bazel_caching_rule(compose_execution_prompt_body(params));
+    if batched_search {
+        with_batched_search_directive(prompt)
+    } else {
+        prompt
+    }
 }
 
 fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
@@ -230,6 +244,7 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
         merge_order_preservation,
         bazel_workspace,
         remote_workspace,
+        batched_search: _,
     } = params;
     let bazel_workspace = if remote_workspace {
         bazel_workspace
@@ -766,12 +781,18 @@ pub(crate) fn bazel_conflict_resolution_gate_text(seam_enabled: bool) -> String 
     )
 }
 
+/// Insert `rule` directly under the prompt's opening line, where the rules
+/// every worker inherits sit.
+pub(super) fn insert_under_opening_line(prompt: String, rule: &str) -> String {
+    match prompt.split_once('\n') {
+        Some((opening, rest)) => format!("{opening}\n{rule}{rest}"),
+        None => format!("{prompt}{rule}"),
+    }
+}
+
 /// Apply the cache policy to generic and separately composed worker prompts.
 pub(super) fn with_bazel_caching_rule(prompt: String) -> String {
-    match prompt.split_once('\n') {
-        Some((opening, rest)) => format!("{opening}\n{}{rest}", bazel_caching_rule_text()),
-        None => format!("{prompt}{}", bazel_caching_rule_text()),
-    }
+    insert_under_opening_line(prompt, bazel_caching_rule_text())
 }
 
 /// Append cache policy without splitting a pinned template.
@@ -1054,29 +1075,6 @@ pub(crate) fn worker_escalation_protocol_directive(seam_enabled: bool) -> String
      work when `\"$BOSS_BIN\" propose` itself is down, so it carries both signal kinds rather than teaching \
      a second marker grammar back. Do not use it once `\"$BOSS_BIN\" propose` has already succeeded for this \
      signal; it is a last resort, not a second channel.\n"
-        .to_string()
-}
-
-/// Teach the worker the structured wait verb so a legitimate background
-/// build/test wait is declared instead of narrated in prose. The produce-a-PR
-/// nudge probe repeats the same command; this prompt copy is the earlier
-/// teaching so the worker can declare before the first Stop.
-fn worker_wait_protocol_directive() -> String {
-    "\n## If you are waiting on a long-running job\n\n\
-     If you are legitimately waiting on a background build, test gate, or similar job, \
-     run this command rather than ending the turn in prose:\n\n\
-     ```\n\
-     \"$BOSS_BIN\" propose wait --reason \"<what you are waiting on>\" --duration <bound>\n\
-     ```\n\n\
-     `--duration` is required (for example `30m` or `2h`; the engine caps a single wait at 2 hours). \
-     Optionally pass `--waiting-on <task-id|pid|file>`. Re-running renews the wait. An accepted \
-     wait remains valid until its deadline, including across turns answering status questions \
-     or checking the job. Those turns neither cancel nor extend it; renew only if the job \
-     needs more time. Each declaration charges its full duration against the cap, including \
-     overlapping renewals; choose the expected remaining wait. An unexpired \
-     wait holds the produce-a-PR nudge ladder and the nudge circuit breaker; it does not pause \
-     the stale-worker reap or other safety checks. After expiry, normal nudging resumes. Total \
-     wait-extension per execution is also capped.\n"
         .to_string()
 }
 

@@ -1937,6 +1937,14 @@ mod tests {
         assert_eq!((opts.review_signal_checks)(owner), expected);
     }
 
+    /// The remote spawn path reads no feature flags, so it resolves no
+    /// experiment arms: every remote run records an empty set and is never
+    /// treated.
+    #[test]
+    fn remote_spawn_opts_carry_no_experiment_arms() {
+        assert!(remote_spawn_opts(0, None, None).experiment_arms.is_empty());
+    }
+
     fn run_occupancy_script(workspace: &Path) -> String {
         run_occupancy_script_scanning(workspace, None)
     }

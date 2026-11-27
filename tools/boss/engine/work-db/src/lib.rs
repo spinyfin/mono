@@ -1055,6 +1055,7 @@ pub use driver_allocation::*;
 pub use engine_rebase_hold::{EngineRebaseBlocker, EngineRebaseHold};
 pub use exec_status_helpers::*;
 pub use exec_tail::content_checksum;
+pub use execution_launch_config::{ExecutionLaunchRecord, StoredExperimentArms};
 use ideas::list_ideas_in_tx;
 pub use insert_helpers::*;
 pub use sweep_reads::{TaskWaitLabel, TerminalExecutionRef};

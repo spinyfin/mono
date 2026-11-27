@@ -1208,6 +1208,13 @@ mod floor_tests {
             }),
         ));
         steps.push((
+            "20261127_2050_execution_experiment_arms",
+            Box::new(|c| {
+                c.execute_batch("ALTER TABLE work_executions ADD COLUMN experiment_arms TEXT")
+                    .unwrap();
+            }),
+        ));
+        steps.push((
             "20261122_0745_operator_question_supersede_close",
             Box::new(|c| {
                 c.execute_batch("ALTER TABLE operator_questions ADD COLUMN supersede_close_json TEXT")

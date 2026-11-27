@@ -412,12 +412,15 @@ impl ExecutionCoordinator {
                     run
                 };
                 if let Some(spawn) = spawn_config_for_event.as_ref()
-                    && let Err(err) = self.work_db.record_execution_launch_config(
-                        &execution.id,
-                        &spawn.driver,
-                        &spawn.model,
-                        spawn.effort_level,
-                    )
+                    && let Err(err) = self
+                        .work_db
+                        .record_execution_launch(&crate::work::ExecutionLaunchRecord {
+                            execution_id: &execution.id,
+                            driver: &spawn.driver,
+                            model: &spawn.model,
+                            effort_level: spawn.effort_level,
+                            experiment_arms: spawn.experiment_arms.as_deref(),
+                        })
                 {
                     tracing::error!(
                         ?err,
@@ -467,6 +470,13 @@ impl ExecutionCoordinator {
                         "driver": spawn.driver,
                         "driver_source": spawn.driver_source.as_str(),
                         "prompt_addendum_applied": spawn.prompt_addendum.is_some(),
+                        // Which arm of each running experiment this launch's
+                        // family was in; `{}` when none was running and null
+                        // when the runner does not run experiments.
+                        "experiment_arms": spawn
+                            .experiment_arms
+                            .as_deref()
+                            .and_then(|arms| serde_json::from_str::<serde_json::Value>(arms).ok()),
                     });
                 }
                 self.dispatch_events

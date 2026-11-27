@@ -334,6 +334,16 @@ pub(super) fn all() -> Vec<Migration> {
             apply: progression_candidates::migrate_execution_provenance,
         },
         Migration {
+            id: "20261127_2050_execution_experiment_arms".into(),
+            legacy_version: None,
+            apply: |conn| {
+                if !table_has_column(conn, "work_executions", "experiment_arms")? {
+                    conn.execute_batch("ALTER TABLE work_executions ADD COLUMN experiment_arms TEXT")?;
+                }
+                Ok(())
+            },
+        },
+        Migration {
             id: "20261118_1200_execution_force_launched".into(),
             legacy_version: None,
             apply: |conn| {

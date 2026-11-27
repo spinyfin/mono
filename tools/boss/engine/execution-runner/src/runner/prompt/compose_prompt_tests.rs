@@ -7,6 +7,8 @@ use boss_protocol::{ExecutionStatus, TaskStatus};
 use super::*;
 use crate::work::Task;
 
+#[path = "compose_prompt_tests/batched_search.rs"]
+mod batched_search;
 #[path = "compose_prompt_tests/blocked_recovery.rs"]
 mod blocked_recovery;
 #[path = "compose_prompt_tests/invocation.rs"]

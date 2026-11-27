@@ -293,6 +293,17 @@ fn hash_bucket(work_item_id: &str) -> u8 {
     (u64::from_be_bytes(first8) % 100) as u8
 }
 
+/// The bucket in `[0, 100)` a PR family draws for one experiment. Includes the
+/// experiment key so two experiments' assignments are independent of each
+/// other, and nothing else, so the same family gets the same bucket at every
+/// launch and every policy decision for as long as the flags stay put.
+///
+/// The flags crate takes this bucket as a plain number
+/// (`boss_feature_flags::assign_arm`); it never learns what a family is.
+pub fn experiment_bucket(family_root_id: &str, experiment_key: &str) -> u8 {
+    hash_bucket(&format!("experiment:{experiment_key}:{family_root_id}"))
+}
+
 /// Read the persisted driver traffic split using an already-open
 /// `Connection`. Callers holding a `WorkDb::connect()` guard (e.g.
 /// `insert_execution`, mid-transaction) MUST use this instead of
