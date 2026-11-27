@@ -2151,6 +2151,8 @@ mod binding_mismatch;
 #[cfg(test)]
 mod conflict_delivery;
 #[cfg(test)]
+mod delta_rereview;
+#[cfg(test)]
 mod local_teardown;
 #[cfg(test)]
 mod no_op_recovery;

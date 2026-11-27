@@ -354,14 +354,15 @@ impl WorkDb {
         if batch.status == boss_protocol::ReviewBatchStatus::Applying {
             return Ok(Some(batch));
         }
-        if batch.status == boss_protocol::ReviewBatchStatus::Supervising
-            && let Err(error) = self.try_advance_review_batch_quorum(&batch.id)
-        {
+        let nudgeable = batch.status == boss_protocol::ReviewBatchStatus::Supervising
+            || (batch.status == boss_protocol::ReviewBatchStatus::Collecting
+                && (batch.single_reviewer || batch.phase == boss_protocol::ReviewBatchPhase::PostMerge));
+        if nudgeable && let Err(error) = self.try_advance_review_batch_quorum(&batch.id) {
             tracing::warn!(
                 proposal_id = %proposal.id,
                 batch_id = %batch.id,
                 ?error,
-                "review-verdict apply: quorum re-advance for a supervising batch failed",
+                "review-verdict apply: quorum re-advance for a pending verdict batch failed",
             );
         }
         if let Some(refreshed) = self.review_batch(&batch.id)? {

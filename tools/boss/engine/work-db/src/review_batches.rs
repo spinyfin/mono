@@ -50,6 +50,10 @@ pub struct ReviewBatchCreateInput {
     ///   `review_batch_fanout` was off, or before this task's chain had a
     ///   batch of its own).
     pub legacy_task_id: Option<String>,
+    /// Dispatch a single Light-tier `ClaudeReviewer` with no supervisor.
+    /// `classification` still stores the PR's whole-PR profile.
+    #[builder(default)]
+    pub single_reviewer_light: bool,
 }
 
 /// Inputs for one role-specific member attempt in a new review batch.
@@ -264,92 +268,12 @@ pub const REVIEW_BATCH_REPORTED_MEMBER_GRACE_SECS: u64 = 120;
 /// "Expand the static review pool to 16 slots".
 pub const PRE_MERGE_BATCH_RESERVATION_UNITS: i64 = 4;
 
-/// Reservation weight of one non-terminal post-merge batch: a single
-/// safety-net reviewer against the already-landed tree.
-const POST_MERGE_BATCH_RESERVATION_UNITS: i64 = 1;
+pub(super) const POST_MERGE_BATCH_RESERVATION_UNITS: i64 = 1;
 
-/// Count non-terminal (reservation-holding) batches of `phase` whose cycle
-/// root is still a live work item. `completed` and `failed` are the only
-/// statuses that release a batch's reservation — `collecting`,
-/// `supervising`, and `applying` all still hold it, matching "from creation
-/// through supervisor completion". Batches whose cycle root is deleted or
-/// already terminal (`done`/`archived`) do not hold a reservation: nothing
-/// can settle them through the quorum path, so counting them would
-/// permanently deny pre-merge review to every other product.
-///
-/// Known gap: post-merge batches effectively never count here. The merge
-/// poller creates a post-merge batch in the same pass that marks its root
-/// `done`, so the done/archived root filter excludes them. Consequences:
-/// post-merge reviewers occupy physical review slots without a reservation,
-/// and the post-merge half of the `review_pool.reserved_units` gauge reads 0.
-/// A fix would exempt `phase = 'post_merge'` from the root-status filter,
-/// mirroring the post-merge carve-out in `reap_inert_review_batches`.
-fn reserved_batch_count_in_tx(tx: &Transaction<'_>, phase: ReviewBatchPhase) -> Result<i64> {
-    let count: i64 = tx.query_row(
-        "SELECT COUNT(*)
-         FROM pr_review_batches b
-         JOIN tasks t ON t.id = b.cycle_root_id
-         WHERE b.phase = ?1
-           AND b.status NOT IN ('completed', 'failed')
-           AND t.deleted_at IS NULL
-           AND t.status NOT IN ('done', 'archived')",
-        params![phase.as_str()],
-        |row| row.get(0),
-    )?;
-    Ok(count)
-}
-
-/// Floors capacity at [`PRE_MERGE_BATCH_RESERVATION_UNITS`] so a pre-merge
-/// batch can always be admitted on an empty pool: a configured
-/// `BOSS_REVIEW_POOL_SIZE` below the reservation weight of a single batch
-/// would otherwise make `can_admit_review_batch_in_tx`'s pre-merge check
-/// permanently false, deferring every PR's review forever.
-fn reservation_capacity(review_pool_size: usize) -> i64 {
-    review_pool_size.clamp(
-        PRE_MERGE_BATCH_RESERVATION_UNITS as usize,
-        boss_engine_storage_values::pool_policy::MAX_REVIEW_POOL_SIZE,
-    ) as i64
-}
-
-/// Whether one more non-terminal batch of `phase` can be admitted into the
-/// review pool's weighted reservation accounting right now.
-///
-/// `reservation_capacity` is the live configured review-pool size (clamped
-/// to [`boss_engine_storage_values::pool_policy::MAX_REVIEW_POOL_SIZE`]), not the compile-time
-/// hard cap: a smaller `BOSS_REVIEW_POOL_SIZE` must not oversubscribe the
-/// physical slots the reservation scheme exists to protect.
-///
-/// Pre-merge admission is checked against pre-merge reservations alone,
-/// which is what gives pre-merge work priority over post-merge safety-net
-/// work: a pre-merge batch is admitted whenever
-/// `pre_merge_units + PRE_MERGE_BATCH_RESERVATION_UNITS <= reservation_capacity`,
-/// regardless of how many post-merge units are currently reserved.
-/// Post-merge admission is checked against BOTH reservations, so a
-/// safety-net batch only starts when genuinely spare capacity remains after
-/// every open pre-merge batch's block.
-///
-/// This is static, conservative admission accounting, not a live count of
-/// claimed physical worker-pool slots: a batch keeps its reservation for its
-/// whole lifetime (through supervisor completion), even while some of its
-/// member executions are still queued behind a busy pool. See
-/// docs/designs/multi-agent-code-review.md, "Expand the static review pool
-/// to 16 slots".
-pub fn can_admit_review_batch_in_tx(
-    tx: &Transaction<'_>,
-    phase: ReviewBatchPhase,
-    reservation_capacity: i64,
-) -> Result<bool> {
-    let pre_merge_units =
-        reserved_batch_count_in_tx(tx, ReviewBatchPhase::PreMerge)? * PRE_MERGE_BATCH_RESERVATION_UNITS;
-    match phase {
-        ReviewBatchPhase::PreMerge => Ok(pre_merge_units + PRE_MERGE_BATCH_RESERVATION_UNITS <= reservation_capacity),
-        ReviewBatchPhase::PostMerge => {
-            let post_merge_units =
-                reserved_batch_count_in_tx(tx, ReviewBatchPhase::PostMerge)? * POST_MERGE_BATCH_RESERVATION_UNITS;
-            Ok(pre_merge_units + post_merge_units + POST_MERGE_BATCH_RESERVATION_UNITS <= reservation_capacity)
-        }
-    }
-}
+pub use super::review_batch_solo::can_admit_review_batch_in_tx;
+use super::review_batch_solo::{
+    can_admit_review_batch_for_units_in_tx, reservation_capacity, reserved_batch_count_in_tx,
+};
 
 fn conversion_error(index: usize, error: impl std::error::Error + Send + Sync + 'static) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(error))
@@ -389,6 +313,7 @@ fn map_review_batch(row: &Row<'_>) -> rusqlite::Result<ReviewBatch> {
         merge_sha: row.get(13)?,
         explicit: row.get(15)?,
         producing_work_item_id: row.get(16)?,
+        single_reviewer: row.get(17)?,
     })
 }
 
@@ -586,8 +511,8 @@ fn create_review_batch_in_tx(
             id, cycle_root_id, base_sha, classification_json, created_at,
             phase, pr_number, pr_url, status, target_sha, updated_at,
             completed_at, final_verdict_proposal_id, merge_sha, generation, explicit,
-            producing_work_item_id
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'collecting', ?9, ?5, NULL, NULL, ?10, ?11, ?12, ?13)",
+            producing_work_item_id, single_reviewer
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'collecting', ?9, ?5, NULL, NULL, ?10, ?11, ?12, ?13, ?14)",
         params![
             batch_id,
             input.cycle_root_id,
@@ -602,6 +527,7 @@ fn create_review_batch_in_tx(
             generation,
             explicit,
             input.legacy_task_id,
+            input.single_reviewer_light,
         ],
     )?;
 
@@ -615,6 +541,7 @@ fn create_review_batch_in_tx(
             .id(batch_id)
             .generation(generation)
             .explicit(explicit)
+            .single_reviewer(input.single_reviewer_light)
             .cycle_root_id(input.cycle_root_id)
             .base_sha(input.base_sha)
             .classification(input.classification)
@@ -691,7 +618,7 @@ fn review_batch_for_target_in(
     conn.query_row(
         "SELECT id, cycle_root_id, base_sha, classification_json, created_at,
                 phase, pr_number, pr_url, status, target_sha, updated_at,
-                completed_at, final_verdict_proposal_id, merge_sha, generation, explicit, producing_work_item_id
+                completed_at, final_verdict_proposal_id, merge_sha, generation, explicit, producing_work_item_id, single_reviewer
          FROM pr_review_batches WHERE cycle_root_id = ?1 AND phase = ?2 AND target_sha = ?3
          ORDER BY generation DESC LIMIT 1",
         params![cycle_root_id, phase.as_str(), target_sha],
@@ -726,7 +653,7 @@ fn review_batch_by_id_in(conn: &rusqlite::Connection, batch_id: &str) -> Result<
     conn.query_row(
         "SELECT id, cycle_root_id, base_sha, classification_json, created_at,
                 phase, pr_number, pr_url, status, target_sha, updated_at,
-                completed_at, final_verdict_proposal_id, merge_sha, generation, explicit, producing_work_item_id
+                completed_at, final_verdict_proposal_id, merge_sha, generation, explicit, producing_work_item_id, single_reviewer
          FROM pr_review_batches WHERE id = ?1",
         params![batch_id],
         map_review_batch,
@@ -767,7 +694,7 @@ const LEAF_REVIEWER_ROLES: [ReviewBatchMemberRole; 3] = [
 /// one retry, so `attempt >= 2` while `Failed` is terminal). Shared by the
 /// leaf-quorum walk and the supervising-state walk so the bound lives in
 /// one place.
-fn member_attempt_is_settled(member: &ReviewBatchMember) -> bool {
+pub(super) fn member_attempt_is_settled(member: &ReviewBatchMember) -> bool {
     match member.status {
         ReviewBatchMemberStatus::Reported => true,
         ReviewBatchMemberStatus::Failed => member.attempt >= 2,
@@ -790,7 +717,10 @@ fn retryable_batch_member_role(role: ReviewBatchMemberRole) -> bool {
 /// The latest (highest-attempt) row for `role` among `members`, or `None` if
 /// the role has no row at all (should not happen for a `collecting` batch,
 /// but a caller must not panic on a data inconsistency).
-fn latest_attempt_for_role(members: &[ReviewBatchMember], role: ReviewBatchMemberRole) -> Option<&ReviewBatchMember> {
+pub(super) fn latest_attempt_for_role(
+    members: &[ReviewBatchMember],
+    role: ReviewBatchMemberRole,
+) -> Option<&ReviewBatchMember> {
     members.iter().filter(|m| m.role == role).max_by_key(|m| m.attempt)
 }
 
@@ -1278,7 +1208,7 @@ fn insufficient_quorum_attention(
 /// attention. Used by every terminal-failure destination of the quorum
 /// machine (insufficient leaf reports, exhausted supervisor, moved head)
 /// so they stay on one kind and one write path.
-fn fail_review_batch_with_attention(
+pub(super) fn fail_review_batch_with_attention(
     pending: &mut PendingEvents,
     tx: &Transaction<'_>,
     batch: &ReviewBatch,
@@ -1637,6 +1567,9 @@ pub(crate) fn try_advance_review_batch_quorum_in_tx(
                 _ => Ok(ReviewBatchQuorumOutcome::NoOp),
             }
         }
+        ReviewBatchStatus::Collecting if batch.single_reviewer => {
+            super::review_batch_solo::try_advance_solo_pre_merge_quorum_in_tx(tx, &batch, &members, &now, pending)
+        }
         ReviewBatchStatus::Collecting => {
             let mut reported = 0usize;
             // Membership is immutable: legacy batches retain their third leaf
@@ -1924,7 +1857,7 @@ impl WorkDb {
     pub fn review_pool_reserved_units(&self) -> Result<(i64, i64)> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let pre = reserved_batch_count_in_tx(&tx, ReviewBatchPhase::PreMerge)? * PRE_MERGE_BATCH_RESERVATION_UNITS;
+        let pre = super::review_batch_solo::reserved_pre_merge_units_in_tx(&tx)?;
         let post = reserved_batch_count_in_tx(&tx, ReviewBatchPhase::PostMerge)? * POST_MERGE_BATCH_RESERVATION_UNITS;
         Ok((pre, post))
     }
@@ -2124,17 +2057,23 @@ impl WorkDb {
             tx.commit()?;
             return Ok(ReviewBatchDispatch::AdmissionDeferred);
         }
-        if !can_admit_review_batch_in_tx(&tx, ReviewBatchPhase::PreMerge, reservation_capacity(review_pool_size))? {
+        let units_needed = if input.single_reviewer_light {
+            super::review_batch_solo::SOLO_PRE_MERGE_BATCH_RESERVATION_UNITS
+        } else {
+            PRE_MERGE_BATCH_RESERVATION_UNITS
+        };
+        if !can_admit_review_batch_for_units_in_tx(
+            &tx,
+            ReviewBatchPhase::PreMerge,
+            units_needed,
+            reservation_capacity(review_pool_size),
+        )? {
             if explicit {
                 bail!(
                     "cannot start review batch: review-pool reservation capacity exhausted \
-                     (requires {PRE_MERGE_BATCH_RESERVATION_UNITS} units)"
+                     (requires {units_needed} unit(s))"
                 );
             }
-            // Read-only so far — nothing to roll back. The caller must hold
-            // the producing task pending review rather than treat this as a
-            // legacy fallback; the deferred-admission sweep retries once an
-            // existing batch completes and frees its reservation.
             tx.commit()?;
             return Ok(ReviewBatchDispatch::AdmissionDeferred);
         }
@@ -2143,7 +2082,12 @@ impl WorkDb {
             None => super::resolve_repo_for_work_item(&tx, &input.cycle_root_id)?
                 .ok_or_else(|| anyhow::anyhow!("cannot start review batch: repository is unresolved"))?,
         };
-        let executions = (0..NEW_BATCH_LEAF_ROLES.len())
+        let member_count = if input.single_reviewer_light {
+            1
+        } else {
+            NEW_BATCH_LEAF_ROLES.len()
+        };
+        let executions = (0..member_count)
             .map(|_| {
                 insert_execution(
                     &tx,
@@ -2160,7 +2104,15 @@ impl WorkDb {
             .iter()
             .map(|execution| execution.id.clone())
             .collect::<Vec<_>>();
-        let members = leaf_member_inputs(&input.classification, &execution_ids)?;
+        let members = if input.single_reviewer_light {
+            let registry = boss_engine_driver::DriverRegistry::default();
+            vec![super::review_batch_solo::solo_pre_merge_member_input(
+                &registry,
+                execution_ids[0].clone(),
+            )?]
+        } else {
+            leaf_member_inputs(&input.classification, &execution_ids)?
+        };
         let (batch, _) = create_review_batch_in_tx(&tx, input, &members, generation, explicit)?;
         resolve_admission_deferred_attention_for_cycle_in_tx(&tx, &batch.cycle_root_id, &batch.target_sha)?;
         if explicit {
@@ -2277,7 +2229,7 @@ impl WorkDb {
         let mut statement = conn.prepare(
             "SELECT id, cycle_root_id, base_sha, classification_json, created_at,
                     phase, pr_number, pr_url, status, target_sha, updated_at,
-                    completed_at, final_verdict_proposal_id, merge_sha, generation, explicit, producing_work_item_id
+                    completed_at, final_verdict_proposal_id, merge_sha, generation, explicit, producing_work_item_id, single_reviewer
              FROM pr_review_batches
              WHERE cycle_root_id = ?1
              ORDER BY created_at DESC, generation DESC, id DESC",
@@ -2299,7 +2251,7 @@ impl WorkDb {
         let mut statement = conn.prepare(
             "SELECT id, cycle_root_id, base_sha, classification_json, created_at,
                     phase, pr_number, pr_url, status, target_sha, updated_at,
-                    completed_at, final_verdict_proposal_id, merge_sha, generation, explicit, producing_work_item_id
+                    completed_at, final_verdict_proposal_id, merge_sha, generation, explicit, producing_work_item_id, single_reviewer
              FROM pr_review_batches
              WHERE status NOT IN ('completed', 'failed')
              ORDER BY created_at ASC, id ASC
@@ -2479,6 +2431,7 @@ impl WorkDb {
                      member.role IN ('claude_reviewer', 'codex_reviewer', 'grok_reviewer')
                      AND member.attempt < 2
                    )
+                   OR (batch.single_reviewer != 0 AND member.role = 'claude_reviewer')
                    OR member.role = 'supervisor'
                )
                AND member.status IN ('pending', 'running', 'failed')

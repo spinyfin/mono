@@ -58,6 +58,12 @@ pub const WORKER_AUTOCOMPACT_EXPERIMENT: &str = "worker_autocompact";
 /// Splits [`WORKER_AUTOCOMPACT_EXPERIMENT`] between half of families and all.
 pub const WORKER_AUTOCOMPACT_AB_SPLIT_FLAG: &str = "worker_autocompact_ab_split";
 
+/// Key of the delta re-review experiment: from the second pre-merge review
+/// round on, run one Light-tier reviewer with no supervisor and a delta brief.
+pub const DELTA_REREVIEW_EXPERIMENT: &str = "delta_rereview";
+
+/// Splits [`DELTA_REREVIEW_EXPERIMENT`] between half of families and all.
+pub const DELTA_REREVIEW_AB_SPLIT_FLAG: &str = "delta_rereview_ab_split";
 /// A surface on which at most one experiment may be assigned at a time.
 ///
 /// Two experiments that rewrite the same instructions, or reshape the same
@@ -127,6 +133,12 @@ pub const EXPERIMENTS: &[ExperimentSpec] = &[
         key: WORKER_AUTOCOMPACT_EXPERIMENT,
         lane: None,
         requires: &[],
+        splits: true,
+    },
+    ExperimentSpec {
+        key: DELTA_REREVIEW_EXPERIMENT,
+        lane: Some(ExperimentLane::PreMergeReview),
+        requires: &["review_batch_fanout"],
         splits: true,
     },
 ];
@@ -916,5 +928,60 @@ mod tests {
         store.set(BATCHED_SEARCH_EXPERIMENT, false).unwrap();
         store.stop_experiments_not_running(&mut recorded);
         assert_eq!(recorded.get(BATCHED_SEARCH_EXPERIMENT), Some(ExperimentArm::Stopped));
+    }
+
+    #[test]
+    fn delta_rereview_is_registered_in_pre_merge_lane_requiring_fanout() {
+        let spec = EXPERIMENTS
+            .iter()
+            .find(|spec| spec.key == DELTA_REREVIEW_EXPERIMENT)
+            .expect("delta_rereview is registered");
+        assert_eq!(spec.lane, Some(ExperimentLane::PreMergeReview));
+        assert_eq!(ExperimentLane::PreMergeReview.as_str(), "pre_merge_review");
+        assert_eq!(spec.requires, &["review_batch_fanout"]);
+        assert!(spec.splits);
+        assert_eq!(ab_split_flag_name(spec.key), DELTA_REREVIEW_AB_SPLIT_FLAG);
+    }
+
+    #[test]
+    fn delta_rereview_ships_inert_requires_fanout_and_splits_from_its_flags() {
+        let (_tmp, store) = store();
+        assert_eq!(store.experiment_state(DELTA_REREVIEW_EXPERIMENT), ExperimentState::Off);
+
+        // Switching delta_rereview on while review_batch_fanout is off leaves it off.
+        store.set(DELTA_REREVIEW_EXPERIMENT, true).unwrap();
+        assert_eq!(store.experiment_state(DELTA_REREVIEW_EXPERIMENT), ExperimentState::Off);
+        assert!(store.resolve_experiment_arms(|_| 10).is_empty());
+
+        // Turning on its required flag starts the half-and-half split.
+        store.set("review_batch_fanout", true).unwrap();
+        assert_eq!(
+            store.experiment_state(DELTA_REREVIEW_EXPERIMENT),
+            ExperimentState::Split
+        );
+        assert_eq!(
+            store.resolve_experiment_arms(|_| 10).get(DELTA_REREVIEW_EXPERIMENT),
+            Some(ExperimentArm::Treatment)
+        );
+        assert_eq!(
+            store.resolve_experiment_arms(|_| 90).get(DELTA_REREVIEW_EXPERIMENT),
+            Some(ExperimentArm::Control)
+        );
+
+        // Turning the split off treats every family.
+        store.set(DELTA_REREVIEW_AB_SPLIT_FLAG, false).unwrap();
+        assert_eq!(store.experiment_state(DELTA_REREVIEW_EXPERIMENT), ExperimentState::All);
+        assert!(
+            store
+                .resolve_experiment_arms(|_| 90)
+                .is_treated(DELTA_REREVIEW_EXPERIMENT)
+        );
+
+        // Turning the master switch or experiment flag off stops it.
+        store.set(TOKEN_EXPERIMENTS_FLAG, false).unwrap();
+        assert_eq!(store.experiment_state(DELTA_REREVIEW_EXPERIMENT), ExperimentState::Off);
+        store.set(TOKEN_EXPERIMENTS_FLAG, true).unwrap();
+        store.set(DELTA_REREVIEW_EXPERIMENT, false).unwrap();
+        assert_eq!(store.experiment_state(DELTA_REREVIEW_EXPERIMENT), ExperimentState::Off);
     }
 }

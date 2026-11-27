@@ -272,9 +272,17 @@ impl SupervisorVerdict {
     /// A post-merge verdict has no leaf reports, so its `sources` are
     /// producing-role names and `rejected` must be empty. For every other
     /// phase the cited ids are checked against real leaf findings by
-    /// [`Self::accounting_errors`], which needs the batch's reports.
+    /// [`Self::accounting_errors`], which needs the batch's reports — unless
+    /// the caller passes `solo = true` via [`Self::structural_errors_with_solo`]
+    /// for a one-member pre-merge batch.
     pub fn structural_errors(&self) -> Vec<VerdictIdError> {
-        let post_merge = self.phase == boss_protocol::ReviewBatchPhase::PostMerge;
+        self.structural_errors_with_solo(self.phase == boss_protocol::ReviewBatchPhase::PostMerge)
+    }
+
+    /// Same as [`Self::structural_errors`], with an explicit `solo` flag for
+    /// one-member batches (both `post_merge` and single-reviewer pre-merge
+    /// delta re-reviews) that have no separate leaf reports to cite or reject.
+    pub fn structural_errors_with_solo(&self, solo: bool) -> Vec<VerdictIdError> {
         let mut errors = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
         for (index, finding) in self.findings.iter().enumerate() {
@@ -298,7 +306,11 @@ impl SupervisorVerdict {
             if finding.sources.is_empty() {
                 errors.push(VerdictIdError::new(
                     format!("findings[{index}].sources"),
-                    "must cite at least one leaf finding id; a finding cannot be unattributed",
+                    if solo {
+                        "must cite at least one source; a finding cannot be unattributed"
+                    } else {
+                        "must cite at least one leaf finding id; a finding cannot be unattributed"
+                    },
                 ));
             }
             let mut seen_sources = std::collections::HashSet::new();
@@ -309,11 +321,11 @@ impl SupervisorVerdict {
                         format!("cites `{source}` more than once"),
                     ));
                 }
-                if post_merge && SupervisorSourceRole::parse(source).is_none() {
+                if solo && SupervisorSourceRole::parse(source).is_none() {
                     errors.push(VerdictIdError::new(
                         format!("findings[{index}].sources"),
                         format!(
-                            "`{source}` is not a reviewer role; a post-merge verdict cites its own role, e.g. `claude`"
+                            "`{source}` is not a reviewer role; a solo-reviewer verdict cites its own role, e.g. `claude`"
                         ),
                     ));
                 }
@@ -321,10 +333,10 @@ impl SupervisorVerdict {
         }
         let mut seen_rejected = std::collections::HashSet::new();
         for (index, rejected) in self.rejected.iter().enumerate() {
-            if post_merge {
+            if solo {
                 errors.push(VerdictIdError::new(
                     format!("rejected[{index}]"),
-                    "a post-merge verdict has no leaf findings to reject; `rejected` must be empty",
+                    "a solo-reviewer verdict has no leaf findings to reject; `rejected` must be empty",
                 ));
                 continue;
             }

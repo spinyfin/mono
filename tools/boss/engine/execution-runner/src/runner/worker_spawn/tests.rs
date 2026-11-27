@@ -2388,3 +2388,334 @@ mod experiment_arm_tests {
         }
     }
 }
+
+mod delta_rereview_spawn_tests {
+    //! Single-reviewer delta re-review spawn wiring: Light-tier Claude model
+    //! resolution, experiment-arm recording, prior-round findings loaded from
+    //! storage, delta-only scope + whole-PR duplication check, and direct
+    //! `boss propose review-verdict` submission.
+
+    use super::*;
+    use crate::feature_flags::{DELTA_REREVIEW_EXPERIMENT, ExperimentArm, ExperimentArmSet};
+    use crate::test_support::{create_test_product, insert_host_capability};
+    use crate::work::{
+        FakePrStateChecker, PrOpenState, PreMergeTargetFreshness, ReviewBatchCreateInput, ReviewBatchDispatch,
+        ReviewVerdictObservation, SubmitWorkerProposalInput,
+    };
+    use boss_protocol::{
+        CreateChoreInput, CreateRevisionInput, ProposalKind, ReviewBatchMemberRole, ReviewBatchPhase,
+        ReviewClassification, ReviewLanguageBucket, ReviewProfile, ReviewReportProposalPayload,
+        ReviewVerdictProposalPayload, WorkItemPatch,
+    };
+    use tempfile::TempDir;
+
+    fn open_memory_db() -> WorkDb {
+        WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap()
+    }
+
+    fn batch_classification() -> ReviewClassification {
+        ReviewClassification::builder()
+            .changed_files(vec!["tools/boss/engine/pr-review/src/brief.rs".to_owned()])
+            .complexity_flags(vec![])
+            .has_production_code(true)
+            .metadata_missing(vec![])
+            .production_languages(vec![ReviewLanguageBucket::Rust])
+            .profile(ReviewProfile::Light)
+            .subsystem_buckets(vec!["tools/boss/engine".to_owned()])
+            .additions(12)
+            .deletions(3)
+            .build()
+    }
+
+    #[tokio::test]
+    async fn solo_delta_batch_renders_delta_brief_with_prior_findings_and_light_tier_config() {
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        insert_host_capability(&db, "local", "driver=claude", "auto");
+        let product = create_test_product(&db);
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Delta re-review target")
+                    .description("Implement feature X.")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        let pr_url = "https://github.com/spinyfin/mono/pull/3099";
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some(pr_url.into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+
+        // Seed round 1 (two-leaf + supervisor) so storage holds structured prior findings.
+        let r1_input = ReviewBatchCreateInput::builder()
+            .cycle_root_id(chore.id.clone())
+            .base_sha("base-0")
+            .classification(batch_classification())
+            .phase(ReviewBatchPhase::PreMerge)
+            .pr_number(3099)
+            .pr_url(pr_url)
+            .target_sha("sha-round-1")
+            .build();
+        let (r1_batch, r1_execs) = match db
+            .create_pre_merge_review_batch(r1_input, "git@github.com:spinyfin/mono.git")
+            .unwrap()
+        {
+            ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
+            other => panic!("expected round 1 batch, got {other:?}"),
+        };
+        for exec in &r1_execs {
+            let payload = ReviewReportProposalPayload {
+                batch_id: r1_batch.id.clone(),
+                target_sha: "sha-round-1".to_owned(),
+                report: serde_json::json!({
+                    "batch_id": r1_batch.id,
+                    "pr_url": pr_url,
+                    "target_sha": "sha-round-1",
+                    "phase": "pre_merge",
+                    "summary": "Found null deref.",
+                    "coverage": {
+                        "files_inspected": ["src/parser.rs"],
+                        "files_omitted": [],
+                        "limitations": [],
+                    },
+                    "findings": [{
+                        "severity": "high",
+                        "category": "correctness",
+                        "confidence": "high",
+                        "file": "src/parser.rs",
+                        "location": "fn parse, ~L88",
+                        "title": "Unchecked slice index on empty input",
+                        "problem": "parse() indexes bytes[0] without checking len.",
+                        "impact": "Panics on empty input.",
+                        "suggested_fix": "Check bytes.is_empty() before indexing.",
+                        "static_evidence": "Direct index bytes[0] in fn parse.",
+                        "needs_runtime_verification": false,
+                    }]
+                }),
+            };
+            db.submit_worker_proposal(SubmitWorkerProposalInput {
+                execution_id: &exec.id,
+                work_item_id: &chore.id,
+                kind: ProposalKind::ReviewReport,
+                payload_json: &serde_json::to_string(&payload).unwrap(),
+                idempotency_key: &format!("r1-report-{}", exec.id),
+            })
+            .unwrap()
+            .unwrap();
+        }
+        let sup_exec = db
+            .review_batch_members(&r1_batch.id)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.role == ReviewBatchMemberRole::Supervisor)
+            .and_then(|m| m.execution_id)
+            .expect("round 1 supervisor execution");
+        let r1_verdict = ReviewVerdictProposalPayload {
+            batch_id: r1_batch.id.clone(),
+            verdict: serde_json::json!({
+                "batch_id": r1_batch.id,
+                "pr_url": pr_url,
+                "target_sha": "sha-round-1",
+                "phase": "pre_merge",
+                "summary": "Round 1 flagged unchecked slice index.",
+                "revision_warranted": true,
+                "findings": [{
+                    "id": "C1",
+                    "severity": "high",
+                    "category": "correctness",
+                    "confidence": "high",
+                    "file": "src/parser.rs",
+                    "location": "fn parse, ~L88",
+                    "title": "Unchecked slice index on empty input",
+                    "detail": "parse() indexes bytes[0] without checking len.",
+                    "sources": ["claude-1", "codex-1"]
+                }],
+                "rejected": [],
+                "contradictions": []
+            }),
+        };
+        let r1_prop = db
+            .submit_worker_proposal(SubmitWorkerProposalInput {
+                execution_id: &sup_exec,
+                work_item_id: &chore.id,
+                kind: ProposalKind::ReviewVerdict,
+                payload_json: &serde_json::to_string(&r1_verdict).unwrap(),
+                idempotency_key: "r1-verdict",
+            })
+            .unwrap()
+            .unwrap();
+        let inputs = db.review_verdict_comparison(&r1_prop.proposal.id).unwrap();
+        let revision_id = db
+            .apply_observed_review_verdict_proposal(
+                &r1_prop.proposal.id,
+                &FakePrStateChecker::always(PrOpenState::Open),
+                ReviewVerdictObservation {
+                    inputs,
+                    freshness: Some(PreMergeTargetFreshness::Current),
+                    deletions: Some(Vec::new()),
+                },
+            )
+            .unwrap()
+            .expect("round 1 minted revision");
+
+        // Now create round 2 as a one-member delta batch.
+        let r2_input = ReviewBatchCreateInput::builder()
+            .cycle_root_id(chore.id.clone())
+            .base_sha("base-0")
+            .classification(batch_classification())
+            .phase(ReviewBatchPhase::PreMerge)
+            .pr_number(3099)
+            .pr_url(pr_url)
+            .target_sha("sha-round-2")
+            .legacy_task_id(revision_id)
+            .single_reviewer_light(true)
+            .build();
+        let (r2_batch, r2_execs) = match db
+            .create_pre_merge_review_batch(r2_input, "git@github.com:spinyfin/mono.git")
+            .unwrap()
+        {
+            ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
+            other => panic!("expected round 2 solo batch, got {other:?}"),
+        };
+        assert!(r2_batch.single_reviewer);
+        assert_eq!(r2_execs.len(), 1);
+
+        let mut arms = ExperimentArmSet::new();
+        arms.insert(DELTA_REREVIEW_EXPERIMENT, ExperimentArm::Treatment);
+        let root_work_item = db.get_work_item(&chore.id).unwrap();
+        let composed = compose_worker_spawn(
+            &db,
+            "review-1",
+            &r2_execs[0],
+            &root_work_item,
+            workspace.path(),
+            None,
+            WorkerSpawnOpts::builder()
+                .review_signal_checks(|_| &[])
+                .experiment_arms(arms)
+                .build(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(composed.spawn_config.driver, "claude");
+        assert_eq!(composed.spawn_config.model, "sonnet");
+        assert_eq!(composed.spawn_config.effort_level, Some(EffortLevel::Medium));
+        assert_eq!(composed.spawn_config.effort_value, Some("high"));
+        assert_eq!(
+            composed.spawn_config.experiment_arms.as_deref(),
+            Some(r#"{"delta_rereview":"treatment"}"#)
+        );
+
+        let prompt = &composed.prompt_text;
+        assert!(prompt.contains("**Trust Bazel's caching.**"));
+        assert!(
+            prompt.contains("# Delta PR re-review"),
+            "must render delta brief:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("Unchecked slice index on empty input"),
+            "must carry prior round finding from storage:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("sha-round-1") && prompt.contains("sha-round-2"),
+            "must reference prior and target SHAs for delta diff:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("propose review-verdict"),
+            "solo delta reviewer must submit via review-verdict:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("propose review-report"),
+            "solo delta reviewer must not instruct review-report:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("Do not scope your review to a diff-only view"),
+            "delta brief must replace the whole-PR re-review instruction:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("Whole-PR duplication check"),
+            "delta brief must keep one explicit whole-PR duplication check:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("delta_rereview"),
+            "prompt must not leak internal experiment names:\n{prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn standard_two_leaf_batch_still_renders_review_report_brief() {
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        insert_host_capability(&db, "local", "driver=claude", "auto");
+        let product = create_test_product(&db);
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Control batch target")
+                    .description("Implement feature Y.")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        let pr_url = "https://github.com/spinyfin/mono/pull/3100";
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some(pr_url.into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let revision = db
+            .create_revision(
+                CreateRevisionInput::builder()
+                    .parent_task_id(chore.id.clone())
+                    .description("Address control review.")
+                    .build(),
+                &FakePrStateChecker::always(PrOpenState::Open),
+            )
+            .unwrap();
+        let input = ReviewBatchCreateInput::builder()
+            .cycle_root_id(chore.id.clone())
+            .base_sha("base-0")
+            .classification(batch_classification())
+            .phase(ReviewBatchPhase::PreMerge)
+            .pr_number(3100)
+            .pr_url(pr_url)
+            .target_sha("sha-control-r2")
+            .legacy_task_id(revision.id)
+            .build();
+        let (_, execs) = match db
+            .create_pre_merge_review_batch(input, "git@github.com:spinyfin/mono.git")
+            .unwrap()
+        {
+            ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
+            other => panic!("expected control batch, got {other:?}"),
+        };
+        let root_work_item = db.get_work_item(&chore.id).unwrap();
+        let composed = compose_worker_spawn(
+            &db,
+            "review-1",
+            &execs[0],
+            &root_work_item,
+            workspace.path(),
+            None,
+            WorkerSpawnOpts::builder().review_signal_checks(|_| &[]).build(),
+        )
+        .await
+        .unwrap();
+        assert!(composed.prompt_text.contains("propose review-report"));
+        assert!(!composed.prompt_text.contains("# Delta PR re-review"));
+    }
+}

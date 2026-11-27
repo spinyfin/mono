@@ -982,6 +982,7 @@ mod proposals;
 mod query_ensure;
 pub mod queue_ci_evidence;
 mod review_badge;
+mod review_batch_solo;
 mod review_batches;
 mod review_findings_followup;
 mod review_guide_context;
@@ -1099,6 +1100,7 @@ pub use progression_ladder::{
 pub use progression_verbs::ProgressionVerbRefusal;
 pub use proposal_apply::*;
 pub use query_ensure::*;
+pub use review_batch_solo::SOLO_PRE_MERGE_BATCH_RESERVATION_UNITS;
 pub use review_batches::{
     MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS, PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND,
     PR_REVIEW_BATCH_STALE_ATTENTION_KIND, PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND,

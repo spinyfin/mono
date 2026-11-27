@@ -18,20 +18,61 @@ struct BatchReviewPrView {
     deletions: Option<i64>,
 }
 
+/// Single routing decision for `delta_rereview`, shared across every automatic
+/// pre-merge review trigger site (`finalize_pr_transition`,
+/// `maybe_enqueue_declared_delivery_reviewer`, deferred admission via
+/// [`GhReviewBatchEnqueuer`], and unpark reconcile via [`CompletionRequests`]).
+///
+/// Returns `true` only when:
+/// 1. The PR family is on round 2 or later (`review_cycle >= 1`) and has a
+///    recorded `last_reviewed_sha` to compute a delta against.
+/// 2. `delta_rereview` is active in `pre_merge_review` (requires
+///    `token_experiments` and `review_batch_fanout`, and no other active
+///    experiment claiming `pre_merge_review`) and this PR family's
+///    deterministic bucket draws [`crate::feature_flags::ExperimentArm::Treatment`].
+pub fn should_use_delta_rereview(
+    feature_flags: &crate::feature_flags::FeatureFlagsStore,
+    work_db: &crate::work::WorkDb,
+    work_item_id: &str,
+) -> bool {
+    let cycle_root_id = work_db.review_cycle_root_id(work_item_id);
+    let (review_cycle, last_reviewed_sha) = match work_db.get_task_review_cycle_state(&cycle_root_id) {
+        Ok(state) => state,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id,
+                cycle_root_id,
+                ?err,
+                "should_use_delta_rereview: failed to read review cycle state; failing closed to full batch",
+            );
+            return false;
+        }
+    };
+    if review_cycle < 1 || last_reviewed_sha.as_deref().is_none_or(str::is_empty) {
+        return false;
+    }
+    let state = feature_flags.experiment_state(crate::feature_flags::DELTA_REREVIEW_EXPERIMENT);
+    let bucket = crate::work::experiment_bucket(&cycle_root_id, crate::feature_flags::DELTA_REREVIEW_EXPERIMENT);
+    crate::feature_flags::assign_arm(state, bucket) == Some(crate::feature_flags::ExperimentArm::Treatment)
+}
+
 /// Fetch and freeze the target metadata before handing it to the atomic DB
 /// creation path. Callers can retain the legacy path if this cannot establish
-/// an immutable target SHA. Shared by `finalize_pr_transition` and the
-/// merge poller's deferred-admission sweep.
-pub(crate) async fn enqueue_review_batch(
+/// an immutable target SHA. Shared by `finalize_pr_transition`,
+/// `maybe_enqueue_declared_delivery_reviewer`, and the merge poller's
+/// deferred-admission sweep.
+pub(crate) async fn enqueue_review_batch_with_mode(
     work_db: &crate::work::WorkDb,
     work_item_id: &str,
     repo_remote_url: &str,
     pr_url: &str,
     review_pool_size: usize,
+    single_reviewer_light: bool,
 ) -> anyhow::Result<crate::work::ReviewBatchDispatch> {
     let root =
         boss_github::pr_files::fetch_pr_view_json(pr_url, "baseRefOid,headRefOid,files,additions,deletions").await?;
-    let input = review_batch_input_from_metadata(work_db, work_item_id, pr_url, root)?;
+    let mut input = review_batch_input_from_metadata(work_db, work_item_id, pr_url, root)?;
+    input.single_reviewer_light = single_reviewer_light;
     work_db.create_pre_merge_review_batch_for_pool(input, repo_remote_url, review_pool_size)
 }
 
@@ -76,7 +117,15 @@ pub fn review_batch_input_from_metadata(
 }
 
 /// Default enqueuer: fetch immutable SHAs from GitHub, then admit a batch.
-pub(crate) struct GhReviewBatchEnqueuer;
+pub(crate) struct GhReviewBatchEnqueuer {
+    feature_flags: Arc<crate::feature_flags::FeatureFlagsStore>,
+}
+
+impl GhReviewBatchEnqueuer {
+    pub(crate) fn new(feature_flags: Arc<crate::feature_flags::FeatureFlagsStore>) -> Self {
+        Self { feature_flags }
+    }
+}
 
 #[async_trait]
 impl ReviewBatchEnqueuer for GhReviewBatchEnqueuer {
@@ -88,7 +137,36 @@ impl ReviewBatchEnqueuer for GhReviewBatchEnqueuer {
         pr_url: &str,
         review_pool_size: usize,
     ) -> anyhow::Result<crate::work::ReviewBatchDispatch> {
-        enqueue_review_batch(work_db, work_item_id, repo_remote_url, pr_url, review_pool_size).await
+        let single_reviewer_light = should_use_delta_rereview(&self.feature_flags, work_db, work_item_id);
+        enqueue_review_batch_with_mode(
+            work_db,
+            work_item_id,
+            repo_remote_url,
+            pr_url,
+            review_pool_size,
+            single_reviewer_light,
+        )
+        .await
+    }
+
+    async fn enqueue_with_mode(
+        &self,
+        work_db: &crate::work::WorkDb,
+        work_item_id: &str,
+        repo_remote_url: &str,
+        pr_url: &str,
+        review_pool_size: usize,
+        single_reviewer_light: bool,
+    ) -> anyhow::Result<crate::work::ReviewBatchDispatch> {
+        enqueue_review_batch_with_mode(
+            work_db,
+            work_item_id,
+            repo_remote_url,
+            pr_url,
+            review_pool_size,
+            single_reviewer_light,
+        )
+        .await
     }
 }
 
@@ -433,14 +511,20 @@ impl WorkerCompletionHandler {
                             // same moment and would otherwise both enqueue a `pr_review`
                             // execution for the same unchanged head sha.
                             if self.feature_flags.is_enabled("review_batch_fanout") {
+                                let single_reviewer_light = should_use_delta_rereview(
+                                    &self.feature_flags,
+                                    &self.work_db,
+                                    &producing.work_item_id,
+                                );
                                 match self
                                     .review_batch_enqueuer
-                                    .enqueue(
+                                    .enqueue_with_mode(
                                         &self.work_db,
                                         &producing.work_item_id,
                                         &producing.repo_remote_url,
                                         &pr_url,
                                         self.review_pool_size,
+                                        single_reviewer_light,
                                     )
                                     .await
                                 {

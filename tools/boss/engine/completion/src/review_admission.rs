@@ -32,6 +32,24 @@ where
     F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<serde_json::Value>>,
 {
+    admit_review_with_mode(db, work_item_id, pr_url, pool, false, pr_checker, fetch_metadata).await
+}
+
+/// Start a review using the configured pipeline, optionally creating a
+/// single-reviewer Light-tier pre-merge batch (`delta_rereview` round 2+).
+pub async fn admit_review_with_mode<F, Fut>(
+    db: &WorkDb,
+    work_item_id: &str,
+    pr_url: Option<&str>,
+    pool: Option<usize>,
+    single_reviewer_light: bool,
+    pr_checker: &dyn PrStateChecker,
+    fetch_metadata: F,
+) -> anyhow::Result<ReviewAdmission>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<serde_json::Value>>,
+{
     db.refuse_if_parked(work_item_id)?;
     let Some(pool) = pool else {
         return db
@@ -47,7 +65,8 @@ where
         Some(state) => anyhow::bail!("cannot start review batch: PR is {state}"),
         None => anyhow::bail!("cannot start review batch: PR metadata omitted open state"),
     }
-    let input = crate::review_batch_input_from_metadata(db, work_item_id, pr_url, metadata)?;
+    let mut input = crate::review_batch_input_from_metadata(db, work_item_id, pr_url, metadata)?;
+    input.single_reviewer_light = single_reviewer_light;
     db.request_pre_merge_review_batch_for_pool(input, pool)
         .map(ReviewAdmission::Batch)
 }

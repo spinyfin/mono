@@ -819,6 +819,12 @@ pub trait CompletionRequests: Send + Sync {
     fn stacked_pr_auto_structuring_enabled(&self) -> bool;
     fn mechanical_rebase_enabled(&self) -> bool;
     fn review_batch_enqueuer(&self) -> &dyn ReviewBatchEnqueuer;
+    /// Whether an automatic pre-merge review for `work_item_id` should use the
+    /// single-reviewer Light-tier delta re-review path (round 2+ for treated
+    /// PR families under `delta_rereview`).
+    fn should_use_delta_rereview(&self, _work_db: &WorkDb, _work_item_id: &str) -> bool {
+        false
+    }
 }
 
 /// Production or test strategy for creating a pre-merge review batch from
@@ -833,6 +839,22 @@ pub trait ReviewBatchEnqueuer: Send + Sync {
         pr_url: &str,
         review_pool_size: usize,
     ) -> anyhow::Result<ReviewBatchDispatch>;
+
+    /// Enqueue a pre-merge review batch with an explicit single-reviewer
+    /// Light-tier mode flag. Defaults to [`Self::enqueue`] so test stubs that
+    /// only implement `enqueue` stay source-compatible.
+    async fn enqueue_with_mode(
+        &self,
+        work_db: &WorkDb,
+        work_item_id: &str,
+        repo_remote_url: &str,
+        pr_url: &str,
+        review_pool_size: usize,
+        _single_reviewer_light: bool,
+    ) -> anyhow::Result<ReviewBatchDispatch> {
+        self.enqueue(work_db, work_item_id, repo_remote_url, pr_url, review_pool_size)
+            .await
+    }
 }
 
 /// Writes PR poll state after an on-transition CI pre-fetch.
@@ -961,6 +983,10 @@ impl<T: CompletionRequests + ?Sized> CompletionRequests for std::sync::Arc<T> {
 
     fn review_batch_enqueuer(&self) -> &dyn ReviewBatchEnqueuer {
         T::review_batch_enqueuer(self.as_ref())
+    }
+
+    fn should_use_delta_rereview(&self, work_db: &WorkDb, work_item_id: &str) -> bool {
+        T::should_use_delta_rereview(self.as_ref(), work_db, work_item_id)
     }
 }
 

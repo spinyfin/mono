@@ -1227,6 +1227,13 @@ mod floor_tests {
             }),
         ));
         steps.push((
+            "20261127_2200_review_batch_single_reviewer",
+            Box::new(|c| {
+                c.execute_batch("ALTER TABLE pr_review_batches ADD COLUMN single_reviewer INTEGER NOT NULL DEFAULT 0")
+                    .unwrap();
+            }),
+        ));
+        steps.push((
             "20261122_0745_operator_question_supersede_close",
             Box::new(|c| {
                 c.execute_batch("ALTER TABLE operator_questions ADD COLUMN supersede_close_json TEXT")

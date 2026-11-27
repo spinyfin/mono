@@ -53,10 +53,10 @@ use serde::{Deserialize, Serialize};
 
 mod experiments;
 pub use experiments::{
-    BATCHED_SEARCH_AB_SPLIT_FLAG, BATCHED_SEARCH_EXPERIMENT, EXPERIMENT_FLAG_CATEGORY, EXPERIMENTS, ExperimentArm,
-    ExperimentArmSet, ExperimentLane, ExperimentSpec, ExperimentState, TOKEN_EXPERIMENTS_FLAG, TREATMENT_BUCKET_LIMIT,
-    WORKER_AUTOCOMPACT_AB_SPLIT_FLAG, WORKER_AUTOCOMPACT_EXPERIMENT, ab_split_flag_name, assign_arm, experiment_state,
-    resolve_arms,
+    BATCHED_SEARCH_AB_SPLIT_FLAG, BATCHED_SEARCH_EXPERIMENT, DELTA_REREVIEW_AB_SPLIT_FLAG, DELTA_REREVIEW_EXPERIMENT,
+    EXPERIMENT_FLAG_CATEGORY, EXPERIMENTS, ExperimentArm, ExperimentArmSet, ExperimentLane, ExperimentSpec,
+    ExperimentState, TOKEN_EXPERIMENTS_FLAG, TREATMENT_BUCKET_LIMIT, WORKER_AUTOCOMPACT_AB_SPLIT_FLAG,
+    WORKER_AUTOCOMPACT_EXPERIMENT, ab_split_flag_name, assign_arm, experiment_state, resolve_arms,
 };
 
 /// One feature flag entry in the registry. The registry is the source
@@ -552,6 +552,33 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
              share one arm. On: half of families are treated and the rest are control. Off: every family is \
              treated. Has no effect while `worker_autocompact` is off. DEFAULT ON, so switching \
              `worker_autocompact` on starts the split; turn this off to treat every family.",
+        category: EXPERIMENT_FLAG_CATEGORY,
+        default_enabled: true,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
+        name: DELTA_REREVIEW_EXPERIMENT,
+        description: "Experiment `delta_rereview` (token-consumption investigation R2 step 1; lane \
+             `pre_merge_review`, requires `review_batch_fanout`). For treated PR families, pre-merge review \
+             rounds after the first use one Light-tier reviewer with no consolidating supervisor and a delta \
+             brief carrying the prior round's findings, the diff since the last reviewed commit, the PR \
+             changed-file list, and one explicit whole-PR duplication check over that list. First-round reviews \
+             always run the full multi-agent batch. Which PR families are treated is decided by \
+             `delta_rereview_ab_split`, and every launch records its family's arm in the execution's launch \
+             record. Has no effect while `token_experiments` or `review_batch_fanout` is off, and is held back \
+             while another experiment in the `pre_merge_review` lane is also on. DEFAULT OFF: ships inert. \
+             Kill switch: set false and the next repeat-review admission uses the full fan-out batch.",
+        category: EXPERIMENT_FLAG_CATEGORY,
+        default_enabled: false,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
+        name: DELTA_REREVIEW_AB_SPLIT_FLAG,
+        description: "Run `delta_rereview` as an A/B experiment on half of PR families, chosen by a stable hash of \
+             the PR family and the experiment key. A work item and all of its revisions, reviews and guides share \
+             one arm. On: half of families are treated and the rest are control. Off: every family is treated. Has \
+             no effect while `delta_rereview` or `review_batch_fanout` is off. DEFAULT ON, so switching \
+             `delta_rereview` on starts the split; turn this off to treat every family.",
         category: EXPERIMENT_FLAG_CATEGORY,
         default_enabled: true,
         capability_id: None,

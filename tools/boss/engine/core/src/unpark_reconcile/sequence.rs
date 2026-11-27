@@ -692,11 +692,14 @@ async fn ai_review_step(env: &UnparkEnv, task: &Task, pr_url: &str) -> StepRecor
             ),
         );
     }
-    use boss_engine_completion::review_admission::{ReviewAdmission, admit_review, fetch_review_admission_metadata};
+    use boss_engine_completion::review_admission::{
+        ReviewAdmission, admit_review_with_mode, fetch_review_admission_metadata,
+    };
     let pool = env
         .completion
         .review_batch_fanout_enabled()
         .then_some(env.completion.review_pool_size());
+    let single_reviewer_light = pool.is_some() && env.completion.should_use_delta_rereview(&env.work_db, &task.id);
     // Parking does not stop a reviewer that was already running. The legacy
     // admission refuses to start a second execution on the item, which would
     // read as a failed step; batch admission reports this case itself.
@@ -707,11 +710,12 @@ async fn ai_review_step(env: &UnparkEnv, task: &Task, pr_url: &str) -> StepRecor
             "a worker is already running for this item, so no second review is started",
         );
     }
-    match admit_review(
+    match admit_review_with_mode(
         &env.work_db,
         &task.id,
         Some(pr_url),
         pool,
+        single_reviewer_light,
         &StaticPrStateChecker(PrOpenState::Open),
         fetch_review_admission_metadata,
     )

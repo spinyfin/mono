@@ -376,6 +376,14 @@ pub struct ReviewBatch {
     /// an ordinary task/chore, or a batch that predates this column.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub producing_work_item_id: Option<String>,
+    /// True for a one-member pre-merge batch (e.g. a Light-tier delta
+    /// re-review with no consolidating supervisor). The sole member submits
+    /// `SupervisorVerdict` directly via `boss propose review-verdict` and
+    /// moves the batch `collecting -> applying`, while `classification`
+    /// retains the PR's whole-PR profile for post-merge eligibility.
+    #[serde(default)]
+    #[builder(default = false)]
+    pub single_reviewer: bool,
 }
 
 fn first_generation() -> i64 {

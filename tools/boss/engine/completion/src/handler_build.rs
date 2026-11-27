@@ -21,6 +21,9 @@ impl WorkerCompletionHandler {
         let local_metrics = Arc::new(Registry::new());
         register_metrics(&local_metrics);
         crate::answer_agent_observability::register_metrics(&local_metrics);
+        let feature_flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(std::path::PathBuf::new()));
+        let review_batch_enqueuer: Arc<dyn ReviewBatchEnqueuer> =
+            Arc::new(GhReviewBatchEnqueuer::new(Arc::clone(&feature_flags)));
         Self {
             stop_locks: Default::default(),
             pending_no_op_completions: Default::default(),
@@ -39,7 +42,7 @@ impl WorkerCompletionHandler {
             staged_revision_pushes: Arc::new(crate::pr_url_capture::StagedRevisionPushCache::new()),
             staged_proposal_channel_errors: Arc::new(crate::proposal_channel_error::ProposalChannelErrorTracker::new()),
             staged_unobserved_commands: Arc::new(crate::codex_unobserved_command::UnobservedCommandTracker::new()),
-            feature_flags: Arc::new(crate::feature_flags::FeatureFlagsStore::new(std::path::PathBuf::new())),
+            feature_flags,
             branch_verifier: Arc::new(CommandBranchVerifier::new()),
             merge_queue_timeline: None,
             branch_verifier_overridden: false,
@@ -66,7 +69,8 @@ impl WorkerCompletionHandler {
             host_adapter_provider: Arc::new(std::sync::RwLock::new(None)),
             execution_cubes: Arc::new(std::sync::RwLock::new(None)),
             now_fn: Arc::new(std::time::Instant::now),
-            review_batch_enqueuer: Arc::new(GhReviewBatchEnqueuer),
+            review_batch_enqueuer,
+            review_batch_enqueuer_overridden: false,
             review_pool_size: boss_execution_contracts::DEFAULT_REVIEW_POOL_SIZE,
             source_packet_collector: crate::review_guide_capture::github_source_packet_collector(),
             collaborators,
@@ -369,6 +373,9 @@ impl WorkerCompletionHandler {
     /// at its registry default), preserving the pre-change behaviour.
     pub fn with_feature_flags(mut self, flags: Arc<crate::feature_flags::FeatureFlagsStore>) -> Self {
         self.feature_flags = flags;
+        if !self.review_batch_enqueuer_overridden {
+            self.review_batch_enqueuer = Arc::new(GhReviewBatchEnqueuer::new(Arc::clone(&self.feature_flags)));
+        }
         self
     }
 
@@ -378,6 +385,7 @@ impl WorkerCompletionHandler {
     #[cfg(any(test, feature = "test-support"))]
     pub fn with_review_batch_enqueuer(mut self, enqueuer: Arc<dyn ReviewBatchEnqueuer>) -> Self {
         self.review_batch_enqueuer = enqueuer;
+        self.review_batch_enqueuer_overridden = true;
         self
     }
 
@@ -553,6 +561,12 @@ impl WorkerCompletionHandler {
         self.review_batch_enqueuer.as_ref()
     }
 
+    /// Whether an automatic pre-merge review for `work_item_id` should use the
+    /// single-reviewer Light-tier delta re-review path.
+    pub fn should_use_delta_rereview(&self, work_db: &WorkDb, work_item_id: &str) -> bool {
+        crate::should_use_delta_rereview(&self.feature_flags, work_db, work_item_id)
+    }
+
     /// Shrink the conflict stop gate's `mergeable=UNKNOWN` re-probe
     /// backoff. Tests pass [`std::time::Duration::ZERO`] so exercising the
     /// indeterminate path costs no wall clock; production keeps the
@@ -656,5 +670,9 @@ impl CompletionRequests for WorkerCompletionHandler {
 
     fn review_batch_enqueuer(&self) -> &dyn ReviewBatchEnqueuer {
         WorkerCompletionHandler::review_batch_enqueuer(self)
+    }
+
+    fn should_use_delta_rereview(&self, work_db: &WorkDb, work_item_id: &str) -> bool {
+        WorkerCompletionHandler::should_use_delta_rereview(self, work_db, work_item_id)
     }
 }

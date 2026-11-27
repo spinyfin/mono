@@ -177,7 +177,7 @@ use conflict_delivery_gate::ConflictDeliveryDecision;
 use contribution_gate::{RevisionContributionReason, RevisionReviewGate};
 use pr_binding_guard::PrUrlDeliverable;
 pub(crate) use pr_transition::GhReviewBatchEnqueuer;
-pub use pr_transition::review_batch_input_from_metadata;
+pub use pr_transition::{review_batch_input_from_metadata, should_use_delta_rereview};
 
 // Counter handles for the PR URL capture channels, in the order they are
 // consulted: the worker's structured-output artifact (the driver-agnostic file
@@ -1752,6 +1752,11 @@ pub struct WorkerCompletionHandler {
     /// [`Self::with_review_batch_enqueuer`] so admission deferral can be
     /// exercised without a live GitHub call.
     review_batch_enqueuer: Arc<dyn ReviewBatchEnqueuer>,
+    /// Tracks whether [`Self::with_review_batch_enqueuer`] replaced the
+    /// default [`GhReviewBatchEnqueuer`], so [`Self::with_feature_flags`]
+    /// refreshes the default enqueuer's flag store without clobbering test
+    /// stubs.
+    review_batch_enqueuer_overridden: bool,
     /// Configured review-pool slot count used as weighted-admission
     /// reservation capacity. Defaults to
     /// [`boss_execution_contracts::DEFAULT_REVIEW_POOL_SIZE`]; production wires
