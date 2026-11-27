@@ -324,6 +324,13 @@ grep -q -F '/proc/{pid}/environ' "$slots_exporter" ||
 if grep -v -E '^[[:space:]]*(#|")' "$slots_exporter" | grep -q -E 'systemctl.*restart|systemctl.*stop'; then
   fail "worker-slots-exporter.py must only read: it must not restart or stop the hub"
 fi
+grep -q -F 'journalctl --unit nativelink-macos-hub.service --output json --all --lines=1' "$readme" ||
+  fail "README.md must describe the JSON journal access check with --all"
+grep -q -F -e '--follow --no-tail --after-cursor <cursor>' "$readme" ||
+  fail "README.md must describe cursor-based journal follow, not --output cat --lines=0"
+if grep -q -F 'journalctl --quiet --unit nativelink-macos-hub.service --output cat --follow --lines=0' "$readme"; then
+  fail "README.md must not describe the old cat --lines=0 journal follower"
+fi
 grep -q -x '## Hub metrics' "$readme" ||
   fail "README.md must keep its \"Hub metrics\" section"
 grep -q -F 'copy_if_changed' "$readme" && grep -q -F 'cmp -s' "$readme" ||

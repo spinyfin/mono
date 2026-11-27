@@ -130,6 +130,8 @@ with patch.object(mod.subprocess, "run", return_value=SimpleNamespace(returncode
     cursor = mod._journal_follow_once(cursor)
     assert cursor == "gap"
     cursor = mod._journal_follow_once(cursor)
+assert "--all" in commands[0]
+assert "--all" in commands[1]
 assert "--no-tail" in commands[1]
 assert commands[1][-2:] == ["--after-cursor", "before"]
 assert commands[2][-2:] == ["--after-cursor", "gap"]
@@ -138,6 +140,65 @@ with patch.object(mod.subprocess, "run", return_value=SimpleNamespace(returncode
     assert mod._journal_follow_once(cursor) == cursor
     popen.assert_not_called()
 assert mod._journal_watch_up == 0
+
+# --- Null / byte-array MESSAGE and unparseable lines must not freeze the cursor ---
+assert mod.normalize_journal_message("plain") == "plain"
+assert mod.normalize_journal_message(None) == ""
+assert mod.normalize_journal_message(list(b"hi")) == "hi"
+assert mod.normalize_journal_message(12) == ""
+assert mod.normalize_journal_message([256]) == ""
+
+def follow_lines(*batches):
+    calls = []
+    def follow(cmd, **kwargs):
+        calls.append(cmd)
+        text = batches[len(calls) - 1] if len(calls) <= len(batches) else ""
+        return SimpleNamespace(stdout=io.StringIO(text), terminate=lambda: None, wait=lambda **kw: 0)
+    return follow, calls
+
+null_entry = json.dumps({"__CURSOR": "c-null", "MESSAGE": None})
+kill_entry = json.dumps({"__CURSOR": "c-kill", "MESSAGE": samples[1][0]})
+byte_entry = json.dumps({"__CURSOR": "c-bytes", "MESSAGE": list(b"binary\x00junk")})
+silence_entry = json.dumps({"__CURSOR": "c-silence", "MESSAGE": samples[3][0]})
+decoded_entry = json.dumps({"__CURSOR": "c-decoded", "MESSAGE": samples[8][0]})
+malformed = "{not json"
+no_cursor = json.dumps({"MESSAGE": samples[1][0]})
+access = entry("seed", "hub started")
+
+before_kill = mod._journal_counts["nativelink_hub_worker_kill_ack_evictions_total"]
+follow, cmds = follow_lines(null_entry + "\n" + kill_entry + "\n", "")
+with patch.object(mod.subprocess, "run", return_value=SimpleNamespace(returncode=0, stderr="", stdout=access)), patch.object(mod.subprocess, "Popen", side_effect=follow):
+    cursor = mod._journal_follow_once("seed")
+    assert cursor == "c-kill"
+    cursor = mod._journal_follow_once(cursor)
+    assert cursor == "c-kill"
+assert "--all" in cmds[0]
+assert cmds[1][-2:] == ["--after-cursor", "c-kill"]
+assert mod._journal_counts["nativelink_hub_worker_kill_ack_evictions_total"] == before_kill + 1
+
+before_silence = mod._journal_counts["nativelink_hub_worker_silence_evictions_total"]
+follow, cmds = follow_lines(byte_entry + "\n" + silence_entry + "\n", "")
+with patch.object(mod.subprocess, "run", return_value=SimpleNamespace(returncode=0, stderr="", stdout=access)), patch.object(mod.subprocess, "Popen", side_effect=follow):
+    cursor = mod._journal_follow_once("seed")
+    assert cursor == "c-silence"
+    cursor = mod._journal_follow_once(cursor)
+    assert cursor == "c-silence"
+assert mod._journal_counts["nativelink_hub_worker_silence_evictions_total"] == before_silence + 1
+
+before_decoded = mod._journal_counts["nativelink_hub_compressed_upload_decoded_size_errors_total"]
+follow, _cmds = follow_lines(malformed + "\n" + no_cursor + "\n" + decoded_entry + "\n")
+with patch.object(mod.subprocess, "run", return_value=SimpleNamespace(returncode=0, stderr="", stdout=access)), patch.object(mod.subprocess, "Popen", side_effect=follow):
+    cursor = mod._journal_follow_once("seed")
+    assert cursor == "c-decoded"
+assert mod._journal_counts["nativelink_hub_compressed_upload_decoded_size_errors_total"] == before_decoded + 1
+
+# A classify failure on one entry still advances past its cursor.
+def boom(line):
+    raise RuntimeError("classify failed")
+follow, _cmds = follow_lines(kill_entry + "\n")
+with patch.object(mod, "record_journal_line", side_effect=boom), patch.object(mod.subprocess, "run", return_value=SimpleNamespace(returncode=0, stderr="", stdout=access)), patch.object(mod.subprocess, "Popen", side_effect=follow):
+    cursor = mod._journal_follow_once("seed")
+    assert cursor == "c-kill"
 
 # --- Hub-side /status probe (200, 503, timeout) ---
 mode = {"kind": "200"}

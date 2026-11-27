@@ -456,6 +456,21 @@ def classify_journal_line(line):
     """Return the list of journal counter metric names matched by one log line."""
     return [name for name, _, pat in JOURNAL_METRICS if pat.search(line)]
 
+def normalize_journal_message(value):
+    """Turn a journalctl JSON MESSAGE into text for classify_journal_line.
+
+    journalctl --output json encodes fields over 4096 bytes as null unless
+    --all is passed, and non-printable fields as arrays of byte values.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        try:
+            return bytes(value).decode("utf-8", "replace")
+        except (TypeError, ValueError):
+            return ""
+    return ""
+
 def record_journal_line(line):
     matched = classify_journal_line(line)
     if matched:
@@ -467,7 +482,7 @@ def record_journal_line(line):
 def _journal_follow_once(cursor):
     """Confirm journal access and resume after the last counted entry."""
     global _journal_watch_up
-    base = ["journalctl", "--unit", HUB_UNIT, "--output", "json", "--no-pager"]
+    base = ["journalctl", "--unit", HUB_UNIT, "--output", "json", "--all", "--no-pager"]
     proc = None
     try:
         # A running journalctl alone does not prove access (it can just print
@@ -475,7 +490,10 @@ def _journal_follow_once(cursor):
         check = subprocess.run(base + ["--lines=1"], capture_output=True, text=True, timeout=10)
         if check.returncode or check.stderr.strip():
             return cursor
-        entry = json.loads(check.stdout.strip())
+        try:
+            entry = json.loads(check.stdout.strip())
+        except json.JSONDecodeError:
+            return cursor
         if not entry.get("__CURSOR") or "MESSAGE" not in entry:
             return cursor
         if cursor is None:
@@ -486,11 +504,18 @@ def _journal_follow_once(cursor):
             _journal_watch_up = 1
         assert proc.stdout is not None
         for line in proc.stdout:
-            entry = json.loads(line)
-            next_cursor = entry["__CURSOR"]
-            if next_cursor != cursor:
-                record_journal_line(entry.get("MESSAGE", ""))
-                cursor = next_cursor
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            next_cursor = entry.get("__CURSOR")
+            if not next_cursor or next_cursor == cursor:
+                continue
+            try:
+                record_journal_line(normalize_journal_message(entry.get("MESSAGE", "")))
+            except Exception:
+                pass
+            cursor = next_cursor
     except Exception:
         pass
     finally:
