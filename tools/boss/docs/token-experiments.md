@@ -61,7 +61,7 @@ A missing key never means control. It means the experiment was not running for t
 - **Flags may change at any time.** What was in force for a run is recovered from the run's own row. Analysis never depends on when a flag was flipped.
 - **Sticky.** A later run of the same execution (a retry) reuses the stored set, so the record stays true. An experiment that started after the first launch is not picked up by a later run, and an execution that recorded NULL is never treated.
 - **A stop rewrites the record.** With `<key>` off, a later run of an execution that recorded the key launches untreated, and the writer changes that key's value to `stopped`, whichever arm it held. Control is rewritten as well as treatment so both arms lose such executions alike. This is the only update made after the first launch. The tokens a treated first run used are then counted in neither arm.
-- **A treatment's definition is fixed for the life of its key.** Changing a threshold or the wording is a new key, so old and new data are never pooled under one name. Keys are never reused, adopted or dropped.
+- **A treatment's definition is fixed for the life of its key.** Changing a threshold or the wording is a new key, so old and new data are never pooled under one name. A key is never reused once its experiment has been adopted or dropped.
 
 The same arm set rides the `pane_spawned` dispatch event, under `details.spawn_config.experiment_arms`, as an object (null when the runner that launched the run does not run experiments). The arm set is deliberately not part of the protocol's `WorkExecution` type.
 

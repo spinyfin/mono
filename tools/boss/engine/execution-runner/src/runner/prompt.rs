@@ -781,12 +781,18 @@ pub(crate) fn bazel_conflict_resolution_gate_text(seam_enabled: bool) -> String 
     )
 }
 
+/// Insert `rule` directly under the prompt's opening line, where the rules
+/// every worker inherits sit.
+pub(super) fn insert_under_opening_line(prompt: String, rule: &str) -> String {
+    match prompt.split_once('\n') {
+        Some((opening, rest)) => format!("{opening}\n{rule}{rest}"),
+        None => format!("{prompt}{rule}"),
+    }
+}
+
 /// Apply the cache policy to generic and separately composed worker prompts.
 pub(super) fn with_bazel_caching_rule(prompt: String) -> String {
-    match prompt.split_once('\n') {
-        Some((opening, rest)) => format!("{opening}\n{}{rest}", bazel_caching_rule_text()),
-        None => format!("{prompt}{}", bazel_caching_rule_text()),
-    }
+    insert_under_opening_line(prompt, bazel_caching_rule_text())
 }
 
 /// Append cache policy without splitting a pinned template.

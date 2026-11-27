@@ -77,10 +77,10 @@ impl WorkDb {
     /// launches the worker, not inferred later from current routing/model
     /// policy, so execution history remains an honest record of what ran.
     ///
-    /// Four positional arguments, no experiment arms: the launch tuple as it
-    /// was before arms existed. [`Self::record_execution_launch`] is the
-    /// writer; this wrapper stays so callers that do not run experiments need
-    /// no change.
+    /// Records the launch tuple without experiment arms, leaving
+    /// `experiment_arms` NULL (not recorded). Convenience wrapper over
+    /// [`Self::record_execution_launch`] for callers that do not run
+    /// experiments.
     pub fn record_execution_launch_config(
         &self,
         execution_id: &str,

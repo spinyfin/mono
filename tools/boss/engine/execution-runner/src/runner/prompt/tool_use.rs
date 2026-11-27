@@ -32,8 +32,5 @@ const BATCHED_SEARCH_DIRECTIVE: &str = "\n**Batch independent tool calls.** When
 /// Insert [`BATCHED_SEARCH_DIRECTIVE`] directly under the prompt's opening
 /// line, where the other rules every worker inherits sit.
 pub(super) fn with_batched_search_directive(prompt: String) -> String {
-    match prompt.split_once('\n') {
-        Some((opening, rest)) => format!("{opening}\n{BATCHED_SEARCH_DIRECTIVE}{rest}"),
-        None => format!("{prompt}{BATCHED_SEARCH_DIRECTIVE}"),
-    }
+    super::insert_under_opening_line(prompt, BATCHED_SEARCH_DIRECTIVE)
 }
