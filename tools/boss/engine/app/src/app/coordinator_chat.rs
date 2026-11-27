@@ -1,5 +1,10 @@
-//! App-only coordinator-chat RPC. This entry declares the surface and answers
-//! that the chat backend is not running; a later entry wires the service.
+//! App-only coordinator-chat RPC. Until a chat backend is attached, every
+//! operation from the app session is answered with `BackendNotRunning`.
+//!
+//! The session check below is the authoritative app-only gate. The request
+//! contract only excludes worker and progression tiers (as for
+//! `RecreateCoordinator`), and it applies only when worker RPC tiering is on,
+//! so this check must not rely on it.
 
 use super::*;
 use boss_protocol::CoordinatorChatOutcome;

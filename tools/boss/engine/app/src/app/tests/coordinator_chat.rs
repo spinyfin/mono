@@ -70,24 +70,18 @@ async fn a_non_app_session_is_rejected() {
     server_state
         .register_app_session("session-app".into(), make_session_sink())
         .await;
-    let sink = make_session_sink();
-    handle_coordinator_chat(
-        dispatch(&server_state, &sink, "session-cli"),
-        chat(CoordinatorChatOperation::Send {
-            text: "hi".into(),
-            client_message_id: "c1".into(),
-            attachments: vec![],
-        }),
-    )
-    .await;
-    match sole_response(&sink).await {
-        FrontendEvent::Error { message } => {
-            assert!(
-                message.contains("only the app session"),
-                "denial must name the app-session rule, got {message}"
-            );
+    for operation in operations() {
+        let sink = make_session_sink();
+        handle_coordinator_chat(dispatch(&server_state, &sink, "session-cli"), chat(operation)).await;
+        match sole_response(&sink).await {
+            FrontendEvent::Error { message } => {
+                assert!(
+                    message.contains("only the app session"),
+                    "denial must name the app-session rule, got {message}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
         }
-        other => panic!("expected Error, got {other:?}"),
     }
 }
 

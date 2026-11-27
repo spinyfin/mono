@@ -328,8 +328,9 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
             ProgressionAccess::Deny,
         ),
         R::VerifyCoordinatorResetRequest { .. } => bulk_read(WorkerAccess::Coordinator, ProgressionAccess::Deny),
-        // Fetch is a read of the conversation projection. Send, cancel and
-        // answering a permission speak as the operator and are app-only.
+        // Fetch reads the conversation projection. Send, cancel and permission
+        // answers are app-only mutations and must not be replayed. The tier
+        // only excludes worker tiers; the handler enforces app-only.
         R::CoordinatorChat { operation } => match operation {
             CoordinatorChatOperation::Fetch { .. } => {
                 bulk_read(WorkerAccess::Coordinator, ProgressionAccess::Deny)

@@ -72,8 +72,6 @@ pub enum CoordinatorChatOutcome {
     /// The named permission request was answered with the chosen option.
     PermissionAnswered { request_id: String },
     /// Snapshot of items after the requested sequence number.
-    /// Boxed: an inline fetch snapshot would make this variant far larger
-    /// than its siblings (clippy::large_enum_variant) — serializes identically.
     Fetch(Box<CoordinatorChatFetchOutcome>),
 }
 
