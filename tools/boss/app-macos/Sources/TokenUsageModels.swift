@@ -186,6 +186,8 @@ struct ExecutionUsageNode: Codable, Equatable, Hashable, Sendable, Identifiable 
     var modelLaunched: String?
     var prUrl: String?
     var startedAtEpochS: Int64?
+    /// Engine-supplied name for a non-worker execution (a coordinator session).
+    var displayLabel: String?
 
     var id: String { executionId }
 }

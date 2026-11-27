@@ -247,9 +247,7 @@ enum TokenUsageTree {
         let id = "\(path)/exec:\(execution.executionId)"
         let children = execution.runs.map { runNode($0, execution: execution, path: id) }
         let convention = execution.runs.first?.inputConvention
-        let displayName = execution.kind == Self.coordinatorKind
-            ? "Session \(shortCoordinatorSessionId(execution.executionId))"
-            : execution.kind
+        let displayName = execution.displayLabel ?? execution.kind
         let observedModels = Set(execution.runs.compactMap(\.modelObserved))
         let executionModel: String
         if observedModels.count == 1, let only = observedModels.first {
@@ -446,21 +444,6 @@ enum TokenUsageTree {
                 tokens: nil
             ),
         ]
-    }
-
-    private static func shortCoordinatorSessionId(_ executionId: String) -> String {
-        var trimmed = executionId
-        if trimmed.hasPrefix("coord_sess_") {
-            trimmed = String(trimmed.dropFirst("coord_sess_".count))
-        }
-        if trimmed.hasPrefix("spawn:") {
-            trimmed = String(trimmed.dropFirst("spawn:".count))
-        }
-        let looksLikeUuid = trimmed.count >= 9 && trimmed[trimmed.index(trimmed.startIndex, offsetBy: 8)] == "-"
-        if looksLikeUuid || trimmed.count > 24 {
-            return String(trimmed.prefix(8))
-        }
-        return trimmed
     }
 
     // MARK: - Taskless

@@ -801,6 +801,7 @@ final class TokenUsageTreeBuilderTests: XCTestCase {
         )
         coordExec.spendClass = .overhead
         coordExec.status = "active"
+        coordExec.displayLabel = "Coordinator session abcd1234"
         coordExec.runs = [
             sampleRun(
                 id: "coord_run_1",
@@ -833,7 +834,7 @@ final class TokenUsageTreeBuilderTests: XCTestCase {
         XCTAssertEqual(coordNode.status, "active")
         XCTAssertEqual(coordNode.totalTokens, 120_000)
         XCTAssertEqual(coordNode.children?.count, 1)
-        XCTAssertEqual(coordNode.children?.first?.name, "Session abcd1234")
+        XCTAssertEqual(coordNode.children?.first?.name, "Coordinator session abcd1234")
         XCTAssertEqual(coordNode.children?.first?.model, "mixed")
         XCTAssertEqual(nodes[2].children?.map(\.name), ["answer_agent"])
     }
