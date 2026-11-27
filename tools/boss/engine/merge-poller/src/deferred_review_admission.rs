@@ -21,10 +21,15 @@ pub(super) fn has_pending_review_admission(work_db: &WorkDb, handler: Option<&dy
 /// from a completed batch on the current SHA (advance to human Review).
 /// The batch-creation strategy is injected so tests can supply PR metadata
 /// without `gh`.
+///
+/// `use_delta_rereview` is the same routing decision the other trigger sites
+/// make (`CompletionRequests::should_use_delta_rereview` in production): a
+/// `true` admits the single-reviewer Light-tier batch.
 pub(crate) async fn sweep_deferred_review_admission_with(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
     enqueuer: &dyn ReviewBatchEnqueuer,
+    use_delta_rereview: &(dyn Fn(&WorkDb, &str) -> bool + Sync),
     wanted_pr_urls: Option<&std::collections::HashSet<&str>>,
     review_pool_size: usize,
     outcome: &mut SweepOutcome,
@@ -75,13 +80,15 @@ pub(crate) async fn sweep_deferred_review_admission_with(
             ),
         }
         enqueued += 1;
+        let single_reviewer_light = use_delta_rereview(work_db, &candidate.task_id);
         match enqueuer
-            .enqueue(
+            .enqueue_with_mode(
                 work_db,
                 &candidate.task_id,
                 &candidate.repo_remote_url,
                 &candidate.pr_url,
                 review_pool_size,
+                single_reviewer_light,
             )
             .await
         {

@@ -26,11 +26,23 @@ pub async fn sweep_deferred_review_admission(
     db: &WorkDb,
     enqueuer: &dyn boss_observation_contracts::ReviewBatchEnqueuer,
 ) -> crate::SweepOutcome {
+    sweep_deferred_review_admission_routed(db, enqueuer, &|_, _| false).await
+}
+
+/// [`sweep_deferred_review_admission`] with the delta re-review routing
+/// decision supplied by the caller, as production supplies it from
+/// `CompletionRequests::should_use_delta_rereview`.
+pub async fn sweep_deferred_review_admission_routed(
+    db: &WorkDb,
+    enqueuer: &dyn boss_observation_contracts::ReviewBatchEnqueuer,
+    use_delta_rereview: &(dyn Fn(&WorkDb, &str) -> bool + Sync),
+) -> crate::SweepOutcome {
     let mut outcome = crate::SweepOutcome::default();
     crate::deferred_review_admission::sweep_deferred_review_admission_with(
         db,
         &RecordingPublisher::default(),
         enqueuer,
+        use_delta_rereview,
         None,
         16,
         &mut outcome,

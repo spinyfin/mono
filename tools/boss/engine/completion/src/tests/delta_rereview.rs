@@ -45,8 +45,8 @@ fn test_classification(profile: ReviewProfile) -> ReviewClassification {
 
 /// Test enqueuer that mirrors `GhReviewBatchEnqueuer`'s production contract
 /// without calling `gh`: `enqueue_with_mode` forwards the caller's flag, and
-/// `enqueue` (used by deferred admission) computes `should_use_delta_rereview`
-/// from the same `FeatureFlagsStore`.
+/// plain `enqueue` is always the full multi-leaf batch. Routing lives in the
+/// trigger sites, never in the enqueuer.
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
 struct ModeAwareStubEnqueuer {
@@ -55,7 +55,6 @@ struct ModeAwareStubEnqueuer {
     additions: i64,
     #[builder(default = 6)]
     deletions: i64,
-    flags: Arc<FeatureFlagsStore>,
     #[builder(default)]
     calls: AtomicUsize,
     #[builder(default)]
@@ -63,23 +62,21 @@ struct ModeAwareStubEnqueuer {
 }
 
 impl ModeAwareStubEnqueuer {
-    fn new(head_sha: &str, flags: Arc<FeatureFlagsStore>) -> Arc<Self> {
+    fn new(head_sha: &str) -> Arc<Self> {
         Arc::new(Self {
             head_sha: head_sha.to_owned(),
             additions: 24,
             deletions: 6,
-            flags,
             calls: AtomicUsize::new(0),
             last_single_reviewer: AtomicBool::new(false),
         })
     }
 
-    fn with_diff_size(head_sha: &str, additions: i64, deletions: i64, flags: Arc<FeatureFlagsStore>) -> Arc<Self> {
+    fn with_diff_size(head_sha: &str, additions: i64, deletions: i64) -> Arc<Self> {
         Arc::new(Self {
             head_sha: head_sha.to_owned(),
             additions,
             deletions,
-            flags,
             calls: AtomicUsize::new(0),
             last_single_reviewer: AtomicBool::new(false),
         })
@@ -107,8 +104,7 @@ impl ReviewBatchEnqueuer for ModeAwareStubEnqueuer {
         pr_url: &str,
         review_pool_size: usize,
     ) -> anyhow::Result<ReviewBatchDispatch> {
-        let single = should_use_delta_rereview(&self.flags, work_db, work_item_id);
-        self.enqueue_with_mode(work_db, work_item_id, repo_remote_url, pr_url, review_pool_size, single)
+        self.enqueue_with_mode(work_db, work_item_id, repo_remote_url, pr_url, review_pool_size, false)
             .await
     }
 
@@ -329,7 +325,7 @@ async fn all_trigger_sites_agree_on_round_1_full_batch_and_round_2_delta_routing
         "round 1 must stay on the full batch even for a treated family"
     );
     let r1_exec = start_running_execution(&db, &treated_root, ExecutionKind::ChoreImplementation, workspace.path());
-    let r1_enqueuer = ModeAwareStubEnqueuer::new("sha-r1", flags.clone());
+    let r1_enqueuer = ModeAwareStubEnqueuer::new("sha-r1");
     let verifier = StubBranchVerifier::ok("boss/test");
     let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
         .handler
@@ -415,7 +411,7 @@ async fn all_trigger_sites_agree_on_round_1_full_batch_and_round_2_delta_routing
         )
         .unwrap();
     let rev1_exec = start_running_execution(&db, &rev1.id, ExecutionKind::RevisionImplementation, workspace.path());
-    let r2_enqueuer = ModeAwareStubEnqueuer::new("sha-r2-finalize", flags.clone());
+    let r2_enqueuer = ModeAwareStubEnqueuer::new("sha-r2-finalize");
     let verifier = StubBranchVerifier::ok("boss/test");
     *verifier.fresh_head_oid_result.try_lock().unwrap() = Ok("sha-r2-finalize".to_owned());
     *verifier.head_oid_result.try_lock().unwrap() = Ok("sha-r2-finalize".to_owned());
@@ -470,7 +466,7 @@ async fn all_trigger_sites_agree_on_round_1_full_batch_and_round_2_delta_routing
         ExecutionKind::RevisionImplementation,
         workspace.path(),
     );
-    let ctrl_enqueuer = ModeAwareStubEnqueuer::new("sha-ctrl-r2", flags.clone());
+    let ctrl_enqueuer = ModeAwareStubEnqueuer::new("sha-ctrl-r2");
     let verifier = StubBranchVerifier::ok("boss/test");
     *verifier.fresh_head_oid_result.try_lock().unwrap() = Ok("sha-ctrl-r2".to_owned());
     *verifier.head_oid_result.try_lock().unwrap() = Ok("sha-ctrl-r2".to_owned());
@@ -517,7 +513,7 @@ async fn all_trigger_sites_agree_on_round_1_full_batch_and_round_2_delta_routing
         .unwrap();
     let rev2_exec_id = start_running_execution(&db, &rev2.id, ExecutionKind::RevisionImplementation, workspace.path());
     let rev2_exec = db.get_execution(&rev2_exec_id).unwrap();
-    let run_done_enqueuer = ModeAwareStubEnqueuer::new("sha-r2-rundone", flags.clone());
+    let run_done_enqueuer = ModeAwareStubEnqueuer::new("sha-r2-rundone");
     let run_done_verifier = StubBranchVerifier::ok("boss/test");
     *run_done_verifier.fresh_head_oid_result.try_lock().unwrap() = Ok("sha-r2-rundone".to_owned());
     *run_done_verifier.head_oid_result.try_lock().unwrap() = Ok("sha-r2-rundone".to_owned());
@@ -547,7 +543,7 @@ async fn all_trigger_sites_agree_on_round_1_full_batch_and_round_2_delta_routing
     assert!(rundone_batch.single_reviewer);
     assert_eq!(db.review_batch_members(&rundone_batch.id).unwrap().len(), 1);
 
-    // 5. Trigger site C: unpark reconcile (`admit_review_with_mode` + `CompletionRequests::should_use_delta_rereview`).
+    // 5. Trigger site C's admission call: `admit_review_with_mode` with the mode `CompletionRequests::should_use_delta_rereview` returns.
     let unpark_handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
         .handler
         .with_feature_flags(flags.clone());
@@ -581,19 +577,11 @@ async fn all_trigger_sites_agree_on_round_1_full_batch_and_round_2_delta_routing
         _ => panic!("expected solo batch from unpark admission"),
     }
 
-    // 6. Trigger site D: deferred-admission path (`ReviewBatchEnqueuer::enqueue` without explicit flag).
-    let deferred_enqueuer = ModeAwareStubEnqueuer::new("sha-r2-deferred", flags.clone());
-    let deferred_dispatch = deferred_enqueuer
-        .enqueue(&db, &treated_root, REPO, treated_pr, 16)
-        .await
-        .unwrap();
-    match deferred_dispatch {
-        ReviewBatchDispatch::Created { batch, executions } => {
-            assert!(batch.single_reviewer);
-            assert_eq!(executions.len(), 1);
-        }
-        other => panic!("expected solo batch from deferred admission, got {other:?}"),
-    }
+    // Trigger site D (the merge poller's deferred-admission sweep) and the
+    // production wiring of site C (unpark reconcile's `ai_review_step`) cannot
+    // be built from this crate: they are exercised against the real sweep and
+    // the real step, with the real routing decision, in the merge-poller's
+    // `deferred_review_admission_tests` and core's `unpark_reconcile` steps tests.
 }
 
 /// Multi-round integration across both paths:
@@ -838,7 +826,7 @@ async fn cycle_counting_and_prior_findings_carry_seamlessly_across_fanout_and_de
 
     // Round 3 with max_review_cycles = 2 must trip the cycle cap and record skipped_cycle_cap.
     let rev2_exec = start_running_execution(&db, &rev2_id, ExecutionKind::RevisionImplementation, workspace.path());
-    let r3_enqueuer = ModeAwareStubEnqueuer::new("sha-r3", flags.clone());
+    let r3_enqueuer = ModeAwareStubEnqueuer::new("sha-r3");
     let verifier = StubBranchVerifier::ok("boss/test");
     *verifier.fresh_head_oid_result.try_lock().unwrap() = Ok("sha-r3".to_owned());
     *verifier.head_oid_result.try_lock().unwrap() = Ok("sha-r3".to_owned());
@@ -1029,7 +1017,7 @@ async fn solo_delta_batch_persists_whole_pr_deep_classification_for_post_merge_e
     let root_id = create_chore_in_arm(&db, &product.id, pr_url, true);
 
     // Round 1 was Standard (below Deep's 1000-line threshold).
-    let r1_enqueuer = ModeAwareStubEnqueuer::with_diff_size("sha-r1", 500, 100, flags.clone());
+    let r1_enqueuer = ModeAwareStubEnqueuer::with_diff_size("sha-r1", 500, 100);
     let r1_dispatch = r1_enqueuer.enqueue(&db, &root_id, REPO, pr_url, 16).await.unwrap();
     let r1_batch = match r1_dispatch {
         ReviewBatchDispatch::Created { batch, .. } => batch,
@@ -1053,8 +1041,18 @@ async fn solo_delta_batch_persists_whole_pr_deep_classification_for_post_merge_e
 
     // Round 2 grows past 1000 lines: classified Deep for post-merge eligibility,
     // yet dispatched as a single Light-tier (`sonnet`) delta reviewer!
-    let r2_enqueuer = ModeAwareStubEnqueuer::with_diff_size("sha-r2", 950, 250, flags.clone());
-    let r2_dispatch = r2_enqueuer.enqueue(&db, &root_id, REPO, pr_url, 16).await.unwrap();
+    let r2_enqueuer = ModeAwareStubEnqueuer::with_diff_size("sha-r2", 950, 250);
+    let r2_dispatch = r2_enqueuer
+        .enqueue_with_mode(
+            &db,
+            &root_id,
+            REPO,
+            pr_url,
+            16,
+            should_use_delta_rereview(&flags, &db, &root_id),
+        )
+        .await
+        .unwrap();
     let (r2_batch, r2_execs) = match r2_dispatch {
         ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
         other => panic!("expected round 2 solo batch, got {other:?}"),

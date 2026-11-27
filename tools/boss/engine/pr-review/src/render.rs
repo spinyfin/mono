@@ -184,17 +184,7 @@ pub fn render_revision_instructions(result: &ReviewResult, origin: ReviewOrigin)
 
     for f in &findings {
         let loc = f.location.as_deref().map(|l| format!(" ({l})")).unwrap_or_default();
-        let category = match f.category {
-            ReviewFindingCategory::Correctness => "correctness",
-            ReviewFindingCategory::Regression => "regression",
-            ReviewFindingCategory::Architecture => "architecture",
-            ReviewFindingCategory::Readability => "readability",
-            ReviewFindingCategory::Tests => "tests",
-            ReviewFindingCategory::EdgeCase => "edgecase",
-            ReviewFindingCategory::Duplication => "duplication",
-            ReviewFindingCategory::DeferredScope => "deferred_scope",
-            ReviewFindingCategory::AgentIsms => "agent_isms",
-        };
+        let category = f.category.as_str();
         // Findings without ids or sources get no identity or provenance lines.
         let id_line =
             f.id.as_deref()

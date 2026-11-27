@@ -22,11 +22,25 @@ impl ReviewBatchEnqueuer for FixedHeadEnqueuer {
         pr_url: &str,
         review_pool_size: usize,
     ) -> Result<ReviewBatchDispatch> {
+        self.enqueue_with_mode(work_db, work_item_id, repo_remote_url, pr_url, review_pool_size, false)
+            .await
+    }
+
+    async fn enqueue_with_mode(
+        &self,
+        work_db: &WorkDb,
+        work_item_id: &str,
+        repo_remote_url: &str,
+        pr_url: &str,
+        review_pool_size: usize,
+        single_reviewer_light: bool,
+    ) -> Result<ReviewBatchDispatch> {
         // As the production enqueuer builds it: keyed on the cycle root, and
         // naming the candidate when that is a revision of the root.
         let root_id = work_db.review_cycle_root_id(work_item_id);
         let mut input = batch_input(root_id.clone(), pr_url, self.head);
         input.legacy_task_id = (work_item_id != root_id).then(|| work_item_id.to_owned());
+        input.single_reviewer_light = single_reviewer_light;
         work_db.create_pre_merge_review_batch_for_pool(input, repo_remote_url, review_pool_size)
     }
 }
@@ -109,12 +123,79 @@ async fn sweep(db: &WorkDb, publisher: &RecordingPublisher, head: &'static str) 
         db,
         publisher,
         &FixedHeadEnqueuer { head },
+        &|_, _| false,
         None,
         16,
         &mut outcome,
     )
     .await;
     outcome
+}
+
+async fn sweep_routed(
+    db: &WorkDb,
+    publisher: &RecordingPublisher,
+    head: &'static str,
+    use_delta_rereview: &(dyn Fn(&WorkDb, &str) -> bool + Sync),
+) -> SweepOutcome {
+    let mut outcome = SweepOutcome::default();
+    super::super::deferred_review_admission::sweep_deferred_review_admission_with(
+        db,
+        publisher,
+        &FixedHeadEnqueuer { head },
+        use_delta_rereview,
+        None,
+        16,
+        &mut outcome,
+    )
+    .await;
+    outcome
+}
+
+/// The sweep asks the routing decision per candidate and admits the batch
+/// shape it names: one Light-tier reviewer when it says delta, the full
+/// two-leaf batch otherwise.
+#[tokio::test]
+async fn sweep_admits_the_batch_shape_the_delta_routing_decision_names() {
+    for (delta, expected_members, expected_solo) in [(true, 1, true), (false, 2, false)] {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let root_id = in_review_root(&db);
+        // A reaped batch leaves the current head unreviewed, so the sweep re-admits it.
+        let (reaped, _) = settled_batch(&db, &root_id, "head-a");
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE pr_review_batch_members SET status = 'failed' WHERE batch_id = ?1",
+                rusqlite::params![reaped.id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE pr_review_batches SET status = 'failed' WHERE id = ?1",
+                rusqlite::params![reaped.id],
+            )
+            .unwrap();
+        }
+        let publisher = RecordingPublisher::default();
+        let asked = std::sync::Mutex::new(Vec::new());
+
+        let outcome = sweep_routed(&db, &publisher, "head-a", &|_, id| {
+            asked.lock().unwrap().push(id.to_owned());
+            delta
+        })
+        .await;
+
+        assert_eq!(outcome.review_admission_recovered, 1, "delta={delta}");
+        assert_eq!(*asked.lock().unwrap(), vec![root_id.clone()], "delta={delta}");
+        let batch = db
+            .review_batches_for_cycle_root(&root_id)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id != reaped.id)
+            .expect("batch admitted");
+        assert_eq!(batch.single_reviewer, expected_solo, "delta={delta}");
+        assert_eq!(db.review_batch_members(&batch.id).unwrap().len(), expected_members);
+    }
 }
 
 /// An `in_review` root whose newest batch was reaped gets generation 2 at
@@ -236,6 +317,7 @@ async fn sweep_skips_enqueue_for_roots_held_by_focus() {
         &db,
         &publisher,
         &PanicEnqueuer,
+        &|_, _| false,
         None,
         16,
         &mut outcome,
@@ -401,6 +483,7 @@ async fn sweep_admits_the_review_of_a_launched_revisions_push_through_focus() {
                 &db,
                 &publisher,
                 &PanicEnqueuer,
+                &|_, _| false,
                 None,
                 16,
                 &mut outcome,

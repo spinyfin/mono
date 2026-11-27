@@ -60,6 +60,12 @@ pub struct DeltaRereviewContext {
     /// GitHub metadata (`PrReviewContext`) could not be pre-fetched and no
     /// prior verdict row recorded a head SHA.
     pub last_reviewed_sha: Option<String>,
+    /// The last reviewed commit is no longer a clean ancestor of the target
+    /// (rebase, amend, force-push, or a base-branch merge in between), so a
+    /// compare against it is not a trustworthy delta. `delta_diff_content`
+    /// then holds the full PR diff, and the brief says so.
+    #[builder(default)]
+    pub history_rewritten: bool,
 }
 
 /// Compose the initial prompt for a single-reviewer delta re-review round.
@@ -99,6 +105,7 @@ pub fn render_delta_rereviewer_initial_prompt(
     let prior_findings_block = render_prior_findings_block(delta.prior_round.as_ref());
     let (delta_diff_step, embedded_delta_diff_section) = render_delta_diff_sections(
         delta.delta_diff_content.as_deref(),
+        delta.history_rewritten,
         last_reviewed_sha,
         target_sha,
         &pr_ref,
@@ -313,7 +320,7 @@ fn render_prior_findings_block(prior_round: Option<&PriorReviewRound>) -> String
                 severity = finding.severity.as_str(),
                 title = finding.title,
                 file = finding.file,
-                category = category_label(&finding.category),
+                category = finding.category.as_str(),
                 detail = finding.detail,
             ));
         }
@@ -338,14 +345,43 @@ fn render_prior_findings_block(prior_round: Option<&PriorReviewRound>) -> String
     out
 }
 
+/// Reviewer note that applies to every delta brief: upstream changes that
+/// arrived through the base branch were not written by this PR.
+const BASE_BRANCH_SCOPE_NOTE: &str = "Changes that came in from the base branch (a rebase onto, or merge of, the \
+     base) are out of scope: do not raise findings against upstream code this PR did not write.";
+
 fn render_delta_diff_sections(
-    delta_diff: Option<&str>,
+    diff: Option<&str>,
+    history_rewritten: bool,
     last_reviewed_sha: Option<&str>,
     target_sha: &str,
     pr_ref: &str,
     repo_slug: &str,
 ) -> (String, String) {
-    if let Some(diff) = delta_diff {
+    if history_rewritten {
+        let rewritten_note = format!(
+            "The PR's history was rewritten since the last review (rebase, amend, force-push, or a \
+             base-branch merge), so a delta against the last reviewed commit would be misleading. \
+             Review the **full PR diff** instead and verify the prior findings against it. \
+             {BASE_BRANCH_SCOPE_NOTE}"
+        );
+        if let Some(diff) = diff {
+            let step = "2. The PR history was rewritten, so the **full PR diff** is pre-embedded in \
+                        **Full PR diff** below — no need to fetch it separately.\n"
+                .to_owned();
+            let section =
+                format!("## Full PR diff (history rewritten)\n\n{rewritten_note}\n\n```diff\n{diff}\n```\n\n");
+            return (step, section);
+        }
+        let step = format!(
+            "2. The PR history was rewritten since the last review, so do NOT diff against the last \
+             reviewed commit. Fetch the full PR diff (`gh pr diff {pr_ref} --repo {repo_slug}`) and review \
+             it, verifying the prior findings against it. {BASE_BRANCH_SCOPE_NOTE}\n"
+        );
+        return (step, String::new());
+    }
+
+    if let Some(diff) = diff {
         let step = "2. The delta diff since the last reviewed commit is pre-embedded in \
                     **Delta diff** below — no need to fetch it separately.\n"
             .to_owned();
@@ -353,7 +389,8 @@ fn render_delta_diff_sections(
             "## Delta diff\n\
              \n\
              Pre-fetched diff since the last reviewed commit. Review only these changes \
-             (plus the prior findings and the one whole-PR duplication check).\n\
+             (plus the prior findings and the one whole-PR duplication check). \
+             {BASE_BRANCH_SCOPE_NOTE}\n\
              \n\
              ```diff\n\
              {diff}\n\
@@ -366,9 +403,10 @@ fn render_delta_diff_sections(
     let step = match last_reviewed_sha {
         Some(last_sha) => format!(
             "2. Fetch the delta diff since `{last_sha}`: \
-             `gh api repos/{repo_slug}/compare/{last_sha}...{target_sha} -H \"Accept: application/vnd.github.diff\"` \
-             (or `jj diff -R <workspace> --from {last_sha} --to {target_sha}`). \
-             Only fall back to `gh pr diff {pr_ref} --repo {repo_slug}` if `{last_sha}` is no longer reachable.\n"
+             `gh api repos/{repo_slug}/compare/{last_sha}...{target_sha} -H \"Accept: application/vnd.github.diff\"`. \
+             Check first that `{last_sha}` is still an ancestor of `{target_sha}` (the compare `status` is \
+             `ahead`); if the PR was rebased, amended or had its base merged in, review the full PR diff \
+             (`gh pr diff {pr_ref} --repo {repo_slug}`) instead. {BASE_BRANCH_SCOPE_NOTE}\n"
         ),
         None => format!(
             "2. Fetch the PR diff (`gh pr diff {pr_ref} --repo {repo_slug}`) and inspect recent commits \
@@ -418,20 +456,6 @@ fn render_delta_rubric_section(scope: &ReviewScope) -> String {
              - Run the single **Whole-PR duplication check** over the **Changed files** list \
                to confirm no duplicate document copy was left behind.\n"
             .to_owned(),
-    }
-}
-
-fn category_label(category: &ReviewFindingCategory) -> &'static str {
-    match category {
-        ReviewFindingCategory::Correctness => "correctness",
-        ReviewFindingCategory::Regression => "regression",
-        ReviewFindingCategory::Architecture => "architecture",
-        ReviewFindingCategory::Readability => "readability",
-        ReviewFindingCategory::Tests => "tests",
-        ReviewFindingCategory::EdgeCase => "edgecase",
-        ReviewFindingCategory::Duplication => "duplication",
-        ReviewFindingCategory::DeferredScope => "deferred_scope",
-        ReviewFindingCategory::AgentIsms => "agent_isms",
     }
 }
 
@@ -558,7 +582,7 @@ mod tests {
             ),
             "expected compare command fallback:\n{prompt}"
         );
-        assert!(prompt.contains("jj diff -R <workspace> --from head-sha-1 --to head-sha-2"));
+        assert!(prompt.contains("is still an ancestor of `head-sha-2`"), "{prompt}");
     }
 
     #[test]
@@ -614,5 +638,56 @@ mod tests {
             control.contains("Do not scope your review to a diff-only view"),
             "control/first-round prompt must remain unchanged"
         );
+    }
+
+    fn render_with(delta: &DeltaRereviewContext) -> String {
+        render_delta_rereviewer_initial_prompt(
+            &ReviewBriefPacket::from_task("Address review findings", "Fix C1 from round 1."),
+            &sample_destination(),
+            ReviewScope::Code,
+            Some(&sample_ctx()),
+            delta,
+            "org/repo",
+        )
+    }
+
+    #[test]
+    fn rebased_or_amended_history_reviews_the_full_pr_diff_instead_of_a_delta() {
+        let prompt = render_with(
+            &DeltaRereviewContext::builder()
+                .prior_round(sample_prior_round())
+                .delta_diff_content("diff --git a/src/a.rs b/src/a.rs\n+whole_pr_change();\n")
+                .history_rewritten(true)
+                .build(),
+        );
+        assert!(prompt.contains("## Full PR diff (history rewritten)"), "{prompt}");
+        assert!(prompt.contains("+whole_pr_change();"));
+        assert!(!prompt.contains("## Delta diff"));
+        assert!(prompt.contains("out of scope: do not raise findings against upstream code"));
+    }
+
+    #[test]
+    fn rewritten_history_without_an_embedded_diff_never_points_at_a_compare_range() {
+        let prompt = render_with(
+            &DeltaRereviewContext::builder()
+                .prior_round(sample_prior_round())
+                .history_rewritten(true)
+                .build(),
+        );
+        assert!(prompt.contains("gh pr diff 42 --repo org/repo"), "{prompt}");
+        assert!(!prompt.contains("compare/head-sha-1...head-sha-2"), "{prompt}");
+        assert!(prompt.contains("do NOT diff against the last reviewed commit"));
+    }
+
+    #[test]
+    fn a_linear_delta_tells_the_reviewer_base_branch_changes_are_out_of_scope() {
+        let prompt = render_with(
+            &DeltaRereviewContext::builder()
+                .prior_round(sample_prior_round())
+                .delta_diff_content("diff --git a/src/a.rs b/src/a.rs\n+x();\n")
+                .build(),
+        );
+        assert!(prompt.contains("## Delta diff"));
+        assert!(prompt.contains("came in from the base branch"));
     }
 }

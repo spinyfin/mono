@@ -7,6 +7,10 @@
 //! full batch verdict-application pipeline (cycle counting, stale-head guard,
 //! duplicate-head guard, deletion tripwire, revision-hold settlement, and
 //! structured verdict storage).
+//!
+//! This module also owns the review pool's weighted reservation accounting
+//! (the reserved-unit counts and admission checks), because a single-reviewer
+//! batch weighs less than a multi-leaf one.
 
 use anyhow::Result;
 use boss_protocol::{
@@ -35,7 +39,21 @@ pub(super) fn migrate_review_batch_single_reviewer(conn: &Connection) -> Result<
 }
 
 /// Count non-terminal (reservation-holding) batches of `phase` whose cycle
-/// root is still a live work item.
+/// root is still a live work item. `completed` and `failed` are the only
+/// statuses that release a batch's reservation — `collecting`,
+/// `supervising`, and `applying` all still hold it, matching "from creation
+/// through supervisor completion". Batches whose cycle root is deleted or
+/// already terminal (`done`/`archived`) do not hold a reservation: nothing
+/// can settle them through the quorum path, so counting them would
+/// permanently deny pre-merge review to every other product.
+///
+/// Known gap: post-merge batches effectively never count here. The merge
+/// poller creates a post-merge batch in the same pass that marks its root
+/// `done`, so the done/archived root filter excludes them. Consequences:
+/// post-merge reviewers occupy physical review slots without a reservation,
+/// and the post-merge half of the `review_pool.reserved_units` gauge reads 0.
+/// A fix would exempt `phase = 'post_merge'` from the root-status filter,
+/// mirroring the post-merge carve-out in `reap_inert_review_batches`.
 pub(super) fn reserved_batch_count_in_tx(tx: &Transaction<'_>, phase: ReviewBatchPhase) -> Result<i64> {
     let count: i64 = tx.query_row(
         "SELECT COUNT(*)
@@ -51,8 +69,11 @@ pub(super) fn reserved_batch_count_in_tx(tx: &Transaction<'_>, phase: ReviewBatc
     Ok(count)
 }
 
-/// Floors capacity at `PRE_MERGE_BATCH_RESERVATION_UNITS` so a pre-merge batch
-/// can always be admitted on an empty pool.
+/// Floors capacity at [`PRE_MERGE_BATCH_RESERVATION_UNITS`] so a pre-merge
+/// batch can always be admitted on an empty pool: a configured
+/// `BOSS_REVIEW_POOL_SIZE` below the reservation weight of a single batch
+/// would otherwise make `can_admit_review_batch_in_tx`'s pre-merge check
+/// permanently false, deferring every PR's review forever.
 pub(super) fn reservation_capacity(review_pool_size: usize) -> i64 {
     review_pool_size.clamp(
         PRE_MERGE_BATCH_RESERVATION_UNITS as usize,
@@ -83,6 +104,29 @@ pub(super) fn reserved_pre_merge_units_in_tx(tx: &Transaction<'_>) -> Result<i64
 
 /// Whether one more non-terminal batch of `phase` can be admitted into the
 /// review pool's weighted reservation accounting right now.
+///
+/// `reservation_capacity` is the live configured review-pool size (clamped
+/// to [`boss_engine_storage_values::pool_policy::MAX_REVIEW_POOL_SIZE`]), not the compile-time
+/// hard cap: a smaller `BOSS_REVIEW_POOL_SIZE` must not oversubscribe the
+/// physical slots the reservation scheme exists to protect.
+///
+/// Pre-merge admission is checked against pre-merge reservations alone,
+/// which is what gives pre-merge work priority over post-merge safety-net
+/// work: a pre-merge batch is admitted whenever
+/// `pre_merge_units + units_needed <= reservation_capacity`,
+/// regardless of how many post-merge units are currently reserved.
+/// Post-merge admission is checked against BOTH reservations, so a
+/// safety-net batch only starts when genuinely spare capacity remains after
+/// every open pre-merge batch's block. A multi-leaf pre-merge batch weighs
+/// [`PRE_MERGE_BATCH_RESERVATION_UNITS`]; a single-reviewer one weighs
+/// [`SOLO_PRE_MERGE_BATCH_RESERVATION_UNITS`].
+///
+/// This is static, conservative admission accounting, not a live count of
+/// claimed physical worker-pool slots: a batch keeps its reservation for its
+/// whole lifetime (through supervisor completion), even while some of its
+/// member executions are still queued behind a busy pool. See
+/// docs/designs/multi-agent-code-review.md, "Expand the static review pool
+/// to 16 slots".
 pub fn can_admit_review_batch_in_tx(
     tx: &Transaction<'_>,
     phase: ReviewBatchPhase,
@@ -95,6 +139,8 @@ pub fn can_admit_review_batch_in_tx(
     can_admit_review_batch_for_units_in_tx(tx, phase, units, reservation_capacity)
 }
 
+/// [`can_admit_review_batch_in_tx`] with an explicit weight for the batch
+/// being admitted.
 pub(super) fn can_admit_review_batch_for_units_in_tx(
     tx: &Transaction<'_>,
     phase: ReviewBatchPhase,

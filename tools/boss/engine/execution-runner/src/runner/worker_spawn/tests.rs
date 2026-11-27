@@ -2719,3 +2719,22 @@ mod delta_rereview_spawn_tests {
         assert!(!composed.prompt_text.contains("# Delta PR re-review"));
     }
 }
+
+#[test]
+fn delta_history_is_linear_only_for_an_ahead_range_with_no_base_merge() {
+    assert_eq!(classify_delta_history("ahead\t0"), DeltaHistory::Linear);
+    assert_eq!(classify_delta_history("identical\t0\n"), DeltaHistory::Linear);
+}
+
+#[test]
+fn rebased_amended_merged_or_unreadable_history_is_rewritten() {
+    // Rebase or amend: the last reviewed head is no longer an ancestor.
+    assert_eq!(classify_delta_history("diverged\t0"), DeltaHistory::Rewritten);
+    assert_eq!(classify_delta_history("behind\t0"), DeltaHistory::Rewritten);
+    // Main merged into the branch: the range pulls in upstream changes.
+    assert_eq!(classify_delta_history("ahead\t1"), DeltaHistory::Rewritten);
+    // Anything that cannot be read fails closed.
+    assert_eq!(classify_delta_history(""), DeltaHistory::Rewritten);
+    assert_eq!(classify_delta_history("ahead"), DeltaHistory::Rewritten);
+    assert_eq!(classify_delta_history("ahead\tmany"), DeltaHistory::Rewritten);
+}

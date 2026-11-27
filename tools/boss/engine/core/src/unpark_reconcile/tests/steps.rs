@@ -939,3 +939,89 @@ async fn a_reviewer_still_running_at_un_park_is_recorded_as_in_flight() {
     assert_eq!((review.kind, review.code), (StepKind::Ok, "in_flight"), "{review:?}");
     assert!(!outcome.has_error(), "{outcome:?}");
 }
+
+// ── step 4's AI review under `delta_rereview` ──────────────────────────────
+
+/// A chore in review whose deterministic `delta_rereview` bucket falls in the
+/// requested arm, already reviewed once at `head-1`.
+fn reviewed_once_chore_in_arm(f: &Fixture, pr: &str, treated: bool) -> String {
+    let product = create_test_product_with_repo(&f.db, "Product-delta", Some("git@github.com:foo/bar.git"));
+    for idx in 0..200 {
+        let chore = chore_in_review_for_product(&f.db, &product.id, &format!("delta-{treated}-{idx}"), pr);
+        let in_treatment = crate::work::experiment_bucket(&chore, crate::feature_flags::DELTA_REREVIEW_EXPERIMENT) < 50;
+        if in_treatment == treated {
+            f.db.connect()
+                .unwrap()
+                .execute(
+                    "UPDATE tasks SET review_cycle = 1, last_reviewed_sha = 'head-1' WHERE id = ?1",
+                    [&chore],
+                )
+                .unwrap();
+            return chore;
+        }
+    }
+    panic!("no chore drawn in arm treated={treated}");
+}
+
+async fn run_ai_review_with_head_2(f: &Fixture, chore: &str, pr: &str) -> StepRecord {
+    let task = f.task(chore);
+    super::super::sequence::ai_review_step_with(&f.env, &task, pr, |_| async {
+        Ok(serde_json::json!({
+            "state": "OPEN",
+            "baseRefOid": "base-1",
+            "headRefOid": "head-2",
+            "files": [{"path": "src/lib.rs"}],
+            "additions": 10,
+            "deletions": 2,
+        }))
+    })
+    .await
+}
+
+#[tokio::test]
+async fn unpark_review_of_a_treated_repeat_round_admits_the_one_reviewer_batch() {
+    let f = Fixture::with_delta_rereview();
+    let pr = "https://github.com/foo/bar/pull/7301";
+    let chore = reviewed_once_chore_in_arm(&f, pr, true);
+
+    let record = run_ai_review_with_head_2(&f, &chore, pr).await;
+
+    assert_eq!((record.kind, record.code), (StepKind::Ok, "scheduled"), "{record:?}");
+    let batch = f.db.review_batches_for_cycle_root(&chore).unwrap().remove(0);
+    assert!(batch.single_reviewer);
+    assert_eq!(f.db.review_batch_members(&batch.id).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn unpark_review_of_a_control_repeat_round_admits_the_full_batch() {
+    let f = Fixture::with_delta_rereview();
+    let pr = "https://github.com/foo/bar/pull/7302";
+    let chore = reviewed_once_chore_in_arm(&f, pr, false);
+
+    let record = run_ai_review_with_head_2(&f, &chore, pr).await;
+
+    assert_eq!((record.kind, record.code), (StepKind::Ok, "scheduled"), "{record:?}");
+    let batch = f.db.review_batches_for_cycle_root(&chore).unwrap().remove(0);
+    assert!(!batch.single_reviewer);
+    assert_eq!(f.db.review_batch_members(&batch.id).unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn unpark_review_of_a_treated_first_round_admits_the_full_batch() {
+    let f = Fixture::with_delta_rereview();
+    let pr = "https://github.com/foo/bar/pull/7303";
+    let chore = reviewed_once_chore_in_arm(&f, pr, true);
+    f.db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET review_cycle = 0, last_reviewed_sha = NULL WHERE id = ?1",
+            [&chore],
+        )
+        .unwrap();
+
+    let record = run_ai_review_with_head_2(&f, &chore, pr).await;
+
+    assert_eq!((record.kind, record.code), (StepKind::Ok, "scheduled"), "{record:?}");
+    let batch = f.db.review_batches_for_cycle_root(&chore).unwrap().remove(0);
+    assert!(!batch.single_reviewer, "round 1 is never a delta round");
+}

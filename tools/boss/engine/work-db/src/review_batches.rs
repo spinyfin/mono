@@ -268,6 +268,8 @@ pub const REVIEW_BATCH_REPORTED_MEMBER_GRACE_SECS: u64 = 120;
 /// "Expand the static review pool to 16 slots".
 pub const PRE_MERGE_BATCH_RESERVATION_UNITS: i64 = 4;
 
+/// Reservation weight of one non-terminal post-merge batch: a single
+/// safety-net reviewer against the already-landed tree.
 pub(super) const POST_MERGE_BATCH_RESERVATION_UNITS: i64 = 1;
 
 pub use super::review_batch_solo::can_admit_review_batch_in_tx;
@@ -2074,6 +2076,10 @@ impl WorkDb {
                      (requires {units_needed} unit(s))"
                 );
             }
+            // Read-only so far — nothing to roll back. The caller must hold
+            // the producing task pending review rather than treat this as a
+            // legacy fallback; the deferred-admission sweep retries once an
+            // existing batch completes and frees its reservation.
             tx.commit()?;
             return Ok(ReviewBatchDispatch::AdmissionDeferred);
         }
@@ -2409,7 +2415,11 @@ impl WorkDb {
     /// on every sweep for the remaining life of the PR. The supervisor is
     /// not filtered that way: its last attempt can die without Stop ever
     /// firing (`pending`/`running` at `attempt >= 2`), and the recovery
-    /// sweep is the only durable hook that will then fail the batch. Once
+    /// sweep is the only durable hook that will then fail the batch. A
+    /// single-reviewer batch's sole `ClaudeReviewer` is listed at any
+    /// attempt for the same reason: the batch has no supervisor, so its
+    /// exhausted attempt is the only thing that can fail the batch; this
+    /// extra arm is deliberate, not an accident. Once
     /// the batch is `failed` it drops out via `batch.status NOT IN (...)`.
     pub fn list_dead_review_batch_member_candidates(&self) -> Result<Vec<DeadPrReviewCandidate>> {
         let conn = self.connect()?;

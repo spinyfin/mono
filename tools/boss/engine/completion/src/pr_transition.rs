@@ -20,8 +20,9 @@ struct BatchReviewPrView {
 
 /// Single routing decision for `delta_rereview`, shared across every automatic
 /// pre-merge review trigger site (`finalize_pr_transition`,
-/// `maybe_enqueue_declared_delivery_reviewer`, deferred admission via
-/// [`GhReviewBatchEnqueuer`], and unpark reconcile via [`CompletionRequests`]).
+/// `maybe_enqueue_declared_delivery_reviewer`, the merge poller's
+/// deferred-admission sweep, and unpark reconcile; the last two reach it
+/// through `CompletionRequests::should_use_delta_rereview`).
 ///
 /// Returns `true` only when:
 /// 1. The PR family is on round 2 or later (`review_cycle >= 1`) and has a
@@ -117,15 +118,12 @@ pub fn review_batch_input_from_metadata(
 }
 
 /// Default enqueuer: fetch immutable SHAs from GitHub, then admit a batch.
-pub(crate) struct GhReviewBatchEnqueuer {
-    feature_flags: Arc<crate::feature_flags::FeatureFlagsStore>,
-}
-
-impl GhReviewBatchEnqueuer {
-    pub(crate) fn new(feature_flags: Arc<crate::feature_flags::FeatureFlagsStore>) -> Self {
-        Self { feature_flags }
-    }
-}
+///
+/// It holds no feature-flag state: every trigger site computes the mode with
+/// [`should_use_delta_rereview`] (via `CompletionRequests`) and passes it to
+/// `enqueue_with_mode`, so the routing lives in one place. `enqueue` is the
+/// full multi-leaf batch.
+pub(crate) struct GhReviewBatchEnqueuer;
 
 #[async_trait]
 impl ReviewBatchEnqueuer for GhReviewBatchEnqueuer {
@@ -137,16 +135,7 @@ impl ReviewBatchEnqueuer for GhReviewBatchEnqueuer {
         pr_url: &str,
         review_pool_size: usize,
     ) -> anyhow::Result<crate::work::ReviewBatchDispatch> {
-        let single_reviewer_light = should_use_delta_rereview(&self.feature_flags, work_db, work_item_id);
-        enqueue_review_batch_with_mode(
-            work_db,
-            work_item_id,
-            repo_remote_url,
-            pr_url,
-            review_pool_size,
-            single_reviewer_light,
-        )
-        .await
+        enqueue_review_batch_with_mode(work_db, work_item_id, repo_remote_url, pr_url, review_pool_size, false).await
     }
 
     async fn enqueue_with_mode(

@@ -1752,11 +1752,6 @@ pub struct WorkerCompletionHandler {
     /// [`Self::with_review_batch_enqueuer`] so admission deferral can be
     /// exercised without a live GitHub call.
     review_batch_enqueuer: Arc<dyn ReviewBatchEnqueuer>,
-    /// Tracks whether [`Self::with_review_batch_enqueuer`] replaced the
-    /// default [`GhReviewBatchEnqueuer`], so [`Self::with_feature_flags`]
-    /// refreshes the default enqueuer's flag store without clobbering test
-    /// stubs.
-    review_batch_enqueuer_overridden: bool,
     /// Configured review-pool slot count used as weighted-admission
     /// reservation capacity. Defaults to
     /// [`boss_execution_contracts::DEFAULT_REVIEW_POOL_SIZE`]; production wires

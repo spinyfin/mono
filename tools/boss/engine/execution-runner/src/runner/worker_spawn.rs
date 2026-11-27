@@ -308,6 +308,54 @@ async fn fetch_compare_diff(repo_slug: &str, base_sha: &str, head_sha: &str) -> 
         .ok()
 }
 
+/// Whether `last_reviewed_sha..target_sha` is a clean linear continuation, so
+/// that GitHub's compare diff is exactly what changed since the last review.
+///
+/// GitHub's `base...head` compare diffs from `merge-base(base, head)`. That
+/// equals `base` only when `base` is an ancestor of `head` (status `ahead` or
+/// `identical`). After a rebase or force-push the status is `diverged`/`behind`
+/// and the diff would hide removals relative to the reviewed head or drag in
+/// upstream changes. A merge commit in the range (main merged into the branch)
+/// also pulls base-branch changes into an otherwise `ahead` range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeltaHistory {
+    Linear,
+    Rewritten,
+}
+
+/// Parse the `<status>\t<merge-commit-count>` projection produced by
+/// [`fetch_delta_history`]. Anything unparseable counts as rewritten, so the
+/// reviewer falls back to the full PR diff instead of a possibly wrong delta.
+fn classify_delta_history(projection: &str) -> DeltaHistory {
+    let mut parts = projection.trim().split('\t');
+    let status = parts.next().unwrap_or("");
+    let merge_commits = parts.next().and_then(|n| n.trim().parse::<u64>().ok());
+    match (status, merge_commits) {
+        ("ahead" | "identical", Some(0)) => DeltaHistory::Linear,
+        _ => DeltaHistory::Rewritten,
+    }
+}
+
+/// Ask GitHub whether `last_sha` is still a linear ancestor of `target_sha`
+/// with no base-branch merge in between. Fails closed to `Rewritten`.
+async fn fetch_delta_history(repo_slug: &str, last_sha: &str, target_sha: &str) -> DeltaHistory {
+    const PROJECTION: &str =
+        r#"[.status, ([.commits[]? | select((.parents | length) > 1)] | length | tostring)] | join("\t")"#;
+    match boss_github::compare::gh_compare_jq(repo_slug, last_sha, target_sha, PROJECTION).await {
+        Ok(out) => classify_delta_history(&out),
+        Err(err) => {
+            tracing::warn!(
+                repo_slug,
+                last_sha,
+                target_sha,
+                error = %err,
+                "fetch_delta_history: compare status unavailable; treating history as rewritten",
+            );
+            DeltaHistory::Rewritten
+        }
+    }
+}
+
 /// The row-derived inputs that decide a worker's *model* (not its driver or
 /// effort), after execution-kind policy has been applied.
 ///
@@ -1066,42 +1114,54 @@ pub async fn compose_worker_spawn(
             // mechanical Boss-construct sweep below always runs, even when
             // diff embedding is disabled via BOSS_MAX_EMBED_DIFF_LINES=0.
             let mut delta_diff_content: Option<String> = None;
+            let mut delta_history_rewritten = false;
             if let Some(ref target_sha) = solo_delta_target_sha {
                 if let (Some(slug), Some(last_sha)) = (
                     parsed_repo_slug.as_deref(),
                     last_reviewed_sha.as_deref().filter(|s| !s.is_empty()),
                 ) && !target_sha.is_empty()
                     && last_sha != target_sha
-                    && let Some(diff) = fetch_compare_diff(slug, last_sha, target_sha).await
                 {
-                    if let Some(ref mut ctx) = pr_review_context {
-                        let diff_hits = crate::boss_construct_scan::scan_diff_added_lines(&diff);
-                        ctx.boss_construct_refs
-                            .extend(crate::boss_construct_scan::hit_lines(&diff_hits));
-                    }
-                    let line_count = diff.lines().count() as u64;
-                    if max_embed_diff_lines > 0 && line_count <= max_embed_diff_lines {
-                        tracing::info!(
-                            execution_id = %execution.id,
-                            pr_url,
-                            last_sha,
-                            target_sha,
-                            line_count,
-                            max_embed_diff_lines,
-                            "pr_review execution: embedding delta diff in solo re-reviewer prompt",
-                        );
-                        delta_diff_content = Some(diff);
+                    delta_history_rewritten =
+                        fetch_delta_history(slug, last_sha, target_sha).await == DeltaHistory::Rewritten;
+                    // A rebased, amended or main-merged head makes the compare
+                    // diff wrong, so review the full PR diff instead.
+                    let diff = if delta_history_rewritten {
+                        fetch_pr_diff(pr_url).await
                     } else {
-                        tracing::debug!(
-                            execution_id = %execution.id,
-                            pr_url,
-                            last_sha,
-                            target_sha,
-                            line_count,
-                            max_embed_diff_lines,
-                            "pr_review execution: delta diff too large to embed, or embedding disabled; \
-                             reviewer will fetch it",
-                        );
+                        fetch_compare_diff(slug, last_sha, target_sha).await
+                    };
+                    if let Some(diff) = diff {
+                        if let Some(ref mut ctx) = pr_review_context {
+                            let diff_hits = crate::boss_construct_scan::scan_diff_added_lines(&diff);
+                            ctx.boss_construct_refs
+                                .extend(crate::boss_construct_scan::hit_lines(&diff_hits));
+                        }
+                        let line_count = diff.lines().count() as u64;
+                        if max_embed_diff_lines > 0 && line_count <= max_embed_diff_lines {
+                            tracing::info!(
+                                execution_id = %execution.id,
+                                pr_url,
+                                last_sha,
+                                target_sha,
+                                line_count,
+                                max_embed_diff_lines,
+                                delta_history_rewritten,
+                                "pr_review execution: embedding diff in solo re-reviewer prompt",
+                            );
+                            delta_diff_content = Some(diff);
+                        } else {
+                            tracing::debug!(
+                                execution_id = %execution.id,
+                                pr_url,
+                                last_sha,
+                                target_sha,
+                                line_count,
+                                max_embed_diff_lines,
+                                "pr_review execution: diff too large to embed, or embedding disabled; \
+                                 reviewer will fetch it",
+                            );
+                        }
                     }
                 }
             } else if let Some(ref mut ctx) = pr_review_context
@@ -1249,6 +1309,7 @@ pub async fn compose_worker_spawn(
                     let delta_ctx = crate::pr_review::DeltaRereviewContext::builder()
                         .maybe_prior_round(prior_round)
                         .maybe_delta_diff_content(delta_diff_content)
+                        .history_rewritten(delta_history_rewritten)
                         .maybe_last_reviewed_sha(last_reviewed_sha)
                         .build();
                     crate::pr_review::render_delta_rereviewer_initial_prompt(

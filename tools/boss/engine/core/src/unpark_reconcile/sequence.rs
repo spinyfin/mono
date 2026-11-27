@@ -664,6 +664,27 @@ fn refresh_record(sweep: &SweepOutcome, observed_open: bool, after: Option<&Task
 /// Step 4's AI review: schedule one if no review has covered the PR's current
 /// head, through the admission `bossctl review start` uses.
 async fn ai_review_step(env: &UnparkEnv, task: &Task, pr_url: &str) -> StepRecord {
+    ai_review_step_with(
+        env,
+        task,
+        pr_url,
+        boss_engine_completion::review_admission::fetch_review_admission_metadata,
+    )
+    .await
+}
+
+/// [`ai_review_step`] with the PR-metadata fetch injected, so the admission
+/// routing can be exercised without GitHub.
+pub(super) async fn ai_review_step_with<F, Fut>(
+    env: &UnparkEnv,
+    task: &Task,
+    pr_url: &str,
+    fetch_metadata: F,
+) -> StepRecord
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<serde_json::Value>>,
+{
     let root = env.work_db.review_cycle_root_id(&task.id);
     let (cycle, last_reviewed) = match env.work_db.get_task_review_cycle_state(&root) {
         Ok(state) => state,
@@ -692,9 +713,7 @@ async fn ai_review_step(env: &UnparkEnv, task: &Task, pr_url: &str) -> StepRecor
             ),
         );
     }
-    use boss_engine_completion::review_admission::{
-        ReviewAdmission, admit_review_with_mode, fetch_review_admission_metadata,
-    };
+    use boss_engine_completion::review_admission::{ReviewAdmission, admit_review_with_mode};
     let pool = env
         .completion
         .review_batch_fanout_enabled()
@@ -717,7 +736,7 @@ async fn ai_review_step(env: &UnparkEnv, task: &Task, pr_url: &str) -> StepRecor
         pool,
         single_reviewer_light,
         &StaticPrStateChecker(PrOpenState::Open),
-        fetch_review_admission_metadata,
+        fetch_metadata,
     )
     .await
     {

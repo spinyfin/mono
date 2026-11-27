@@ -841,8 +841,10 @@ pub trait ReviewBatchEnqueuer: Send + Sync {
     ) -> anyhow::Result<ReviewBatchDispatch>;
 
     /// Enqueue a pre-merge review batch with an explicit single-reviewer
-    /// Light-tier mode flag. Defaults to [`Self::enqueue`] so test stubs that
-    /// only implement `enqueue` stay source-compatible.
+    /// Light-tier mode flag. The default forwards a full-batch request to
+    /// [`Self::enqueue`] so stubs that only implement `enqueue` stay
+    /// source-compatible, and refuses a single-reviewer request rather than
+    /// silently admitting the wrong batch shape.
     async fn enqueue_with_mode(
         &self,
         work_db: &WorkDb,
@@ -850,8 +852,11 @@ pub trait ReviewBatchEnqueuer: Send + Sync {
         repo_remote_url: &str,
         pr_url: &str,
         review_pool_size: usize,
-        _single_reviewer_light: bool,
+        single_reviewer_light: bool,
     ) -> anyhow::Result<ReviewBatchDispatch> {
+        if single_reviewer_light {
+            anyhow::bail!("this review batch enqueuer does not support single-reviewer admission");
+        }
         self.enqueue(work_db, work_item_id, repo_remote_url, pr_url, review_pool_size)
             .await
     }
