@@ -464,3 +464,69 @@ groups:
           severity: warning
           service: nativelink-hub
         isPaused: false
+
+      - uid: nl-hub-monitoring-unavailable
+        title: NativeLink hub monitoring unavailable
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: >-
+                max(up{job="nativelink-pool"} == 0) + 1
+                or (1 - min(nativelink_hub_journal_watch_up == 0))
+                or ((time() - min(nativelink_hub_status_last_probe_timestamp_seconds)) > 90)
+                or max(absent(up{job="nativelink-pool"}))
+                or absent(nativelink_hub_journal_watch_up)
+                or absent(nativelink_hub_status_last_probe_timestamp_seconds)
+                or vector(0)
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator:
+                    params:
+                      - 0.5
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: B
+              type: threshold
+        dashboardUid: nativelink-overview
+        panelId: 141
+        noDataState: Alerting
+        executionErrorState: Alerting
+        for: 3m
+        annotations:
+          summary: NativeLink hub monitoring has been unavailable for 3m
+          description: >-
+            Prometheus cannot scrape the pool exporter, the hub journal is
+            unreadable or its follower stopped, or the last /status probe is
+            older than 90s. Hub event alerts cannot be trusted until restored.
+        labels:
+          severity: warning
+          service: nativelink-hub
+        isPaused: false

@@ -406,7 +406,7 @@ def status_metrics():
 # Hub journal event counters.
 #
 # Tails the hub's JSON journal (NL_LOG=json on nativelink-macos-hub.service)
-# with `journalctl --quiet --unit ... --output cat --follow --lines=0`. Every
+# with cursor-based JSON journalctl output, resuming after reconnects. Every
 # counter starts at 0 at exporter start so Prometheus increase() observes even
 # the first occurrence of a rare fault without a cold-series blind spot.
 # ---------------------------------------------------------------------------
@@ -464,32 +464,52 @@ def record_journal_line(line):
                 _journal_counts[name] += 1
     return matched
 
-def _journal_loop():
+def _journal_follow_once(cursor):
+    """Confirm journal access and resume after the last counted entry."""
     global _journal_watch_up
-    cmd = ["journalctl", "--quiet", "--unit", HUB_UNIT, "--output", "cat", "--follow", "--lines=0"]
+    base = ["journalctl", "--unit", HUB_UNIT, "--output", "json", "--no-pager"]
+    proc = None
+    try:
+        # A running journalctl alone does not prove access (it can just print
+        # an access warning and wait forever). Require a readable unit entry.
+        check = subprocess.run(base + ["--lines=1"], capture_output=True, text=True, timeout=10)
+        if check.returncode or check.stderr.strip():
+            return cursor
+        entry = json.loads(check.stdout.strip())
+        if not entry.get("__CURSOR") or "MESSAGE" not in entry:
+            return cursor
+        if cursor is None:
+            cursor = entry["__CURSOR"]
+        proc = subprocess.Popen(base + ["--follow", "--no-tail", "--after-cursor", cursor],
+                                stdout=subprocess.PIPE, text=True, bufsize=1)
+        with _journal_lock:
+            _journal_watch_up = 1
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            entry = json.loads(line)
+            next_cursor = entry["__CURSOR"]
+            if next_cursor != cursor:
+                record_journal_line(entry.get("MESSAGE", ""))
+                cursor = next_cursor
+    except Exception:
+        pass
+    finally:
+        with _journal_lock:
+            _journal_watch_up = 0
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                proc.kill()
+                proc.wait()
+    return cursor
+
+
+def _journal_loop():
+    cursor = None
     while True:
-        proc = None
-        try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
-            with _journal_lock:
-                _journal_watch_up = 1
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                record_journal_line(line)
-        except Exception:
-            pass
-        finally:
-            with _journal_lock:
-                _journal_watch_up = 0
-            if proc is not None:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=2)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
+        cursor = _journal_follow_once(cursor)
         time.sleep(5)
 
 def journal_metrics():

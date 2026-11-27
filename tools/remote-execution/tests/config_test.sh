@@ -395,7 +395,7 @@ if [[ -e "${dir}/nativelink/hub.env" ]]; then
   fail "hub.env names listen addresses and must not be in the repository"
 fi
 
-for file in "$hub" "$worker" "$plist" "$hub_unit" "$health_unit" "$health_timer" "$textfile" "$textfile_unit" "$textfile_timer" "$slots_exporter" "$slots_unit" "$readme" "$grafana_overview" "$grafana_alerts"; do
+for file in "$hub" "$worker" "$plist" "$hub_unit" "$health_unit" "$health_timer" "$textfile" "$textfile_unit" "$textfile_timer" "$slots_exporter" "$slots_unit" "$readme" "$grafana_overview" "$grafana_alerts" "${dir}/grafana/dashboards/nativelink-workers.json" "${dir}/grafana/dashboards/buildkite-pipelines.json" "${dir}/grafana/provisioning/nativelink.yaml"; do
   # Loopback is the one address that is the same on every host.
   if grep -o -E '([0-9]{1,3}\.){3}[0-9]{1,3}' "$file" | grep -v -x -q '127\.0\.0\.1'; then
     fail "$(basename "$file") contains an IP address; addresses are host configuration"
@@ -410,6 +410,7 @@ done
 # ---------------------------------------------------------------------------
 
 if ! python3 -c '
+import ast
 import json
 import re
 import sys
@@ -417,6 +418,12 @@ import sys
 dash_path, alert_path = sys.argv[1], sys.argv[2]
 with open(dash_path) as f:
     dash = json.load(f)
+
+from pathlib import Path
+ast.parse((Path(dash_path).parent.parent / "preview-alerts.py").read_text())
+for path in Path(dash_path).parent.glob("*.json"):
+    other = json.loads(path.read_text())
+    assert other["uid"] and other["panels"], path
 
 uid = dash.get("uid")
 assert uid == "nativelink-overview", f"unexpected uid: {uid}"
@@ -464,6 +471,7 @@ for uid in (
     "nl-hub-sched-timeouts-evictions",
     "nl-hub-decoded-size-error",
     "nl-hub-cache-disk-full",
+    "nl-hub-monitoring-unavailable",
 ):
     assert f"uid: {uid}" in alert_text, f"missing alert rule uid {uid}"
 for m in re.finditer(r"panelId:\s*(\d+)", alert_text):

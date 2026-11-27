@@ -2624,12 +2624,12 @@
       },
       "targets": [
         {
-          "expr": "1000 * max(rate(node_disk_write_time_seconds_total{instance=\"headcrash\",device=\"nvme1n1\"}[1m])) / clamp_min(max(rate(node_disk_writes_completed_total{instance=\"headcrash\",device=\"nvme1n1\"}[1m])), 1)",
+          "expr": "1000 * max(rate(node_disk_write_time_seconds_total{instance=\"headcrash\",device=\"nvme1n1\"}[1m])) / (max(rate(node_disk_writes_completed_total{instance=\"headcrash\",device=\"nvme1n1\"}[1m])) > 0)",
           "legendFormat": "write await (ms)",
           "refId": "A"
         },
         {
-          "expr": "1000 * max(rate(node_disk_read_time_seconds_total{instance=\"headcrash\",device=\"nvme1n1\"}[1m])) / clamp_min(max(rate(node_disk_reads_completed_total{instance=\"headcrash\",device=\"nvme1n1\"}[1m])), 1)",
+          "expr": "1000 * max(rate(node_disk_read_time_seconds_total{instance=\"headcrash\",device=\"nvme1n1\"}[1m])) / (max(rate(node_disk_reads_completed_total{instance=\"headcrash\",device=\"nvme1n1\"}[1m])) > 0)",
           "legendFormat": "read await (ms)",
           "refId": "B"
         },

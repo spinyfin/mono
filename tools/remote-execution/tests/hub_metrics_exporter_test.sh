@@ -106,6 +106,39 @@ for metric in (
 ):
     assert metric in jtext, f"missing {metric!r} in:\n{jtext}"
 
+# --- Reconnect resumes the cursor and counts gap events exactly once ---
+from unittest.mock import patch
+from types import SimpleNamespace
+import io
+
+def entry(cursor, message):
+    return json.dumps({"__CURSOR": cursor, "MESSAGE": message})
+
+baseline = entry("before", "hub started")
+fault = entry("gap", samples[0][0])
+commands = []
+def follow(cmd, **kwargs):
+    commands.append(cmd)
+    # The first follower exits; an event arrives during its reconnect delay.
+    lines = "" if len(commands) == 1 else fault + "\n"
+    return SimpleNamespace(stdout=io.StringIO(lines), terminate=lambda: None, wait=lambda **kw: 0)
+
+before = mod._journal_counts["nativelink_hub_store_health_timeouts_total"]
+with patch.object(mod.subprocess, "run", return_value=SimpleNamespace(returncode=0, stderr="", stdout=baseline)), patch.object(mod.subprocess, "Popen", side_effect=follow):
+    cursor = mod._journal_follow_once(None)
+    assert cursor == "before"
+    cursor = mod._journal_follow_once(cursor)
+    assert cursor == "gap"
+    cursor = mod._journal_follow_once(cursor)
+assert "--no-tail" in commands[1]
+assert commands[1][-2:] == ["--after-cursor", "before"]
+assert commands[2][-2:] == ["--after-cursor", "gap"]
+assert mod._journal_counts["nativelink_hub_store_health_timeouts_total"] == before + 1
+with patch.object(mod.subprocess, "run", return_value=SimpleNamespace(returncode=0, stderr="Permission denied", stdout="")), patch.object(mod.subprocess, "Popen") as popen:
+    assert mod._journal_follow_once(cursor) == cursor
+    popen.assert_not_called()
+assert mod._journal_watch_up == 0
+
 # --- Hub-side /status probe (200, 503, timeout) ---
 mode = {"kind": "200"}
 
@@ -182,7 +215,7 @@ chmod +x "${stub_bin}/systemctl"
 
 # Note: hub-textfile-metrics.sh uses `declare -A` (bash 4+ on Linux); run it
 # with bash if >=4 or skip the associative-array execution on macOS bash 3.2
-# after checking syntax via python/grep.
+# after checking shell syntax and the memory property/metric contract.
 if ((BASH_VERSINFO[0] >= 4)); then
   PATH="${stub_bin}:${PATH}" NL_TEXTFILE_DIR="$out_dir" bash "$textfile_script"
   prom="${out_dir}/nativelink_hub.prom"
@@ -204,6 +237,12 @@ if ((BASH_VERSINFO[0] >= 4)); then
     cat "$prom" >&2
     exit 1
   fi
+else
+  bash -n "$textfile_script"
+  for name in MemoryCurrent MemoryPeak nativelink_hub_memory_current_bytes nativelink_hub_memory_peak_bytes; do
+    grep -q -F "$name" "$textfile_script"
+  done
+  echo "bash 3.2: memory exporter syntax and names checked; runtime requires bash 4+"
 fi
 
 echo "ok"

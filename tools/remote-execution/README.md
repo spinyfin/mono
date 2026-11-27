@@ -17,6 +17,9 @@ What decides whether a build executes remotely is elsewhere: [`.buildkite/README
 | `nativelink/worker-slots-exporter.py`                    | `~/nativelink-macos-hub/worker-slots-exporter.py`            | Per-worker slots, connected worker count, loopback `/status` probe, hub journal fault counters, and CAS eviction figures, on 127.0.0.1:9108.                             |
 | `nativelink/nativelink-worker-slots-exporter.service`    | `~/.config/systemd/user/` on the hub                         | Starts the slots, health and CAS exporter.                                                                                                                               |
 | `grafana/dashboards/nativelink-overview.json`            | `/var/lib/grafana/dashboards/` on the hub (root)             | NativeLink Overview Grafana dashboard (file-provisioned via `/etc/grafana/provisioning/dashboards/nativelink.yaml`).                                                     |
+| `grafana/dashboards/nativelink-workers.json`             | `/var/lib/grafana/dashboards/`                               | NativeLink Workers dashboard, captured from the hub.                                                                                                                     |
+| `grafana/dashboards/buildkite-pipelines.json`            | `/var/lib/grafana/dashboards/`                               | Buildkite pipelines dashboard, captured from the hub.                                                                                                                    |
+| `grafana/provisioning/nativelink.yaml`                   | `/etc/grafana/provisioning/dashboards/`                      | File dashboard provider for all three dashboards.                                                                                                                        |
 | `grafana/alerting/nativelink-hub.yaml`                   | `/etc/grafana/provisioning/alerting/` on the hub (root)      | Grafana Unified Alerting rules for store health timeouts, `/status`, connected workers, timeouts/kills, decoded-size errors, and `/mnt/cache` fullness.                  |
 | `nativelink/worker-macos.json5`                          | `~/nativelink/worker-macos.json5` on each Mac                | The worker. The same file on every Mac.                                                                                                                                  |
 | `nativelink/com.brianduff.nativelink.plist`              | `~/Library/LaunchAgents/` on each Mac                        | Starts the worker and sets what differs per Mac.                                                                                                                         |
@@ -208,7 +211,11 @@ Two exporters run on the hub so Prometheus can see what NativeLink's own metrics
 
 **Slots, store health, journal events, and CAS.** `worker-slots-exporter.py` listens on `127.0.0.1:9108/metrics`. On each scrape it asks the hub's admin API (loopback, `NL_HUB_ADMIN_LISTEN`) for each worker's slots, running actions, and total/per-OS connected worker counts (`nativelink_hub_connected_workers`, `nativelink_hub_connected_workers_by_os`, plus `nativelink_hub_expected_workers` from `NL_HEALTH_EXPECTED_WORKERS`). A background thread probes `http://$NL_HUB_ADMIN_LISTEN/status` every 15 s (10 s timeout) so a stalled store health check never blocks `/metrics` scrapes, exporting `nativelink_hub_status_up`, `nativelink_hub_status_http_code`, `nativelink_hub_status_duration_seconds`, and `nativelink_hub_status_probes_total{outcome}`. A second background thread tails `journalctl --quiet --unit nativelink-macos-hub.service --output cat --follow --lines=0` and counts `FilesystemStore::check_health: stat timed out`, kill-ack and silence worker evictions, scheduler `Action.timeout` (`Timing out operation`), `Action ended by a kill`, `Command timed out on the worker`, and compressed-upload decoded-size errors, with every counter initialized to `0` on exporter start. NativeLink 1.8.6 has no eviction counter, so inserts and evictions are counted from inotify: a rename into `cas-content/d2` is an insert, a rename into `cas-tmp/d2` is an eviction, and the size is in the file name. A walk of `cas-content/d2` every 15 minutes, at nice 19 and idle I/O priority, gives the entry count and content bytes; between walks those are kept current from the counters. The CAS cap it exports (`nativelink_hub_cache_cap_bytes`) is `NL_HUB_CAS_MAX_BYTES` from the _running_ hub process, so an edit of `hub.env` is not reported until the hub itself is restarted. The exporter only reads; it never changes the hub.
 
-**Grafana dashboards and alerting.** Grafana on `headcrash` file-provisions dashboards from `/var/lib/grafana/dashboards` via `/etc/grafana/provisioning/dashboards/nativelink.yaml` (`updateIntervalSeconds: 30`) and Unified Alerting rules from `/etc/grafana/provisioning/alerting/` on startup/restart. Nothing in CI deploys them automatically: they live in `grafana/dashboards/nativelink-overview.json` and `grafana/alerting/nativelink-hub.yaml` and are copied onto `headcrash` by hand ("Installing or updating hub files"). Prometheus on `headcrash` has no Alertmanager configured and Grafana's default notification receiver is `empty`, so provisioned alert rules evaluate and surface in Grafana's Alerting UI immediately; external paging requires adding a Grafana contact point.
+**Grafana dashboards and alerting.** Grafana on `headcrash` file-provisions dashboards from `/var/lib/grafana/dashboards` via `/etc/grafana/provisioning/dashboards/nativelink.yaml` (`updateIntervalSeconds: 30`) and Unified Alerting rules from `/etc/grafana/provisioning/alerting/` on startup/restart. Nothing in CI deploys them automatically: they live in `grafana/dashboards/*.json`, `grafana/provisioning/nativelink.yaml`, and `grafana/alerting/nativelink-hub.yaml` and are copied onto `headcrash` by hand ("Installing or updating hub files"). Prometheus on `headcrash` has no Alertmanager configured and Grafana's default notification receiver is `empty`, so provisioned alert rules evaluate and surface in Grafana's Alerting UI immediately; external paging requires adding a Grafana contact point.
+
+The monitoring-availability rule fires after 3 minutes if the exporter scrape fails, the journal cannot be read or followed, or the last status probe is over 90 seconds old. Journal reconnects resume from the last processed cursor; exporter process restarts establish a new tail.
+
+**Alert preview without production changes.** On the Grafana host with Python 3 and PyYAML, run `python3 <checkout>/tools/remote-execution/grafana/preview-alerts.py <checkout>/tools/remote-execution/grafana/alerting/nativelink-hub.yaml http://localhost:3000`. This calls Grafana’s `/api/v1/eval` preview API with synthetic source series and the committed query operators and thresholds. It asserts the Alerting threshold for all eight rules, each burst branch separately, and each monitoring failure separately; healthy monitoring must return Normal. The preview evaluates conditions immediately and does not wait through the rules’ pending periods or deliver notifications.
 
 **Client Mac watchdog stops.** `dev-remote-workspace-status.sh` writes watchdog stops only to local `$TMPDIR/dev-remote-watchdog.log` on each developer Mac. Developer laptops are not scraped by Prometheus on `headcrash`, run no exporter or log shipper, and `headcrash` runs no Loki or Pushgateway. Collecting client watchdog stops centrally would require either a lightweight local textfile/exporter on each Mac scraped over Tailscale, or a small push endpoint (Prometheus Pushgateway or Loki) on `headcrash` with a non-blocking log-shipper on each Mac.
 
@@ -310,14 +317,17 @@ sudo systemctl enable --now nativelink-hub-textfile.timer
 
 # Grafana dashboard and Unified Alerting rules (not deployed by CI).
 GRAFANA_REPO=<checkout>/tools/remote-execution/grafana
-if sudo test -e /var/lib/grafana/dashboards/nativelink-overview.json &&
-   sudo cmp -s "$GRAFANA_REPO/dashboards/nativelink-overview.json" /var/lib/grafana/dashboards/nativelink-overview.json; then
-  :
-else
+sudo install -d -o grafana -g grafana /var/lib/grafana/dashboards
+for dashboard in nativelink-overview nativelink-workers buildkite-pipelines; do
   sudo install -o grafana -g grafana -m 644 \
-    "$GRAFANA_REPO/dashboards/nativelink-overview.json" \
-    /var/lib/grafana/dashboards/nativelink-overview.json
-fi
+    "$GRAFANA_REPO/dashboards/$dashboard.json" \
+    "/var/lib/grafana/dashboards/$dashboard.json"
+done
+sudo install -o root -g grafana -m 640 \
+  "$GRAFANA_REPO/provisioning/nativelink.yaml" \
+  /etc/grafana/provisioning/dashboards/nativelink.yaml
+# Restart after changing the provider, even when alert definitions are unchanged.
+sudo systemctl restart grafana-server.service
 if sudo test -e /etc/grafana/provisioning/alerting/nativelink-hub.yaml &&
    sudo cmp -s "$GRAFANA_REPO/alerting/nativelink-hub.yaml" /etc/grafana/provisioning/alerting/nativelink-hub.yaml; then
   :
