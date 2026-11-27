@@ -966,6 +966,15 @@ pub(crate) async fn sweep_one(
                     observation_sequence,
                 );
             }
+            // Ready for a person: required checks green on this head and no
+            // conflict. The completion service decides whether the family
+            // is one that generates its guide at this point.
+            if let (Some(handler), Some(head_sha)) = (completion_handler, probe_result.head_ref_oid.as_deref())
+                && open.mergeability == OpenPrMergeability::Clean
+                && open.ci == OpenPrCiStatus::Clean
+            {
+                handler.review_guide_ready_from_probe(&candidate.work_item_id, &candidate.pr_url, head_sha);
+            }
             known_active_queue_failure =
                 Some(reap_superseded_merge_queue_attempt(work_db, publisher, candidate, &probe_result).await);
             // Design §Q1: conflict pre-empts CI — the conflict-resolver

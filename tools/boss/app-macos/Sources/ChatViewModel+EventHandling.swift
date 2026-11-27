@@ -967,8 +967,10 @@ extension ChatViewModel {
             asyncMarkdownViewerVM.canRetry = true
             asyncMarkdownViewerVM.onRetry = { [weak self] in
                 guard let self, let rootTaskId = self.pendingReviewGuideRootTaskId,
-                      let task = self.task(withID: rootTaskId) else { return }
-                self.openReviewGuide(for: task)
+                      let task = self.task(withID: rootTaskId),
+                      let versionId = task.reviewGuideReadableVersionId else { return }
+                // Retrying a failed load is not a second open.
+                self.openReviewGuide(versionId: versionId, rootTaskId: rootTaskId, onOpen: false)
             }
         }
     }

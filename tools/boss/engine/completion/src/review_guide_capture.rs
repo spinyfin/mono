@@ -21,8 +21,10 @@ use boss_pr_review_sources::{
 };
 use boss_protocol::{ExecutionKind, ExecutionStatus};
 
-use crate::feature_flags::FeatureFlagsStore;
-use crate::work::{PrReviewGuideSourceCapture, PrSourceCapturePersistOutcome, PrSourceCaptureTrigger, WorkDb};
+use crate::feature_flags::{ExperimentArm, FeatureFlagsStore, REVIEW_GUIDE_WHEN_READY_EXPERIMENT, assign_arm};
+use crate::work::{
+    PrReviewGuideSourceCapture, PrSourceCapturePersistOutcome, PrSourceCaptureTrigger, WorkDb, experiment_bucket,
+};
 
 /// Operator-controlled rollout gate for automatic source capture.
 pub const REVIEW_GUIDE_SOURCE_CAPTURE_FLAG: &str = "review_guide_source_capture";
@@ -684,50 +686,183 @@ fn enqueue_review_guide_generation(
     if !feature_flags.is_enabled(REVIEW_GUIDE_GENERATION_FLAG) {
         return;
     }
-    match work_db.review_guide_comparison_has_attempt(&capture.comparison_id) {
-        Ok(true) => return,
+    // A treated family gets its guide when the PR is ready for a person or
+    // when someone opens it, not on every new comparison.
+    if review_guide_when_ready_arm(work_db, feature_flags, &capture.root_task_id) == Some(ExperimentArm::Treatment) {
+        tracing::debug!(
+            root_task_id = %capture.root_task_id,
+            comparison_id = %capture.comparison_id,
+            "review-guide generation: not enqueued on capture; the family generates when its PR is ready or opened",
+        );
+        return;
+    }
+    admit_review_guide_generation(work_db, capture);
+}
+
+/// The arm `root_task_id`'s PR family draws in `review_guide_when_ready` right
+/// now, or `None` when the experiment is not running or the family cannot be
+/// resolved (which leaves today's behaviour in force).
+///
+/// The same family id and key the launch record uses
+/// (`experiment_family_root`), so this decision and the arm recorded on the
+/// guide's execution agree for as long as the flags stay put.
+pub fn review_guide_when_ready_arm(
+    work_db: &WorkDb,
+    feature_flags: &FeatureFlagsStore,
+    root_task_id: &str,
+) -> Option<ExperimentArm> {
+    let state = feature_flags.experiment_state(REVIEW_GUIDE_WHEN_READY_EXPERIMENT);
+    if !state.is_running() {
+        return None;
+    }
+    let family = match work_db
+        .connect()
+        .and_then(|conn| crate::work::chain_root(&conn, root_task_id))
+    {
+        Ok(family) => family,
+        Err(error) => {
+            tracing::warn!(
+                root_task_id,
+                ?error,
+                "review_guide_when_ready: could not resolve the PR family; treating it as untouched",
+            );
+            return None;
+        }
+    };
+    assign_arm(state, experiment_bucket(&family, REVIEW_GUIDE_WHEN_READY_EXPERIMENT))
+}
+
+/// Generate the guide for a treated family whose PR the merge poller has just
+/// observed ready for a person: required checks green on `head_sha`, and no
+/// live review batch, review or revision in the family. Returns whether an
+/// attempt was admitted.
+///
+/// Cheap while the experiment is off (flags only) and in steady state (one
+/// indexed read once the head has been tried), because the poller asks on every
+/// pass. A comparison that already has any attempt is left alone, so a failed
+/// guide is not relaunched each pass.
+pub fn enqueue_review_guide_when_ready(
+    work_db: &WorkDb,
+    feature_flags: &FeatureFlagsStore,
+    root_task_id: &str,
+    pr_url: &str,
+    head_sha: &str,
+) -> bool {
+    if !feature_flags.is_enabled(REVIEW_GUIDE_GENERATION_FLAG)
+        || !feature_flags
+            .experiment_state(REVIEW_GUIDE_WHEN_READY_EXPERIMENT)
+            .is_running()
+    {
+        return false;
+    }
+    let (series_id, comparison_id) =
+        match work_db.review_guide_untried_comparison_at_head(root_task_id, pr_url, head_sha) {
+            Ok(Some(untried)) => untried,
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!(
+                    root_task_id,
+                    pr_url,
+                    ?error,
+                    "review-guide ready trigger: could not read the series"
+                );
+                return false;
+            }
+        };
+    if review_guide_when_ready_arm(work_db, feature_flags, root_task_id) != Some(ExperimentArm::Treatment) {
+        return false;
+    }
+    match work_db.review_guide_family_is_quiet(root_task_id) {
+        Ok(true) => {}
+        Ok(false) => return false,
+        Err(error) => {
+            tracing::warn!(
+                root_task_id,
+                pr_url,
+                ?error,
+                "review-guide ready trigger: could not read the family"
+            );
+            return false;
+        }
+    }
+    tracing::info!(
+        root_task_id,
+        pr_url,
+        comparison_id,
+        "review-guide ready trigger: the PR is ready for a person; generating its guide",
+    );
+    admit_review_guide_generation_for(work_db, root_task_id, &series_id, &comparison_id)
+}
+
+fn admit_review_guide_generation(work_db: &WorkDb, capture: &PrReviewGuideSourceCapture) {
+    admit_review_guide_generation_for(
+        work_db,
+        &capture.root_task_id,
+        &capture.series_id,
+        &capture.comparison_id,
+    );
+}
+
+/// Admit one durable attempt for the comparison and dispatch its execution.
+/// Returns whether an attempt was created.
+fn admit_review_guide_generation_for(
+    work_db: &WorkDb,
+    root_task_id: &str,
+    series_id: &str,
+    comparison_id: &str,
+) -> bool {
+    match work_db.review_guide_comparison_has_attempt(comparison_id) {
+        Ok(true) => return false,
         Ok(false) => {}
         Err(error) => {
             tracing::warn!(?error, "review-guide generation: could not check existing attempt");
-            return;
+            return false;
         }
     }
-    match work_db.resolve_repo_for_task(&capture.root_task_id) {
+    match work_db.resolve_repo_for_task(root_task_id) {
         Ok(Some(_)) => {}
         Ok(None) => {
-            tracing::warn!(root_task_id = %capture.root_task_id, "review-guide generation: root task has no repository; skipping enqueue");
-            return;
+            tracing::warn!(
+                root_task_id,
+                "review-guide generation: root task has no repository; skipping enqueue"
+            );
+            return false;
         }
         Err(error) => {
-            tracing::warn!(root_task_id = %capture.root_task_id, ?error, "review-guide generation: could not resolve repository; skipping enqueue");
-            return;
+            tracing::warn!(
+                root_task_id,
+                ?error,
+                "review-guide generation: could not resolve repository; skipping enqueue"
+            );
+            return false;
         }
     }
-    let attempt = match work_db.create_automatic_pr_review_guide_attempt(&capture.series_id, &capture.comparison_id) {
+    let attempt = match work_db.create_automatic_pr_review_guide_attempt(series_id, comparison_id) {
         Ok(attempt) => attempt,
         Err(error) => {
             tracing::warn!(
-                comparison_id = %capture.comparison_id,
+                comparison_id,
                 ?error,
                 "review-guide generation: could not create a durable attempt",
             );
-            return;
+            return false;
         }
     };
-    match work_db.dispatch_pr_review_guide_attempt(&attempt.id, &capture.root_task_id) {
+    match work_db.dispatch_pr_review_guide_attempt(&attempt.id, root_task_id) {
         Ok(bound) => tracing::info!(
-            comparison_id = %capture.comparison_id,
+            comparison_id,
             attempt_id = %bound.id,
             execution_id = ?bound.execution_id,
             "review-guide generation: enqueued a durable generation attempt",
         ),
         Err(error) => tracing::warn!(
-            comparison_id = %capture.comparison_id,
+            comparison_id,
             attempt_id = %attempt.id,
             ?error,
             "review-guide generation: created a durable attempt but could not dispatch its execution; reconcile will retry",
         ),
     }
+    true
 }
 
 struct CapturePersistContext<'a> {

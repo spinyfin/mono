@@ -51,8 +51,13 @@ struct WorkNavigatorReview: View {
             model.loadNavigatorReviewGuide(for: root, versionID: versionID)
         })
         .task(id: [root.id, root.prURL ?? "", root.reviewGuideReadableVersionId ?? "", String(isActive)]) {
-            guard isActive else { return }
-            model.loadNavigatorReviewGuide(for: root)
+            guard isActive else {
+                model.reviewGuideSurfaceClosed(rootTaskID: root.id)
+                return
+            }
+            // One visit to the tab is one open, however often these inputs change.
+            let opened = model.reviewGuideSurfaceOpened(root: root)
+            model.loadNavigatorReviewGuide(for: root, onOpen: opened)
         }
         .task(id: "\(root.id)|\(isActive)") {
             guard isActive else { return }
@@ -74,7 +79,8 @@ struct WorkNavigatorReview: View {
     @ViewBuilder
     private var actionButtons: some View {
         if let versionID = reader?.versionID {
-            Button("Open guide in window") { model.openReviewGuide(versionId: versionID, rootTaskId: root.id) }
+            // The visit to this tab was already counted as the open.
+            Button("Open guide in window") { model.openReviewGuide(versionId: versionID, rootTaskId: root.id, onOpen: false) }
         }
         if root.boardColumn == .review || root.boardColumn == .done {
             Button("Open review terminal") { model.openReviewTerminal(for: root) }

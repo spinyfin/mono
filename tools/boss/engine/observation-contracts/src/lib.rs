@@ -815,6 +815,12 @@ pub trait CompletionRequests: Send + Sync {
         head_sha: &str,
         observation_sequence: i64,
     );
+    /// The poller observed `pr_url` open at `head_sha` with green required
+    /// checks, no conflict, and nothing in flight on it: the PR is ready for a
+    /// person. Gives the completion service the moment a treated
+    /// `review_guide_when_ready` family's guide is generated. The default does
+    /// nothing, so hosts that do not generate guides need not implement it.
+    fn review_guide_ready_from_probe(&self, _root_task_id: &str, _pr_url: &str, _head_sha: &str) {}
     fn speculative_conflict_prediction_enabled(&self) -> bool;
     fn stacked_pr_auto_structuring_enabled(&self) -> bool;
     fn mechanical_rebase_enabled(&self) -> bool;
@@ -945,6 +951,10 @@ impl<T: CompletionRequests + ?Sized> CompletionRequests for std::sync::Arc<T> {
             head_sha,
             observation_sequence,
         );
+    }
+
+    fn review_guide_ready_from_probe(&self, root_task_id: &str, pr_url: &str, head_sha: &str) {
+        T::review_guide_ready_from_probe(self.as_ref(), root_task_id, pr_url, head_sha);
     }
 
     fn speculative_conflict_prediction_enabled(&self) -> bool {

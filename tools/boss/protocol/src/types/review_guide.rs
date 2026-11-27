@@ -99,19 +99,50 @@ mod tests {
             let request = crate::FrontendRequest::GenerateReviewGuide {
                 root_task_id: "root".to_owned(),
                 idempotency_token: token.clone(),
+                on_open: false,
             };
             let encoded = serde_json::to_value(request).unwrap();
             assert_eq!(encoded["type"], "generate_review_guide");
             assert_eq!(encoded.get("idempotency_token").is_some(), token.is_some());
+            assert!(
+                encoded.get("on_open").is_none(),
+                "an ordinary click adds nothing to the wire"
+            );
             let crate::FrontendRequest::GenerateReviewGuide {
                 root_task_id,
                 idempotency_token,
+                on_open,
             } = serde_json::from_value(encoded).unwrap()
             else {
                 panic!("wrong request")
             };
             assert_eq!(root_task_id, "root");
             assert_eq!(idempotency_token, token);
+            assert!(!on_open);
         }
+    }
+
+    #[test]
+    fn open_markers_round_trip_and_default_off_for_older_apps() {
+        let generate = serde_json::json!({"type": "generate_review_guide", "root_task_id": "root", "on_open": true});
+        let crate::FrontendRequest::GenerateReviewGuide { on_open, .. } = serde_json::from_value(generate).unwrap()
+        else {
+            panic!("wrong request")
+        };
+        assert!(on_open);
+
+        let content = serde_json::json!({"type": "get_review_guide_content", "version_id": "v1"});
+        let crate::FrontendRequest::GetReviewGuideContent { on_open, .. } = serde_json::from_value(content).unwrap()
+        else {
+            panic!("wrong request")
+        };
+        assert!(!on_open, "a request without the marker is not an open");
+
+        let encoded = serde_json::to_value(crate::FrontendRequest::GetReviewGuideContent {
+            version_id: "v1".to_owned(),
+            on_open: true,
+        })
+        .unwrap();
+        assert_eq!(encoded["on_open"], true);
     }
 }

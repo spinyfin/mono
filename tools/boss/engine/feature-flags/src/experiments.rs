@@ -58,6 +58,13 @@ pub const WORKER_AUTOCOMPACT_EXPERIMENT: &str = "worker_autocompact";
 /// Splits [`WORKER_AUTOCOMPACT_EXPERIMENT`] between half of families and all.
 pub const WORKER_AUTOCOMPACT_AB_SPLIT_FLAG: &str = "worker_autocompact_ab_split";
 
+/// Key of the review-guide experiment: generate one guide per PR when the PR
+/// is ready for a person or first opened, instead of on every new comparison.
+pub const REVIEW_GUIDE_WHEN_READY_EXPERIMENT: &str = "review_guide_when_ready";
+
+/// Splits [`REVIEW_GUIDE_WHEN_READY_EXPERIMENT`] between half of families and all.
+pub const REVIEW_GUIDE_WHEN_READY_AB_SPLIT_FLAG: &str = "review_guide_when_ready_ab_split";
+
 /// A surface on which at most one experiment may be assigned at a time.
 ///
 /// Two experiments that rewrite the same instructions, or reshape the same
@@ -123,10 +130,11 @@ pub const EXPERIMENTS: &[ExperimentSpec] = &[
         requires: &[],
         splits: true,
     },
+    ExperimentSpec { key: WORKER_AUTOCOMPACT_EXPERIMENT, lane: None, requires: &[], splits: true },
     ExperimentSpec {
-        key: WORKER_AUTOCOMPACT_EXPERIMENT,
+        key: REVIEW_GUIDE_WHEN_READY_EXPERIMENT,
         lane: None,
-        requires: &[],
+        requires: &["review_guide_generation"],
         splits: true,
     },
 ];
@@ -853,6 +861,18 @@ mod tests {
         assert!(resolved.is_treated(WORKER_AUTOCOMPACT_EXPERIMENT));
     }
 
+    #[test]
+    fn review_guide_when_ready_has_no_lane_and_needs_guide_generation() {
+        let spec = EXPERIMENTS
+            .iter()
+            .find(|spec| spec.key == REVIEW_GUIDE_WHEN_READY_EXPERIMENT)
+            .expect("review_guide_when_ready is registered");
+        assert_eq!(spec.lane, None);
+        assert_eq!(spec.requires, &["review_guide_generation"]);
+        assert!(spec.splits);
+        assert_eq!(ab_split_flag_name(spec.key), REVIEW_GUIDE_WHEN_READY_AB_SPLIT_FLAG);
+    }
+
     fn store() -> (tempfile::TempDir, FeatureFlagsStore) {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = FeatureFlagsStore::new(tmp.path().join("feature-flags.toml"));
@@ -898,6 +918,43 @@ mod tests {
         assert!(store.resolve_experiment_arms(|_| 10).is_empty());
         store.set(TOKEN_EXPERIMENTS_FLAG, true).unwrap();
         store.set(BATCHED_SEARCH_EXPERIMENT, false).unwrap();
+        assert!(store.resolve_experiment_arms(|_| 10).is_empty());
+    }
+
+    #[test]
+    fn review_guide_when_ready_runs_only_while_guide_generation_is_on() {
+        let (_tmp, store) = store();
+        store.set(REVIEW_GUIDE_WHEN_READY_EXPERIMENT, true).unwrap();
+        assert_eq!(
+            store.experiment_state(REVIEW_GUIDE_WHEN_READY_EXPERIMENT),
+            ExperimentState::Off,
+            "guide generation is off, so the experiment has nothing to change"
+        );
+        assert!(store.resolve_experiment_arms(|_| 10).is_empty());
+
+        store.set("review_guide_generation", true).unwrap();
+        assert_eq!(
+            store.experiment_state(REVIEW_GUIDE_WHEN_READY_EXPERIMENT),
+            ExperimentState::Split
+        );
+        assert!(
+            store
+                .resolve_experiment_arms(|_| 10)
+                .is_treated(REVIEW_GUIDE_WHEN_READY_EXPERIMENT)
+        );
+        assert!(
+            !store
+                .resolve_experiment_arms(|_| 90)
+                .is_treated(REVIEW_GUIDE_WHEN_READY_EXPERIMENT)
+        );
+
+        store.set(REVIEW_GUIDE_WHEN_READY_AB_SPLIT_FLAG, false).unwrap();
+        assert_eq!(
+            store.experiment_state(REVIEW_GUIDE_WHEN_READY_EXPERIMENT),
+            ExperimentState::All
+        );
+
+        store.set("review_guide_generation", false).unwrap();
         assert!(store.resolve_experiment_arms(|_| 10).is_empty());
     }
 

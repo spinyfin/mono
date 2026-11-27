@@ -1247,23 +1247,32 @@ extension EngineClient {
     /// Fetch one immutable review-guide version's full Markdown. Engine
     /// replies with `review_guide_content` carrying a
     /// `ReviewGuideVersionContent` (`content: nil` when the version id is
-    /// unknown).
+    /// unknown). `onOpen` marks the fetch a person opening the guide caused,
+    /// which the engine counts; refreshes and version-history lookups leave it
+    /// off.
     @discardableResult
-    func sendGetReviewGuideContent(versionID: String) -> String? {
-        sendLine([
+    func sendGetReviewGuideContent(versionID: String, onOpen: Bool = false) -> String? {
+        var line: [String: Any] = [
             "type": "get_review_guide_content",
             "version_id": versionID,
-        ], queueIfDisconnected: true)
+        ]
+        if onOpen { line["on_open"] = true }
+        return sendLine(line, queueIfDisconnected: true)
     }
 
     /// Capture sources if needed and generate a guide for an existing PR.
+    /// `onOpen` marks a request made because a person opened a PR's guide and
+    /// none existed for its current comparison; the engine counts it. The
+    /// generation is the same as for a Generate click.
     @discardableResult
-    func sendGenerateReviewGuide(rootTaskID: String, idempotencyToken: String) -> String? {
-        sendLine([
+    func sendGenerateReviewGuide(rootTaskID: String, idempotencyToken: String, onOpen: Bool = false) -> String? {
+        var line: [String: Any] = [
             "type": "generate_review_guide",
             "root_task_id": rootTaskID,
             "idempotency_token": idempotencyToken,
-        ])
+        ]
+        if onOpen { line["on_open"] = true }
+        return sendLine(line)
     }
 
     /// Idempotently request another generation attempt for a PR's current

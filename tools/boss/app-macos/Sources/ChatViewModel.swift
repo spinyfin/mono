@@ -871,6 +871,11 @@ final class ChatViewModel: ObservableObject {
     /// Guards against a duplicate tap on the card's Retry affordance.
     @Published var retryingReviewGuideRootTaskIDs: Set<String> = []
 
+    /// The root task whose review guide the navigator's Review tab is showing
+    /// right now, so one visit counts as one open however many times the tab's
+    /// inputs change while it is up. Not published: nothing renders from it.
+    var reviewGuideSurfaceRootTaskID: String?
+
     /// Indirection for opening the review-terminal window. Installed by
     /// [[ContentView]] using `@Environment(\.openWindow)`. Called on
     /// click (before the engine responds) so the window opens immediately

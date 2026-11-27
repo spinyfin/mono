@@ -17,10 +17,15 @@ extension ChatViewModel {
     func openReviewGuide(for task: WorkTask) {
         guard let versionId = task.reviewGuideReadableVersionId else { return }
         openReviewGuide(versionId: versionId, rootTaskId: task.id)
+        // The version on hand may be for an earlier head of the PR.
+        requestReviewGuideOnOpen(for: task)
     }
 
+    /// Open one guide version in the viewer window. `onOpen` is true for a
+    /// person opening a guide, false for switching versions inside a viewer or
+    /// retrying a failed load, which the engine does not count as opens.
     @MainActor
-    func openReviewGuide(versionId: String, rootTaskId: String) {
+    func openReviewGuide(versionId: String, rootTaskId: String, onOpen: Bool = true) {
         pendingReviewGuideVersionId = versionId
         pendingReviewGuideRootTaskId = rootTaskId
         loadAttachments(taskId: rootTaskId)
@@ -41,19 +46,75 @@ extension ChatViewModel {
         }
         asyncMarkdownViewerVM.pendingRenderProjectShortID = nil
         asyncMarkdownViewerOpener?()
-        pendingReviewGuideRequestId = engine.sendGetReviewGuideContent(versionID: versionId)
+        pendingReviewGuideRequestId = engine.sendGetReviewGuideContent(versionID: versionId, onOpen: onOpen)
         if pendingReviewGuideRequestId == nil {
             asyncMarkdownViewerVM.state = .failed(title: "Review guide", message: "Guide request could not be sent. Reconnect and retry.")
             asyncMarkdownViewerVM.canRetry = true
             asyncMarkdownViewerVM.onRetry = { [weak self] in
-                self?.openReviewGuide(versionId: versionId, rootTaskId: rootTaskId)
+                self?.openReviewGuide(versionId: versionId, rootTaskId: rootTaskId, onOpen: false)
             }
         }
     }
 
-    func loadNavigatorReviewGuide(for root: WorkTask, versionID: String? = nil, refresh: Bool = false) {
+    /// Load a guide version into the navigator's inline reader. `onOpen` is
+    /// true for the load that follows a person opening the Review tab; the
+    /// engine counts it. A guide the reader already holds is not fetched
+    /// again, so that open is reported with a fetch whose reply is not wanted.
+    func loadNavigatorReviewGuide(for root: WorkTask, versionID: String? = nil, refresh: Bool = false, onOpen: Bool = false) {
+        var fetched = false
         navigatorReviewGuides.load(root: root, versionID: versionID, refresh: refresh) {
-            engine.sendGetReviewGuideContent(versionID: $0)
+            fetched = true
+            return engine.sendGetReviewGuideContent(versionID: $0, onOpen: onOpen)
+        }
+        if onOpen, !fetched, hasCurrentReviewGuide(root),
+           let heldVersionID = versionID ?? root.reviewGuideReadableVersionId {
+            _ = engine.sendGetReviewGuideContent(versionID: heldVersionID, onOpen: true)
+        }
+    }
+
+    /// Whether the task has a readable guide generated for its PR's current
+    /// comparison. A guide for an earlier head of the PR is not current.
+    func hasCurrentReviewGuide(_ task: WorkTask) -> Bool {
+        task.reviewGuideReadableVersionId != nil && task.reviewGuideStaleSource != true
+    }
+
+    /// The navigator's Review tab came up for `root`. Returns whether this is a
+    /// new open (the tab was not already showing this root). A new open asks the
+    /// engine for a guide when there is none for the PR's current comparison.
+    @MainActor
+    func reviewGuideSurfaceOpened(root: WorkTask) -> Bool {
+        guard reviewGuideSurfaceRootTaskID != root.id else { return false }
+        reviewGuideSurfaceRootTaskID = root.id
+        requestReviewGuideOnOpen(for: root)
+        return true
+    }
+
+    @MainActor
+    func reviewGuideSurfaceClosed(rootTaskID: String) {
+        if reviewGuideSurfaceRootTaskID == rootTaskID { reviewGuideSurfaceRootTaskID = nil }
+    }
+
+    /// Generate-on-open: a person opening a PR's guide when none exists for its
+    /// current comparison asks the engine for one, through the ordinary generate
+    /// request marked as made on open. Whether the guide is made now, was
+    /// already queued, or is held for the PR to be ready is the engine's
+    /// business; the app does not know which experiment arm a PR is in. The
+    /// engine runs one attempt per PR, so asking again while one is live is safe.
+    ///
+    /// Not asked for work that gets no automatic guide (design and
+    /// investigation PRs), for a guide whose last attempt failed (Retry is on
+    /// the card, and opening must not keep spending on a failing guide), or for
+    /// a PR with no URL.
+    @MainActor
+    func requestReviewGuideOnOpen(for task: WorkTask) {
+        guard task.generateReviewGuideMenuTitle != nil,
+              !hasCurrentReviewGuide(task),
+              !["design", "investigation"].contains(task.kind),
+              task.reviewGuideLifecycle != "failed",
+              !retryingReviewGuideRootTaskIDs.contains(task.id) else { return }
+        retryingReviewGuideRootTaskIDs.insert(task.id)
+        if engine.sendGenerateReviewGuide(rootTaskID: task.id, idempotencyToken: UUID().uuidString, onOpen: true) == nil {
+            retryingReviewGuideRootTaskIDs.remove(task.id)
         }
     }
 

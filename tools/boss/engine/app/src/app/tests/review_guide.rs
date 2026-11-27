@@ -111,6 +111,10 @@ impl Fixture {
     }
 
     async fn request(&self, task_id: &str, token: &str) -> FrontendEvent {
+        self.request_with(task_id, token, false).await
+    }
+
+    async fn request_with(&self, task_id: &str, token: &str, on_open: bool) -> FrontendEvent {
         let sink = make_session_sink();
         let ctx = Dispatch::builder()
             .server_state(self.state.clone())
@@ -126,6 +130,7 @@ impl Fixture {
             FrontendRequest::GenerateReviewGuide {
                 root_task_id: task_id.to_owned(),
                 idempotency_token: Some(token.to_owned()),
+                on_open,
             },
         )
         .await;
@@ -959,4 +964,147 @@ async fn guide_context_fails_loudly_when_the_project_or_root_is_missing() {
             .unwrap_err()
     );
     assert!(error.contains("originating task"), "{error}");
+}
+
+// ---- review-guide opens ---------------------------------------------------
+
+fn metric(f: &Fixture, name: &str) -> Option<u64> {
+    f.state.metrics.counter_value(name)
+}
+
+async fn get_content_with(f: &Fixture, version_id: &str, on_open: bool) -> FrontendEvent {
+    let sink = make_session_sink();
+    let ctx = Dispatch::builder()
+        .server_state(f.state.clone())
+        .work_db(f.state.work_db.clone())
+        .sink(sink.clone())
+        .session_id("session")
+        .request_id("request")
+        .recv_instant(std::time::Instant::now())
+        .decode_ms(0.0)
+        .build();
+    crate::app::review_guide::handle_get_review_guide_content(
+        ctx,
+        FrontendRequest::GetReviewGuideContent {
+            version_id: version_id.to_owned(),
+            on_open,
+        },
+    )
+    .await;
+    sink.close();
+    let reply = sink.next().await.unwrap();
+    reply.payload
+}
+
+#[tokio::test]
+async fn a_generate_on_open_counts_an_open_that_found_no_current_guide() {
+    let f = Fixture::new(false);
+    let reply = f.request_with(&f.root, "open-1", true).await;
+    assert!(
+        matches!(reply, FrontendEvent::ReviewGuideRetryQueued { .. }),
+        "{reply:?}"
+    );
+    assert_eq!(metric(&f, "review_guide.opens"), Some(1));
+    assert_eq!(metric(&f, "review_guide.opens_without_current_guide"), Some(1));
+    assert_eq!(
+        metric(&f, "review_guide.opens.treatment"),
+        None,
+        "no experiment is running, so no arm is counted"
+    );
+    // The request itself is the ordinary one: it queued exactly one attempt.
+    assert_eq!(
+        f.state
+            .work_db
+            .get_pr_review_guide_summary_for_root(&f.root)
+            .unwrap()
+            .unwrap()
+            .lifecycle,
+        "generating"
+    );
+}
+
+#[tokio::test]
+async fn an_ordinary_generate_click_is_not_an_open() {
+    let f = Fixture::new(false);
+    f.generate("click", false).await;
+    assert_eq!(metric(&f, "review_guide.opens"), None);
+    assert_eq!(metric(&f, "review_guide.opens_without_current_guide"), None);
+}
+
+#[tokio::test]
+async fn opening_a_current_guide_counts_an_open_and_not_a_missing_guide() {
+    let f = Fixture::new(false);
+    let first = f.generate("first", false).await;
+    let db = &f.state.work_db;
+    let PublishReviewGuideOutcome::Published(version) =
+        db.publish_pr_review_guide_version(&first.id, "# Guide", "raw").unwrap()
+    else {
+        panic!("expected publication")
+    };
+    assert!(matches!(
+        get_content_with(&f, &version.id, false).await,
+        FrontendEvent::ReviewGuideContent { content: Some(_), .. }
+    ));
+    assert_eq!(
+        metric(&f, "review_guide.opens"),
+        None,
+        "a refresh or history lookup is not an open"
+    );
+
+    assert!(matches!(
+        get_content_with(&f, &version.id, true).await,
+        FrontendEvent::ReviewGuideContent { content: Some(_), .. }
+    ));
+    assert_eq!(metric(&f, "review_guide.opens"), Some(1));
+    assert_eq!(metric(&f, "review_guide.opens_without_current_guide"), None);
+
+    // A request raced a publication: the guide was current when it arrived.
+    f.request_with(&f.root, "raced", true).await;
+    assert_eq!(metric(&f, "review_guide.opens"), Some(2));
+    assert_eq!(metric(&f, "review_guide.opens_without_current_guide"), None);
+}
+
+#[tokio::test]
+async fn a_guide_for_an_older_comparison_is_not_current_when_the_pr_has_moved() {
+    let f = Fixture::new(false);
+    let first = f.generate("first", false).await;
+    let db = &f.state.work_db;
+    db.publish_pr_review_guide_version(&first.id, "# Guide", "raw").unwrap();
+    // The PR moved on: a newer comparison is now the selected one.
+    let newer = source_capture_packet(PR_URL, "base", "newer-head");
+    db.persist_pr_review_guide_source_capture(
+        &f.root,
+        db.allocate_pr_review_guide_source_observation_sequence().unwrap(),
+        PrSourceCaptureTrigger::Poller,
+        &newer,
+    )
+    .unwrap();
+    assert!(!db.review_guide_is_current(&f.root).unwrap());
+    // `on_open` is set by an app that saw the stale guide; its generate request
+    // recaptures and counts an open that found no current guide.
+    f.request_with(&f.root, "stale-open", true).await;
+    assert_eq!(metric(&f, "review_guide.opens_without_current_guide"), Some(1));
+}
+
+#[tokio::test]
+async fn opens_are_counted_per_arm_while_the_experiment_runs() {
+    let f = Fixture::new(false);
+    for flag in [
+        "review_guide_generation",
+        boss_feature_flags::REVIEW_GUIDE_WHEN_READY_EXPERIMENT,
+    ] {
+        f.state.feature_flags.set(flag, true).unwrap();
+    }
+    f.state
+        .feature_flags
+        .set(boss_feature_flags::REVIEW_GUIDE_WHEN_READY_AB_SPLIT_FLAG, false)
+        .unwrap();
+    f.request_with(&f.root, "treated-open", true).await;
+    assert_eq!(metric(&f, "review_guide.opens"), Some(1));
+    assert_eq!(metric(&f, "review_guide.opens.treatment"), Some(1));
+    assert_eq!(
+        metric(&f, "review_guide.opens_without_current_guide.treatment"),
+        Some(1)
+    );
+    assert_eq!(metric(&f, "review_guide.opens.control"), None);
 }

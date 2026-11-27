@@ -656,10 +656,17 @@ pub enum FrontendRequest {
     /// otherwise admits a new epoch and immutable version, preserving history.
     /// Replies with [`FrontendEvent::ReviewGuideRetryQueued`] or
     /// [`FrontendEvent::WorkError`].
+    ///
+    /// `on_open` marks a request the app made because a person opened the PR's
+    /// guide and none existed for its current comparison, as opposed to a
+    /// deliberate Generate click. The engine counts such opens (see the
+    /// `review_guide_when_ready` experiment); the generation itself is the same.
     GenerateReviewGuide {
         root_task_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         idempotency_token: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        on_open: bool,
     },
 
     /// Fetch one attention group by id (`atg_…` or `A<n>` short id).
@@ -909,8 +916,13 @@ pub enum FrontendRequest {
     /// detail replies use [`Self::GetReviewGuideSummary`] alone. Replies
     /// with [`FrontendEvent::ReviewGuideContent`] (`content: None` when the
     /// version id is unknown).
+    ///
+    /// `on_open` marks the fetch a person's opening of the guide caused, as
+    /// opposed to a refresh or a history lookup. The engine counts such opens.
     GetReviewGuideContent {
         version_id: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        on_open: bool,
     },
 
     /// Series identity and current lifecycle for a PR's review guide, keyed

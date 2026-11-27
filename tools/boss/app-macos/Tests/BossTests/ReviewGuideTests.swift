@@ -173,6 +173,92 @@ final class ReviewGuideTests: XCTestCase {
         XCTAssertFalse(model.retryingReviewGuideRootTaskIDs.contains(task.id))
     }
 
+    // MARK: - Generate on open
+
+    private func recordedRequests(_ model: ChatViewModel) -> RequestLog {
+        let log = RequestLog()
+        model.engine.outboundRecorder = { log.all.append($0) }
+        return log
+    }
+
+    /// Only the review-guide requests: opening a guide also loads attachments.
+    private final class RequestLog {
+        var all: [[String: Any]] = []
+        var sent: [[String: Any]] {
+            all.filter { ["get_review_guide_content", "generate_review_guide"].contains($0["type"] as? String ?? "") }
+        }
+        func types() -> [String] { sent.compactMap { $0["type"] as? String } }
+    }
+
+    func testOpeningAPRWithNoGuideAsksForOneThroughTheGenerateRequestMarkedAsOnOpen() {
+        let model = makeModel()
+        let log = recordedRequests(model)
+        let task = Self.makeTask(id: "task_1", readableVersionId: nil)
+        XCTAssertTrue(model.reviewGuideSurfaceOpened(root: task))
+        XCTAssertEqual(log.types(), ["generate_review_guide"])
+        XCTAssertEqual(log.sent[0]["root_task_id"] as? String, task.id)
+        XCTAssertEqual(log.sent[0]["on_open"] as? Bool, true)
+        // The tab's inputs changing while it stays up is not another visit.
+        XCTAssertFalse(model.reviewGuideSurfaceOpened(root: task))
+        XCTAssertEqual(log.sent.count, 1)
+        // Leaving and coming back is.
+        model.reviewGuideSurfaceClosed(rootTaskID: task.id)
+        model.retryingReviewGuideRootTaskIDs.removeAll()
+        XCTAssertTrue(model.reviewGuideSurfaceOpened(root: task))
+        XCTAssertEqual(log.sent.count, 2)
+    }
+
+    func testOpeningAPRWithACurrentGuideDoesNotAskForAnother() {
+        let model = makeModel()
+        let log = recordedRequests(model)
+        let task = Self.makeTask(id: "task_1", readableVersionId: "prgv_1")
+        XCTAssertTrue(model.reviewGuideSurfaceOpened(root: task))
+        XCTAssertEqual(log.sent.count, 0)
+        XCTAssertFalse(model.retryingReviewGuideRootTaskIDs.contains(task.id))
+    }
+
+    func testAGuideForAnEarlierHeadCountsAsNoCurrentGuideOnOpen() {
+        let model = makeModel()
+        let log = recordedRequests(model)
+        var task = Self.makeTask(id: "task_1", readableVersionId: "prgv_old")
+        task.reviewGuideStaleSource = true
+        XCTAssertFalse(model.hasCurrentReviewGuide(task))
+        model.openReviewGuide(for: task)
+        // The old version opens, and the engine is asked for one for the new head.
+        XCTAssertEqual(log.types(), ["get_review_guide_content", "generate_review_guide"])
+        XCTAssertEqual(log.sent[0]["on_open"] as? Bool, true)
+        XCTAssertEqual(log.sent[1]["on_open"] as? Bool, true)
+    }
+
+    func testGenerateOnOpenSkipsWorkThatGetsNoAutomaticGuideAndFailedGuides() {
+        let model = makeModel()
+        let log = recordedRequests(model)
+        for kind in ["design", "investigation"] {
+            let task = Self.makeTask(id: "doc_\(kind)", readableVersionId: nil, kind: kind)
+            XCTAssertTrue(model.reviewGuideSurfaceOpened(root: task))
+        }
+        var failed = Self.makeTask(id: "failed", readableVersionId: nil)
+        failed.reviewGuideLifecycle = "failed"
+        XCTAssertTrue(model.reviewGuideSurfaceOpened(root: failed))
+        var noPR = Self.makeTask(id: "no_pr", readableVersionId: nil)
+        noPR.prURL = nil
+        XCTAssertTrue(model.reviewGuideSurfaceOpened(root: noPR))
+        let revision = Self.makeTask(id: "revision", readableVersionId: nil, kind: "revision")
+        XCTAssertTrue(model.reviewGuideSurfaceOpened(root: revision))
+        XCTAssertEqual(log.sent.count, 0)
+    }
+
+    func testOnlyAnOpenMarksTheContentFetchAndTheMarkerIsOmittedOtherwise() {
+        let model = makeModel()
+        let log = recordedRequests(model)
+        model.openReviewGuide(versionId: "prgv_1", rootTaskId: "root")
+        model.openReviewGuide(versionId: "prgv_2", rootTaskId: "root", onOpen: false)
+        XCTAssertEqual(log.sent[0]["on_open"] as? Bool, true)
+        XCTAssertNil(log.sent[1]["on_open"], "switching versions in a viewer is not an open")
+        model.generateReviewGuide(for: Self.makeTask(id: "task_9", readableVersionId: nil))
+        XCTAssertNil(log.sent.last?["on_open"], "a Generate click is not an open")
+    }
+
     func testGenerateSharesRetryGuardAndEngineErrorsAreVisible() {
         let model = makeModel()
         var sent = 0

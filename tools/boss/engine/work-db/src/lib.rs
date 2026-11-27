@@ -990,6 +990,7 @@ mod review_guide_recovery;
 pub use review_guide_recovery::OrphanedGuideSubmission;
 mod review_guide_sources;
 mod review_guide_submission;
+mod review_guide_when_ready;
 mod review_section;
 mod review_verdict_apply;
 mod review_verdicts;
