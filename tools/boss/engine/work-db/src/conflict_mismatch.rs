@@ -347,9 +347,9 @@ pub(super) fn attempt_for_question(conn: &Connection, question_id: &str) -> Resu
 }
 
 fn question_for(pr_number: i64, evidence: &ArchitecturalMismatchEvidence) -> OperatorQuestion {
-    let choices = vec![
-        CONFLICT_MISMATCH_CHOICE_REWRITE.to_owned(),
-        CONFLICT_MISMATCH_CHOICE_FORCE_MERGE.to_owned(),
+    let options = vec![
+        boss_protocol::OperatorChoiceOption::resume(CONFLICT_MISMATCH_CHOICE_REWRITE),
+        boss_protocol::OperatorChoiceOption::resume(CONFLICT_MISMATCH_CHOICE_FORCE_MERGE),
     ];
     let explanation = format!(
         "Context:\n\
@@ -371,7 +371,7 @@ What was attempted: {}",
     );
     OperatorQuestion {
         text: format!("Rewrite PR #{pr_number} onto the new base, or force a merge?"),
-        answer_type: OperatorAnswerType::MultipleChoice { choices },
+        answer_type: OperatorAnswerType::multiple_choice(options),
         explanation,
     }
 }
@@ -535,7 +535,7 @@ mod tests {
             recommendation: "Rewrite around the dispatcher.".into(),
         };
         let question = question_for(3405, &evidence);
-        let OperatorAnswerType::MultipleChoice { choices } = &question.answer_type else {
+        let OperatorAnswerType::MultipleChoice { choices, .. } = &question.answer_type else {
             panic!("expected a multiple-choice question");
         };
         assert_eq!(

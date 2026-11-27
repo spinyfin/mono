@@ -728,7 +728,36 @@ impl<'a> PayloadReader<'a> {
             self.error("question.answer_type.kind", format!("unsupported answer type: {kind}"));
             return None;
         }
-        let mut question = match serde_json::from_value::<boss_protocol::OperatorQuestion>(value.clone()) {
+        let mut question_value = value.clone();
+        if question_value.pointer("/answer_type/kind").and_then(Value::as_str) == Some("multiple_choice") {
+            let Some(raw_options) = question_value.pointer("/answer_type/options").and_then(Value::as_array) else {
+                self.error(
+                    "question.answer_type.options",
+                    "every multiple-choice option must declare an explicit disposition (resume, archive, or park)",
+                );
+                return None;
+            };
+            if raw_options.is_empty() {
+                self.error(
+                    "question.answer_type.options",
+                    "every multiple-choice option must declare an explicit disposition (resume, archive, or park)",
+                );
+                return None;
+            }
+            if question_value
+                .pointer("/answer_type/choices")
+                .is_none_or(Value::is_null)
+            {
+                let derived: Vec<Value> = raw_options
+                    .iter()
+                    .filter_map(|item| item.get("label").cloned())
+                    .collect();
+                if let Some(answer_type) = question_value.get_mut("answer_type").and_then(Value::as_object_mut) {
+                    answer_type.insert("choices".to_owned(), Value::Array(derived));
+                }
+            }
+        }
+        let mut question = match serde_json::from_value::<boss_protocol::OperatorQuestion>(question_value) {
             Ok(question) => question,
             Err(err) => {
                 self.error("question", format!("unsupported or invalid question: {err}"));
@@ -869,11 +898,41 @@ impl<'a> PayloadReader<'a> {
                 pr_url,
             };
         } else {
-            if let boss_protocol::OperatorAnswerType::MultipleChoice { choices } = &question.answer_type
-                && let Err(message) = boss_protocol::OperatorAnswerType::validate_choices(choices)
-            {
-                self.error("question.answer_type.choices", message);
-                return None;
+            if let boss_protocol::OperatorAnswerType::MultipleChoice { choices, options } = question.answer_type {
+                let mut canonical_options = Vec::with_capacity(options.len());
+                for (idx, mut option) in options.into_iter().enumerate() {
+                    option.label = option.label.trim().to_owned();
+                    if let Some(addendum) = option.addendum {
+                        let trimmed = addendum.trim();
+                        if trimmed.is_empty() {
+                            self.error(
+                                "question.answer_type.options",
+                                format!("choice {} addendum must not be empty", idx + 1),
+                            );
+                            return None;
+                        }
+                        option.addendum = Some(trimmed.to_owned());
+                    }
+                    canonical_options.push(option);
+                }
+                let trimmed_choices: Vec<String> = choices.into_iter().map(|c| c.trim().to_owned()).collect();
+                if trimmed_choices.len() != canonical_options.len()
+                    || trimmed_choices
+                        .iter()
+                        .zip(&canonical_options)
+                        .any(|(choice, option)| choice != &option.label)
+                {
+                    self.error(
+                        "question.answer_type.choices",
+                        "multiple-choice `choices` must match `options` labels in order",
+                    );
+                    return None;
+                }
+                if let Err(message) = boss_protocol::OperatorAnswerType::validate_options(&canonical_options) {
+                    self.error("question.answer_type.options", message);
+                    return None;
+                }
+                question.answer_type = boss_protocol::OperatorAnswerType::multiple_choice(canonical_options);
             }
             question.text = self.text_from("question.text", &Value::String(question.text), 500)?;
             if question.text.contains(['\n', '\r']) {
@@ -1117,19 +1176,40 @@ mod operator_question_tests {
         }})
     }
 
-    fn multiple_choice_payload(choices: serde_json::Value) -> serde_json::Value {
+    fn multiple_choice_payload(options: serde_json::Value) -> serde_json::Value {
+        let choices = options
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("label").cloned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         json!({"outcome":"blocked", "summary":"Needs a decision", "question":{
             "text":"  Which rollout should I use?  ",
-            "answer_type":{"kind":"multiple_choice", "choices": choices},
+            "answer_type":{"kind":"multiple_choice", "choices": choices, "options": options},
             "explanation":"The brief allows both."
         }})
+    }
+
+    fn resume_options(labels: &[&str]) -> serde_json::Value {
+        json!(
+            labels
+                .iter()
+                .map(|label| json!({"label": label, "disposition": "resume"}))
+                .collect::<Vec<_>>()
+        )
     }
 
     #[test]
     fn multiple_choice_question_is_accepted_with_two_to_six_distinct_choices() {
         let canonical = validate_payload(
             ProposalKind::RunDone,
-            &multiple_choice_payload(json!(["Gradual", "All at once"])),
+            &multiple_choice_payload(json!([
+                {"label": "  Gradual  ", "disposition": "resume"},
+                {"label": "Chore is obsolete, archive it", "disposition": "archive"}
+            ])),
         )
         .unwrap();
         let parsed: RunDoneProposalPayload = serde_json::from_str(&canonical.canonical_json).unwrap();
@@ -1137,34 +1217,55 @@ mod operator_question_tests {
         assert_eq!(question.text, "Which rollout should I use?");
         assert_eq!(
             question.answer_type,
-            boss_protocol::OperatorAnswerType::MultipleChoice {
-                choices: vec!["Gradual".into(), "All at once".into()]
-            }
+            boss_protocol::OperatorAnswerType::multiple_choice(vec![
+                boss_protocol::OperatorChoiceOption::resume("Gradual"),
+                boss_protocol::OperatorChoiceOption::archive("Chore is obsolete, archive it"),
+            ])
         );
-        let six = json!(["a", "b", "c", "d", "e", "f"]);
-        assert!(validate_payload(ProposalKind::RunDone, &multiple_choice_payload(six)).is_ok());
-        for choices in [
-            json!([]),
-            json!(["only one"]),
-            json!(["a", "b", "c", "d", "e", "f", "g"]),
-            json!(["a", ""]),
-            json!(["a", "   "]),
-            json!(["a", "a"]),
-            json!(["a", "two\nlines"]),
-            json!(["a", 7]),
-        ] {
-            assert!(
-                validate_payload(ProposalKind::RunDone, &multiple_choice_payload(choices.clone())).is_err(),
-                "{choices}"
-            );
-        }
-        let mut missing = multiple_choice_payload(json!(["a", "b"]));
-        missing["question"]["answer_type"]
+        // Omitting redundant `choices` when `options` is provided canonicalizes cleanly.
+        let mut options_only = multiple_choice_payload(resume_options(&["Gradual", "All at once"]));
+        options_only["question"]["answer_type"]
             .as_object_mut()
             .unwrap()
             .remove("choices");
-        assert!(validate_payload(ProposalKind::RunDone, &missing).is_err());
-        let mut not_blocked = multiple_choice_payload(json!(["a", "b"]));
+        assert!(validate_payload(ProposalKind::RunDone, &options_only).is_ok());
+
+        let six = resume_options(&["a", "b", "c", "d", "e", "f"]);
+        assert!(validate_payload(ProposalKind::RunDone, &multiple_choice_payload(six)).is_ok());
+        for bad_options in [
+            json!([]),
+            resume_options(&["only one"]),
+            resume_options(&["a", "b", "c", "d", "e", "f", "g"]),
+            resume_options(&["a", ""]),
+            resume_options(&["a", "   "]),
+            resume_options(&["a", "a"]),
+            resume_options(&["a", "two\nlines"]),
+            json!([{"label": "a", "disposition": "resume"}, {"label": 7, "disposition": "resume"}]),
+            // Missing or non-executable dispositions are rejected at card creation.
+            json!([{"label": "a"}, {"label": "b", "disposition": "resume"}]),
+            json!([{"label": "a", "disposition": "merge"}, {"label": "b", "disposition": "resume"}]),
+            json!([{"label": "a", "disposition": "reap_worker"}, {"label": "b", "disposition": "resume"}]),
+            json!([{"label": "a", "disposition": "archive", "addendum": "do something"}, {"label": "b", "disposition": "resume"}]),
+        ] {
+            assert!(
+                validate_payload(ProposalKind::RunDone, &multiple_choice_payload(bad_options.clone())).is_err(),
+                "{bad_options}"
+            );
+        }
+        // Choices without structured `options` (missing dispositions) are rejected.
+        let legacy_shape = json!({"outcome":"blocked", "summary":"Needs a decision", "question":{
+            "text":"Which rollout should I use?",
+            "answer_type":{"kind":"multiple_choice", "choices":["a", "b"]},
+            "explanation":"The brief allows both."
+        }});
+        assert!(validate_payload(ProposalKind::RunDone, &legacy_shape).is_err());
+
+        // Mismatched `choices` vs `options` labels is rejected.
+        let mut mismatched = multiple_choice_payload(resume_options(&["a", "b"]));
+        mismatched["question"]["answer_type"]["choices"] = json!(["a", "different"]);
+        assert!(validate_payload(ProposalKind::RunDone, &mismatched).is_err());
+
+        let mut not_blocked = multiple_choice_payload(resume_options(&["a", "b"]));
         not_blocked["outcome"] = json!("delivered");
         assert!(validate_payload(ProposalKind::RunDone, &not_blocked).is_err());
     }

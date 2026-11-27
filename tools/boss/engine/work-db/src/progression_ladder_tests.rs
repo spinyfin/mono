@@ -436,9 +436,11 @@ fn run_one_acts_run_two_follows_on_the_unchanged_fingerprint_and_the_engine_asks
     assert_eq!(question.question.text, QUESTION_TEXT);
     assert_eq!(
         question.question.answer_type,
-        OperatorAnswerType::MultipleChoice {
-            choices: vec![PARK_IT.into(), ARCHIVE_IT.into(), KEEP_TRYING.into()]
-        }
+        OperatorAnswerType::multiple_choice(vec![
+            boss_protocol::OperatorChoiceOption::park(PARK_IT),
+            boss_protocol::OperatorChoiceOption::archive(ARCHIVE_IT),
+            boss_protocol::OperatorChoiceOption::resume(KEEP_TRYING),
+        ])
     );
     let explanation = &question.question.explanation;
     for expected in [

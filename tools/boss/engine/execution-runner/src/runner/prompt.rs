@@ -1267,9 +1267,9 @@ pub(crate) fn run_done_directive(
      ```\n\n\
      Say in plain words what is blocked and what each answer will do; put check names and numbers in Details. \"Can I proceed?\" is not specific enough. Put the justification in the explanation file, not the question.{question_companion} One question per run: ask the most blocking decision and disclose any further decisions in the explanation. The run waits durably for the answer. Yes records the approval and redispatches. No records the declined path (granting no authorization) and redispatches so the next worker takes it. Both Yes and No must name an actionable path the engine or the next worker will take; \"No = remain blocked\" is not a real choice. If there is only one viable path, do not ask; proceed, or report the blocker without a question.\n\n\
      Follow the question-writing contract in the generated worker rules.\n\n\
-     **When the decision is a choice among several options rather than approve/decline, use `--answer-type multiple-choice`.** Pass two to six short, distinct, single-line labels with `--choices`; the card shows one button per label. Use `--question` for the decision itself and an explanation with only `Context:` (say what each option leads to), `Recommendation:` and optional `Details:` — no `Yes:` or `No:` sections, which are rejected for this type. Example:\n\n\
+     **When the decision is a choice among several options rather than approve/decline, use `--answer-type multiple-choice`.** Pass two to six short, distinct, single-line labels with `--choices` and pair every option with `--dispositions <resume|archive|park>` in the same order (`resume` records the chosen option and resumes work; `archive` and `park` are executed directly by the engine when the repo owner selects them, never inferred from label wording; cards with missing or other dispositions are rejected). Use `--question` for the decision itself and an explanation with only `Context:` (say what each option leads to), `Recommendation:` and optional `Details:` — no `Yes:` or `No:` sections, which are rejected for this type. Never use `yes-no` to ask whether to archive or park this item. Example:\n\n\
      ```\n\
-     {boss} propose done --outcome blocked --summary \"<blocker>\" --question \"Which rollout should the migration use?\" --answer-type multiple-choice --choices \"Gradual\" \"All at once\" --explanation-file /tmp/explanation.txt\n\
+     {boss} propose done --outcome blocked --summary \"<blocker>\" --question \"Which rollout should the migration use?\" --answer-type multiple-choice --choices \"Gradual\" \"All at once\" --dispositions resume resume --explanation-file /tmp/explanation.txt\n\
      ```\n\n\
      The same one-question-per-run rule applies. The chosen label is recorded verbatim and the task restarts in the preserved workspace; your next run's task description ends with a `## Recorded answer` section naming the question and the chosen option. Act on that choice; it grants no authorization beyond the decision itself.\n\n\
      **When your task cannot finish until another PR lands first, ask to create a prerequisite task instead of a plain Yes/No.** Example: a CI-fix revision finds that a pre-existing test fixture races retention cleanup; that needs its own fix on main before the PR's CI can go green, and it is out of scope for you. Do not file a plain blocker, a plain yes/no question or `followup-task` for that case. Propose that work as its own task:\n\n\
@@ -1329,39 +1329,10 @@ pub(crate) fn run_done_directive(
     )
 }
 
-/// `[deferred-scope]` marker protocol directive (root-caused to PR #765).
-/// A worker that deliberately narrows its own scope — delivers part of the
-/// brief and consciously defers a piece of it, rather than merely running
-/// out of turns — had no sanctioned way to record that decision: task
-/// completion is binary (PR merged => done) and nothing reconciles
-/// delivered scope against the brief. The PR #765 worker wired part
-/// of a feature, deferred the rest because it needed new data plumbing, and
-/// wrote "I've filed it as a followup" in the PR body — workers cannot file
-/// anything, so the remainder silently died until an operator noticed weeks
-/// later. This directive gives deferred scope a parseable channel mirroring
-/// `[effort-escalation]`'s grammar; see [`crate::deferred_scope`] for the
-/// parser and
-/// `completion::WorkerCompletionHandler::detect_and_record_deferred_scope`
-/// for what the engine does with it: appends a durable audit line to the
-/// work item's description and files a coordinator-visible attention item.
-///
-/// `seam_enabled` mirrors the `deferred_scope_proposals_seam` feature flag —
-/// the same flag
-/// `completion::WorkerCompletionHandler::detect_and_record_deferred_scope`
-/// reads for the engine's read path, threaded here so the two halves of the
-/// migration move together (following the
-/// recipe [`worker_escalation_protocol_directive`] established): a worker
-/// must never be taught the `"$BOSS_BIN" propose deferred-scope` verb when the
-/// engine won't yet read proposals-first for it, and flipping the flag off
-/// must restore today's marker-only directive exactly.
-///
-/// `seam_enabled = false` reproduces the pre-migration directive verbatim.
-/// `seam_enabled = true` instructs `"$BOSS_BIN" propose deferred-scope` instead —
-/// unlike `[blocked]`, the `[deferred-scope]` marker has no bootstrap-
-/// fallback carve-out (design §"Failure semantics": only `[blocked]` is
-/// retained indefinitely), so the seam-enabled directive teaches the verb
-/// only; the engine still accepts a stray legacy marker as a counted
-/// fallback (see [`crate::deferred_scope`]).
+/// `[deferred-scope]` marker protocol directive (PR #765). When `seam_enabled`
+/// (`deferred_scope_proposals_seam`) is `false`, reproduces the pre-migration
+/// marker directive verbatim; when `true`, instructs `propose deferred-scope`
+/// while the engine still accepts a stray legacy marker as a counted fallback.
 pub(crate) fn deferred_scope_directive(seam_enabled: bool) -> String {
     if !seam_enabled {
         return "\n## If you deliver less than the task asks: declare the gap\n\n\

@@ -252,7 +252,16 @@ pub(super) mod tests {
             (format!("{VALID}{quoted}"), vec!["--question", "Approve the fix?"]),
             (
                 format!("{VALID_CHOICE}{quoted}"),
-                vec!["--choices", "Gradual", "All at once", "--question", "Which rollout?"],
+                vec![
+                    "--choices",
+                    "Gradual",
+                    "All at once",
+                    "--dispositions",
+                    "resume",
+                    "resume",
+                    "--question",
+                    "Which rollout?",
+                ],
             ),
         ] {
             assert_eq!(validate(&text).unwrap(), text);

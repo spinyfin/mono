@@ -240,7 +240,7 @@ fn a_mismatch_raises_a_question_and_leaves_no_dead_end() {
     );
     let questions = open_questions(&f);
     assert_eq!(questions.len(), 1, "{questions:?}");
-    let OperatorAnswerType::MultipleChoice { choices } = &questions[0].question.answer_type else {
+    let OperatorAnswerType::MultipleChoice { choices, .. } = &questions[0].question.answer_type else {
         panic!("expected a multiple-choice question");
     };
     assert_eq!(
@@ -570,7 +570,7 @@ fn declare_outcome_keyed(f: &Fixture, outcome: RunDoneOutcome, key: &str) {
 fn assert_one_open_linked_question_still_answers(f: &Fixture) {
     assert_eq!(open_questions(f).len(), 1, "{:?}", open_questions(f));
     assert_eq!(open_linked_question_count(f), 1);
-    let OperatorAnswerType::MultipleChoice { choices } = &open_questions(f)[0].question.answer_type else {
+    let OperatorAnswerType::MultipleChoice { choices, .. } = &open_questions(f)[0].question.answer_type else {
         panic!("expected a multiple-choice question");
     };
     assert_eq!(

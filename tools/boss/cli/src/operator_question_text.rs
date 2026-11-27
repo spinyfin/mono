@@ -58,9 +58,17 @@ pub(crate) fn operator_question_lines(record: &OperatorQuestionRecord) -> Vec<St
         lines.push(format!("    {} (--choice \"{}\" or --yes)", labels.yes, labels.yes));
         lines.push(format!("    {} (--choice \"{}\" or --no)", labels.no, labels.no));
     }
-    if let OperatorAnswerType::MultipleChoice { choices } = &q.answer_type {
+    if let OperatorAnswerType::MultipleChoice { choices, options } = &q.answer_type {
         lines.push("  Options:".into());
-        lines.extend(choices.iter().map(|choice| format!("    {choice}")));
+        if options.len() == choices.len() {
+            lines.extend(
+                options
+                    .iter()
+                    .map(|option| format!("    {} [{}]", option.label, option.disposition)),
+            );
+        } else {
+            lines.extend(choices.iter().map(|choice| format!("    {choice}")));
+        }
     }
     if let Some(answer) = &record.answer {
         lines.push(format!(
@@ -153,12 +161,26 @@ mod tests {
         let choice = operator_question_lines(&record(
             OperatorAnswerType::MultipleChoice {
                 choices: vec!["a".into(), "b".into()],
+                options: vec![],
             },
             Some(OperatorAnswer::MultipleChoice { value: "b".into() }),
         ))
         .join("\n");
         assert!(choice.contains("Options:\n    a\n    b"), "{choice}");
         assert!(choice.contains("Answer: b;"), "{choice}");
+
+        let typed_choice = operator_question_lines(&record(
+            OperatorAnswerType::multiple_choice(vec![
+                boss_protocol::OperatorChoiceOption::archive("Chore is obsolete, archive it"),
+                boss_protocol::OperatorChoiceOption::resume("Retry"),
+            ]),
+            None,
+        ))
+        .join("\n");
+        assert!(
+            typed_choice.contains("Options:\n    Chore is obsolete, archive it [archive]\n    Retry [resume]"),
+            "{typed_choice}"
+        );
     }
 
     #[test]

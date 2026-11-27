@@ -5,7 +5,15 @@ use super::*;
 pub(super) fn multiple_choice_payload() -> Value {
     json!({"outcome":"blocked", "summary":"Two rollouts fit the brief", "question":{
         "text":"Which rollout should I use?",
-        "answer_type":{"kind":"multiple_choice", "choices":["Gradual", "All at once", "Behind a flag"]},
+        "answer_type":{
+            "kind":"multiple_choice",
+            "choices":["Gradual", "All at once", "Behind a flag"],
+            "options":[
+                {"label":"Gradual", "disposition":"resume"},
+                {"label":"All at once", "disposition":"resume"},
+                {"label":"Behind a flag", "disposition":"resume"}
+            ]
+        },
         "explanation":"The brief allows each of them."
     }})
 }
@@ -32,9 +40,11 @@ async fn multiple_choice_question_parks_with_its_options_on_the_card() {
     let question = task.operator_question.unwrap();
     assert_eq!(
         question.answer_type,
-        boss_protocol::OperatorAnswerType::MultipleChoice {
-            choices: vec!["Gradual".into(), "All at once".into(), "Behind a flag".into()]
-        }
+        boss_protocol::OperatorAnswerType::multiple_choice(vec![
+            boss_protocol::OperatorChoiceOption::resume("Gradual"),
+            boss_protocol::OperatorChoiceOption::resume("All at once"),
+            boss_protocol::OperatorChoiceOption::resume("Behind a flag"),
+        ])
     );
 }
 
@@ -142,11 +152,29 @@ async fn an_answer_that_does_not_fit_the_question_is_refused_and_leaves_it_open(
 }
 
 #[tokio::test]
-async fn a_multiple_choice_proposal_with_bad_options_is_rejected_at_submission() {
-    let (state, _dir, execution_id, _) = live_chore_execution();
-    for choices in [json!(["only one"]), json!(["a", "a"]), json!(["a", ""])] {
+async fn a_multiple_choice_proposal_with_bad_or_non_executable_options_is_rejected_at_submission() {
+    let (state, _dir, execution_id, task_id) = live_chore_execution();
+    for bad_answer_type in [
+        // Missing structured `options` (choices only).
+        json!({"kind":"multiple_choice", "choices":["a", "b"]}),
+        // Missing `disposition` on an option.
+        json!({"kind":"multiple_choice", "options":[{"label":"a"}, {"label":"b", "disposition":"resume"}]}),
+        // Non-executable dispositions outside the closed engine set.
+        json!({"kind":"multiple_choice", "options":[{"label":"a", "disposition":"merge"}, {"label":"b", "disposition":"resume"}]}),
+        json!({"kind":"multiple_choice", "options":[{"label":"a", "disposition":"reap_worker"}, {"label":"b", "disposition":"resume"}]}),
+        json!({"kind":"multiple_choice", "options":[{"label":"a", "disposition":"change_priority"}, {"label":"b", "disposition":"resume"}]}),
+        // Non-executable combination: archive cannot carry a resume addendum.
+        json!({"kind":"multiple_choice", "options":[
+            {"label":"Chore is obsolete, archive it", "disposition":"archive", "addendum":"continue running"},
+            {"label":"Retry", "disposition":"resume"}
+        ]}),
+        // Bad option counts or labels.
+        json!({"kind":"multiple_choice", "options":[{"label":"only one", "disposition":"resume"}]}),
+        json!({"kind":"multiple_choice", "options":[{"label":"a", "disposition":"resume"}, {"label":"a", "disposition":"archive"}]}),
+        json!({"kind":"multiple_choice", "options":[{"label":"a", "disposition":"resume"}, {"label":"", "disposition":"resume"}]}),
+    ] {
         let mut payload = multiple_choice_payload();
-        payload["question"]["answer_type"]["choices"] = choices;
+        payload["question"]["answer_type"] = bad_answer_type.clone();
         let response = call_with_peer(
             &state,
             Some(std::process::id() as libc::pid_t),
@@ -155,9 +183,30 @@ async fn a_multiple_choice_proposal_with_bad_options_is_rejected_at_submission()
         .await;
         assert!(
             matches!(response, FrontendEvent::ProposalRejected { .. }),
-            "{response:?}"
+            "expected rejection for {bad_answer_type}: {response:?}"
         );
     }
+
+    // Even past wire validation, card creation in WorkDb rejects archive/park options on an already-terminal item.
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute("UPDATE tasks SET status = 'archived' WHERE id = ?1", [&task_id])
+        .unwrap();
+    let (proposal, _) = submitted(
+        call_with_peer(
+            &state,
+            Some(std::process::id() as libc::pid_t),
+            submit_request(
+                &execution_id,
+                ProposalKind::RunDone,
+                disposition_payload("Chore is obsolete, archive it", "archive"),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(proposal.state, boss_protocol::ProposalState::Rejected);
 }
 
 #[tokio::test]
@@ -263,16 +312,29 @@ async fn archive_it_archives_the_item_progression_could_not_unstick() {
     );
 }
 
-fn disposition_payload(choice: &str) -> Value {
+fn disposition_payload(choice: &str, disposition: &str) -> Value {
     let mut payload = multiple_choice_payload();
-    payload["question"]["answer_type"]["choices"] = json!([choice, "Pick a PR", "Keep trying"]);
+    payload["question"]["answer_type"] = json!({
+        "kind": "multiple_choice",
+        "choices": [choice, "Pick a PR", "Keep trying"],
+        "options": [
+            {"label": choice, "disposition": disposition},
+            {"label": "Pick a PR", "disposition": "resume"},
+            {"label": "Keep trying", "disposition": "resume"}
+        ]
+    });
     payload
 }
 
 #[tokio::test]
-async fn owner_archive_choices_archive_once_without_a_new_worker_or_question() {
-    for choice in ["Archive this chore", "Archive this item", "Archive this task"] {
-        let (state, _dir, _, task_id) = parked_task_with_question(disposition_payload(choice)).await;
+async fn owner_archive_choices_archive_once_for_any_label_without_a_new_worker_or_question() {
+    for choice in [
+        "Chore is obsolete, archive it",
+        "No longer needed — drop it",
+        "Archive",
+        "Archive this chore",
+    ] {
+        let (state, _dir, _, task_id) = parked_task_with_question(disposition_payload(choice, "archive")).await;
         let question = question_task(&state, &task_id).operator_question.unwrap();
         for _ in 0..2 {
             assert!(matches!(
@@ -280,11 +342,19 @@ async fn owner_archive_choices_archive_once_without_a_new_worker_or_question() {
                 FrontendEvent::WorkItemUpdated { .. }
             ));
             let task = question_task(&state, &task_id);
-            assert_eq!(task.status, boss_protocol::TaskStatus::Archived);
+            assert_eq!(task.status, boss_protocol::TaskStatus::Archived, "{choice}");
             assert_eq!(task.last_status_actor, "human");
             assert_eq!(task.archived_by.as_deref(), Some("manual_status_change"));
             assert!(task.operator_question.is_none());
             assert_eq!(state.work_db.list_executions(Some(&task_id)).unwrap().len(), 1);
+            assert!(
+                state
+                    .work_db
+                    .list_attention_items_for_work_item(&task_id)
+                    .unwrap()
+                    .is_empty(),
+                "archiving must raise no attention item"
+            );
         }
         let history = state.work_db.list_operator_questions(&task_id).unwrap();
         assert_eq!(history.len(), 1);
@@ -323,14 +393,14 @@ fn open_continuations(state: &Arc<ServerState>, task_id: &str) -> usize {
 
 #[tokio::test]
 async fn owner_park_choice_parks_without_launching_and_unparks_into_one_continuation() {
-    for revision in [false, true] {
+    for (revision, label) in [(false, "Hold off until next week"), (true, "Park this item")] {
         let (state, _dir, _, task_id) =
-            parked_task_with_question_kind(disposition_payload("Park this item"), revision).await;
+            parked_task_with_question_kind(disposition_payload(label, "park"), revision).await;
         let task = question_task(&state, &task_id);
         let root_id = task.parent_task_id.clone().unwrap_or_else(|| task_id.clone());
         let question = task.operator_question.unwrap();
         assert!(matches!(
-            choose(&state, &question.id, "Park this item").await,
+            choose(&state, &question.id, label).await,
             FrontendEvent::WorkItemUpdated { .. }
         ));
         let task = question_task(&state, &task_id);
@@ -340,11 +410,11 @@ async fn owner_park_choice_parks_without_launching_and_unparks_into_one_continua
         assert!(task.operator_question.is_none());
         assert_eq!(task.status, boss_protocol::TaskStatus::Todo);
         assert!(task.autostart, "unpark must restore dispatch eligibility");
-        assert!(task.description.contains("Operator chose:** Park this item"));
+        assert!(task.description.contains(&format!("Operator chose:** {label}")));
         assert_eq!(open_continuations(&state, &task_id), 0, "nothing launches while parked");
         // A repeated answer neither mints nor launches anything.
         assert!(matches!(
-            choose(&state, &question.id, "Park this item").await,
+            choose(&state, &question.id, label).await,
             FrontendEvent::WorkItemUpdated { .. }
         ));
         assert_eq!(open_continuations(&state, &task_id), 0);
@@ -385,7 +455,7 @@ async fn owner_park_choice_parks_without_launching_and_unparks_into_one_continua
 
 #[tokio::test]
 async fn owner_park_choice_with_an_unmet_prerequisite_records_the_answer_and_stays_gated() {
-    let (state, _dir, _, task_id) = parked_task_with_question(disposition_payload("Park this item")).await;
+    let (state, _dir, _, task_id) = parked_task_with_question(disposition_payload("Put on ice", "park")).await;
     let task = question_task(&state, &task_id);
     let question = task.operator_question.clone().unwrap();
     let prerequisite =
@@ -399,7 +469,7 @@ async fn owner_park_choice_with_an_unmet_prerequisite_records_the_answer_and_sta
         })
         .unwrap();
     assert!(matches!(
-        choose(&state, &question.id, "Park this item").await,
+        choose(&state, &question.id, "Put on ice").await,
         FrontendEvent::WorkItemUpdated { .. }
     ));
     let task = question_task(&state, &task_id);
@@ -423,25 +493,36 @@ async fn owner_park_choice_with_an_unmet_prerequisite_records_the_answer_and_sta
 }
 
 #[tokio::test]
-async fn ordinary_choices_still_resume_including_pr_selection_and_keep_trying() {
-    for choice in ["Pick a PR", "Keep trying", "Archive the old logs"] {
-        let (state, _dir, _, task_id) = parked_task_with_question(disposition_payload("Archive the old logs")).await;
+async fn resume_disposition_ignores_archive_or_park_label_wording_and_carries_addendum() {
+    // Even if a label literally says "Archive this item" or "Park this item",
+    // a `resume` disposition must resume rather than archiving or parking:
+    // label text never drives behaviour.
+    for choice in ["Archive this item", "Park this item", "Archive the old logs"] {
+        let mut payload = disposition_payload(choice, "resume");
+        payload["question"]["answer_type"]["options"][0]["addendum"] =
+            json!("Move old log files to cold storage only.");
+        let (state, _dir, _, task_id) = parked_task_with_question(payload).await;
         let question = question_task(&state, &task_id).operator_question.unwrap();
         assert!(matches!(
             choose(&state, &question.id, choice).await,
             FrontendEvent::WorkItemUpdated { .. }
         ));
         let task = question_task(&state, &task_id);
-        assert_eq!(task.status, boss_protocol::TaskStatus::Todo);
-        assert!(task.parked_at.is_none());
+        assert_eq!(task.status, boss_protocol::TaskStatus::Todo, "{choice}");
+        assert!(task.parked_at.is_none(), "{choice}");
         assert!(task.description.contains(&format!("Operator chose:** {choice}")));
+        assert!(
+            task.description
+                .contains("- **Option addendum:** Move old log files to cold storage only.\n")
+        );
         assert_eq!(state.work_db.list_executions(Some(&task_id)).unwrap().len(), 2);
     }
 }
 
 #[tokio::test]
 async fn failed_archive_rolls_back_the_answer_so_the_owner_can_retry() {
-    let (state, _dir, _, task_id) = parked_task_with_question(disposition_payload("Archive this item")).await;
+    let (state, _dir, _, task_id) =
+        parked_task_with_question(disposition_payload("Chore is obsolete, archive it", "archive")).await;
     let question = question_task(&state, &task_id).operator_question.unwrap();
     state
         .work_db
@@ -453,7 +534,7 @@ async fn failed_archive_rolls_back_the_answer_so_the_owner_can_retry() {
         )
         .unwrap();
     assert!(!matches!(
-        choose(&state, &question.id, "Archive this item").await,
+        choose(&state, &question.id, "Chore is obsolete, archive it").await,
         FrontendEvent::WorkItemUpdated { .. }
     ));
     assert_eq!(
@@ -471,7 +552,7 @@ async fn failed_archive_rolls_back_the_answer_so_the_owner_can_retry() {
         .execute_batch("DROP TRIGGER refuse_test_archive")
         .unwrap();
     assert!(matches!(
-        choose(&state, &question.id, "Archive this item").await,
+        choose(&state, &question.id, "Chore is obsolete, archive it").await,
         FrontendEvent::WorkItemUpdated { .. }
     ));
     assert_eq!(
@@ -481,26 +562,34 @@ async fn failed_archive_rolls_back_the_answer_so_the_owner_can_retry() {
 }
 
 #[tokio::test]
-async fn disposition_labels_chosen_by_a_non_owner_resume_the_worker_instead_of_acting() {
-    for (actor, choice) in [
-        ("worker", "Archive this item"),
-        ("worker", "Park this item"),
-        ("boss", "Archive this item"),
-        ("boss", "Park this item"),
+async fn structured_dispositions_chosen_by_a_non_owner_resume_the_worker_instead_of_acting() {
+    for (actor, choice, disposition) in [
+        ("worker", "Chore is obsolete, archive it", "archive"),
+        ("worker", "Hold off for now", "park"),
+        ("boss", "Chore is obsolete, archive it", "archive"),
+        ("boss", "Hold off for now", "park"),
     ] {
-        let (state, _dir, _, task_id) = parked_task_with_question(disposition_payload(choice)).await;
+        let (state, _dir, _, task_id) = parked_task_with_question(disposition_payload(choice, disposition)).await;
         let question = question_task(&state, &task_id).operator_question.unwrap();
-        state
-            .work_db
-            .answer_operator_question_from(
-                &question.id,
-                boss_protocol::OperatorAnswer::MultipleChoice { value: choice.into() },
-                state.pr_state_checker.as_ref(),
-                actor,
-                None,
-                false,
+        let pid = std::process::id() as libc::pid_t;
+        if actor == "worker" {
+            state.worker_registry.register(pid, "other_live_worker");
+        } else {
+            state.set_boss_pid(pid);
+        }
+        assert!(matches!(
+            call_with_peer(
+                &state,
+                Some(pid),
+                FrontendRequest::AnswerOperatorQuestion {
+                    suppress_start: false,
+                    id: question.id.clone(),
+                    answer: boss_protocol::OperatorAnswer::MultipleChoice { value: choice.into() },
+                },
             )
-            .unwrap();
+            .await,
+            FrontendEvent::WorkItemUpdated { .. }
+        ));
         let task = question_task(&state, &task_id);
         assert_eq!(task.status, boss_protocol::TaskStatus::Todo, "{actor} {choice}");
         assert!(task.parked_at.is_none(), "{actor} {choice} must not park");
@@ -509,32 +598,12 @@ async fn disposition_labels_chosen_by_a_non_owner_resume_the_worker_instead_of_a
 }
 
 #[tokio::test]
-async fn bare_archive_and_park_labels_on_an_unrelated_question_resume_the_worker() {
-    for choice in ["Archive", "Park", "Archive it", "Park it"] {
-        let mut payload = multiple_choice_payload();
-        payload["question"]["text"] = json!("What should happen to the old output?");
-        payload["question"]["answer_type"]["choices"] = json!([choice, "Delete", "Keep"]);
-        let (state, _dir, _, task_id) = parked_task_with_question(payload).await;
-        let question = question_task(&state, &task_id).operator_question.unwrap();
-        assert!(matches!(
-            choose(&state, &question.id, choice).await,
-            FrontendEvent::WorkItemUpdated { .. }
-        ));
-        let task = question_task(&state, &task_id);
-        assert_eq!(task.status, boss_protocol::TaskStatus::Todo, "{choice}");
-        assert!(task.parked_at.is_none(), "{choice}");
-        assert!(task.description.contains(&format!("Operator chose:** {choice}")));
-        assert_eq!(state.work_db.list_executions(Some(&task_id)).unwrap().len(), 2);
-    }
-}
-
-#[tokio::test]
 async fn owner_archive_choice_archives_a_revision() {
     let (state, _dir, _, task_id) =
-        parked_task_with_question_kind(disposition_payload("Archive this revision"), true).await;
+        parked_task_with_question_kind(disposition_payload("Revision is moot, archive it", "archive"), true).await;
     let question = question_task(&state, &task_id).operator_question.unwrap();
     assert!(matches!(
-        choose(&state, &question.id, "Archive this revision").await,
+        choose(&state, &question.id, "Revision is moot, archive it").await,
         FrontendEvent::WorkItemUpdated { .. }
     ));
     let task = question_task(&state, &task_id);
@@ -547,23 +616,72 @@ async fn owner_archive_choice_archives_a_revision() {
     );
 }
 
+/// Regression test for an unbound "Rebase onto main to clear Trunk merge
+/// conflict" chore whose worker failed, followed by a progression run offering
+/// "Chore is obsolete, archive it" (`disposition: archive`). Choosing it as the
+/// repo owner archives the chore immediately, releases the worker's pane and
+/// workspace lease, and raises no follow-up worker, progression run, or
+/// attention.
 #[tokio::test]
-async fn archive_this_chore_closes_an_unbound_merge_conflict_chore() {
-    let (state, _dir, execution, id) = live_chore_execution();
+async fn progression_archive_option_with_freeform_label_archives_unbound_chore_and_releases_resources() {
+    let (state, _dir, worker_execution, id) = live_chore_execution();
+    prepare_workspace_teardown(&state, &worker_execution);
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET name = 'Rebase onto main to clear Trunk merge conflict' WHERE id = ?1",
+            [&id],
+        )
+        .unwrap();
+    // Simulate the worker failing while its pane/lease still need teardown on archive,
+    // then a progression run raising the multiple-choice card.
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'failed', finished_at = strftime('%s','now') WHERE id = ?1",
+            [&worker_execution],
+        )
+        .unwrap();
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'blocked', blocked_reason = 'worker_failed', autostart = 0 WHERE id = ?1",
+            [&id],
+        )
+        .unwrap();
+    let prog = state
+        .work_db
+        .create_execution(
+            boss_protocol::CreateExecutionInput::builder()
+                .work_item_id(&id)
+                .kind(boss_protocol::ExecutionKind::Progression)
+                .status(boss_protocol::ExecutionStatus::Running)
+                .build(),
+        )
+        .unwrap();
+    state
+        .worker_registry
+        .register(std::process::id() as libc::pid_t, prog.id.clone());
+    let mut payload = disposition_payload("Chore is obsolete, archive it", "archive");
+    payload["criterion"] = json!("1");
     submitted(
         call_with_peer(
             &state,
             Some(std::process::id() as libc::pid_t),
-            submit_request(
-                &execution,
-                ProposalKind::RunDone,
-                disposition_payload("Archive this chore"),
-            ),
+            submit_request(&prog.id, ProposalKind::RunDone, payload),
         )
         .await,
     );
+    state.work_db.finish_progression_declared(&prog.id).unwrap();
+
     let question = state.work_db.list_operator_questions(&id).unwrap().remove(0).question;
-    let response = choose(&state, &question.id, "Archive this chore").await;
+    let response = choose(&state, &question.id, "Chore is obsolete, archive it").await;
     let FrontendEvent::WorkItemUpdated {
         item: boss_work_db::WorkItem::Chore(task),
     } = response
@@ -573,8 +691,141 @@ async fn archive_this_chore_closes_an_unbound_merge_conflict_chore() {
     assert!(task.pr_url.is_none());
     assert_eq!(task.status, boss_protocol::TaskStatus::Archived);
     assert_eq!(task.last_status_actor, "human");
+    assert_eq!(task.archived_by.as_deref(), Some("manual_status_change"));
     assert!(task.operator_question.is_none());
+
+    // Let the spawned force_release task complete (which runs subprocess-backed
+    // occupancy/preservation checks under full shard concurrency) and verify
+    // both the worker pane slot and workspace lease are released.
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            if state.worker_registry.slot_for_run(&worker_execution).is_none()
+                && state
+                    .work_db
+                    .get_execution(&worker_execution)
+                    .unwrap()
+                    .cube_lease_id
+                    .is_none()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("spawned force_release must release worker pane slot and cube workspace lease");
+
+    // Neither execution reconciliation nor progression nominates the archived chore or raises new cards.
     state.work_db.reconcile_product_executions(&task.product_id).unwrap();
-    assert_eq!(state.work_db.list_executions(Some(&id)).unwrap().len(), 1);
+    let mint = state.work_db.mint_progression_executions().unwrap();
+    assert!(mint.minted.is_empty() && mint.asked.is_empty());
+    assert_eq!(state.work_db.list_executions(Some(&id)).unwrap().len(), 2);
     assert_eq!(state.work_db.list_operator_questions(&id).unwrap().len(), 1);
+    assert!(
+        state
+            .work_db
+            .list_attention_items_for_work_item(&id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn unparkable_worker_question_attention_archives_on_owner_action_and_not_for_non_owner() {
+    for (actor, expect_archived) in [("human", true), ("worker", false), ("boss", false)] {
+        let (state, _dir, execution_id, task_id) = live_chore_execution();
+        state
+            .work_db
+            .connect()
+            .unwrap()
+            .execute("UPDATE tasks SET status = 'in_review' WHERE id = ?1", [&task_id])
+            .unwrap();
+        submitted(
+            call_with_peer(
+                &state,
+                Some(std::process::id() as libc::pid_t),
+                submit_request(
+                    &execution_id,
+                    ProposalKind::RunDone,
+                    disposition_payload("Chore is obsolete, archive it", "archive"),
+                ),
+            )
+            .await,
+        );
+        state
+            .work_db
+            .record_worker_awaiting_operator_answer(
+                &execution_id,
+                "blocked on decision",
+                &state
+                    .work_db
+                    .execution_operator_question(&execution_id)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        let (attn_id, group_id): (String, String) = state
+            .work_db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT a.id, g.id FROM attentions a
+                 JOIN attention_groups g ON g.id = a.group_id
+                 WHERE g.association_task_id = ?1 AND g.state = 'open'",
+                [&task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        state
+            .work_db
+            .answer_attention(&attn_id, Some("Chore is obsolete, archive it".into()), false, false)
+            .unwrap();
+
+        let sink = make_session_sink();
+        let pid = std::process::id() as libc::pid_t;
+        let peer_pid = match actor {
+            "human" => None,
+            "worker" => {
+                state.worker_registry.register(pid, "other_live_worker");
+                Some(pid)
+            }
+            "boss" => {
+                state.worker_registry.unregister(pid);
+                state.set_boss_pid(pid);
+                Some(pid)
+            }
+            _ => unreachable!(),
+        };
+        crate::app::attentions::handle_action_attention_group(
+            dispatch_with_peer(&state, &sink, peer_pid),
+            FrontendRequest::ActionAttentionGroup {
+                id: group_id.clone(),
+                skip_unanswered: false,
+                member_overrides: Default::default(),
+            },
+        )
+        .await;
+        sink.close();
+        let reply = sink.next().await.expect("handler must reply").payload;
+        assert!(
+            matches!(reply, FrontendEvent::AttentionGroupActioned { .. }),
+            "{reply:?}"
+        );
+
+        let (boss_work_db::WorkItem::Chore(task) | boss_work_db::WorkItem::Task(task)) =
+            state.work_db.get_work_item(&task_id).unwrap()
+        else {
+            panic!("expected task or chore");
+        };
+        let all_tasks = state.work_db.list_tasks(&task.product_id, None, None, true).unwrap();
+        if expect_archived {
+            assert_eq!(task.status, boss_protocol::TaskStatus::Archived);
+            assert_eq!(task.last_status_actor, "human");
+            assert_eq!(task.archived_by.as_deref(), Some("manual_status_change"));
+            assert_eq!(all_tasks.len(), 1, "owner archive must not spawn a follow-up chore");
+        } else {
+            assert_eq!(task.status, boss_protocol::TaskStatus::InReview);
+            assert_eq!(all_tasks.len(), 2, "non-owner action resumes via a follow-up item");
+        }
+    }
 }

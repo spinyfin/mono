@@ -595,8 +595,8 @@ pub(crate) struct RunDoneArgs {
 
     /// The options of a `multiple-choice` question, each a short single-line
     /// button label: two to six distinct, non-empty values, e.g.
-    /// `--choices "Merge now" "Wait for review"`. The kanban card shows one
-    /// button per option and the chosen option reaches the next run verbatim.
+    /// `--choices "Chore is obsolete, archive it" "Rebase and retry"`. Pair
+    /// every option with `--dispositions` in the same order.
     #[arg(
         long,
         num_args = 1..,
@@ -605,6 +605,24 @@ pub(crate) struct RunDoneArgs {
         required_if_eq("answer_type", "multiple-choice")
     )]
     choices: Vec<String>,
+
+    /// Engine-executable disposition for each `--choices` entry, in the same
+    /// order: one of `resume`, `archive`, or `park`. Required with
+    /// `--answer-type multiple-choice` so option behaviour is structured data
+    /// rather than inferred from label wording.
+    #[arg(
+        long,
+        num_args = 1..,
+        value_name = "DISPOSITION",
+        requires = "answer_type",
+        required_if_eq("answer_type", "multiple-choice")
+    )]
+    dispositions: Vec<String>,
+
+    /// Optional per-choice brief addendum for `resume` or `park` options,
+    /// matching `--choices` in order (pass `""` for options without one).
+    #[arg(long, num_args = 1.., value_name = "ADDENDUM", requires = "answer_type")]
+    choice_addendums: Vec<String>,
 
     /// Progression agents only, and required there: which of the four numbered
     /// reasons for asking the owner this question meets (1 the action is
@@ -1128,6 +1146,8 @@ fn operator_question_from_flags(args: &RunDoneArgs) -> Result<Option<boss_protoc
     let question = args.question.clone();
     let answer_type = args.answer_type.as_deref();
     let choices = args.choices.clone();
+    let dispositions = args.dispositions.clone();
+    let choice_addendums = args.choice_addendums.clone();
     let explanation = resolve_explanation_source(&args.explanation_source)?;
     let prerequisite_name = args.prerequisite_name.clone();
     let prerequisite_brief = args.prerequisite_brief.clone();
@@ -1152,9 +1172,11 @@ fn operator_question_from_flags(args: &RunDoneArgs) -> Result<Option<boss_protoc
             explanation::validate_for(&explanation.unwrap_or_default(), shape).map_err(CliError::usage)?
         }
     };
-    if answer_type != Some("multiple-choice") && !choices.is_empty() {
+    if answer_type != Some("multiple-choice")
+        && (!choices.is_empty() || !dispositions.is_empty() || !choice_addendums.is_empty())
+    {
         return Err(CliError::usage(
-            "--choices only applies to --answer-type multiple-choice",
+            "--choices, --dispositions, and --choice-addendums only apply to --answer-type multiple-choice",
         ));
     }
     if answer_type != Some("create-prerequisite-task") && file_count_bypass.is_some() {
@@ -1180,12 +1202,42 @@ fn operator_question_from_flags(args: &RunDoneArgs) -> Result<Option<boss_protoc
             ))
         }
         Some("multiple-choice") => {
-            let choices: Vec<String> = choices.into_iter().map(|choice| choice.trim().to_owned()).collect();
-            boss_protocol::OperatorAnswerType::validate_choices(&choices)
+            if dispositions.len() != choices.len() {
+                return Err(CliError::usage(format!(
+                    "--dispositions count ({}) must match --choices count ({})",
+                    dispositions.len(),
+                    choices.len()
+                )));
+            }
+            if !choice_addendums.is_empty() && choice_addendums.len() != choices.len() {
+                return Err(CliError::usage(format!(
+                    "--choice-addendums count ({}) must match --choices count ({})",
+                    choice_addendums.len(),
+                    choices.len()
+                )));
+            }
+            let mut options = Vec::with_capacity(choices.len());
+            for (idx, (raw_label, raw_disposition)) in choices.into_iter().zip(dispositions).enumerate() {
+                let disposition = raw_disposition
+                    .trim()
+                    .parse::<boss_protocol::ChoiceDisposition>()
+                    .map_err(|message| CliError::usage(format!("--dispositions: {message}")))?;
+                let addendum = choice_addendums
+                    .get(idx)
+                    .map(|raw| raw.trim())
+                    .filter(|trimmed| !trimmed.is_empty())
+                    .map(str::to_owned);
+                options.push(boss_protocol::OperatorChoiceOption {
+                    disposition,
+                    label: raw_label.trim().to_owned(),
+                    addendum,
+                });
+            }
+            boss_protocol::OperatorAnswerType::validate_options(&options)
                 .map_err(|message| CliError::usage(format!("--choices: {message}")))?;
             Ok(question.map(|text| boss_protocol::OperatorQuestion {
                 text,
-                answer_type: boss_protocol::OperatorAnswerType::MultipleChoice { choices },
+                answer_type: boss_protocol::OperatorAnswerType::multiple_choice(options),
                 explanation,
             }))
         }
@@ -1596,35 +1648,98 @@ mod tests {
             };
             payload_for(args.command.unwrap()).ok().map(|(_, payload, _)| payload)
         };
-        // The options are required with the multiple-choice type.
+        // The options and dispositions are required with the multiple-choice type.
         assert!(Cli::try_parse_from(base).is_err());
+        assert!(Cli::try_parse_from(base.iter().chain(&["--choices", "a", "b"])).is_err());
         // A multiple-choice explanation has no Yes/No sections.
         let mut with_yes_no = base;
         *with_yes_no.last_mut().unwrap() = explanation::tests::VALID;
-        let Commands::Propose(args) = Cli::try_parse_from(with_yes_no.iter().chain(&["--choices", "a", "b"]))
-            .unwrap()
-            .command
+        let Commands::Propose(args) = Cli::try_parse_from(with_yes_no.iter().chain(&[
+            "--choices",
+            "a",
+            "b",
+            "--dispositions",
+            "resume",
+            "resume",
+        ]))
+        .unwrap()
+        .command
         else {
             panic!("expected propose")
         };
         assert!(payload_for(args.command.unwrap()).is_err());
-        let built = payload(&["--choices", " Gradual ", "All at once"]).unwrap();
+        let built = payload(&[
+            "--choices",
+            " Gradual ",
+            "Chore is obsolete, archive it",
+            "--dispositions",
+            "resume",
+            "archive",
+        ])
+        .unwrap();
         assert_eq!(
             built["question"]["answer_type"],
-            serde_json::json!({"kind": "multiple_choice", "choices": ["Gradual", "All at once"]})
+            serde_json::json!({
+                "kind": "multiple_choice",
+                "choices": ["Gradual", "Chore is obsolete, archive it"],
+                "options": [
+                    {"disposition": "resume", "label": "Gradual"},
+                    {"disposition": "archive", "label": "Chore is obsolete, archive it"}
+                ]
+            })
         );
         assert_eq!(built["question"]["text"], "Which rollout should I use?");
         // Repeating the flag accumulates, like listing the values after one flag.
-        let repeated = payload(&["--choices", "a", "--choices", "b"]).unwrap();
+        let repeated = payload(&[
+            "--choices",
+            "a",
+            "--choices",
+            "b",
+            "--dispositions",
+            "resume",
+            "--dispositions",
+            "park",
+        ])
+        .unwrap();
         assert_eq!(
             repeated["question"]["answer_type"]["choices"],
             serde_json::json!(["a", "b"])
         );
         for bad in [
-            vec!["--choices", "only one"],
-            vec!["--choices", "a", "a"],
-            vec!["--choices", "a", " "],
-            vec!["--choices", "a", "b", "c", "d", "e", "f", "g"],
+            vec!["--choices", "only one", "--dispositions", "resume"],
+            vec!["--choices", "a", "a", "--dispositions", "resume", "resume"],
+            vec!["--choices", "a", " ", "--dispositions", "resume", "resume"],
+            vec!["--choices", "a", "b", "--dispositions", "resume"],
+            vec!["--choices", "a", "b", "--dispositions", "resume", "merge"],
+            vec![
+                "--choices",
+                "a",
+                "b",
+                "--dispositions",
+                "archive",
+                "resume",
+                "--choice-addendums",
+                "not executable on archive",
+                "",
+            ],
+            vec![
+                "--choices",
+                "a",
+                "b",
+                "c",
+                "d",
+                "e",
+                "f",
+                "g",
+                "--dispositions",
+                "resume",
+                "resume",
+                "resume",
+                "resume",
+                "resume",
+                "resume",
+                "resume",
+            ],
         ] {
             assert!(payload(&bad).is_none(), "{bad:?}");
         }

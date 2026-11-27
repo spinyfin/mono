@@ -862,11 +862,17 @@ pub(crate) fn file_question(
         .with_context(|| format!("{item_id} has no progression run to hang a question on"))?;
     let question = OperatorQuestion {
         text: QUESTION_TEXT.to_owned(),
-        answer_type: OperatorAnswerType::MultipleChoice {
-            choices: vec![PARK_IT.to_owned(), ARCHIVE_IT.to_owned(), KEEP_TRYING.to_owned()],
-        },
+        answer_type: OperatorAnswerType::multiple_choice(vec![
+            boss_protocol::OperatorChoiceOption::park(PARK_IT),
+            boss_protocol::OperatorChoiceOption::archive(ARCHIVE_IT),
+            boss_protocol::OperatorChoiceOption::resume(KEEP_TRYING),
+        ]),
         explanation: explanation(reason, &task, &runs),
     };
+    question
+        .answer_type
+        .validate_for_creation()
+        .map_err(anyhow::Error::msg)?;
     let stuck_classification = crate::stuck_report::classification(conn, &task, None)?;
     let prior = capture_prior(conn, item_id)?;
     let question_id = next_id("oq");
@@ -942,11 +948,14 @@ pub(crate) struct LadderAnswerEffect {
 }
 
 /// Apply the owner's answer to the engine's question, in the answer's
-/// transaction. See the module documentation for each choice.
+/// transaction, dispatching on structured [`boss_protocol::ChoiceDisposition`]
+/// (falling back to the legacy constants only for rows stored before `options`
+/// existed). See the module documentation for each choice.
 pub(crate) fn answer_in_tx(
     pending: &mut PendingEvents,
     tx: &Connection,
     task: &Task,
+    question: &boss_protocol::OperatorQuestionView,
     choice: &str,
     now: &str,
     attribution: crate::task_status_audit::WriteAttribution<'_>,
@@ -961,9 +970,18 @@ pub(crate) fn answer_in_tx(
         .flatten()
         .map(|json| serde_json::from_str(&json))
         .transpose()?;
+    let disposition = match question.answer_type.choice_disposition(choice) {
+        Some(disposition) => disposition,
+        None => match choice {
+            KEEP_TRYING => boss_protocol::ChoiceDisposition::Resume,
+            PARK_IT => boss_protocol::ChoiceDisposition::Park,
+            ARCHIVE_IT => boss_protocol::ChoiceDisposition::Archive,
+            other => bail!("`{other}` is not an answer to the progression ladder's question"),
+        },
+    };
     let mut effect = LadderAnswerEffect::default();
-    match choice {
-        KEEP_TRYING => {
+    match disposition {
+        boss_protocol::ChoiceDisposition::Resume => {
             tx.execute(
                 "UPDATE progression_ladder
                  SET reset_at = CAST(?2 AS INTEGER),
@@ -973,7 +991,7 @@ pub(crate) fn answer_in_tx(
             )?;
             restore_prior(tx, &task.id, prior.as_ref(), true, attribution)?;
         }
-        PARK_IT => {
+        boss_protocol::ChoiceDisposition::Park => {
             // A revision follows its parent PR and cannot be parked alone.
             let (root, _) = chain_family(tx, &task.id)?;
             crate::parking::set_task_parked(
@@ -987,11 +1005,10 @@ pub(crate) fn answer_in_tx(
             )?;
             restore_prior(tx, &task.id, prior.as_ref(), false, attribution)?;
         }
-        ARCHIVE_IT => {
+        boss_protocol::ChoiceDisposition::Archive => {
             restore_prior(tx, &task.id, prior.as_ref(), false, attribution)?;
             effect.archive = true;
         }
-        other => bail!("`{other}` is not an answer to the progression ladder's question"),
     }
     stage_task_board_change(pending, tx, &task.id)?;
     Ok(effect)

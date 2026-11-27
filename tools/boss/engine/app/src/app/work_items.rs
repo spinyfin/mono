@@ -145,7 +145,15 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
         }
         return;
     };
-    let actor = resolve_status_actor(&server_state, peer_pid);
+    // Worker panes do not descend from `boss_pid`, so `resolve_status_actor`
+    // would report them as `human`; classify them explicitly so a worker peer
+    // (for example when `worker_rpc_tier` is off) never gains owner authority
+    // on `archive` or `park` dispositions.
+    let actor = if server_state.classify_peer(peer_pid).is_worker() {
+        boss_protocol::LAST_STATUS_ACTOR_ENGINE
+    } else {
+        resolve_status_actor(&server_state, peer_pid)
+    };
     let provenance = resolve_write_basis(
         &server_state,
         peer_pid,
@@ -181,14 +189,18 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
         Ok(outcome) => {
             tracing::info!(%request_id, verb, elapsed_ms = write_ms, "operator answer durable write completed");
             let item = outcome.item;
-            // An answer that archived the item (the owner's "Archive" choice)
-            // frees the latest execution's pane and workspace lease exactly as
-            // the ordinary update path does. Idempotent when already released,
-            // and a no-op for any item the answer left open.
-            if let Some(execution_id) = terminal_chore_execution(&work_db, &item) {
+            // An answer that archived the item (an owner `archive` disposition)
+            // frees both the latest execution's pane and any worker execution's
+            // pane/workspace lease (for example when a progression run raised
+            // the card after a failed worker run). Idempotent when already
+            // released, and a no-op for any item the answer left open.
+            let release_ids = super::handler_helpers::terminal_chore_executions_to_release(&work_db, &item);
+            if !release_ids.is_empty() {
                 let handler = server_state.completion_handler.clone();
                 boss_task_scope::spawn(async move {
-                    handler.force_release(&execution_id).await;
+                    for execution_id in release_ids {
+                        handler.force_release(&execution_id).await;
+                    }
                 });
             }
             let product_id = item.product_id().to_string();

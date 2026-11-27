@@ -97,7 +97,13 @@ pub fn render_progression_claude_md(scratch_dir: &str, boss: &str) -> String {
        'Recommendation:' '<one-line reason>' --criterion 1|2|3|4`: ask the owner.\n\
        A bare `blocked` is refused. Ask only under one of the four numbered criteria in\n\
        your brief, and never to confirm something you may do directly. For\n\
-       `multiple-choice` omit Yes:/No: and say in Context what each option leads to.\n\
+       `multiple-choice`, pass `--choices '<label>' ... --dispositions <resume|archive|park> ...`\n\
+       (one disposition per choice, in the same order; optional `--choice-addendums '<text>' ...`\n\
+       for `resume`/`park` options), omit Yes:/No:, and say in Context what each option\n\
+       leads to. The engine executes `archive` and `park` directly when the owner clicks\n\
+       them, regardless of label wording, and rejects any disposition outside\n\
+       `resume|archive|park`. Never use `yes-no` to ask whether to archive or park an item\n\
+       (`yes-no` always resumes; use `multiple-choice` with `archive` or `park` dispositions).\n\
      \n\
      ## Your working directory\n\
      \n\
@@ -169,6 +175,8 @@ mod tests {
         assert!(md.contains("pass single-line text inline in single quotes"));
         assert!(md.contains("--explanation 'Context:'"));
         assert!(md.contains("one quoted argument per line"));
+        assert!(md.contains("--dispositions <resume|archive|park>"));
+        assert!(md.contains("Never use `yes-no` to ask whether to archive or park"));
     }
 
     #[test]

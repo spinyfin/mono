@@ -1159,20 +1159,26 @@ The repo owner recorded this decline on the kanban. Proceed with the declined pa
 }
 
 /// The brief addendum for a multiple-choice answer: the chosen option,
-/// verbatim. Unlike [`authorization_block`] it grants nothing beyond
-/// the decision itself.
+/// verbatim, plus any structured per-option addendum. Unlike
+/// [`authorization_block`] it grants nothing beyond the decision itself.
 pub(super) fn choice_block(question: &OperatorQuestionView, choice: &str, timestamp: &str) -> String {
+    let addendum_line = question
+        .answer_type
+        .choice_option(choice)
+        .and_then(|option| option.addendum.as_deref())
+        .map_or_else(String::new, |addendum| format!("- **Option addendum:** {addendum}\n"));
     format!(
         "\n\n---\n\n## Recorded answer ({timestamp})\n\n\
 - **Question the previous worker asked:** {}\n\
 - **Options offered:** {}\n\
 - **Operator chose:** {choice}\n\
+{addendum_line}\
 - **The worker's explanation:** {}\n\
 - **Asked by run:** `{}`\n\n\
 The operator recorded this choice on the kanban. Proceed with the chosen option. It decides exactly the question above and nothing broader: it does not authorize bypassing any check or exceeding any limit.\n",
         question.text,
         match &question.answer_type {
-            OperatorAnswerType::MultipleChoice { choices } => choices.join(" / "),
+            OperatorAnswerType::MultipleChoice { choices, .. } => choices.join(" / "),
             _ => String::new(),
         },
         question.explanation,

@@ -605,7 +605,11 @@ pub(super) async fn handle_action_attention_group(ctx: Dispatch, req: FrontendRe
     else {
         unreachable!()
     };
-    let actor = super::process_signals::resolve_status_actor(&server_state, peer_pid);
+    let actor = if server_state.classify_peer(peer_pid).is_worker() {
+        boss_protocol::LAST_STATUS_ACTOR_ENGINE
+    } else {
+        super::process_signals::resolve_status_actor(&server_state, peer_pid)
+    };
     let provenance = super::process_signals::resolve_write_basis(
         &server_state,
         peer_pid,
@@ -626,6 +630,24 @@ pub(super) async fn handle_action_attention_group(ctx: Dispatch, req: FrontendRe
             group,
             produced_work_item_ids,
         }) => {
+            let mut release_ids = Vec::new();
+            for item_id in &produced_work_item_ids {
+                if let Ok(item) = work_db.get_work_item(item_id) {
+                    for exec_id in super::handler_helpers::terminal_chore_executions_to_release(&work_db, &item) {
+                        if !release_ids.contains(&exec_id) {
+                            release_ids.push(exec_id);
+                        }
+                    }
+                }
+            }
+            if !release_ids.is_empty() {
+                let handler = server_state.completion_handler.clone();
+                boss_task_scope::spawn(async move {
+                    for execution_id in release_ids {
+                        handler.force_release(&execution_id).await;
+                    }
+                });
+            }
             let members = work_db.list_attentions_for_group(&group.id).unwrap_or_default();
             // Live-update the Notifications window + inline doc surface.
             server_state

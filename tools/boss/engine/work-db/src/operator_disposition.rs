@@ -1,30 +1,50 @@
-//! Engine-side meanings of the known, item-local disposition choices.
+//! Engine-side execution and creation-time validation of structured choice dispositions.
 use super::*;
 use crate::prerequisite_question::RestartOptions;
-use boss_protocol::OperatorQuestionView;
+use boss_protocol::{ChoiceDisposition, OperatorAnswerType, OperatorQuestion, OperatorQuestionView};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Disposition {
-    Archive,
-    Park,
+/// Validate a decision card at creation time so a stored card can never offer
+/// an option whose disposition is missing or cannot be executed by the engine.
+pub(crate) fn validate_question_for_creation(
+    asking: Option<&Task>,
+    question: &OperatorQuestion,
+) -> std::result::Result<(), String> {
+    question.answer_type.validate_for_creation()?;
+    let Some(task) = asking else {
+        return Err("an operator question can only be filed for a task, chore, revision, or followup".into());
+    };
+    if let OperatorAnswerType::MultipleChoice { options, .. } = &question.answer_type
+        && options
+            .iter()
+            .any(|opt| matches!(opt.disposition, ChoiceDisposition::Archive | ChoiceDisposition::Park))
+        && (task.deleted_at.is_some() || task.status.is_terminal())
+    {
+        let state = if task.deleted_at.is_some() {
+            "deleted".to_owned()
+        } else {
+            task.status.to_string()
+        };
+        return Err(format!(
+            "cannot offer archive or park options on {} while it is {state}",
+            task.id
+        ));
+    }
+    Ok(())
 }
 
-/// Deliberately match complete labels that name the item being disposed of,
-/// never substrings, arbitrary prose, or a bare verb: "Archive the old logs",
-/// "Archive" and "Park" on a question about something other than the item
-/// remain instructions for the worker.
-pub(crate) fn known_choice(choice: &str) -> Option<Disposition> {
-    match choice.trim().to_ascii_lowercase().as_str() {
-        "archive this item"
-        | "archive this chore"
-        | "archive this task"
-        | "archive this revision"
-        | "archive this followup" => Some(Disposition::Archive),
-        "park this item" | "park this chore" | "park this task" | "park this revision" | "park this followup" => {
-            Some(Disposition::Park)
-        }
-        _ => None,
+/// Resolve the owner-executable disposition of `choice` from the card's
+/// structured option metadata — never from button label text. Non-owner
+/// answerers always return `None` so worker/coordinator answers resume instead
+/// of archiving or parking.
+pub(crate) fn owner_choice_disposition(
+    actor: &str,
+    question: &OperatorQuestionView,
+    choice: &str,
+) -> Option<ChoiceDisposition> {
+    if actor != LAST_STATUS_ACTOR_HUMAN {
+        return None;
     }
+    question.answer_type.choice_disposition(choice)
 }
 
 /// Park the item as the owner and settle the answered question.

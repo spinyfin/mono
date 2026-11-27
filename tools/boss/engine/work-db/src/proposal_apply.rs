@@ -1183,6 +1183,9 @@ fn apply_run_done(
 
     let stored_question = if let Some(question) = &payload.question {
         let asking = query_task(tx, &execution.work_item_id)?;
+        if let Err(reason) = super::operator_disposition::validate_question_for_creation(asking.as_ref(), question) {
+            return Ok(ApplyDecision::Rejected(reason));
+        }
         match super::prerequisite_link::resolve_stored_question(tx, asking.as_ref(), question)? {
             super::prerequisite_link::ResolvedQuestion::Ready(question) => Some(question),
             super::prerequisite_link::ResolvedQuestion::Rejected(reason) => {
