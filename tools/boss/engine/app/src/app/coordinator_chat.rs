@@ -9,6 +9,17 @@
 use super::*;
 use boss_protocol::CoordinatorChatOutcome;
 
+/// True when `session_id` is the registered app session. False when no app
+/// session is registered.
+pub(super) async fn is_app_session(server_state: &ServerState, session_id: &str) -> bool {
+    server_state
+        .app_session
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|handle| handle.session_id == session_id)
+}
+
 pub(super) async fn handle_coordinator_chat(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
@@ -20,13 +31,7 @@ pub(super) async fn handle_coordinator_chat(ctx: Dispatch, req: FrontendRequest)
     let FrontendRequest::CoordinatorChat { .. } = req else {
         unreachable!()
     };
-    let app_session_id = server_state
-        .app_session
-        .lock()
-        .await
-        .as_ref()
-        .map(|handle| handle.session_id.clone());
-    if app_session_id.as_deref() != Some(session_id.as_str()) {
+    if !is_app_session(&server_state, &session_id).await {
         send_response(
             &sink,
             &request_id,

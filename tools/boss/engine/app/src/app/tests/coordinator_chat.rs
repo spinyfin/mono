@@ -104,3 +104,78 @@ async fn no_app_session_is_rejected() {
         other => panic!("expected Error, got {other:?}"),
     }
 }
+
+fn subscribe(topics: &[&str]) -> FrontendRequest {
+    FrontendRequest::Subscribe {
+        topics: topics.iter().map(|t| (*t).to_owned()).collect(),
+    }
+}
+
+#[tokio::test]
+async fn app_session_may_subscribe_to_the_chat_topic() {
+    use crate::app::subscriptions::handle_subscribe;
+    let (server_state, _dir) = test_server_state();
+    server_state
+        .register_app_session("session-app".into(), make_session_sink())
+        .await;
+    let sink = make_session_sink();
+    handle_subscribe(
+        dispatch(&server_state, &sink, "session-app"),
+        subscribe(&[boss_protocol::TOPIC_COORDINATOR_CHAT]),
+    )
+    .await;
+    match sole_response(&sink).await {
+        FrontendEvent::Subscribed { topics, .. } => {
+            assert_eq!(topics, vec![boss_protocol::TOPIC_COORDINATOR_CHAT.to_owned()]);
+        }
+        other => panic!("expected Subscribed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn non_app_and_absent_app_sessions_cannot_subscribe_to_the_chat_topic() {
+    use crate::app::subscriptions::handle_subscribe;
+    for register_app in [true, false] {
+        for name in ["coordinator.chat", "  coordinator.chat\t"] {
+            let (server_state, _dir) = test_server_state();
+            if register_app {
+                server_state
+                    .register_app_session("session-app".into(), make_session_sink())
+                    .await;
+            }
+            let sink = make_session_sink();
+            handle_subscribe(
+                dispatch(&server_state, &sink, "session-cli"),
+                subscribe(&["work", name]),
+            )
+            .await;
+            match sole_response(&sink).await {
+                FrontendEvent::Error { message } => assert!(message.contains("only the app session")),
+                other => panic!("expected Error, got {other:?}"),
+            }
+            assert!(
+                server_state
+                    .topic_broker
+                    .subscribe("session-cli", &["work".to_owned()])
+                    .await
+                    == vec!["work".to_owned()],
+                "a rejected subscribe must not have subscribed any topic"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn other_topics_are_unchanged_for_non_app_sessions() {
+    use crate::app::subscriptions::handle_subscribe;
+    let (server_state, _dir) = test_server_state();
+    server_state
+        .register_app_session("session-app".into(), make_session_sink())
+        .await;
+    let sink = make_session_sink();
+    handle_subscribe(dispatch(&server_state, &sink, "session-cli"), subscribe(&["work"])).await;
+    match sole_response(&sink).await {
+        FrontendEvent::Subscribed { topics, .. } => assert_eq!(topics, vec!["work".to_owned()]),
+        other => panic!("expected Subscribed, got {other:?}"),
+    }
+}

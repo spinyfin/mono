@@ -18,6 +18,22 @@ pub(super) async fn handle_subscribe(ctx: Dispatch, req: FrontendRequest) {
     let FrontendRequest::Subscribe { topics } = req else {
         unreachable!()
     };
+    // The coordinator-chat topic is app-only, independent of worker RPC
+    // tiering. The broker trims topic names, so compare the trimmed name.
+    if topics
+        .iter()
+        .any(|topic| topic.trim() == boss_protocol::TOPIC_COORDINATOR_CHAT)
+        && !coordinator_chat::is_app_session(&server_state, &session_id).await
+    {
+        send_response(
+            &sink,
+            &request_id,
+            FrontendEvent::Error {
+                message: "subscribe: only the app session may subscribe to coordinator.chat".to_owned(),
+            },
+        );
+        return;
+    }
     {
         let wants_decisions = topics.iter().any(|topic| topic.trim() == decision_notifications::TOPIC);
         let topics = server_state.topic_broker.subscribe(&session_id, &topics).await;
