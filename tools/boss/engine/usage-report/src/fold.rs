@@ -9,7 +9,7 @@
 
 use std::collections::BTreeSet;
 
-use boss_protocol::{CostMeasurement, RunCoverage};
+use boss_protocol::{CallStats, CostMeasurement, RunCoverage};
 
 /// The USD outcome for one run.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -167,6 +167,94 @@ impl RunFold {
             .unsplit_cache_write_runs(self.unsplit_cache_write_runs)
             .build()
     }
+}
+
+/// One run, reduced to what the call statistics need. Each figure is `None`
+/// exactly when the run did not record it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunCalls {
+    pub rounds: Option<i64>,
+    /// The token classes the run reported, summed; `None` when it reported none.
+    pub known_tokens: Option<i64>,
+    pub first_call_context: Option<i64>,
+    pub peak_context: Option<i64>,
+    pub compactions: Option<i64>,
+}
+
+/// Running call statistics for one set of runs, folded in one pass.
+///
+/// A figure is read only over the runs that recorded it: a run with no recorded
+/// peak is absent from the peak's median and maximum rather than counted as a
+/// zero peak, and every `runs_with_*` count says how many runs a figure is over.
+/// A ratio whose denominator is zero is `None`.
+#[derive(Debug, Default, bon::Builder)]
+pub struct CallFold {
+    runs_with_rounds: u32,
+    rounds: i64,
+    /// Rounds and tokens of the runs that have both, so the ratio's numerator
+    /// and denominator are over the same runs.
+    paired_rounds: i64,
+    paired_tokens: i64,
+    paired_runs: u32,
+    first_call_contexts: Vec<i64>,
+    peak_contexts: Vec<i64>,
+    runs_with_compactions: u32,
+    runs_compacted: u32,
+}
+
+impl CallFold {
+    pub fn add(&mut self, run: &RunCalls) {
+        if let Some(rounds) = run.rounds {
+            self.runs_with_rounds += 1;
+            self.rounds = self.rounds.saturating_add(rounds);
+            if let Some(tokens) = run.known_tokens {
+                self.paired_runs += 1;
+                self.paired_rounds = self.paired_rounds.saturating_add(rounds);
+                self.paired_tokens = self.paired_tokens.saturating_add(tokens);
+            }
+        }
+        self.first_call_contexts.extend(run.first_call_context);
+        self.peak_contexts.extend(run.peak_context);
+        if let Some(compactions) = run.compactions {
+            self.runs_with_compactions += 1;
+            if compactions > 0 {
+                self.runs_compacted += 1;
+            }
+        }
+    }
+
+    pub fn finish(mut self) -> CallStats {
+        let rounds_per_run = (self.runs_with_rounds > 0).then(|| self.rounds as f64 / f64::from(self.runs_with_rounds));
+        let tokens_per_round = (self.paired_runs > 0 && self.paired_rounds > 0)
+            .then(|| self.paired_tokens as f64 / self.paired_rounds as f64);
+        CallStats::builder()
+            .runs_with_rounds(self.runs_with_rounds)
+            .rounds(self.rounds)
+            .runs_with_first_call_context(self.first_call_contexts.len() as u32)
+            .runs_with_peak_context(self.peak_contexts.len() as u32)
+            .runs_with_compactions_recorded(self.runs_with_compactions)
+            .runs_compacted(self.runs_compacted)
+            .maybe_rounds_per_run(rounds_per_run)
+            .maybe_tokens_per_round(tokens_per_round)
+            .maybe_median_first_call_context(median(&mut self.first_call_contexts))
+            .maybe_median_peak_context(median(&mut self.peak_contexts))
+            .maybe_max_peak_context(self.peak_contexts.iter().copied().max())
+            .build()
+    }
+}
+
+/// The middle value, or the mean of the two middle values; `None` for no values.
+fn median(values: &mut [i64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    let middle = values.len() / 2;
+    Some(if values.len() % 2 == 1 {
+        values[middle] as f64
+    } else {
+        (values[middle - 1] as f64 + values[middle] as f64) / 2.0
+    })
 }
 
 #[cfg(test)]

@@ -74,6 +74,17 @@ pub struct UsageRunRecord {
     /// `work_runs.usage_unavailable`: why the run has no, or incomplete,
     /// provider usage. `None` means usage was observed.
     pub usage_unavailable: Option<String>,
+    /// `work_runs.first_call_context_tokens`: the prompt size of the run's first
+    /// model call. `None` where the driver's transcript does not expose it.
+    pub first_call_context_tokens: Option<i64>,
+    /// `work_runs.first_call_cache_write_tokens`: tokens the first call wrote
+    /// to the prompt cache. `None` where the driver does not report writes.
+    pub first_call_cache_write_tokens: Option<i64>,
+    /// `work_runs.peak_context_tokens`: the largest prompt any call sent.
+    pub peak_context_tokens: Option<i64>,
+    /// `work_runs.compactions`: context compactions the transcript records.
+    /// `None` is "not exposed", never a recorded zero.
+    pub compactions: Option<i64>,
     pub execution_started_at_epoch_s: Option<i64>,
     pub execution_finished_at_epoch_s: Option<i64>,
     pub execution_pr_url: Option<String>,

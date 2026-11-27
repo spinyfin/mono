@@ -731,6 +731,7 @@ fn print_usage_rows_report(report: &boss_protocol::TokenUsageRowsReport, depth: 
     }
     println!();
     print_measurement_summary(&report.overall);
+    println!("  Calls: {}", format_call_stats(&report.overall_calls));
     print_usage_coverage(&report.coverage);
     print_pricing_gaps(&report.pricing_gaps);
 
@@ -783,6 +784,7 @@ fn print_usage_groups(groups: &[boss_protocol::UsageGroup], depth: UsageDepth, u
             group.measurement.runs_measured,
             group.measurement.runs_total,
         );
+        println!("{}  calls: {}", "  ".repeat(level), format_call_stats(&group.calls));
         if group.subgroups.is_empty() {
             print_usage_tree(&group.tasks, &group.taskless, depth, usd);
         } else {
@@ -802,7 +804,9 @@ fn print_usage_tree(
         println!("  (no runs)");
         return;
     }
-    let mut headers = vec!["NAME", "KIND", "DRIVER", "MODEL", "STATUS", "TOKENS", "RUNS", "CAVEATS"];
+    let mut headers = vec![
+        "NAME", "KIND", "DRIVER", "MODEL", "STATUS", "TOKENS", "RUNS", "ROUNDS", "PEAK CTX", "COMPACT", "CAVEATS",
+    ];
     if usd {
         headers.push("USD (EST)");
     }
@@ -865,6 +869,7 @@ fn usage_tree_rows(
         if task.runs_outside_window > 0 {
             runs.push_str(&format!(" (+{} outside window)", task.runs_outside_window));
         }
+        let [rounds, peak, compacted] = node_call_cells(&task.calls);
         let mut row = vec![
             name,
             task.kind.clone(),
@@ -873,6 +878,9 @@ fn usage_tree_rows(
             task.status.clone(),
             tokens,
             runs,
+            rounds,
+            peak,
+            compacted,
             String::new(),
         ];
         if usd {
@@ -896,6 +904,7 @@ fn usage_tree_rows(
         depth: UsageDepth,
         usd: bool,
     ) {
+        let [rounds, peak, compacted] = node_call_cells(&execution.calls);
         let mut row = vec![
             format!("{indent}{} ({})", execution.kind, execution.spend_class.as_str()),
             String::new(),
@@ -907,6 +916,9 @@ fn usage_tree_rows(
                 "{}/{}",
                 execution.measurement.runs_measured, execution.measurement.runs_total
             ),
+            rounds,
+            peak,
+            compacted,
             String::new(),
         ];
         if usd {
@@ -923,6 +935,7 @@ fn usage_tree_rows(
                     None => "unknown".to_owned(),
                 };
                 let caveats: Vec<&str> = run.caveats.iter().map(|caveat| caveat.code.as_str()).collect();
+                let [rounds, peak, compacted] = run_call_cells(run);
                 let mut row = vec![
                     format!("{indent}  run {}", run.run_id),
                     String::new(),
@@ -931,6 +944,9 @@ fn usage_tree_rows(
                     run.status.clone(),
                     tokens,
                     run.coverage.as_str().to_owned(),
+                    rounds,
+                    peak,
+                    compacted,
                     caveats.join(","),
                 ];
                 if usd {
@@ -950,16 +966,8 @@ fn usage_tree_rows(
         push_task(&mut rows, task, false, depth, usd);
     }
     for execution in taskless {
-        let mut row = vec![
-            format!("(no task) {}", execution.work_item_id),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-        ];
+        let mut row = vec![format!("(no task) {}", execution.work_item_id)];
+        row.resize(11, String::new());
         if usd {
             row.push(String::new());
         }
@@ -967,6 +975,88 @@ fn usage_tree_rows(
         push_execution(&mut rows, execution, "  ", depth, usd);
     }
     rows
+}
+
+const NO_FIGURE: &str = "—";
+
+/// The three call columns of a run: its own figures, each a dash when the
+/// driver's transcript did not expose it (never `0`).
+fn run_call_cells(run: &boss_protocol::RunUsageRow) -> [String; 3] {
+    let cell = |value: Option<i64>, format: fn(i64) -> String| value.map_or_else(|| NO_FIGURE.to_owned(), format);
+    [
+        cell(run.rounds, |rounds| rounds.to_string()),
+        cell(run.peak_context_tokens, format_tokens),
+        cell(run.compactions, |compactions| compactions.to_string()),
+    ]
+}
+
+/// The three call columns of a task or execution row: the average rounds per
+/// run, the largest peak context, and how many runs compacted out of the runs
+/// that record compactions. A dash means no run recorded the figure.
+fn node_call_cells(calls: &boss_protocol::CallStats) -> [String; 3] {
+    [
+        calls
+            .rounds_per_run
+            .map_or_else(|| NO_FIGURE.to_owned(), |average| format!("{average:.1}/run")),
+        calls
+            .max_peak_context
+            .map_or_else(|| NO_FIGURE.to_owned(), |peak| format!("max {}", format_tokens(peak))),
+        if calls.runs_with_compactions_recorded == 0 {
+            NO_FIGURE.to_owned()
+        } else {
+            format!("{}/{} runs", calls.runs_compacted, calls.runs_with_compactions_recorded)
+        },
+    ]
+}
+
+/// One line of call statistics for a total or a group. Every part names how
+/// many runs it is over, and a part no run recorded says `unknown` instead of
+/// printing a zero.
+fn format_call_stats(calls: &boss_protocol::CallStats) -> String {
+    let runs = |count: u32| format!("{count} run{}", if count == 1 { "" } else { "s" });
+    let rounds = if calls.runs_with_rounds == 0 {
+        "rounds unknown".to_owned()
+    } else {
+        let mut text = format!(
+            "{} rounds over {}",
+            format_tokens(calls.rounds),
+            runs(calls.runs_with_rounds)
+        );
+        if let Some(average) = calls.rounds_per_run {
+            text.push_str(&format!(" ({average:.1}/run)"));
+        }
+        if let Some(per_round) = calls.tokens_per_round {
+            text.push_str(&format!(", {} tokens/round", format_tokens(per_round.round() as i64)));
+        }
+        text
+    };
+    let first = match calls.median_first_call_context {
+        Some(median) => format!(
+            "first-call context median {} ({})",
+            format_tokens(median.round() as i64),
+            runs(calls.runs_with_first_call_context)
+        ),
+        None => "first-call context unknown".to_owned(),
+    };
+    let peak = match (calls.median_peak_context, calls.max_peak_context) {
+        (Some(median), Some(max)) => format!(
+            "peak context median {}, max {} ({})",
+            format_tokens(median.round() as i64),
+            format_tokens(max),
+            runs(calls.runs_with_peak_context)
+        ),
+        _ => "peak context unknown".to_owned(),
+    };
+    let compactions = if calls.runs_with_compactions_recorded == 0 {
+        "compactions unknown".to_owned()
+    } else {
+        format!(
+            "{} of {} compacted",
+            calls.runs_compacted,
+            runs(calls.runs_with_compactions_recorded)
+        )
+    };
+    format!("{rounds}; {first}; {peak}; {compactions}")
 }
 
 fn format_optional_tokens(value: Option<i64>) -> String {
@@ -1366,6 +1456,88 @@ mod tests {
             at_execution[2]
         );
         assert!(!at_execution.iter().any(|row| row[0].contains("run ")));
+    }
+
+    #[test]
+    fn call_columns_show_each_run_figure_and_a_dash_for_one_the_driver_did_not_expose() {
+        let exposed = boss_protocol::RunUsageRow::builder()
+            .run_id("run_exposed")
+            .coverage(boss_protocol::RunCoverage::Measured)
+            .created_at_epoch_s(1)
+            .host_id("local")
+            .input_convention(boss_protocol::InputConvention::Net)
+            .status("completed")
+            .rounds(41)
+            .peak_context_tokens(173_801)
+            .compactions(2)
+            .build();
+        let hidden = boss_protocol::RunUsageRow::builder()
+            .run_id("run_hidden")
+            .coverage(boss_protocol::RunCoverage::Partial)
+            .created_at_epoch_s(1)
+            .host_id("local")
+            .input_convention(boss_protocol::InputConvention::Net)
+            .status("completed")
+            .rounds(3)
+            .build();
+        let rows = usage_tree_rows(
+            &[],
+            &[usage_execution(vec![exposed, hidden], Some("claude"))],
+            UsageDepth::Run,
+            false,
+        );
+        // [0] is the no-task header, [1] the execution, [2] and [3] the runs.
+        assert_eq!(rows[2][7..10], ["41", "173,801", "2"]);
+        assert_eq!(
+            rows[3][7..10],
+            ["3", "—", "—"],
+            "a peak or compaction count that was not recorded is a dash, never 0"
+        );
+    }
+
+    #[test]
+    fn node_call_columns_average_rounds_and_count_compacted_runs_over_those_that_record_them() {
+        let calls = boss_protocol::CallStats::builder()
+            .runs_with_rounds(4)
+            .rounds(52)
+            .rounds_per_run(13.0)
+            .max_peak_context(220_000)
+            .runs_with_compactions_recorded(3)
+            .runs_compacted(1)
+            .build();
+        assert_eq!(node_call_cells(&calls), ["13.0/run", "max 220,000", "1/3 runs"]);
+        assert_eq!(
+            node_call_cells(&boss_protocol::CallStats::default()),
+            ["—", "—", "—"],
+            "no run recorded anything: dashes, not zeros"
+        );
+    }
+
+    #[test]
+    fn call_stats_line_names_the_runs_each_figure_is_over_and_says_unknown_for_the_rest() {
+        let calls = boss_protocol::CallStats::builder()
+            .runs_with_rounds(4)
+            .rounds(52)
+            .rounds_per_run(13.0)
+            .tokens_per_round(47_213.4)
+            .runs_with_first_call_context(2)
+            .median_first_call_context(24_500.0)
+            .runs_with_peak_context(3)
+            .median_peak_context(180_000.0)
+            .max_peak_context(220_000)
+            .runs_with_compactions_recorded(3)
+            .runs_compacted(1)
+            .build();
+        assert_eq!(
+            format_call_stats(&calls),
+            "52 rounds over 4 runs (13.0/run), 47,213 tokens/round; \
+             first-call context median 24,500 (2 runs); \
+             peak context median 180,000, max 220,000 (3 runs); 1 of 3 runs compacted"
+        );
+        assert_eq!(
+            format_call_stats(&boss_protocol::CallStats::default()),
+            "rounds unknown; first-call context unknown; peak context unknown; compactions unknown"
+        );
     }
 
     #[test]

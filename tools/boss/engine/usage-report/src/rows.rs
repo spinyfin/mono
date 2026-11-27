@@ -15,14 +15,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use boss_protocol::{
-    CostBucket, CostMeasurement, ExecutionUsageNode, ModelUsage, RunCoverage, RunUsageRow, SpendClass, TaskUsageNode,
-    TokenUsageRowsReport, UsageCaveatCount, UsageCoverage, UsageDimension, UsageDimensionValue, UsageDimensionValues,
-    UsageFilter, UsageGroup, UsageGroupKey, UsageNote,
+    CallStats, CostBucket, CostMeasurement, ExecutionUsageNode, ModelUsage, RunCoverage, RunUsageRow, SpendClass,
+    TaskUsageNode, TokenUsageRowsReport, UsageCaveatCount, UsageCoverage, UsageDimension, UsageDimensionValue,
+    UsageDimensionValues, UsageFilter, UsageGroup, UsageGroupKey, UsageNote,
 };
 
 use crate::classify::{ClassifyContext, RunFacts, UsdEstimator, classify, dimension_value, finalize_kept};
 use crate::classify::{known_total, model_label, token_classes};
-use crate::fold::{RunFold, UsdOutcome};
+use crate::fold::{CallFold, RunFold, UsdOutcome};
 use crate::record::{UsageRunRecord, UsageTaskRecord, UsageWindowRecords};
 
 /// The most runs one reply carries. Past it the most recent runs are kept
@@ -158,6 +158,7 @@ pub fn build_usage_rows_report(
 
     // 4. Totals, coverage, notes.
     let overall = measure(&kept);
+    let overall_calls = call_stats(&kept);
     let gaps = pricing_gaps(&kept);
     let coverage = coverage(query, &kept, &gaps, want_usd);
 
@@ -179,6 +180,7 @@ pub fn build_usage_rows_report(
         .coverage(coverage)
         .generated_at_epoch_s(query.generated_at_epoch_s)
         .overall(overall)
+        .overall_calls(overall_calls)
         .run_cap(query.run_cap)
         .since_epoch_s(query.since_epoch_s)
         .spans_capture_boundary(query.since_epoch_s < query.capture_start_epoch_s)
@@ -199,6 +201,14 @@ fn measure(runs: &[&RunFacts<'_>]) -> CostMeasurement {
     let mut fold = RunFold::default();
     for facts in runs {
         fold.add(&facts.sample());
+    }
+    fold.finish()
+}
+
+fn call_stats(runs: &[&RunFacts<'_>]) -> CallStats {
+    let mut fold = CallFold::default();
+    for facts in runs {
+        fold.add(&facts.calls());
     }
     fold.finish()
 }
@@ -407,10 +417,12 @@ fn build_groups(
                 label: label.to_owned(),
             });
             let measurement = measure(&members);
+            let calls = call_stats(&members);
             if dims.len() > 1 {
                 UsageGroup::builder()
                     .key(key.clone())
                     .measurement(measurement)
+                    .calls(calls)
                     .subgroups(build_groups(ctx, &members, &dims[1..], &key))
                     .build()
             } else {
@@ -418,6 +430,7 @@ fn build_groups(
                 UsageGroup::builder()
                     .key(key)
                     .measurement(measurement)
+                    .calls(calls)
                     .tasks(tasks)
                     .taskless(taskless)
                     .build()
@@ -455,11 +468,13 @@ fn build_tree(ctx: &TreeCtx<'_>, runs: &[&RunFacts<'_>]) -> (Vec<TaskUsageNode>,
     for (root_id, member_ids) in chains {
         let chain_runs: Vec<&RunFacts<'_>> = member_ids.iter().flat_map(|id| by_task[id].iter().copied()).collect();
         let inclusive = measure(&chain_runs);
+        let inclusive_calls = call_stats(&chain_runs);
         if ctx.roll_up {
             let root_record = ctx.tasks[root_id];
             let own: &[&RunFacts<'_>] = by_task.get(root_id).map(Vec::as_slice).unwrap_or(&[]);
             let mut node = task_node(ctx, root_record, own);
             node.inclusive = Some(inclusive);
+            node.inclusive_calls = Some(inclusive_calls);
             let mut revisions: Vec<(i64, TaskUsageNode)> = member_ids
                 .iter()
                 .filter(|id| **id != root_id)
@@ -481,6 +496,7 @@ fn build_tree(ctx: &TreeCtx<'_>, runs: &[&RunFacts<'_>]) -> (Vec<TaskUsageNode>,
                 let mut node = task_node(ctx, members[0].task.expect("task runs carry their task"), members);
                 if id == root_id {
                     node.inclusive = Some(inclusive.clone());
+                    node.inclusive_calls = Some(inclusive_calls.clone());
                 }
                 top.push(node);
             }
@@ -499,6 +515,7 @@ fn task_node(ctx: &TreeCtx<'_>, task: &UsageTaskRecord, runs: &[&RunFacts<'_>]) 
         .task_id(&task.task_id)
         .chain_root_id(ctx.root_of(task))
         .direct(measure(runs))
+        .calls(call_stats(runs))
         .is_chain_root(ctx.root_of(task) == task.task_id)
         .kind(&task.kind)
         .name(&task.name)
@@ -542,6 +559,7 @@ fn execution_nodes(runs: &[&RunFacts<'_>]) -> Vec<ExecutionUsageNode> {
                 .driver_source(rec.driver.source())
                 .kind(&rec.execution_kind)
                 .measurement(measure(&members))
+                .calls(call_stats(&members))
                 .spend_class(first.spend_class)
                 .status(&rec.execution_status)
                 .runs(members.iter().map(|facts| run_row(facts)).collect())
@@ -591,6 +609,10 @@ fn run_row(facts: &RunFacts<'_>) -> RunUsageRow {
         .maybe_tokens(tokens)
         .maybe_agent_active_ms(rec.agent_active_ms)
         .maybe_finished_at_epoch_s(rec.run_finished_at_epoch_s)
+        .maybe_first_call_cache_write_tokens(rec.first_call_cache_write_tokens)
+        .maybe_first_call_context_tokens(rec.first_call_context_tokens)
+        .maybe_compactions(rec.compactions)
+        .maybe_peak_context_tokens(rec.peak_context_tokens)
         .maybe_model_observed(rec.run_model.clone())
         .maybe_rounds(rec.rounds)
         .maybe_started_at_epoch_s(rec.run_started_at_epoch_s)

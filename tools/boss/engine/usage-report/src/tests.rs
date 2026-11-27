@@ -1227,6 +1227,244 @@ fn usd_prices_split_cache_writes_when_present_and_labels_unsplit_cache_writes() 
     );
 }
 
+// ── Call statistics ───────────────────────────────────────────────────────
+
+fn with_calls(
+    mut record: UsageRunRecord,
+    rounds: Option<i64>,
+    first_call: Option<i64>,
+    peak: Option<i64>,
+    compactions: Option<i64>,
+) -> UsageRunRecord {
+    record.rounds = rounds;
+    record.first_call_context_tokens = first_call;
+    record.peak_context_tokens = peak;
+    record.compactions = compactions;
+    record
+}
+
+#[test]
+fn a_run_carries_its_context_shape_and_an_unrecorded_figure_stays_null() {
+    let mut recorded = with_calls(
+        tokens(run("r1", "e1", "t1", BASE_EPOCH_S), 100, 50, 10, 5),
+        Some(40),
+        Some(19_806),
+        Some(173_801),
+        Some(2),
+    );
+    recorded.first_call_cache_write_tokens = Some(19_800);
+    let report = build(&window(), &records(vec![recorded], vec![task("t1", "t1", 1)]));
+    let row = only_run(&report);
+    assert_eq!(
+        (
+            row.first_call_context_tokens,
+            row.first_call_cache_write_tokens,
+            row.peak_context_tokens,
+            row.compactions
+        ),
+        (Some(19_806), Some(19_800), Some(173_801), Some(2))
+    );
+
+    let unrecorded = build(
+        &window(),
+        &records(
+            vec![tokens(run("r1", "e1", "t1", BASE_EPOCH_S), 100, 50, 10, 5)],
+            vec![task("t1", "t1", 1)],
+        ),
+    );
+    let row = only_run(&unrecorded);
+    assert_eq!(
+        (
+            row.first_call_context_tokens,
+            row.first_call_cache_write_tokens,
+            row.peak_context_tokens,
+            row.compactions
+        ),
+        (None, None, None, None),
+        "a run captured before the context shape existed is unknown, not zero"
+    );
+}
+
+#[test]
+fn call_stats_read_each_figure_only_over_the_runs_that_recorded_it() {
+    let report = build(
+        &window(),
+        &records(
+            vec![
+                with_calls(
+                    tokens(run("r1", "e1", "t1", BASE_EPOCH_S), 1_000, 400, 0, 600),
+                    Some(40),
+                    Some(20_000),
+                    Some(100_000),
+                    Some(1),
+                ),
+                with_calls(
+                    tokens(run("r2", "e2", "t1", BASE_EPOCH_S + 1), 1_000, 100, 0, 900),
+                    Some(10),
+                    Some(30_000),
+                    Some(60_000),
+                    Some(0),
+                ),
+                // A driver whose transcript exposes rounds but no prompt size.
+                with_calls(
+                    tokens(run("r3", "e3", "t1", BASE_EPOCH_S + 2), 500, 100, 0, 400),
+                    Some(20),
+                    None,
+                    None,
+                    None,
+                ),
+                // Nothing recorded at all.
+                run("r4", "e4", "t1", BASE_EPOCH_S + 3),
+            ],
+            vec![task("t1", "t1", 4)],
+        ),
+    );
+    let calls = &report.overall_calls;
+    assert_eq!((calls.runs_with_rounds, calls.rounds), (3, 70));
+    assert_eq!(calls.rounds_per_run, Some(70.0 / 3.0));
+    // (2,000 + 2,000 + 1,000) tokens over the same three runs' 70 rounds; the
+    // fourth run reported neither tokens nor rounds and is in neither side.
+    assert_eq!(calls.tokens_per_round, Some(5_000.0 / 70.0));
+    assert_eq!(calls.runs_with_first_call_context, 2);
+    assert_eq!(calls.median_first_call_context, Some(25_000.0));
+    assert_eq!(calls.runs_with_peak_context, 2);
+    assert_eq!(calls.median_peak_context, Some(80_000.0));
+    assert_eq!(calls.max_peak_context, Some(100_000));
+    // Only two runs record compactions: one of them compacted. The run that
+    // records none is not a run that did not compact.
+    assert_eq!((calls.runs_with_compactions_recorded, calls.runs_compacted), (2, 1));
+}
+
+#[test]
+fn a_call_ratio_is_absent_when_no_run_contributes_and_never_zero() {
+    let none_recorded = build(
+        &window(),
+        &records(
+            vec![
+                tokens(run("r1", "e1", "t1", BASE_EPOCH_S), 100, 50, 10, 5),
+                run("r2", "e2", "t1", BASE_EPOCH_S + 1),
+            ],
+            vec![task("t1", "t1", 2)],
+        ),
+    );
+    assert_eq!(none_recorded.overall_calls, boss_protocol::CallStats::default());
+    assert_eq!(none_recorded.overall_calls.rounds_per_run, None);
+    assert_eq!(none_recorded.overall_calls.tokens_per_round, None);
+    assert_eq!(none_recorded.overall_calls.median_peak_context, None);
+
+    // A recorded zero is a figure: a run that made no calls has zero rounds per
+    // run, but no tokens per round, because there is no round to divide by.
+    let zero_rounds = build(
+        &window(),
+        &records(
+            vec![with_calls(
+                tokens(run("r1", "e1", "t1", BASE_EPOCH_S), 100, 50, 10, 5),
+                Some(0),
+                None,
+                None,
+                None,
+            )],
+            vec![task("t1", "t1", 1)],
+        ),
+    );
+    assert_eq!(zero_rounds.overall_calls.rounds_per_run, Some(0.0));
+    assert_eq!(zero_rounds.overall_calls.tokens_per_round, None);
+
+    // Rounds without tokens give a rounds-per-run but no tokens-per-round.
+    let unmeasured = build(
+        &window(),
+        &records(
+            vec![with_calls(
+                run("r1", "e1", "t1", BASE_EPOCH_S),
+                Some(8),
+                None,
+                None,
+                None,
+            )],
+            vec![task("t1", "t1", 1)],
+        ),
+    );
+    assert_eq!(unmeasured.overall_calls.rounds_per_run, Some(8.0));
+    assert_eq!(unmeasured.overall_calls.tokens_per_round, None);
+}
+
+#[test]
+fn every_node_and_group_carries_call_stats_over_its_own_runs() {
+    let claude = |id: &str, execution: &str, item: &str, at: i64, rounds: i64, peak: i64| {
+        with_calls(
+            tokens(run(id, execution, item, at), 100, 50, 10, 5),
+            Some(rounds),
+            Some(20_000),
+            Some(peak),
+            Some(0),
+        )
+    };
+    let codex = with_calls(
+        with_driver(
+            tokens(run("r3", "e3", "t1", BASE_EPOCH_S + 2), 100, 50, 0, 5),
+            Some("codex"),
+        ),
+        Some(4),
+        Some(14_000),
+        Some(15_000),
+        Some(0),
+    );
+    let recs = records(
+        vec![
+            claude("r1", "e1", "t1", BASE_EPOCH_S, 10, 50_000),
+            claude("r2", "e2", "t2", BASE_EPOCH_S + 1, 30, 90_000),
+            codex,
+        ],
+        vec![task("t1", "t1", 2), task("t2", "t1", 1)],
+    );
+
+    // The tree: a task's own runs, and on its chain root the whole chain too.
+    let report = build(&window(), &recs);
+    let root = &report.tasks[0];
+    assert_eq!((root.calls.rounds, root.calls.max_peak_context), (14, Some(50_000)));
+    let inclusive = root
+        .inclusive_calls
+        .as_ref()
+        .expect("a chain root carries inclusive calls");
+    assert_eq!((inclusive.rounds, inclusive.max_peak_context), (44, Some(90_000)));
+    assert_eq!(root.revisions[0].calls.rounds, 30);
+    assert_eq!(root.revisions[0].inclusive_calls, None);
+    let first_execution = root.executions.iter().find(|e| e.execution_id == "e1").unwrap();
+    assert_eq!(first_execution.calls.rounds, 10);
+    assert_eq!(report.overall_calls.rounds, 44);
+
+    // Groups: each sees only its own runs, so the driver groups differ.
+    let grouped = build(
+        &UsageRowsQuery {
+            group_by: vec![UsageDimension::Driver],
+            ..window()
+        },
+        &recs,
+    );
+    let by_driver = |value: &str| {
+        grouped
+            .groups
+            .iter()
+            .find(|group| group.key[0].value == value)
+            .unwrap_or_else(|| panic!("driver group {value}"))
+    };
+    assert_eq!(by_driver("claude").calls.rounds, 40);
+    assert_eq!(by_driver("claude").calls.max_peak_context, Some(90_000));
+    assert_eq!(by_driver("codex").calls.rounds, 4);
+    assert_eq!(by_driver("codex").calls.max_peak_context, Some(15_000));
+}
+
+#[test]
+fn a_reply_from_an_engine_without_call_stats_still_decodes_with_empty_ones() {
+    let report = build(&window(), &mixed_records());
+    let mut json = serde_json::to_value(&report).unwrap();
+    json.as_object_mut().unwrap().remove("overall_calls");
+    json["tasks"][0].as_object_mut().unwrap().remove("calls");
+    let decoded: TokenUsageRowsReport = serde_json::from_value(json).expect("older replies decode");
+    assert_eq!(decoded.overall_calls, boss_protocol::CallStats::default());
+    assert_eq!(decoded.tasks[0].calls, boss_protocol::CallStats::default());
+}
+
 // ── Wire shape ────────────────────────────────────────────────────────────
 
 #[test]

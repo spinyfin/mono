@@ -11,7 +11,7 @@ use boss_protocol::{
 };
 
 pub(crate) use crate::fold::UsdOutcome;
-use crate::fold::{RunSample, RunTokens};
+use crate::fold::{RunCalls, RunSample, RunTokens};
 use crate::record::{UsageRunRecord, UsageTaskRecord};
 
 /// Caveat codes, closed for this engine build. A client labels the ones it
@@ -141,6 +141,18 @@ impl RunFacts<'_> {
             agent_active_ms: self.rec.agent_active_ms,
             usage_unavailable: self.rec.usage_unavailable.as_deref(),
             usd: self.usd,
+        }
+    }
+
+    /// This run as the call-statistics accumulator sees it.
+    pub(crate) fn calls(&self) -> RunCalls {
+        let tokens = run_tokens(self.rec);
+        RunCalls {
+            rounds: self.rec.rounds,
+            known_tokens: tokens.is_measured().then(|| tokens.known_total()),
+            first_call_context: self.rec.first_call_context_tokens,
+            peak_context: self.rec.peak_context_tokens,
+            compactions: self.rec.compactions,
         }
     }
 }

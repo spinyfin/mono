@@ -92,14 +92,34 @@ Each delete emits one `work_item_deleted` event with:
 - Distinct `peer_pid` per event + empty `cascade_deleted_ids` = N
   independent CLI calls, not one cascading action.
 
-## 2. Per-task cost — transcripts only, ~29-day cliff
+## 2. Per-task cost — `work_runs` since capture began, transcripts before it
 
-Per-task cost is **not** in `state.db`. No table holds tokens, model,
-or turn counts.
+Per-task cost **is** in `state.db` for every run created since per-run
+token capture began (2026-07-27 09:23 UTC). Each `work_runs` row carries
+the run's tokens by class (input, output, cache creation with its
+five-minute / one-hour split, cache read), its observed `model`, `rounds`,
+`agent_active_ms`, a `usage_unavailable` reason when provider usage was
+missing or incomplete, and its context shape (`first_call_context_tokens`,
+`first_call_cache_write_tokens`, `peak_context_tokens`, `compactions`). A
+NULL means the driver's transcript did not expose the figure, never zero.
+`boss cost window`, `task`, `top`, `rows` and `series` read these columns;
+how each driver's transcript maps onto them is in
+[`run-token-usage.md`](run-token-usage.md). The columns are written from
+the transcript on every hook, so an interrupted or orphaned run keeps the
+usage observed up to its last hook.
 
-### Where cost lives
+Two things still need the transcript:
 
-The only source is the Claude Code session JSONL:
+- **Runs created before capture began.** Their token columns are NULL by
+  construction and nothing backfills them, so for those runs the only
+  source is the session transcript, and it is subject to the retention
+  cliff below.
+- **Anything finer than the columns**: per-call detail, tool calls and
+  their sizes, message text.
+
+### Where the transcript lives
+
+The source is the Claude Code session JSONL:
 
 ```text
 ~/.claude/projects/<workspace-slug>/<session-uuid>.jsonl
@@ -114,7 +134,8 @@ cube workspace path, e.g.:
 
 ### Retention cliff
 
-Measured 2026-07-26 against the live state root:
+Measured 2026-07-26, the day before capture began, against the live state
+root:
 
 | Age of transcript | Survival |
 | ----------------- | -------- |
@@ -130,10 +151,14 @@ Of 12,411 `work_runs` ever recorded (same measurement window):
 - 7,348 have a `transcript_path`
 - only 4,883 still resolve on disk
 
-Roughly two-thirds of Boss run history is permanently cost-blind.
+Roughly two-thirds of the run history from before capture began is
+permanently cost-blind. Runs since then are not exposed to the cliff for
+anything the columns hold.
 
 ### What is durable in `state.db`
 
+- Per-run tokens, model, rounds, active time and context shape, for runs
+  created since capture began (above)
 - Wall-clock timing
 - Queue wait
 - Retry counts

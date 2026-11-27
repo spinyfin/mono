@@ -118,7 +118,11 @@ const USAGE_RUN_COLUMNS: &str = "
     we.host_id,
     we.driver,
     we.model,
-    we.effort_level
+    we.effort_level,
+    wr.first_call_context_tokens,
+    wr.first_call_cache_write_tokens,
+    wr.peak_context_tokens,
+    wr.compactions
 ";
 
 fn map_usage_run_record(row: &Row) -> rusqlite::Result<UsageRunRecord> {
@@ -155,6 +159,10 @@ fn map_usage_run_record(row: &Row) -> rusqlite::Result<UsageRunRecord> {
         driver,
         execution_model: row.get(26)?,
         execution_effort: row.get(27)?,
+        first_call_context_tokens: row.get(28)?,
+        first_call_cache_write_tokens: row.get(29)?,
+        peak_context_tokens: row.get(30)?,
+        compactions: row.get(31)?,
     })
 }
 
@@ -1463,6 +1471,28 @@ mod tests {
             assert_eq!(run.tokens.as_ref().unwrap().cache_creation, None);
             assert_eq!(run.agent_active_ms, None);
             assert_eq!(run.unpriceable_cause.as_deref(), Some(cause::SUBSCRIPTION_UNPRICED));
+        }
+
+        // The context shape: Claude and Codex record all four figures, Grok
+        // and Antigravity only the first and peak prompt, and the runs that
+        // made no model call or were never captured record none.
+        let calls = &report.overall_calls;
+        assert_eq!((calls.runs_with_rounds, calls.rounds), (17, 261));
+        assert_eq!(calls.runs_with_first_call_context, 15);
+        assert_eq!(calls.runs_with_peak_context, 15);
+        assert_eq!(calls.max_peak_context, Some(205_000));
+        assert_eq!(
+            (calls.runs_with_compactions_recorded, calls.runs_compacted),
+            (13, 3),
+            "Grok and Antigravity record no compactions; they are not 13 + 2 runs that did not compact"
+        );
+        for driver in ["grok", "agy"] {
+            let (_, run) = all_runs
+                .iter()
+                .find(|(d, _)| *d == Some(driver))
+                .unwrap_or_else(|| panic!("a {driver} run"));
+            assert!(run.first_call_context_tokens.is_some() && run.peak_context_tokens.is_some());
+            assert_eq!((run.first_call_cache_write_tokens, run.compactions), (None, None));
         }
 
         // A recent window: the chain root whose own run is 40 days old is
