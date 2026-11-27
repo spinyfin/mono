@@ -391,6 +391,56 @@ mod apply_permission_extra_args_tests {
 #[path = "pane_spawn/pty_initial_input_tests.rs"]
 mod pty_initial_input_tests;
 
+/// Launch knobs for this spawn: only a treated Claude worker gets the
+/// auto-compact window. Other drivers, and control/stopped/unrecorded
+/// Claude launches, stay on today's line.
+fn worker_launch_options(driver: &str, arms: &crate::feature_flags::ExperimentArmSet) -> crate::driver::LaunchOptions {
+    crate::driver::LaunchOptions {
+        auto_compact_window: (driver == "claude"
+            && arms.is_treated(crate::feature_flags::WORKER_AUTOCOMPACT_EXPERIMENT))
+        .then_some(crate::driver::CLAUDE_WORKER_AUTO_COMPACT_WINDOW),
+    }
+}
+
+#[cfg(test)]
+mod launch_options_tests {
+    use super::worker_launch_options;
+    use crate::feature_flags::{ExperimentArm, ExperimentArmSet, WORKER_AUTOCOMPACT_EXPERIMENT};
+
+    fn arms(arm: ExperimentArm) -> ExperimentArmSet {
+        let mut set = ExperimentArmSet::new();
+        set.insert(WORKER_AUTOCOMPACT_EXPERIMENT, arm);
+        set
+    }
+
+    #[test]
+    fn only_a_treated_claude_worker_gets_the_window() {
+        let treated = worker_launch_options("claude", &arms(ExperimentArm::Treatment));
+        assert_eq!(
+            treated.auto_compact_window,
+            Some(crate::driver::CLAUDE_WORKER_AUTO_COMPACT_WINDOW)
+        );
+        for driver in ["grok", "codex", "agy"] {
+            assert_eq!(
+                worker_launch_options(driver, &arms(ExperimentArm::Treatment)).auto_compact_window,
+                None,
+                "{driver}"
+            );
+        }
+        for arm in [ExperimentArm::Control, ExperimentArm::Stopped] {
+            assert_eq!(
+                worker_launch_options("claude", &arms(arm)).auto_compact_window,
+                None,
+                "{arm:?}"
+            );
+        }
+        assert_eq!(
+            worker_launch_options("claude", &ExperimentArmSet::new()).auto_compact_window,
+            None
+        );
+    }
+}
+
 /// `ExecutionRunner` that writes per-lease configuration, starts a detached
 /// tmux worker, and registers its pid for hook-event correlation. The macOS
 /// app may attach a viewer after the worker starts.
@@ -978,7 +1028,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 .review_batch_fanout_enabled(review_batch_fanout_enabled)
                 .run_done_proposals_seam_enabled(run_done_proposals_seam_enabled)
                 .maybe_repo_guidance(spawner.repo_guidance())
-                .experiment_arms(experiment_arms)
+                .experiment_arms(experiment_arms.clone())
                 .build(),
         )
         .await
@@ -1203,14 +1253,18 @@ impl ExecutionRunner for PaneSpawnRunner {
             })?;
         pre_pane.permission_config = permission_config_began.elapsed();
 
-        let mut spawn_plan = driver.spawn_invocation(crate::driver::SpawnRequest {
-            model: &spawn_config.model,
-            effort: spawn_config.effort_value,
-            settings_path: Some(&worker_settings_path),
-            non_opus_auto_mode: spawner.non_opus_auto_mode(),
-            permission_mode_override,
-            run_id: Some(execution.id.as_str()),
-        });
+        let launch_options = worker_launch_options(&spawn_config.driver, &experiment_arms);
+        let mut spawn_plan = driver.spawn_invocation_with_options(
+            crate::driver::SpawnRequest {
+                model: &spawn_config.model,
+                effort: spawn_config.effort_value,
+                settings_path: Some(&worker_settings_path),
+                non_opus_auto_mode: spawner.non_opus_auto_mode(),
+                permission_mode_override,
+                run_id: Some(execution.id.as_str()),
+            },
+            &launch_options,
+        );
         // Merge permission-policy env (e.g. Codex CODEX_HOME) without
         // duplicating keys the spawn plan already set.
         for (key, value) in &permission_artifacts.env {
@@ -1412,6 +1466,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                     .is_review_supervisor(is_review_supervisor)
                     .is_post_merge_reviewer(is_post_merge_reviewer)
                     .checkout_positioned_on_pr_head(checkout_positioned_on_pr_head)
+                    .launch_options(launch_options)
                     .build(),
                 StdDuration::from_secs(30),
             )

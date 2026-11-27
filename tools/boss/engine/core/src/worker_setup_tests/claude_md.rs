@@ -645,3 +645,71 @@ fn shared_publication_and_ci_policy_lives_in_worker_rules() {
         assert!(rendered.contains(rule), "missing shared policy: {rule}");
     }
 }
+
+#[test]
+fn compact_instructions_keep_the_named_parts_and_are_the_only_difference() {
+    let untreated = claude_md_for(&sample_input());
+    let treated = with_compact_instructions(untreated.clone());
+    assert!(
+        !untreated.contains(COMPACT_INSTRUCTIONS_HEADING),
+        "control worker rules must not carry compact instructions"
+    );
+    assert_eq!(
+        with_compact_instructions(treated.clone()),
+        treated,
+        "applying compact instructions twice must not duplicate the block"
+    );
+    assert!(treated.contains(COMPACT_INSTRUCTIONS_HEADING));
+    for wanted in [
+        "execution context",
+        "task description",
+        "open checklist",
+        "done-declaration command",
+        r#"`"$BOSS_BIN" propose done`"#,
+        "verbatim",
+    ] {
+        assert!(treated.contains(wanted), "missing {wanted}");
+    }
+    let lowered = treated.to_lowercase();
+    for hidden in ["experiment", "treatment", "control arm", "worker_autocompact", "a/b"] {
+        assert!(!lowered.contains(hidden), "the worker must not be told about {hidden}");
+    }
+    let prefix = untreated.strip_suffix('\n').unwrap_or(&untreated);
+    let suffix = treated
+        .strip_prefix(prefix)
+        .expect("treated rules must preserve untreated rules verbatim as a prefix");
+    assert!(
+        suffix.starts_with(&format!("\n{COMPACT_INSTRUCTIONS_HEADING}\n\n")),
+        "added suffix must begin with the compact-instructions heading"
+    );
+    assert_eq!(
+        suffix.matches("\n## ").count(),
+        1,
+        "added suffix must contain only the compact-instructions section"
+    );
+}
+
+#[test]
+fn compact_instructions_apply_to_every_worker_kind() {
+    for kind in [
+        WorkerKind::Standard,
+        WorkerKind::Reviewer,
+        WorkerKind::Triage,
+        WorkerKind::AnswerAgent,
+        WorkerKind::Progression,
+        WorkerKind::ReviewGuide,
+    ] {
+        let mut input = sample_input();
+        input.worker_kind = kind.clone();
+        let untreated = claude_md_for(&input);
+        let treated = with_compact_instructions(untreated.clone());
+        assert!(
+            treated.contains(COMPACT_INSTRUCTIONS_HEADING),
+            "{kind:?} must carry compact instructions when treated"
+        );
+        assert!(
+            !untreated.contains(COMPACT_INSTRUCTIONS_HEADING),
+            "{kind:?} control rules must not"
+        );
+    }
+}

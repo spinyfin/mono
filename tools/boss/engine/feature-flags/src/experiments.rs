@@ -50,6 +50,14 @@ pub const BATCHED_SEARCH_EXPERIMENT: &str = "batched_search";
 /// Splits [`BATCHED_SEARCH_EXPERIMENT`] between half of families and all.
 pub const BATCHED_SEARCH_AB_SPLIT_FLAG: &str = "batched_search_ab_split";
 
+/// Key of the Claude auto-compact experiment: a 200k window and compact
+/// instructions in the worker rules. No lane; it may overlap any other
+/// experiment.
+pub const WORKER_AUTOCOMPACT_EXPERIMENT: &str = "worker_autocompact";
+
+/// Splits [`WORKER_AUTOCOMPACT_EXPERIMENT`] between half of families and all.
+pub const WORKER_AUTOCOMPACT_AB_SPLIT_FLAG: &str = "worker_autocompact_ab_split";
+
 /// A surface on which at most one experiment may be assigned at a time.
 ///
 /// Two experiments that rewrite the same instructions, or reshape the same
@@ -108,12 +116,20 @@ pub fn ab_split_flag_name(key: &str) -> String {
 /// Every experiment. Append in the order the experiments should win a lane:
 /// when two experiments in one lane are switched on, the one registered first
 /// runs and the other is held.
-pub const EXPERIMENTS: &[ExperimentSpec] = &[ExperimentSpec {
-    key: BATCHED_SEARCH_EXPERIMENT,
-    lane: Some(ExperimentLane::WorkerPrompt),
-    requires: &[],
-    splits: true,
-}];
+pub const EXPERIMENTS: &[ExperimentSpec] = &[
+    ExperimentSpec {
+        key: BATCHED_SEARCH_EXPERIMENT,
+        lane: Some(ExperimentLane::WorkerPrompt),
+        requires: &[],
+        splits: true,
+    },
+    ExperimentSpec {
+        key: WORKER_AUTOCOMPACT_EXPERIMENT,
+        lane: None,
+        requires: &[],
+        splits: true,
+    },
+];
 
 /// What the flags say an experiment is doing right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -802,6 +818,39 @@ mod tests {
         assert!(spec.splits);
         assert!(spec.requires.is_empty());
         assert_eq!(ab_split_flag_name(spec.key), BATCHED_SEARCH_AB_SPLIT_FLAG);
+    }
+
+    #[test]
+    fn worker_autocompact_is_a_laneless_split() {
+        let spec = EXPERIMENTS
+            .iter()
+            .find(|spec| spec.key == WORKER_AUTOCOMPACT_EXPERIMENT)
+            .expect("worker_autocompact is registered");
+        assert_eq!(spec.lane, None);
+        assert!(spec.splits);
+        assert!(spec.requires.is_empty());
+        assert_eq!(ab_split_flag_name(spec.key), WORKER_AUTOCOMPACT_AB_SPLIT_FLAG);
+    }
+
+    #[test]
+    fn worker_autocompact_runs_alongside_batched_search() {
+        let on = [
+            TOKEN_EXPERIMENTS_FLAG,
+            BATCHED_SEARCH_EXPERIMENT,
+            WORKER_AUTOCOMPACT_EXPERIMENT,
+        ];
+        let flag = |name: &str| on.contains(&name);
+        assert_eq!(
+            experiment_state(EXPERIMENTS, BATCHED_SEARCH_EXPERIMENT, &flag),
+            ExperimentState::All
+        );
+        assert_eq!(
+            experiment_state(EXPERIMENTS, WORKER_AUTOCOMPACT_EXPERIMENT, &flag),
+            ExperimentState::All
+        );
+        let resolved = resolve_arms(EXPERIMENTS, &flag, &|_| 0);
+        assert!(resolved.is_treated(BATCHED_SEARCH_EXPERIMENT));
+        assert!(resolved.is_treated(WORKER_AUTOCOMPACT_EXPERIMENT));
     }
 
     fn store() -> (tempfile::TempDir, FeatureFlagsStore) {

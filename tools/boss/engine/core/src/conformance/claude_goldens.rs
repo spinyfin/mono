@@ -14,7 +14,9 @@
 
 use std::path::PathBuf;
 
-use crate::driver::{AgentDriver, ClaudeDriver, EnvDirective, SpawnRequest};
+use crate::driver::{
+    AgentDriver, CLAUDE_WORKER_AUTO_COMPACT_WINDOW, ClaudeDriver, EnvDirective, LaunchOptions, SpawnRequest,
+};
 use crate::worker_setup::{WorkerKind, WorkerSetupInput, render_claude_md, render_settings_json};
 
 /// Deterministic fixture input — absolute paths, no host temp dir, so the
@@ -174,6 +176,49 @@ fn golden_spawn_line_dont_ask_override() {
     );
 }
 
+#[test]
+fn golden_spawn_line_opus_with_settings_is_unchanged_under_default_launch_options() {
+    let settings = PathBuf::from("/tmp/boss-worker-settings/mono-agent-007.json");
+    let request = SpawnRequest {
+        model: "opus",
+        effort: None,
+        settings_path: Some(settings.as_path()),
+        non_opus_auto_mode: false,
+        permission_mode_override: None,
+        run_id: None,
+    };
+    assert_eq!(
+        ClaudeDriver.spawn_invocation(request).command,
+        ClaudeDriver
+            .spawn_invocation_with_options(request, &LaunchOptions::default())
+            .command,
+        "default launch options must keep the control spawn line byte-for-byte",
+    );
+}
+
+#[test]
+fn golden_spawn_line_opus_with_autocompact() {
+    let settings = PathBuf::from("/tmp/boss-worker-settings/mono-agent-007.json");
+    let plan = ClaudeDriver.spawn_invocation_with_options(
+        SpawnRequest {
+            model: "opus",
+            effort: None,
+            settings_path: Some(settings.as_path()),
+            non_opus_auto_mode: false,
+            permission_mode_override: None,
+            run_id: None,
+        },
+        &LaunchOptions {
+            auto_compact_window: Some(CLAUDE_WORKER_AUTO_COMPACT_WINDOW),
+        },
+    );
+    assert_eq!(
+        plan.command,
+        "python3 -I .claude/initial-prompt.py claude --model opus --disallowedTools=AskUserQuestion --permission-mode auto --settings '/tmp/boss-worker-settings/mono-agent-007.json' --autocompact 200k\n",
+        "treated Claude spawn line must pass --autocompact 200k",
+    );
+}
+
 // ── Deny rules ──────────────────────────────────────────────────────────────
 
 #[test]
@@ -257,6 +302,10 @@ fn golden_claude_md_standard_worker() {
     assert_eq!(
         rendered, GOLDEN_CLAUDE_MD_STANDARD,
         "CLAUDE.md must match the golden byte-for-byte through the driver preamble + renderer",
+    );
+    assert!(
+        !rendered.contains(crate::worker_setup::COMPACT_INSTRUCTIONS_HEADING),
+        "control worker rules must not carry compact instructions",
     );
 }
 

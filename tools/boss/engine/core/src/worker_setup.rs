@@ -98,8 +98,8 @@ pub(crate) use crate::driver::claude::{
 pub(crate) use crate::driver::ProgressObservationWiring;
 
 pub use boss_execution_runner::worker_setup::{
-    WorkerKind, WorkerSetupInput, render_claude_md, render_claude_md_with_invocation, worker_boss_invocation,
-    worker_kind_for_execution,
+    COMPACT_INSTRUCTIONS_HEADING, WorkerKind, WorkerSetupInput, render_claude_md, render_claude_md_with_invocation,
+    with_compact_instructions, worker_boss_invocation, worker_kind_for_execution,
 };
 
 /// Whether the worker settings should install the engine-data-dir
@@ -1279,6 +1279,16 @@ pub fn write_workspace_files(
     input: &WorkerSetupInput,
     driver: &dyn crate::driver::AgentDriver,
 ) -> io::Result<WrittenFiles> {
+    write_workspace_files_with_options(input, driver, &crate::driver::LaunchOptions::default())
+}
+
+/// [`write_workspace_files`] with the launch knobs the runner resolved
+/// from the arm set. Default options keep today's worker rules.
+pub fn write_workspace_files_with_options(
+    input: &WorkerSetupInput,
+    driver: &dyn crate::driver::AgentDriver,
+    options: &crate::driver::LaunchOptions,
+) -> io::Result<WrittenFiles> {
     let descriptor = driver.descriptor();
     let config_dir = input.workspace_path.join(descriptor.config_dir);
     std::fs::create_dir_all(&config_dir)?;
@@ -1311,15 +1321,16 @@ pub fn write_workspace_files(
     let gitignore_path = config_dir.join(".gitignore");
 
     let preamble = driver.agent_rules_preamble();
-    std::fs::write(
-        &agent_rules_path,
-        render_claude_md_with_invocation(
-            input,
-            preamble,
-            descriptor.config_dir,
-            worker_boss_invocation(descriptor.name, &input.worker_kind),
-        ),
-    )?;
+    let mut rules = render_claude_md_with_invocation(
+        input,
+        preamble,
+        descriptor.config_dir,
+        worker_boss_invocation(descriptor.name, &input.worker_kind),
+    );
+    if options.auto_compact_window.is_some() {
+        rules = with_compact_instructions(rules);
+    }
+    std::fs::write(&agent_rules_path, rules)?;
     std::fs::write(&gitignore_path, driver.config_dir_gitignore())?;
 
     let settings_path = worker_settings_path(&input.workspace_path);
