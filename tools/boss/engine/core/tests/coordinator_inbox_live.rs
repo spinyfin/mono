@@ -2,15 +2,16 @@
 //! fixture. No production session, configuration, or model credential is used.
 use std::path::{Path, PathBuf};
 
+#[path = "../src/conformance/anthropic_loopback.rs"]
+mod anthropic_loopback;
 #[path = "coordinator_inbox_tui.rs"]
 mod tui;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
+use serde_json::Value;
+use tokio::io::AsyncWriteExt;
 
 fn declared_claude() -> Result<PathBuf> {
     let root = PathBuf::from(std::env::var("TEST_SRCDIR")?);
@@ -25,52 +26,8 @@ fn declared_claude() -> Result<PathBuf> {
         .context("Bazel must declare the host Claude executable for this test")
 }
 
-async fn model_fixture() -> Result<std::net::SocketAddr> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let address = listener.local_addr()?;
-    tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            tokio::spawn(async move {
-                let mut reader = BufReader::new(stream);
-                let mut header = String::new();
-                let mut content_length = 0;
-                let mut request_line = String::new();
-                reader.read_line(&mut request_line).await.unwrap();
-                loop {
-                    header.clear();
-                    reader.read_line(&mut header).await.unwrap();
-                    if header == "\r\n" || header.is_empty() {
-                        break;
-                    }
-                    if let Some(value) = header.to_lowercase().strip_prefix("content-length:") {
-                        content_length = value.trim().parse::<usize>().unwrap();
-                    }
-                }
-                let mut body = vec![0; content_length];
-                reader.read_exact(&mut body).await.unwrap();
-                let (content_type, response) = if request_line.contains("count_tokens") {
-                    ("application/json", "{\"input_tokens\":1}".to_owned())
-                } else {
-                    let events = [
-                        json!({"type":"message_start", "message":{"id":"msg_fixture", "type":"message", "role":"assistant", "model":"claude-sonnet-4-5", "content":[], "stop_reason":null, "stop_sequence":null, "usage":{"input_tokens":1, "output_tokens":0}}}),
-                        json!({"type":"content_block_start", "index":0, "content_block":{"type":"text", "text":""}}),
-                        json!({"type":"content_block_delta", "index":0, "delta":{"type":"text_delta", "text":"fixture ready"}}),
-                        json!({"type":"content_block_stop", "index":0}),
-                        json!({"type":"message_delta", "delta":{"stop_reason":"end_turn", "stop_sequence":null}, "usage":{"output_tokens":2}}),
-                        json!({"type":"message_stop"}),
-                    ];
-                    let response = events
-                        .iter()
-                        .map(|event| format!("event: {}\ndata: {event}\n\n", event["type"].as_str().unwrap()))
-                        .collect::<String>();
-                    ("text/event-stream", response)
-                };
-                let mut stream = reader.into_inner();
-                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
-            });
-        }
-    });
-    Ok(address)
+fn model_fixture() -> Result<anthropic_loopback::AnthropicSseLoopback> {
+    anthropic_loopback::AnthropicSseLoopback::spawn().context("bind loopback Anthropic fixture")
 }
 
 #[tokio::test]
@@ -81,7 +38,7 @@ async fn installed_claude_acknowledges_a_separate_inbox_message() -> Result<()> 
     std::fs::create_dir(&config)?;
     let output = root.path().join("claude-output.jsonl");
     let errors = root.path().join("claude-errors.log");
-    let api = model_fixture().await?;
+    let api = model_fixture()?;
     let mut child = tokio::process::Command::new(declared_claude()?)
         .args([
             "-p",
@@ -100,7 +57,7 @@ async fn installed_claude_acknowledges_a_separate_inbox_message() -> Result<()> 
         .current_dir(root.path())
         .env("CLAUDE_CONFIG_DIR", &config)
         .env("CLAUDE_CODE_TMPDIR", root.path())
-        .env("ANTHROPIC_BASE_URL", format!("http://{api}"))
+        .env("ANTHROPIC_BASE_URL", format!("http://{}", api.addr()))
         .env("ANTHROPIC_API_KEY", "sk-ant-test-fixture-not-a-real-key")
         .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
         .env_remove("CLAUDE_CODE_OAUTH_TOKEN")

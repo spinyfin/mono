@@ -17,7 +17,9 @@ use std::path::PathBuf;
 use crate::driver::{
     AgentDriver, CLAUDE_WORKER_AUTO_COMPACT_WINDOW, ClaudeDriver, EnvDirective, LaunchOptions, SpawnRequest,
 };
-use crate::worker_setup::{WorkerKind, WorkerSetupInput, render_claude_md, render_settings_json};
+use crate::worker_setup::{
+    WorkerKind, WorkerSetupInput, render_claude_md, render_settings_json, render_settings_json_with_options,
+};
 
 /// Deterministic fixture input — absolute paths, no host temp dir, so the
 /// CLAUDE.md / deny-rule goldens are portable across machines and CI.
@@ -278,7 +280,14 @@ fn golden_spawn_line_opus_with_lean_environment_and_autocompact() {
 #[test]
 fn golden_lean_environment_still_passes_hook_settings_file() {
     let input = golden_input();
-    let rendered = render_settings_json(&input, &ClaudeDriver as &dyn AgentDriver);
+    let rendered = render_settings_json_with_options(
+        &input,
+        &ClaudeDriver as &dyn AgentDriver,
+        &LaunchOptions {
+            lean_environment: true,
+            ..LaunchOptions::default()
+        },
+    );
     let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
     let hooks = parsed["hooks"].as_object().expect("rendered settings must carry hooks");
     for event in [
@@ -319,6 +328,13 @@ fn golden_lean_environment_still_passes_hook_settings_file() {
         "treated lean launch must never pass --bare or --safe-mode (both skip hooks); got: {}",
         plan.command,
     );
+    for (key, enabled) in crate::driver::claude::CLAUDE_LEAN_PERMISSION_ACKNOWLEDGEMENTS {
+        assert_eq!(
+            parsed[*key],
+            serde_json::Value::Bool(*enabled),
+            "lean --settings must carry {key} so excluding the user source does not reintroduce the accept dialog"
+        );
+    }
 }
 
 // ── Deny rules ──────────────────────────────────────────────────────────────

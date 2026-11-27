@@ -875,22 +875,6 @@ fn agy_fixture_stream_carries_required_1_5_7_envelope_fields() {
 /// project instructions and `--settings` hooks active.
 const MIN_QUALIFIED_CLAUDE_LEAN_VERSION: &str = "2.1.332";
 
-/// Parse `2.1.332 (Claude Code)` stdout from `claude --version`.
-fn parse_claude_cli_version(stdout: &str) -> Option<String> {
-    let token = stdout.lines().next()?.split_whitespace().next()?;
-    let trimmed = token.strip_prefix('v').unwrap_or(token);
-    let parts: Vec<_> = trimmed.split('.').collect();
-    if parts.len() >= 3
-        && parts
-            .iter()
-            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
-    {
-        Some(trimmed.to_owned())
-    } else {
-        None
-    }
-}
-
 /// Sentinel stderr emitted by Claude Code when every CLI flag and `--settings`
 /// file parsed cleanly under `-p ""` with empty stdin.
 const CLAUDE_EMPTY_PRINT_INPUT_ERROR: &str =
@@ -998,7 +982,11 @@ fn claude_flag_probe_classifier_fails_loudly_on_rejected_flags() {
     let fail_status = std::process::ExitStatus::from_raw(1 << 8);
 
     assert_eq!(
-        parse_claude_cli_version("2.1.332 (Claude Code)\n").as_deref(),
+        crate::coordinator_tmux::parse_claude_version("2.1.332 (Claude Code)\n").as_deref(),
+        Some("2.1.332")
+    );
+    assert_eq!(
+        crate::coordinator_tmux::parse_claude_version("v2.1.332 (Claude Code)\n").as_deref(),
         Some("2.1.332")
     );
     assert!(version_at_least("2.1.332", MIN_QUALIFIED_CLAUDE_LEAN_VERSION));
@@ -1057,7 +1045,7 @@ fn installed_claude_accepts_lean_launch_flags_when_present() {
         String::from_utf8_lossy(&version_out.stderr),
     );
     let version_stdout = String::from_utf8_lossy(&version_out.stdout);
-    let version = parse_claude_cli_version(&version_stdout)
+    let version = crate::coordinator_tmux::parse_claude_version(&version_stdout)
         .unwrap_or_else(|| panic!("could not parse `claude --version` from {version_stdout:?}"));
     assert!(
         version_at_least(&version, MIN_QUALIFIED_CLAUDE_LEAN_VERSION),
@@ -1145,86 +1133,63 @@ fn installed_claude_accepts_lean_launch_flags_when_present() {
     );
 }
 
+fn require_or_skip_claude() -> Option<std::path::PathBuf> {
+    let require = require_claude_cli();
+    match claude_cli_binary() {
+        Some(bin) => Some(bin),
+        None if require => {
+            panic!("BOSS_REQUIRE_CLAUDE_CLI/BOSS_CLAUDE_BIN is set but claude is unavailable")
+        }
+        None => {
+            eprintln!(
+                "claude not on PATH; skipping live lean-environment check \
+                 (set BOSS_REQUIRE_CLAUDE_CLI=1 or run //tools/boss/engine/core:claude_cli_flags_live_test)"
+            );
+            None
+        }
+    }
+}
+
+fn spawn_print_claude(
+    claude_bin: &std::path::Path,
+    ws: &std::path::Path,
+    home: &std::path::Path,
+    tmp: &std::path::Path,
+    api: std::net::SocketAddr,
+    args: &[String],
+) -> std::process::Output {
+    use std::process::Stdio;
+    Command::new(claude_bin)
+        .current_dir(ws)
+        .env("HOME", home)
+        .env("CLAUDE_CODE_TMPDIR", tmp)
+        .env("ANTHROPIC_BASE_URL", format!("http://{api}"))
+        .env("ANTHROPIC_API_KEY", "sk-ant-test-fixture-not-a-real-key")
+        .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env_remove("BOSS_EVENTS_SOCKET")
+        .stdin(Stdio::null())
+        .args(args)
+        .args(["-p", "say hi"])
+        .output()
+        .expect("spawn claude loopback probe")
+}
+
 #[test]
 fn installed_claude_lean_flags_exclude_user_env_and_keep_hooks_when_present() {
+    use crate::conformance::anthropic_loopback::AnthropicSseLoopback;
     use crate::driver::claude::{CLAUDE_BASE_DISALLOWED_TOOLS, CLAUDE_LEAN_EXTRA_DISALLOWED_TOOLS, claude_spawn_args};
     use crate::driver::{LaunchOptions, SpawnRequest};
-    use std::io::{BufRead, BufReader, Read, Write};
-    use std::net::TcpListener;
-    use std::process::Stdio;
-    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
-    let require = require_claude_cli();
-    let Some(claude_bin) = claude_cli_binary() else {
-        if require {
-            panic!("BOSS_REQUIRE_CLAUDE_CLI/BOSS_CLAUDE_BIN is set but claude is unavailable");
-        }
-        eprintln!(
-            "claude not on PATH; skipping live lean-environment loopback check \
-             (set BOSS_REQUIRE_CLAUDE_CLI=1 or run //tools/boss/engine/core:claude_cli_flags_live_test)"
-        );
+    let Some(claude_bin) = require_or_skip_claude() else {
         return;
     };
 
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback mock API");
-    let addr = listener.local_addr().expect("local_addr");
-    let captured_bodies: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
-    let captured_clone = Arc::clone(&captured_bodies);
-    let server = std::thread::spawn(move || {
-        while let Ok((stream, _)) = listener.accept() {
-            let mut reader = BufReader::new(stream);
-            let mut req_line = String::new();
-            if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
-                continue;
-            }
-            let mut content_length = 0usize;
-            let mut header = String::new();
-            loop {
-                header.clear();
-                if reader.read_line(&mut header).unwrap_or(0) == 0 || header == "\r\n" {
-                    break;
-                }
-                if let Some(val) = header.to_ascii_lowercase().strip_prefix("content-length:") {
-                    content_length = val.trim().parse::<usize>().unwrap_or(0);
-                }
-            }
-            let mut body = vec![0u8; content_length];
-            let _ = reader.read_exact(&mut body);
-            let body_str = String::from_utf8_lossy(&body).into_owned();
-            let is_shutdown = req_line.contains("/__shutdown");
-            if !is_shutdown {
-                captured_clone
-                    .lock()
-                    .expect("captured lock")
-                    .push((req_line.clone(), body_str));
-            }
-            let (content_type, resp_body) = if req_line.contains("count_tokens") {
-                ("application/json", r#"{"input_tokens":1}"#.to_owned())
-            } else if is_shutdown {
-                ("text/plain", "bye".to_owned())
-            } else {
-                let sse = concat!(
-                    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-5\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
-                    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
-                    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
-                    "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
-                    "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}\n\n",
-                    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
-                );
-                ("text/event-stream", sse.to_owned())
-            };
-            let mut stream = reader.into_inner();
-            let _ = write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
-                resp_body.len()
-            );
-            let _ = stream.flush();
-            if is_shutdown {
-                break;
-            }
-        }
-    });
+    let api = AnthropicSseLoopback::spawn().expect("bind loopback mock API");
+    let addr = api.addr();
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let fake_home = tmp.path().join("home");
@@ -1238,6 +1203,8 @@ fn installed_claude_lean_flags_exclude_user_env_and_keep_hooks_when_present() {
     let repo_sentinel = "REPO_ROOT_CLAUDE_MD_SENTINEL_639";
     let worker_rules_sentinel = "WORKER_RULES_CLAUDE_MD_SENTINEL_740";
     let mcp_sentinel = "fake_user_mcp_server_851";
+    let control_mcp_marker = tmp.path().join("mcp-started-control.txt");
+    let treated_mcp_marker = tmp.path().join("mcp-started-treated.txt");
 
     std::fs::write(user_claude.join("CLAUDE.md"), format!("{user_sentinel}\n")).expect("write user CLAUDE.md");
     std::fs::write(
@@ -1245,76 +1212,81 @@ fn installed_claude_lean_flags_exclude_user_env_and_keep_hooks_when_present() {
         format!("---\nname: fake-skill\ndescription: {skill_sentinel}\n---\nBody\n"),
     )
     .expect("write fake skill");
-    std::fs::write(
-        fake_home.join(".claude.json"),
-        serde_json::json!({
-            "mcpServers": {
-                mcp_sentinel: { "command": "/bin/echo", "args": ["hello"] }
-            }
-        })
-        .to_string(),
-    )
-    .expect("write .claude.json");
     std::fs::write(ws.join("CLAUDE.md"), format!("{repo_sentinel}\n")).expect("write repo CLAUDE.md");
     std::fs::write(ws.join(".claude/CLAUDE.md"), format!("{worker_rules_sentinel}\n"))
         .expect("write worker rules CLAUDE.md");
 
     let hook_marker = tmp.path().join("session-start-fired.txt");
     let settings_path = tmp.path().join("worker-settings.json");
-    std::fs::write(
-        &settings_path,
-        serde_json::json!({
-            "hooks": {
-                "SessionStart": [{
-                    "matcher": "*",
-                    "hooks": [{
-                        "type": "command",
-                        "command": format!("printf fired > '{}'", hook_marker.display()),
-                    }]
+    let mut settings = serde_json::json!({
+        "hooks": {
+            "SessionStart": [{
+                "matcher": "*",
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("printf fired > '{}'", hook_marker.display()),
                 }]
-            }
-        })
-        .to_string(),
-    )
-    .expect("write settings.json");
+            }]
+        }
+    });
+    for (key, enabled) in crate::driver::claude::CLAUDE_LEAN_PERMISSION_ACKNOWLEDGEMENTS {
+        settings[*key] = serde_json::Value::Bool(*enabled);
+    }
+    std::fs::write(&settings_path, settings.to_string()).expect("write settings.json");
 
-    let args = claude_spawn_args(
-        SpawnRequest {
-            model: "sonnet",
-            effort: None,
-            settings_path: Some(settings_path.as_path()),
-            non_opus_auto_mode: false,
-            permission_mode_override: None,
-            run_id: None,
-        },
+    let write_mcp = |marker: &std::path::Path| {
+        std::fs::write(
+            fake_home.join(".claude.json"),
+            serde_json::json!({
+                "mcpServers": {
+                    mcp_sentinel: {
+                        "command": "/bin/sh",
+                        "args": ["-c", format!("printf started > '{}'", marker.display())],
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write .claude.json");
+    };
+
+    let spawn_req = SpawnRequest {
+        model: "sonnet",
+        effort: None,
+        settings_path: Some(settings_path.as_path()),
+        non_opus_auto_mode: false,
+        permission_mode_override: None,
+        run_id: None,
+    };
+
+    write_mcp(&control_mcp_marker);
+    let control_args = claude_spawn_args(spawn_req, &LaunchOptions::default());
+    let control_out = spawn_print_claude(&claude_bin, &ws, &fake_home, tmp.path(), addr, &control_args);
+    assert!(
+        control_out.status.success(),
+        "control claude loopback run must succeed; status={} stdout={} stderr={}",
+        control_out.status,
+        String::from_utf8_lossy(&control_out.stdout),
+        String::from_utf8_lossy(&control_out.stderr),
+    );
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline && !control_mcp_marker.exists() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        control_mcp_marker.exists(),
+        "control launch (no --strict-mcp-config) must start the inherited MCP fixture"
+    );
+
+    write_mcp(&treated_mcp_marker);
+    let treated_args = claude_spawn_args(
+        spawn_req,
         &LaunchOptions {
             lean_environment: true,
             ..LaunchOptions::default()
         },
     );
-
-    let out = Command::new(&claude_bin)
-        .current_dir(&ws)
-        .env("HOME", &fake_home)
-        .env("CLAUDE_CODE_TMPDIR", tmp.path())
-        .env("ANTHROPIC_BASE_URL", format!("http://{addr}"))
-        .env("ANTHROPIC_API_KEY", "sk-ant-test-fixture-not-a-real-key")
-        .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
-        .env_remove("CLAUDE_CONFIG_DIR")
-        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
-        .env_remove("ANTHROPIC_AUTH_TOKEN")
-        .env_remove("BOSS_EVENTS_SOCKET")
-        .stdin(Stdio::null())
-        .args(&args)
-        .args(["-p", "say hi"])
-        .output()
-        .expect("spawn claude loopback probe");
-
-    // Wake and stop the loopback listener cleanly.
-    if let Ok(mut conn) = std::net::TcpStream::connect(addr) {
-        let _ = write!(conn, "POST /__shutdown HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
-    }
-    let _ = server.join();
+    let out = spawn_print_claude(&claude_bin, &ws, &fake_home, tmp.path(), addr, &treated_args);
 
     assert!(
         out.status.success(),
@@ -1327,12 +1299,23 @@ fn installed_claude_lean_flags_exclude_user_env_and_keep_hooks_when_present() {
         hook_marker.exists(),
         "SessionStart hook from --settings must still fire under lean flags"
     );
+    assert!(
+        !treated_mcp_marker.exists(),
+        "--strict-mcp-config must not start the inherited MCP fixture; marker was written"
+    );
 
-    let bodies = captured_bodies.lock().expect("captured lock");
-    let (_, raw_msg) = bodies
-        .iter()
-        .find(|(req, _)| req.contains("messages") && !req.contains("count_tokens"))
-        .expect("loopback server must receive a /messages request");
+    let messages = api.messages_bodies();
+    assert!(
+        messages.len() >= 2,
+        "control and treated launches must each send a /messages request; got {}",
+        messages.len()
+    );
+    let control_msg = &messages[0];
+    assert!(
+        control_msg.contains(user_sentinel),
+        "control launch must still load user-level CLAUDE.md so the treated exclusion is meaningful"
+    );
+    let raw_msg = messages.last().expect("treated /messages body");
 
     assert!(
         !raw_msg.contains(user_sentinel),
@@ -1374,5 +1357,209 @@ fn installed_claude_lean_flags_exclude_user_env_and_keep_hooks_when_present() {
     assert!(
         !tool_names.contains(&"Skill"),
         "Skill tool must be absent when --disable-slash-commands is set; got {tool_names:?}"
+    );
+}
+
+/// Collapse a PTY capture for dialog assertions: strip CSI/OSC, drop
+/// whitespace, lowercase. Claude's TUI writes `Yes, I accept` with CUP/CHA
+/// between the words (`Yes,\x1b[9gI\x1b[12gaccept`), so a whitespace-only
+/// collapse cannot match.
+fn collapsed_visible(s: &str) -> String {
+    strip_ansi(s)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '\u{1b}' {
+            if !c.is_control() {
+                out.push(c);
+            }
+            continue;
+        }
+        match it.peek().copied() {
+            Some('[') => {
+                it.next();
+                for d in it.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&d) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                it.next();
+                while let Some(d) = it.next() {
+                    if d == '\u{07}' {
+                        break;
+                    }
+                    if d == '\u{1b}' && it.peek() == Some(&'\\') {
+                        it.next();
+                        break;
+                    }
+                }
+            }
+            Some(_) => {
+                let _ = it.next();
+            }
+            None => {}
+        }
+    }
+    out
+}
+
+#[test]
+fn collapsed_visible_strips_csi_between_dialog_words() {
+    let raw = "\u{1b}[38;5;153m❯\u{1b}[5gyes,\u{1b}[9gi\u{1b}[12gaccept";
+    assert!(
+        collapsed_visible(raw).contains("yes,iaccept"),
+        "{}",
+        collapsed_visible(raw)
+    );
+}
+
+#[test]
+fn installed_claude_lean_interactive_tui_skips_permission_dialog_when_present() {
+    use crate::conformance::anthropic_loopback::AnthropicSseLoopback;
+    use crate::driver::claude::{CLAUDE_LEAN_PERMISSION_ACKNOWLEDGEMENTS, claude_spawn_args};
+    use crate::driver::{LaunchOptions, SpawnRequest};
+    use std::process::Stdio;
+
+    let Some(claude_bin) = require_or_skip_claude() else {
+        return;
+    };
+
+    let api = AnthropicSseLoopback::spawn().expect("bind loopback mock API");
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let fake_home = tmp.path().join("home");
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(fake_home.join(".claude")).expect("home .claude");
+    std::fs::create_dir_all(&ws).expect("ws");
+    let ws = ws.canonicalize().expect("canonicalize ws");
+    std::fs::write(ws.join("CLAUDE.md"), "repo rules\n").expect("repo CLAUDE.md");
+
+    let api_key = "sk-ant-test-fixture-not-a-real-key";
+    let mut projects = serde_json::Map::new();
+    projects.insert(
+        ws.display().to_string(),
+        serde_json::json!({"hasTrustDialogAccepted": true}),
+    );
+    if let Some(stripped) = ws.to_str().and_then(|p| p.strip_prefix("/private")) {
+        projects.insert(stripped.to_owned(), serde_json::json!({"hasTrustDialogAccepted": true}));
+    }
+    std::fs::write(
+        fake_home.join(".claude.json"),
+        serde_json::json!({
+            "hasCompletedOnboarding": true,
+            "lastOnboardingVersion": MIN_QUALIFIED_CLAUDE_LEAN_VERSION,
+            "customApiKeyResponses": {"approved": [&api_key[api_key.len() - 20..]], "rejected": []},
+            "projects": projects,
+        })
+        .to_string(),
+    )
+    .expect("write .claude.json");
+
+    let settings_with_acks = tmp.path().join("settings-acks.json");
+    let settings_without_acks = tmp.path().join("settings-empty.json");
+    let mut acks = serde_json::json!({});
+    for (key, enabled) in CLAUDE_LEAN_PERMISSION_ACKNOWLEDGEMENTS {
+        acks[*key] = serde_json::Value::Bool(*enabled);
+    }
+    std::fs::write(&settings_with_acks, acks.to_string()).expect("write acks settings");
+    std::fs::write(&settings_without_acks, "{}\n").expect("write empty settings");
+
+    let pty_script = tmp.path().join("pty_launch.py");
+    std::fs::write(
+        &pty_script,
+        r#"
+import os, pty, select, signal, sys, time
+claude, wait = sys.argv[1], float(sys.argv[2])
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvpe(claude, [claude, *sys.argv[3:]], os.environ)
+buf = b""
+end = time.time() + wait
+try:
+    while time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.2)
+        if fd in r:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+finally:
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        pass
+sys.stdout.buffer.write(buf)
+"#,
+    )
+    .expect("write pty script");
+
+    let run_tui = |settings: &std::path::Path| -> String {
+        let args = claude_spawn_args(
+            SpawnRequest {
+                model: "sonnet",
+                effort: None,
+                settings_path: Some(settings),
+                non_opus_auto_mode: false,
+                permission_mode_override: None,
+                run_id: None,
+            },
+            &LaunchOptions {
+                lean_environment: true,
+                ..LaunchOptions::default()
+            },
+        );
+        let mut cmd = Command::new("python3");
+        cmd.arg(&pty_script)
+            .arg(&claude_bin)
+            .arg("12")
+            .args(&args)
+            .current_dir(&ws)
+            .env("HOME", &fake_home)
+            .env("TERM", "xterm-256color")
+            .env("CLAUDE_CODE_TMPDIR", tmp.path())
+            .env("ANTHROPIC_BASE_URL", format!("http://{}", api.addr()))
+            .env("ANTHROPIC_API_KEY", api_key)
+            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+            .env_remove("ANTHROPIC_AUTH_TOKEN")
+            .env_remove("BOSS_EVENTS_SOCKET")
+            .stdin(Stdio::null());
+        let out = cmd.output().expect("python3 pty launch");
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr)
+    };
+
+    let without = collapsed_visible(&run_tui(&settings_without_acks));
+    assert!(
+        without.contains("yes,iaccept"),
+        "treated interactive launch without acknowledgement keys must show the bypass dialog; got {without}"
+    );
+
+    let with_acks = collapsed_visible(&run_tui(&settings_with_acks));
+    assert!(
+        !with_acks.contains("yes,iaccept"),
+        "2.1.332 must honour skipDangerousModePermissionPrompt from --settings; got {with_acks}"
+    );
+    assert!(
+        with_acks.contains("bypasspermissionson"),
+        "treated interactive launch with acknowledgements must reach the bypass-permissions prompt; got {with_acks}"
     );
 }

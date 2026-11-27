@@ -1,4 +1,5 @@
 use super::*;
+use serde_json::json;
 use std::path::Path;
 use tmux_fixture::{TmuxServerGuard, declared_tmux_binary};
 
@@ -57,10 +58,10 @@ pub(super) async fn terminal_handoff(real_model: bool) -> Result<()> {
             "projects": {cwd.to_str().unwrap(): {"hasTrustDialogAccepted": true}},
         }))?,
     )?;
-    let api = if real_model {
-        "https://api.anthropic.com".to_owned()
-    } else {
-        format!("http://{}", model_fixture().await?)
+    let api_fixture = if real_model { None } else { Some(model_fixture()?) };
+    let api = match api_fixture.as_ref() {
+        None => "https://api.anthropic.com".to_owned(),
+        Some(fixture) => format!("http://{}", fixture.addr()),
     };
     // Production delivers the brief through the terminal relay from a private
     // input directory, so the fixture does the same.

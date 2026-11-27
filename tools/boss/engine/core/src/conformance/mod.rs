@@ -63,6 +63,7 @@
 #![cfg(test)]
 
 mod agy_goldens;
+mod anthropic_loopback;
 mod boundary_equivalence;
 mod claude_goldens;
 mod fixtures;

@@ -620,6 +620,7 @@ rust_test(
     size = "medium",
     timeout = "moderate",
     srcs = [
+        "src/conformance/anthropic_loopback.rs",
         "tests/coordinator_inbox_live.rs",
         "tests/coordinator_inbox_tui.rs",
     ],
@@ -648,6 +649,7 @@ rust_test(
     size = "medium",
     timeout = "moderate",
     srcs = [
+        "src/conformance/anthropic_loopback.rs",
         "tests/coordinator_inbox_live.rs",
         "tests/coordinator_inbox_real_model.rs",
         "tests/coordinator_inbox_tui.rs",

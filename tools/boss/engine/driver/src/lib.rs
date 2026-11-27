@@ -1914,8 +1914,12 @@ pub struct LaunchOptions {
     pub auto_compact_window: Option<&'static str>,
     /// Launch Claude without the personal environment: disable skills and
     /// slash commands, ignore inherited MCP servers, exclude the user-level
-    /// `CLAUDE.md` via `--setting-sources project,local`, and remove unused
-    /// built-in tools by name. `false` keeps today's launch line.
+    /// `CLAUDE.md` and `~/.claude/settings.json` via `--setting-sources
+    /// project,local` (user `permissions` / `autoMode` settings are dropped;
+    /// the worker `--settings` file supplies the bypass/auto acknowledgement
+    /// keys so treated interactive launches do not stop on "Yes, I accept"),
+    /// and remove unused built-in tools by name. `false` keeps today's launch
+    /// line.
     pub lean_environment: bool,
 }
 

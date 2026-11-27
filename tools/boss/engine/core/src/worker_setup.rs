@@ -21,8 +21,11 @@
 //!   binary, so the engine's events socket sees a structured stream of
 //!   worker activity. Also pins `permissions.defaultMode` to `auto` and
 //!   carries the `deny` rules that fence the worker off from Boss's
-//!   runtime state. The engine points the spawned session at it with
-//!   `claude --settings <abs-path>`.
+//!   runtime state. A treated lean-environment spawn additionally writes
+//!   `skipDangerousModePermissionPrompt` and `skipAutoPermissionPrompt`
+//!   so excluding the user settings source does not reintroduce the
+//!   one-time bypass/auto acknowledgement dialogs. The engine points the
+//!   spawned session at it with `claude --settings <abs-path>`.
 //!
 //!   The Boss-data-dir boundary itself is enforced by a *deterministic*
 //!   `PreToolUse` gate (see [`PATH_GUARD_SCRIPT`]): a small script that
@@ -216,8 +219,29 @@ fn hook_entry_runs_path_guard(entry: &serde_json::Value) -> bool {
 /// resolved by the caller via [`crate::driver::DriverRegistry::require`],
 /// never constructed as a concrete type here.
 pub fn render_settings_json(input: &WorkerSetupInput, driver: &dyn AgentDriver) -> String {
-    let value = settings_value(input, EngineDataDirSandbox::Enabled, driver);
+    render_settings_json_with_options(input, driver, &crate::driver::LaunchOptions::default())
+}
+
+/// [`render_settings_json`] with the launch knobs the runner resolved from
+/// the arm set. A treated lean environment writes the bypass/auto
+/// acknowledgement keys into this file so `--setting-sources project,local`
+/// does not reintroduce the one-time permission dialogs.
+pub fn render_settings_json_with_options(
+    input: &WorkerSetupInput,
+    driver: &dyn AgentDriver,
+    options: &crate::driver::LaunchOptions,
+) -> String {
+    let mut value = settings_value(input, EngineDataDirSandbox::Enabled, driver);
+    if options.lean_environment {
+        apply_lean_permission_acknowledgements(&mut value);
+    }
     serde_json::to_string_pretty(&value).expect("settings JSON value is always serializable")
+}
+
+fn apply_lean_permission_acknowledgements(value: &mut serde_json::Value) {
+    for (key, enabled) in crate::driver::claude::CLAUDE_LEAN_PERMISSION_ACKNOWLEDGEMENTS {
+        value[*key] = serde_json::Value::Bool(*enabled);
+    }
 }
 
 /// Render worker settings for a *remote* (SSH-dispatched) worker.
@@ -1344,7 +1368,10 @@ pub fn write_workspace_files_with_options(
         ensure_checkleft_push_guard_script_in(parent)?;
         ensure_git_store_guard_script_in(parent)?;
     }
-    std::fs::write(&settings_path, render_settings_json(input, driver))?;
+    std::fs::write(
+        &settings_path,
+        render_settings_json_with_options(input, driver, options),
+    )?;
 
     Ok(WrittenFiles {
         claude_md_path: agent_rules_path,

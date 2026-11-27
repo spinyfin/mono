@@ -726,11 +726,26 @@ pub const CLAUDE_LEAN_EXTRA_DISALLOWED_TOOLS: &[&str] = &[
 ];
 
 /// Setting sources loaded under [`LaunchOptions::lean_environment`].
-/// Excludes `user` (the operator's `~/.claude/CLAUDE.md` and personal settings)
-/// while keeping repository `CLAUDE.md`, `.claude/CLAUDE.md` worker rules, and
-/// the `--settings` file carrying Boss's hooks and permissions.
+/// Excludes the `user` source (the user-level `~/.claude/CLAUDE.md` and
+/// `~/.claude/settings.json`) while keeping repository `CLAUDE.md`,
+/// `.claude/CLAUDE.md` worker rules, and the `--settings` file carrying
+/// Boss's hooks, permissions, and lean permission-dialog acknowledgements.
 /// Verified against Claude Code 2.1.332.
 pub const CLAUDE_LEAN_SETTING_SOURCES: &str = "project,local";
+
+/// Top-level Claude Code `--settings` keys that skip the one-time bypass
+/// and auto-mode acknowledgement dialogs.
+///
+/// Claude persists `skipDangerousModePermissionPrompt` and
+/// `skipAutoPermissionPrompt` in the user-level `~/.claude/settings.json`.
+/// `--setting-sources project,local` drops that file, and Boss's rendered
+/// `--settings` did not previously supply the keys, so a treated interactive
+/// launch could stop on "Yes, I accept". Confirmed on 2.1.332: the CLI
+/// honours these keys from the flag-supplied `--settings` file.
+pub const CLAUDE_LEAN_PERMISSION_ACKNOWLEDGEMENTS: &[(&str, bool)] = &[
+    ("skipDangerousModePermissionPrompt", true),
+    ("skipAutoPermissionPrompt", true),
+];
 
 /// Build the argv passed to `claude` for a worker launch.
 ///
