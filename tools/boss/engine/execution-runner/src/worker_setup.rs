@@ -166,10 +166,13 @@ pub fn render_claude_md_with_invocation(
 }
 
 /// Heading of the compact-instructions block treated Claude workers receive.
-pub const COMPACT_INSTRUCTIONS_HEADING: &str = "## Compact summaries";
+///
+/// Matches the `Compact Instructions` section heading documented by Claude Code
+/// for customizing compaction summaries in `CLAUDE.md`.
+pub const COMPACT_INSTRUCTIONS_HEADING: &str = "## Compact Instructions";
 
 const COMPACT_INSTRUCTIONS: &str = "\n\
-## Compact summaries\n\
+## Compact Instructions\n\
 \n\
 If this session is compacted, keep the execution context, the task description, the open checklist, and the done-declaration command (`\"$BOSS_BIN\" propose done`) verbatim in the summary. Do not paraphrase or omit them.\n";
 

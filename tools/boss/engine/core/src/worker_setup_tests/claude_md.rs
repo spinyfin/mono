@@ -655,8 +655,8 @@ fn compact_instructions_keep_the_named_parts_and_are_the_only_difference() {
         "control worker rules must not carry compact instructions"
     );
     assert_eq!(
+        with_compact_instructions(treated.clone()),
         treated,
-        with_compact_instructions(untreated.clone()),
         "applying compact instructions twice must not duplicate the block"
     );
     assert!(treated.contains(COMPACT_INSTRUCTIONS_HEADING));
@@ -674,12 +674,19 @@ fn compact_instructions_keep_the_named_parts_and_are_the_only_difference() {
     for hidden in ["experiment", "treatment", "control arm", "worker_autocompact", "a/b"] {
         assert!(!lowered.contains(hidden), "the worker must not be told about {hidden}");
     }
-    let without_block = treated.replacen(
-        "\n## Compact summaries\n\nIf this session is compacted, keep the execution context, the task description, the open checklist, and the done-declaration command (`\"$BOSS_BIN\" propose done`) verbatim in the summary. Do not paraphrase or omit them.\n",
-        "",
-        1,
+    let prefix = untreated.strip_suffix('\n').unwrap_or(&untreated);
+    let suffix = treated
+        .strip_prefix(prefix)
+        .expect("treated rules must preserve untreated rules verbatim as a prefix");
+    assert!(
+        suffix.starts_with(&format!("\n{COMPACT_INSTRUCTIONS_HEADING}\n\n")),
+        "added suffix must begin with the compact-instructions heading"
     );
-    assert_eq!(without_block, untreated);
+    assert_eq!(
+        suffix.matches("\n## ").count(),
+        1,
+        "added suffix must contain only the compact-instructions section"
+    );
 }
 
 #[test]
