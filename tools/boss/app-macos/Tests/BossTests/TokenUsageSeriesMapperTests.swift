@@ -225,6 +225,55 @@ final class TokenUsageSeriesMapperTests: XCTestCase {
         XCTAssertEqual(mapper.groupLabels, ["Antigravity"])
     }
 
+    func testUnrecordedDriverGroupUsesEngineNotRecordedLabel() {
+        let withEngineLabels = makeMapper(report(
+            buckets: [(day0, [cell("claude"), cell("(none)")])],
+            groups: ["claude", "(none)"],
+            groupBy: .driver,
+            labels: ["claude": "claude", "(none)": "not recorded"]
+        ))
+        XCTAssertEqual(withEngineLabels.groupLabels, ["Claude", "not recorded"])
+        XCTAssertEqual(withEngineLabels.tokenBarsByGroup().map(\.series), ["Claude", "not recorded"])
+        XCTAssertEqual(withEngineLabels.tokenBarsByGroup().map(\.seriesKey), ["claude", "(none)"])
+
+        let withoutEngineLabels = makeMapper(report(
+            buckets: [(day0, [cell("(none)")])],
+            groups: ["(none)"],
+            groupBy: .driver
+        ))
+        XCTAssertEqual(withoutEngineLabels.groupLabels, ["not recorded"])
+    }
+
+    func testDuplicateGroupLabelsKeepDistinctSeriesIdentityAndDisambiguateDisplay() {
+        let ratiosA = UsageRatios(tokensPerRun: 100)
+        let ratiosB = UsageRatios(tokensPerRun: 200)
+        let mapper = makeMapper(report(
+            buckets: [
+                (day0, [cell("proj-a", ratios: ratiosA), cell("proj-b", ratios: ratiosB)]),
+                (day0 + day, [cell("proj-a", ratios: ratiosA), cell("proj-b", ratios: ratiosB)]),
+            ],
+            groups: ["proj-a", "proj-b"],
+            groupBy: .project,
+            labels: ["proj-a": "Core", "proj-b": "Core"]
+        ))
+        XCTAssertEqual(mapper.groupLabels, ["Core (proj-a)", "Core (proj-b)"])
+
+        let bars = mapper.tokenBarsByGroup().filter { $0.bucketIndex == 0 }
+        XCTAssertEqual(bars.map(\.seriesKey), ["proj-a", "proj-b"])
+        XCTAssertEqual(bars.map(\.series), ["Core (proj-a)", "Core (proj-b)"])
+        XCTAssertEqual(Set(bars.map(\.id)).count, 2)
+
+        let segments = mapper.normalizedSegments(.perRun)
+        XCTAssertEqual(segments.map(\.seriesKey), ["proj-a", "proj-b"])
+        XCTAssertEqual(segments.map(\.series), ["Core (proj-a)", "Core (proj-b)"])
+        XCTAssertEqual(Set(segments.map(\.id)).count, 2)
+        XCTAssertEqual(segments.map { $0.points.map(\.y) }, [[100, 100], [200, 200]])
+
+        let hoverRows = mapper.hoverTokensByGroup(0).rows
+        XCTAssertEqual(hoverRows.map(\.seriesKey), ["proj-a", "proj-b"])
+        XCTAssertEqual(hoverRows.map(\.label), ["Core (proj-a)", "Core (proj-b)"])
+    }
+
     func testGroupedTokensAndClassModeIsUnavailable() {
         let mapper = makeMapper(report(
             buckets: [(day0, [cell("claude"), cell("agy", measurement: measurement(tokens: 50, cacheWrite: nil, partial: true))])],
@@ -339,15 +388,49 @@ final class TokenUsageSeriesMapperTests: XCTestCase {
 
     func testUnpricedBucketsAreFlaggedNotDrawnAsZeroDollars() {
         let priced = measurement(usd: 1.5, usdPartial: true)
-        let unpriced = measurement(usd: nil)
+        let unpriceable = measurement(usd: nil, usdPartial: true)
+        let unmeasured = measurement(measured: 0, total: 2, tokens: 0, input: nil, output: nil, cacheWrite: nil, cacheRead: nil, usd: nil)
         let mapper = makeMapper(report(buckets: [
             (day0, [cell(measurement: priced)]),
-            (day0 + day, [cell(measurement: unpriced)]),
+            (day0 + day, [cell(measurement: unpriceable)]),
+            (day0 + 2 * day, [cell(measurement: unmeasured)]),
         ]))
         XCTAssertEqual(mapper.usdBars().map(\.value), [1.5])
-        XCTAssertEqual(mapper.usdFlags().map(\.kind), [.floor, .noData])
+        let flags = mapper.usdFlags()
+        XCTAssertEqual(flags.map(\.kind), [.floor, .noData, .noData])
+        XCTAssertFalse(flags[0].detail.contains("subscription"), "subscription billing never sets estimated_usd_partial")
         XCTAssertEqual(mapper.hoverUsd(1).rows.first?.value, "not priced")
+        XCTAssertEqual(mapper.hoverUsd(2).rows.first?.value, "not priced")
         XCTAssertTrue(mapper.hoverUsd(0).rows.first?.value.hasPrefix("est. $1.50") == true)
+    }
+
+    func testSubscriptionUnpricedCellIsNotFlaggedAndShowsSubscriptionReadout() {
+        let grokOnly = measurement(measured: 2, total: 2, tokens: 800, cacheWrite: nil, partial: true, usd: nil, usdPartial: false)
+        let ungrouped = makeMapper(report(buckets: [(day0, [cell(measurement: grokOnly)])]))
+        XCTAssertTrue(ungrouped.usdBars().isEmpty)
+        XCTAssertTrue(ungrouped.usdFlags().isEmpty)
+        XCTAssertEqual(ungrouped.hoverUsd(0).rows.first?.value, "unpriced (subscription)")
+
+        let claudePriced = measurement(measured: 2, total: 2, tokens: 1_000, usd: 1.5, usdPartial: false)
+        let groupedWithClaude = makeMapper(report(
+            buckets: [(day0, [cell("claude", measurement: claudePriced), cell("grok", measurement: grokOnly)])],
+            groups: ["claude", "grok"],
+            groupBy: .driver
+        ))
+        XCTAssertEqual(groupedWithClaude.usdBars().map(\.seriesKey), ["claude"])
+        XCTAssertEqual(groupedWithClaude.usdBars().map(\.value), [1.5])
+        XCTAssertTrue(groupedWithClaude.usdFlags().isEmpty, "subscription-unpriced driver beside a priced driver is not a floor gap")
+        XCTAssertEqual(groupedWithClaude.hoverUsd(0).rows.map(\.value), ["est. $1.50", "unpriced (subscription)"])
+
+        let codexUnpriceable = measurement(measured: 1, total: 1, tokens: 500, usd: nil, usdPartial: true)
+        let groupedWithCodex = makeMapper(report(
+            buckets: [(day0, [cell("codex", measurement: codexUnpriceable), cell("grok", measurement: grokOnly)])],
+            groups: ["codex", "grok"],
+            groupBy: .driver
+        ))
+        XCTAssertTrue(groupedWithCodex.usdBars().isEmpty)
+        XCTAssertEqual(groupedWithCodex.usdFlags().map(\.kind), [.noData])
+        XCTAssertEqual(groupedWithCodex.hoverUsd(0).rows.map(\.value), ["not priced", "unpriced (subscription)"])
     }
 
     // MARK: - Shading
@@ -425,14 +508,17 @@ final class TokenUsageSeriesMapperTests: XCTestCase {
         XCTAssertTrue(mapper.hoverTokensByGroup(0).title.contains("2026"))
     }
 
-    func testChartCalendarAlignsUnitsToEngineBuckets() {
+    func testChartCalendarAlignsUnitsToEngineBuckets() throws {
         XCTAssertEqual(UsageSeriesGeometry.unit(.week), .weekOfYear)
-        // The epoch (and so every engine week) starts on a Thursday.
+        // Engine week buckets start on Monday 00:00:00 UTC (`WEEK_EPOCH_OFFSET_S = 4 * 86_400`).
         let calendar = UsageSeriesGeometry.chartCalendar(.week, base: utcCalendar)
-        XCTAssertEqual(calendar.firstWeekday, 5)
+        XCTAssertEqual(calendar.firstWeekday, 2)
         XCTAssertEqual(UsageSeriesGeometry.chartCalendar(.day, base: utcCalendar).firstWeekday, utcCalendar.firstWeekday)
-        let start = UsageSeriesGeometry.date(604_800 * 2_900)
-        XCTAssertEqual(calendar.dateInterval(of: .weekOfYear, for: start)?.start, start)
+        let mondayStart: Int64 = 4 * 86_400 + 604_800 * 2_965
+        let mapper = makeMapper(report(buckets: [(mondayStart, [cell()])], width: .week))
+        let interval = try XCTUnwrap(calendar.dateInterval(of: .weekOfYear, for: mapper.plotSpans[0].start))
+        XCTAssertEqual(interval.start, mapper.plotSpans[0].start)
+        XCTAssertEqual(interval.end, mapper.plotSpans[0].end)
     }
 
     func testPlotSpaceKeepsTheUtcWallClockInTheViewersTimeZone() throws {
