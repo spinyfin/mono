@@ -1919,6 +1919,289 @@ mod restart_and_snapshot_tests {
     }
 
     #[test]
+    fn recovered_unsent_dispatch_advances_request_id_high_water_mark_across_two_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let intent_path = dir.path().join("intent.jsonl");
+        let wire_path = dir.path().join("wire.jsonl");
+        let snapshot_path = dir.path().join("snapshot.json");
+
+        // Process 1: wire journal reached request id 9; operator prompt A is
+        // queued and logged as Sent(A, 10), then the engine crashes before id 10
+        // reaches the wire journal.
+        let mut wire_records = vec![
+            wire(
+                1,
+                Direction::ToAgent,
+                json!({"jsonrpc":"2.0","id":9,"method":"initialize","params":{"protocolVersion":1}}),
+            ),
+            wire(
+                2,
+                Direction::FromAgent,
+                json!({"jsonrpc":"2.0","id":9,"result":{"protocolVersion":1}}),
+            ),
+        ];
+        write_wire_file(&wire_path, &wire_records);
+        {
+            let mut log = IntentLog::open(&intent_path).unwrap();
+            let a = log
+                .append_queued_at(
+                    100,
+                    PromptOrigin::Operator,
+                    "operator message A",
+                    Some("cm-a".to_owned()),
+                    Vec::new(),
+                )
+                .unwrap();
+            log.append_sent_at(101, a.intent_id(), RequestId::Number(10)).unwrap();
+        }
+
+        // Restart 1: recovers A back to `queued`. The request-id high-water mark
+        // must include the abandoned Sent(A, 10) so the next dispatch gets 11.
+        let restart1 = recover_from_files(
+            &wire_path,
+            Some(&intent_path),
+            None,
+            CredentialRedactor::none(),
+            UnsentDispatchPolicy::ReconcileNow,
+        )
+        .unwrap();
+        assert_eq!(restart1.recovered_unsent_intents.len(), 1);
+        assert_eq!(restart1.recovered_unsent_intents[0].intent_id, 1);
+        assert_eq!(restart1.reducer.highest_numeric_client_request_id(), Some(10));
+        save_snapshot(&snapshot_path, &restart1.reducer.snapshot()).unwrap();
+
+        // Process 2: higher-priority engine prompt E is queued ahead of A,
+        // allocated a fresh request id from the high-water mark (11), reaches
+        // the wire, and completes. The engine restarts again before A is retried.
+        let next_req_id = restart1.reducer.highest_numeric_client_request_id().unwrap_or(0) + 1;
+        assert_eq!(next_req_id, 11);
+        {
+            let mut log = IntentLog::open(&intent_path).unwrap();
+            let e = log
+                .append_queued_at(200, PromptOrigin::Engine, "engine prompt E", None, Vec::new())
+                .unwrap();
+            assert_eq!(e.intent_id(), 2);
+            log.append_sent_at(201, e.intent_id(), RequestId::Number(next_req_id))
+                .unwrap();
+        }
+        wire_records.push(wire(
+            3,
+            Direction::ToAgent,
+            json!({"jsonrpc":"2.0","id":next_req_id,"method":"session/prompt","params":{"sessionId":"s","prompt":[]}}),
+        ));
+        wire_records.push(wire(
+            4,
+            Direction::FromAgent,
+            json!({"jsonrpc":"2.0","id":next_req_id,"result":{"stopReason":"end_turn"}}),
+        ));
+        write_wire_file(&wire_path, &wire_records);
+
+        // Restart 2: both full replay and snapshot+tail replay must bind the
+        // wire prompt to E (Engine origin), leave E completed, keep A queued
+        // exactly once, and agree identically.
+        let full = recover_from_files(
+            &wire_path,
+            Some(&intent_path),
+            None,
+            CredentialRedactor::none(),
+            UnsentDispatchPolicy::ReconcileNow,
+        )
+        .unwrap();
+        let from_snap = recover_from_files(
+            &wire_path,
+            Some(&intent_path),
+            Some(&snapshot_path),
+            CredentialRedactor::none(),
+            UnsentDispatchPolicy::ReconcileNow,
+        )
+        .unwrap();
+        assert!(matches!(from_snap.snapshot_status, SnapshotLoadStatus::Hit { .. }));
+        assert_eq!(full.recovered_unsent_intents.len(), 1);
+        assert_eq!(full.recovered_unsent_intents[0].intent_id, 1);
+
+        for result in [&full, &from_snap] {
+            assert_eq!(result.reducer.highest_numeric_client_request_id(), Some(11));
+            assert!(result.reducer.queue().dispatched_awaiting_wire().is_empty());
+            assert!(result.reducer.queue().in_flight().is_none());
+            assert_eq!(result.reducer.queue().queued_len(), 1);
+            assert_eq!(result.reducer.queue().queued()[0].intent_id, 1);
+            assert_eq!(result.reducer.queue().queued()[0].origin, PromptOrigin::Operator);
+            assert_eq!(result.reducer.queue().queued()[0].text(), "operator message A");
+
+            let prompt_items: Vec<_> = result
+                .reducer
+                .items()
+                .iter()
+                .filter(|item| item.id.starts_with("prompt-"))
+                .collect();
+            assert_eq!(prompt_items.len(), 1, "only E's wire prompt should be emitted");
+            match &prompt_items[0].kind {
+                CoordinatorChatItemKind::Message(msg) => {
+                    assert_eq!(msg.role, CoordinatorChatMessageRole::Engine);
+                    assert_eq!(msg.text, "engine prompt E");
+                    assert_eq!(msg.client_message_id, None);
+                }
+                other => panic!("expected Message, got {other:?}"),
+            }
+            let turn_boundaries: Vec<_> = result
+                .reducer
+                .items()
+                .iter()
+                .filter_map(|item| match &item.kind {
+                    CoordinatorChatItemKind::TurnBoundary(b) => Some(b),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(turn_boundaries.len(), 1);
+            assert_eq!(turn_boundaries[0].origin, Some(CoordinatorChatTurnOrigin::Engine));
+        }
+
+        assert_eq!(full.reducer.state(), from_snap.reducer.state());
+        assert_eq!(full.reducer.items(), from_snap.reducer.items());
+        assert_eq!(full.reducer.queue(), from_snap.reducer.queue());
+        assert_eq!(
+            full.reducer.highest_numeric_client_request_id(),
+            from_snap.reducer.highest_numeric_client_request_id()
+        );
+    }
+
+    #[test]
+    fn durable_requeued_intent_prevents_abandoned_id_collision_across_two_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let intent_path = dir.path().join("intent.jsonl");
+        let wire_path = dir.path().join("wire.jsonl");
+        let snapshot_path = dir.path().join("snapshot.json");
+
+        // Process 1: operator prompt A is logged as Sent(A, 10), then crashes
+        // before id 10 reaches the wire journal.
+        write_wire_file(&wire_path, &[]);
+        {
+            let mut log = IntentLog::open(&intent_path).unwrap();
+            let a = log
+                .append_queued_at(
+                    100,
+                    PromptOrigin::Operator,
+                    "operator message A",
+                    Some("cm-a".to_owned()),
+                    Vec::new(),
+                )
+                .unwrap();
+            log.append_sent_at(101, a.intent_id(), RequestId::Number(10)).unwrap();
+        }
+
+        // Restart 1: recovers A, records durable Requeued(A) in the intent log,
+        // applies it to the reducer, and saves a snapshot.
+        let mut restart1 = recover_from_files(
+            &wire_path,
+            Some(&intent_path),
+            None,
+            CredentialRedactor::none(),
+            UnsentDispatchPolicy::ReconcileNow,
+        )
+        .unwrap();
+        assert_eq!(restart1.recovered_unsent_intents.len(), 1);
+        {
+            let mut log = IntentLog::open(&intent_path).unwrap();
+            for prompt in &restart1.recovered_unsent_intents {
+                let rec = log.append_requeued_at(150, prompt.intent_id).unwrap();
+                restart1.reducer.apply_intent_record(&rec);
+            }
+        }
+        save_snapshot(&snapshot_path, &restart1.reducer.snapshot()).unwrap();
+
+        // Process 2: higher-priority engine prompt E reuses A's abandoned id 10
+        // and completes on the wire before A is retried.
+        {
+            let mut log = IntentLog::open(&intent_path).unwrap();
+            let e = log
+                .append_queued_at(200, PromptOrigin::Engine, "engine prompt E", None, Vec::new())
+                .unwrap();
+            assert_eq!(e.intent_id(), 2);
+            log.append_sent_at(201, e.intent_id(), RequestId::Number(10)).unwrap();
+        }
+        let wire_records = vec![
+            wire(
+                1,
+                Direction::ToAgent,
+                json!({"jsonrpc":"2.0","id":10,"method":"session/prompt","params":{"sessionId":"s","prompt":[]}}),
+            ),
+            wire(
+                2,
+                Direction::FromAgent,
+                json!({"jsonrpc":"2.0","id":10,"result":{"stopReason":"end_turn"}}),
+            ),
+        ];
+        write_wire_file(&wire_path, &wire_records);
+
+        // Restart 2: even with reused request id 10, durable Requeued(A)
+        // removes A's abandoned attempt from the wire join so E binds to id 10,
+        // E is not requeued, A remains queued once, and full replay matches
+        // snapshot+tail replay identically.
+        let full = recover_from_files(
+            &wire_path,
+            Some(&intent_path),
+            None,
+            CredentialRedactor::none(),
+            UnsentDispatchPolicy::ReconcileNow,
+        )
+        .unwrap();
+        let from_snap = recover_from_files(
+            &wire_path,
+            Some(&intent_path),
+            Some(&snapshot_path),
+            CredentialRedactor::none(),
+            UnsentDispatchPolicy::ReconcileNow,
+        )
+        .unwrap();
+        assert!(matches!(from_snap.snapshot_status, SnapshotLoadStatus::Hit { .. }));
+
+        for result in [&full, &from_snap] {
+            assert!(result.recovered_unsent_intents.is_empty());
+            assert!(result.reducer.queue().dispatched_awaiting_wire().is_empty());
+            assert!(result.reducer.queue().in_flight().is_none());
+            assert_eq!(result.reducer.queue().queued_len(), 1);
+            assert_eq!(result.reducer.queue().queued()[0].intent_id, 1);
+            assert_eq!(result.reducer.queue().queued()[0].origin, PromptOrigin::Operator);
+            assert_eq!(result.reducer.queue().queued()[0].text(), "operator message A");
+
+            let prompt_items: Vec<_> = result
+                .reducer
+                .items()
+                .iter()
+                .filter(|item| item.id.starts_with("prompt-"))
+                .collect();
+            assert_eq!(prompt_items.len(), 1);
+            match &prompt_items[0].kind {
+                CoordinatorChatItemKind::Message(msg) => {
+                    assert_eq!(msg.role, CoordinatorChatMessageRole::Engine);
+                    assert_eq!(msg.text, "engine prompt E");
+                    assert_eq!(msg.client_message_id, None);
+                }
+                other => panic!("expected Message, got {other:?}"),
+            }
+            let turn_boundaries: Vec<_> = result
+                .reducer
+                .items()
+                .iter()
+                .filter_map(|item| match &item.kind {
+                    CoordinatorChatItemKind::TurnBoundary(b) => Some(b),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(turn_boundaries.len(), 1);
+            assert_eq!(turn_boundaries[0].origin, Some(CoordinatorChatTurnOrigin::Engine));
+        }
+
+        assert_eq!(full.reducer.state(), from_snap.reducer.state());
+        assert_eq!(full.reducer.items(), from_snap.reducer.items());
+        assert_eq!(full.reducer.queue(), from_snap.reducer.queue());
+        assert_eq!(
+            full.reducer.highest_numeric_client_request_id(),
+            from_snap.reducer.highest_numeric_client_request_id()
+        );
+    }
+
+    #[test]
     fn recover_from_files_tolerates_intent_log_truncated_mid_utf8() {
         let dir = tempfile::tempdir().unwrap();
         let intent_path = dir.path().join("intent.jsonl");

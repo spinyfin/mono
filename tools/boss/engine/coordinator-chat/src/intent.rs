@@ -77,6 +77,10 @@ pub enum IntentRecordKind {
     /// A previously queued prompt was dispatched as `session/prompt` carrying
     /// `request_id`.
     Sent { intent_id: u64, request_id: RequestId },
+    /// A previously `Sent` prompt that never reached the wire journal before a
+    /// crash was returned to the queue on recovery, abandoning the earlier
+    /// dispatch attempt so it can no longer bind a wire prompt during replay.
+    Requeued { intent_id: u64 },
     /// A queued prompt was removed without being sent to the agent.
     Withdrawn { intent_id: u64, reason: WithdrawReason },
 }
@@ -87,6 +91,7 @@ impl IntentRecord {
         match &self.kind {
             IntentRecordKind::Queued { intent_id, .. }
             | IntentRecordKind::Sent { intent_id, .. }
+            | IntentRecordKind::Requeued { intent_id }
             | IntentRecordKind::Withdrawn { intent_id, .. } => *intent_id,
         }
     }
@@ -199,6 +204,17 @@ impl IntentLog {
     /// Appends a `Sent` record with an explicit `ts_ms` timestamp.
     pub fn append_sent_at(&mut self, ts_ms: u64, intent_id: u64, request_id: RequestId) -> io::Result<IntentRecord> {
         self.append_kind(ts_ms, IntentRecordKind::Sent { intent_id, request_id })
+    }
+
+    /// Appends a `Requeued` record marking a previously `Sent` attempt as
+    /// abandoned and returned to the queue on recovery.
+    pub fn append_requeued(&mut self, intent_id: u64) -> io::Result<IntentRecord> {
+        self.append_requeued_at(now_ms(), intent_id)
+    }
+
+    /// Appends a `Requeued` record with an explicit `ts_ms` timestamp.
+    pub fn append_requeued_at(&mut self, ts_ms: u64, intent_id: u64) -> io::Result<IntentRecord> {
+        self.append_kind(ts_ms, IntentRecordKind::Requeued { intent_id })
     }
 
     /// Appends a `Withdrawn` record for `intent_id`.

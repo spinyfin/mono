@@ -225,10 +225,22 @@ impl ConversationReducer {
             .collect()
     }
 
-    /// Highest numeric client `RequestId` observed on the wire so far, useful
-    /// for seeding a fresh connection's id counter after a restart.
+    /// Highest numeric client `RequestId` observed on the wire or in an
+    /// `IntentRecord::Sent` record so far, useful for seeding a fresh
+    /// connection's id counter after a restart so no previously logged request
+    /// id (including an abandoned unsent attempt) is ever reused.
     pub fn highest_numeric_client_request_id(&self) -> Option<i64> {
         self.wire.highest_numeric_client_request_id
+    }
+
+    fn observe_client_request_id(&mut self, id: &RequestId) {
+        if let RequestId::Number(num) = id {
+            self.wire.highest_numeric_client_request_id = Some(
+                self.wire
+                    .highest_numeric_client_request_id
+                    .map_or(*num, |prev| prev.max(*num)),
+            );
+        }
     }
 
     /// Applies one append-only record from the generation's intent log.
@@ -262,9 +274,13 @@ impl ConversationReducer {
                 });
             }
             IntentRecordKind::Sent { intent_id, request_id } => {
+                self.observe_client_request_id(request_id);
                 self.queue_state
                     .queue
                     .mark_intent_sent(*intent_id, request_id.clone(), record.ts_ms);
+            }
+            IntentRecordKind::Requeued { intent_id } => {
+                self.queue_state.queue.apply_requeued_intent(*intent_id);
             }
             IntentRecordKind::Withdrawn { intent_id, .. } => {
                 self.queue_state.queue.apply_withdrawn_intent(*intent_id);
@@ -401,13 +417,7 @@ impl ConversationReducer {
         params: Option<&Value>,
         delta: &mut ReduceDelta,
     ) {
-        if let RequestId::Number(num) = id {
-            self.wire.highest_numeric_client_request_id = Some(
-                self.wire
-                    .highest_numeric_client_request_id
-                    .map_or(*num, |prev| prev.max(*num)),
-            );
-        }
+        self.observe_client_request_id(id);
         let detail = match method {
             "session/set_mode" => params
                 .and_then(|value| value.get("modeId"))

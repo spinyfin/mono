@@ -421,6 +421,22 @@ impl TurnQueue {
         withdrawn
     }
 
+    /// Applies a `Requeued` intent-log record during live or replay processing.
+    ///
+    /// Removes `intent_id` from `dispatched_awaiting_wire` and re-inserts it
+    /// into `queued` preserving origin/intent order, abandoning the unsent
+    /// attempt so it cannot bind a subsequent wire prompt. Never touches a
+    /// prompt that is already `in_flight` on the wire.
+    pub(crate) fn apply_requeued_intent(&mut self, intent_id: u64) -> Option<QueuedPrompt> {
+        let pos = self
+            .dispatched_awaiting_wire
+            .iter()
+            .position(|entry| entry.prompt.intent_id == intent_id)?;
+        let prompt = self.dispatched_awaiting_wire.remove(pos).prompt;
+        self.insert_preserving_origin_intent_order(prompt.clone());
+        Some(prompt)
+    }
+
     /// Applies a `Withdrawn` intent-log record during live or replay processing.
     ///
     /// Removes the prompt from `queued`, or from `dispatched_awaiting_wire` if
