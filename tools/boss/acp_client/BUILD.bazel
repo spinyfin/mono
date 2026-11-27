@@ -4,8 +4,8 @@ load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 exports_files(["Cargo.toml"])
 
 # ACP v1 client: line framing, the wire journal record, and a connection that
-# owns its request-id table. Nothing depends on it yet except the probe below;
-# widen the visibility when the engine's coordinator chat service lands.
+# owns its request-id table. Linked by the probe below and by the engine's
+# coordinator-chat reducer crate.
 rust_library(
     name = "acp_client",
     srcs = glob(
@@ -16,7 +16,7 @@ rust_library(
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    visibility = ["//visibility:private"],
+    visibility = ["//tools/boss/engine/coordinator-chat:__pkg__"],
     deps = ["//tools/boss/agent-host:agent_host"] + all_crate_deps(normal = True),
 )
 

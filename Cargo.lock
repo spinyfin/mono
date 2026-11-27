@@ -903,6 +903,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-engine-coordinator-chat"
+version = "0.1.0"
+dependencies = [
+ "boss-acp-client",
+ "boss-agent-host",
+ "boss-protocol",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "boss-engine-day-rotated-log"
 version = "0.1.0"
 dependencies = [
