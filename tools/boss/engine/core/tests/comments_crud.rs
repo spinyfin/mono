@@ -101,6 +101,44 @@ fn unexpected(context: &str, event: FrontendEvent) -> anyhow::Error {
 }
 
 #[tokio::test]
+async fn design_comment_requires_selected_quote() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    for quote in ["", "selected design text"] {
+        let result = create_comment(
+            &mut client,
+            CreateCommentInput {
+                artifact_kind: "pr_doc".to_owned(),
+                artifact_id: "pr_doc:test:main:design.md".to_owned(),
+                doc_version: "v0".to_owned(),
+                anchor: anchor(quote, "", ""),
+                body: "A design comment".to_owned(),
+                author: "user:test".to_owned(),
+                plain_text_projection_version: 1,
+            },
+        )
+        .await;
+        if quote.is_empty() {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("comment anchor.exact may not be empty")
+            );
+        } else {
+            assert_eq!(result?.anchor.exact, quote);
+        }
+    }
+    assert_eq!(
+        list_comments(&mut client, "pr_doc", "pr_doc:test:main:design.md", false)
+            .await?
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn comments_create_list_resolve_dismiss_round_trip() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;

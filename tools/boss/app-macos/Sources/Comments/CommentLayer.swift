@@ -513,7 +513,7 @@ final class CommentLayer: NSObject, ObservableObject {
     func addComment(quoted: String, body: String) {
         guard !isReadOnly else { return }
         let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, guideVersionId == nil || !quoted.isEmpty else { return }
+        guard !trimmed.isEmpty, !quoted.isEmpty else { return }
         // Leave the composer (and its draft) open when the retry queue is full.
         if backend != nil, !artifactId.isEmpty,
            backend?.canAcceptUserSubmission(describing: "Your comment") == false { return }
@@ -1149,10 +1149,18 @@ final class CommentLayer: NSObject, ObservableObject {
 
     /// Reads the selection via pasteboard copy. Acceptable Phase 1 trade-off:
     /// called only when the user explicitly opens the comment form.
-    private func captureCurrentSelection() -> String? {
+    func captureCurrentSelection() -> String? {
         if let provided = liveSelectionProvider { return provided() }
         let before = NSPasteboard.general.changeCount
-        NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: nil)
+        // Selection detection is window-scoped; Copy must use the same responder
+        // chain even before this document window becomes the app key window.
+        let action = #selector(NSText.copy(_:))
+        var responder = (hostWindow ?? NSApp.keyWindow)?.firstResponder
+        while let current = responder, !current.responds(to: action) {
+            responder = current.nextResponder
+        }
+        guard let responder else { return nil }
+        NSApp.sendAction(action, to: responder, from: nil)
         guard NSPasteboard.general.changeCount != before else { return nil }
         return NSPasteboard.general.string(forType: .string)
     }

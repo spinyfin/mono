@@ -31,6 +31,11 @@ struct CommentPopover: View {
         VStack(alignment: .leading, spacing: 12) {
             Text(isResumingDraft ? "Resume Comment" : "New Comment")
                 .font(.headline)
+            if layer.pendingQuotedText.isEmpty {
+                Text("Select text in the document before adding a comment.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             if isResumingDraft {
                 Text(layer.pendingQuotedText)
                     .font(.caption)
@@ -76,7 +81,7 @@ struct CommentPopover: View {
                     submit()
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled((layer.guideVersionId != nil && layer.pendingQuotedText.isEmpty)
+                .disabled(layer.pendingQuotedText.isEmpty
                     || commentBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }

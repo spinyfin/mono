@@ -62,7 +62,7 @@ final class CommentLayerTests: XCTestCase {
 
     func testAddCommentTrimsBodyWhitespace() {
         let layer = CommentLayer()
-        layer.addComment(quoted: "", body: "  hello  ")
+        layer.addComment(quoted: "selected text", body: "  hello  ")
         XCTAssertEqual(layer.comments[0].body, "hello")
     }
 
@@ -368,6 +368,45 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertFalse(
             layer.hasCurrentSelection(),
             "a selection that lives in a different window must not count as this layer's own")
+    }
+
+    func testCaptureSelectionUsesDocumentWindowBeforeItBecomesKey() {
+        let layer = CommentLayer()
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 200, height: 100),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        let textView = NSTextView(frame: window.contentView!.bounds)
+        textView.string = "The selected quote is here"
+        window.contentView = textView
+        window.makeFirstResponder(textView)
+        textView.setSelectedRange(NSRange(location: 4, length: 14))
+        layer.setHostWindow(window)
+
+        XCTAssertFalse(window.isKeyWindow)
+        XCTAssertTrue(layer.hasCurrentSelection())
+        let quote = layer.captureCurrentSelection()
+        XCTAssertEqual(quote, "selected quote")
+        layer.addComment(quoted: quote ?? "", body: "Keep this")
+        XCTAssertEqual(layer.comments.first?.anchor.exact, "selected quote")
+
+        textView.setSelectedRange(NSRange(location: 4, length: 0))
+        XCTAssertNil(layer.captureCurrentSelection(), "Do not reuse the previous clipboard quote")
+    }
+
+    func testDesignDocCommentWithoutSelectionKeepsComposerAndDoesNotSend() {
+        let layer = CommentLayer()
+        let backend = FakeCommentBackend()
+        layer.configure(source: "Design prose", baseURL: nil,
+            artifact: .prDoc(repoRemoteURL: "git@github.com:o/r.git", branch: "main", path: "design.md"),
+            backend: backend)
+        layer.isShowingPopover = true
+        layer.addComment(quoted: "", body: "A design comment")
+        XCTAssertTrue(backend.createCalls.isEmpty)
+        XCTAssertTrue(layer.comments.isEmpty)
+        XCTAssertTrue(layer.isShowingPopover)
+
+        layer.addComment(quoted: "Design prose", body: "A design comment")
+        XCTAssertEqual(backend.createCalls.first?.anchor.exact, "Design prose")
     }
 
     // MARK: - W3C anchor capture
