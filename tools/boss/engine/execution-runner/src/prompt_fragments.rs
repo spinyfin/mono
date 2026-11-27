@@ -51,6 +51,100 @@ pub fn prepush_rebase_fragment() -> String {
     )
 }
 
+/// One-line pointer for treated PR-producing briefs when the full
+/// [`prepush_rebase_fragment`] lives in the worker rules.
+pub(crate) fn prepush_rebase_pointer() -> &'static str {
+    "\nBefore the first push and every later push, follow the \"Before every PR branch push\" section in the worker rules (default branch only, fetch and local-rebase, resolve conflicts cleanly, re-validate).\n"
+}
+
+/// Authoritative check-bypass prohibition shared by treated worker rules and
+/// control briefs.
+pub(crate) fn check_bypass_prohibition_body() -> &'static str {
+    "**Hard constraint — fix failing checks at the root cause; never bypass them.**\n\
+     Do not suppress failures with exclusions/allowlists (`CHECKS.yaml`, checkleft), lint-disable comments, `allow_bypass` or override flags, `--no-verify` or skipped hooks, broad `#[allow(...)]` / `// swiftlint:disable` / `# noqa`, deleted/ignored/xfail/skipped tests, weakened assertions, or raised thresholds/limits. Fix the underlying code, tests, lint, or file size instead. A genuinely necessary check relaxation requires approval by the repo owner with full justification: STOP and surface it. Use the typed question flags on a blocked declaration when that channel is enabled; never decide autonomously.\n"
+}
+
+/// One-line pointer for treated briefs when [`check_bypass_prohibition_body`]
+/// lives in the worker rules.
+pub(crate) fn check_bypass_prohibition_pointer() -> &'static str {
+    "\nFollow the \"Fix failing checks at the root cause\" section in the worker rules — never bypass or suppress a failing check.\n"
+}
+
+/// Long-form details of the no-`timeout` and command-diagnosis rules for
+/// treated build-gate Standard worker rules. Expands on the driver preamble's
+/// opening no-`timeout` line without repeating that sentence verbatim.
+pub(crate) fn long_running_commands_rules() -> &'static str {
+    "## Long-running build and test commands\n\
+     \n\
+     Bazel's own per-test timeouts (test size and timeout attributes) are what bound tests; do not wrap other build or test commands in a shell `timeout` either. A build that is still compiling with no errors is making progress, even when it is slow because other builds share the machine. If a wait bound is needed (for example a polling yield), keep polling the running command instead of killing it. If a hard cap is ever unavoidable for some other command, it must be at least two hours, and a timeout must never be treated as a reason to rerun the same command under the same cap. To diagnose a command, inspect only this invocation's output base and logs; never infer ownership or blockage from global process-name matches.\n"
+}
+
+/// One-line pointer for treated pre-push build gates when
+/// [`long_running_commands_rules`] lives in the worker rules.
+pub(crate) fn long_running_commands_pointer() -> &'static str {
+    "Follow the \"Long-running build and test commands\" section in the worker rules (no shell `timeout`; keep polling a still-compiling build; inspect only this invocation's logs)."
+}
+
+/// Whether a Standard execution kind can touch enough files to hit the
+/// repository `change/file-count` limit (and thus needs the split-vs-bypass
+/// file-count protocol in its worker rules and done-declaration section).
+///
+/// Single-file doc kinds (`investigation_implementation`, `project_design`,
+/// `product_design`), infra retriggers (`ci_remediation`), and scope-frozen
+/// conflict resolutions (`conflict_resolution`) cannot expand a PR past the
+/// file-count limit.
+pub(crate) fn execution_kind_supports_file_count_protocol(execution_kind: &str) -> bool {
+    matches!(
+        execution_kind,
+        "task_implementation" | "chore_implementation" | "revision_implementation"
+    )
+}
+
+/// Whether a Standard execution kind can legitimately block on another code PR
+/// landing first (`create-prerequisite-task` / `link-prerequisite-task`).
+pub(crate) fn execution_kind_supports_prerequisite_questions(execution_kind: &str) -> bool {
+    matches!(
+        execution_kind,
+        "task_implementation" | "chore_implementation" | "revision_implementation" | "conflict_resolution"
+    )
+}
+
+/// Whether a Standard execution kind can ask a multi-way `--answer-type
+/// multiple-choice` question.
+pub(crate) fn execution_kind_supports_multiple_choice_questions(execution_kind: &str) -> bool {
+    execution_kind != "ci_remediation"
+}
+
+/// Whether a Standard execution kind carries a pre-push build gate (and
+/// therefore needs the long-running command rules and the validation-failure
+/// gate-exception paragraph).
+pub(crate) fn execution_kind_has_build_gate(execution_kind: &str) -> bool {
+    matches!(
+        execution_kind,
+        "task_implementation" | "chore_implementation" | "revision_implementation" | "conflict_resolution"
+    )
+}
+
+/// Whether a Standard execution kind can declare `--outcome no-changes-needed`.
+///
+/// Matches `no_op_completion_directive` / `revision_no_op_completion_directive`
+/// and `completion::no_op`: only fresh task/chore implementations (no bound PR
+/// yet) and revisions support closing as a sanctioned no-op.
+pub(crate) fn execution_kind_supports_no_op_outcome(execution_kind: &str, has_bound_pr: bool) -> bool {
+    execution_kind == "revision_implementation"
+        || (!has_bound_pr && matches!(execution_kind, "task_implementation" | "chore_implementation"))
+}
+
+/// Whether a Standard execution already has a bound PR (so `--superseded-by`
+/// can apply).
+pub(crate) fn execution_kind_has_bound_pr(execution_kind: &str, existing_pr_url: bool) -> bool {
+    existing_pr_url
+        || matches!(
+            execution_kind,
+            "revision_implementation" | "conflict_resolution" | "ci_remediation"
+        )
+}
+
 /// The one-sentence rule for a command a worker deliberately runs in the
 /// background: declare the wait, and never idle in a wait-loop without one.
 ///

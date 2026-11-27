@@ -2301,9 +2301,12 @@ mod experiment_arm_tests {
     //! site records), and the default is "nothing was running".
 
     use super::*;
-    use crate::feature_flags::{BATCHED_SEARCH_EXPERIMENT, ExperimentArm, ExperimentArmSet};
+    use crate::feature_flags::{
+        BATCHED_SEARCH_EXPERIMENT, ExperimentArm, ExperimentArmSet, SLIM_WORKER_BRIEF_EXPERIMENT,
+    };
 
     const RULE: &str = "**Batch independent tool calls.**";
+    const SLIM_REBASE_POINTER: &str = "\"Before every PR branch push\" section in the worker rules";
 
     async fn compose_with(arms: Option<ExperimentArmSet>, workspace: &Path) -> ComposedWorkerSpawn {
         let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
@@ -2326,7 +2329,10 @@ mod experiment_arm_tests {
             .created_at("2026-05-15T00:00:00Z")
             .updated_at("2026-05-15T00:00:00Z")
             .build();
-        let opts = WorkerSpawnOpts::builder().review_signal_checks(|_| &[]);
+        let opts = WorkerSpawnOpts::builder()
+            .review_signal_checks(|_| &[])
+            .run_done_proposals_seam_enabled(true)
+            .worker_signal_proposals_seam_enabled(true);
         let opts = match arms {
             Some(arms) => opts.experiment_arms(arms).build(),
             None => opts.build(),
@@ -2350,6 +2356,12 @@ mod experiment_arm_tests {
         arms
     }
 
+    fn slim_set(arm: ExperimentArm) -> ExperimentArmSet {
+        let mut arms = ExperimentArmSet::new();
+        arms.insert(SLIM_WORKER_BRIEF_EXPERIMENT, arm);
+        arms
+    }
+
     #[tokio::test]
     async fn a_caller_that_resolves_no_arms_records_an_empty_set_and_is_never_treated() {
         // The remote spawn path builds its options without arms.
@@ -2357,6 +2369,7 @@ mod experiment_arm_tests {
         let composed = compose_with(None, workspace.path()).await;
         assert_eq!(composed.spawn_config.experiment_arms.as_deref(), Some("{}"));
         assert!(!composed.prompt_text.contains(RULE));
+        assert!(!composed.prompt_text.contains(SLIM_REBASE_POINTER));
     }
 
     #[tokio::test]
@@ -2379,6 +2392,44 @@ mod experiment_arm_tests {
             (ExperimentArm::Stopped, r#"{"batched_search":"stopped"}"#),
         ] {
             let composed = compose_with(Some(set(arm)), workspace.path()).await;
+            assert_eq!(composed.prompt_text, untreated.prompt_text, "{arm:?}");
+            assert_eq!(
+                composed.spawn_config.experiment_arms.as_deref(),
+                Some(recorded),
+                "{arm:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn slim_worker_brief_treatment_shrinks_the_brief_and_is_recorded() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("MODULE.bazel"), "").unwrap();
+        let untreated = compose_with(None, workspace.path()).await;
+        let treated = compose_with(Some(slim_set(ExperimentArm::Treatment)), workspace.path()).await;
+        assert!(
+            treated.prompt_text.contains(SLIM_REBASE_POINTER),
+            "treated prompt should carry the slim rebase pointer"
+        );
+        assert!(
+            !treated.prompt_text.contains("### Before every PR branch push"),
+            "treated prompt should not duplicate the long-form pre-push rebase block"
+        );
+        assert!(
+            treated.prompt_text.len() < untreated.prompt_text.len(),
+            "treated brief ({}) must be smaller than control ({})",
+            treated.prompt_text.len(),
+            untreated.prompt_text.len(),
+        );
+        assert_eq!(
+            treated.spawn_config.experiment_arms.as_deref(),
+            Some(r#"{"slim_worker_brief":"treatment"}"#)
+        );
+        for (arm, recorded) in [
+            (ExperimentArm::Control, r#"{"slim_worker_brief":"control"}"#),
+            (ExperimentArm::Stopped, r#"{"slim_worker_brief":"stopped"}"#),
+        ] {
+            let composed = compose_with(Some(slim_set(arm)), workspace.path()).await;
             assert_eq!(composed.prompt_text, untreated.prompt_text, "{arm:?}");
             assert_eq!(
                 composed.spawn_config.experiment_arms.as_deref(),

@@ -58,6 +58,14 @@ pub const WORKER_AUTOCOMPACT_EXPERIMENT: &str = "worker_autocompact";
 /// Splits [`WORKER_AUTOCOMPACT_EXPERIMENT`] between half of families and all.
 pub const WORKER_AUTOCOMPACT_AB_SPLIT_FLAG: &str = "worker_autocompact_ab_split";
 
+/// Key of the slim-worker-brief experiment: state each worker rule once (long
+/// form in the worker rules, one-line pointer in the brief) and gate
+/// kind-specific sections to the execution kinds that can use them.
+pub const SLIM_WORKER_BRIEF_EXPERIMENT: &str = "slim_worker_brief";
+
+/// Splits [`SLIM_WORKER_BRIEF_EXPERIMENT`] between half of families and all.
+pub const SLIM_WORKER_BRIEF_AB_SPLIT_FLAG: &str = "slim_worker_brief_ab_split";
+
 /// A surface on which at most one experiment may be assigned at a time.
 ///
 /// Two experiments that rewrite the same instructions, or reshape the same
@@ -126,6 +134,12 @@ pub const EXPERIMENTS: &[ExperimentSpec] = &[
     ExperimentSpec {
         key: WORKER_AUTOCOMPACT_EXPERIMENT,
         lane: None,
+        requires: &[],
+        splits: true,
+    },
+    ExperimentSpec {
+        key: SLIM_WORKER_BRIEF_EXPERIMENT,
+        lane: Some(ExperimentLane::WorkerPrompt),
         requires: &[],
         splits: true,
     },
@@ -916,5 +930,62 @@ mod tests {
         store.set(BATCHED_SEARCH_EXPERIMENT, false).unwrap();
         store.stop_experiments_not_running(&mut recorded);
         assert_eq!(recorded.get(BATCHED_SEARCH_EXPERIMENT), Some(ExperimentArm::Stopped));
+    }
+
+    #[test]
+    fn slim_worker_brief_is_registered_in_the_prompt_lane_and_ships_inert() {
+        let spec = EXPERIMENTS
+            .iter()
+            .find(|spec| spec.key == SLIM_WORKER_BRIEF_EXPERIMENT)
+            .expect("slim_worker_brief must be registered");
+        assert_eq!(spec.lane, Some(ExperimentLane::WorkerPrompt));
+        assert!(spec.splits);
+        assert!(spec.requires.is_empty());
+        assert_eq!(ab_split_flag_name(spec.key), SLIM_WORKER_BRIEF_AB_SPLIT_FLAG);
+
+        let (_tmp, store) = store();
+        assert_eq!(
+            store.experiment_state(SLIM_WORKER_BRIEF_EXPERIMENT),
+            ExperimentState::Off
+        );
+        assert!(store.resolve_experiment_arms(|_| 0).is_empty());
+
+        store.set(SLIM_WORKER_BRIEF_EXPERIMENT, true).unwrap();
+        assert_eq!(
+            store.experiment_state(SLIM_WORKER_BRIEF_EXPERIMENT),
+            ExperimentState::Split
+        );
+        assert_eq!(
+            store.resolve_experiment_arms(|_| 10).get(SLIM_WORKER_BRIEF_EXPERIMENT),
+            Some(ExperimentArm::Treatment)
+        );
+        assert_eq!(
+            store.resolve_experiment_arms(|_| 90).get(SLIM_WORKER_BRIEF_EXPERIMENT),
+            Some(ExperimentArm::Control)
+        );
+
+        // Sharing the worker_prompt lane: batched_search is registered first and holds the lane.
+        store.set(BATCHED_SEARCH_EXPERIMENT, true).unwrap();
+        assert_eq!(
+            store.experiment_state(SLIM_WORKER_BRIEF_EXPERIMENT),
+            ExperimentState::Held {
+                holder: BATCHED_SEARCH_EXPERIMENT,
+            }
+        );
+        let both = store.resolve_experiment_arms(|_| 10);
+        assert_eq!(both.get(BATCHED_SEARCH_EXPERIMENT), Some(ExperimentArm::Treatment));
+        assert_eq!(both.get(SLIM_WORKER_BRIEF_EXPERIMENT), None);
+
+        store.set(BATCHED_SEARCH_EXPERIMENT, false).unwrap();
+        store.set(SLIM_WORKER_BRIEF_AB_SPLIT_FLAG, false).unwrap();
+        assert_eq!(
+            store.experiment_state(SLIM_WORKER_BRIEF_EXPERIMENT),
+            ExperimentState::All
+        );
+        assert!(
+            store
+                .resolve_experiment_arms(|_| 90)
+                .is_treated(SLIM_WORKER_BRIEF_EXPERIMENT)
+        );
     }
 }
