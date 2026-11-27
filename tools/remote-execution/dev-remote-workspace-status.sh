@@ -70,16 +70,19 @@ watchdog_os() {
 }
 
 watchdog_reason() {
-  local host="$1" port="$2" status="$3"
+  local host="$1" port="$2" status="$3" count_reason=""
+  if [[ -n "${4:-}" ]]; then
+    count_reason=" after ${4} consecutive bad status checks"
+  fi
   case "$status" in
     timeout)
-      echo "dev-remote watchdog: the hub at ${host} port ${port} did not answer a status request within ${status_timeout_s}s; stopping this build. Re-run with --config=dev-local to finish on this Mac. See tools/remote-execution/README.md, \"What bounds a stuck action\"."
+      echo "dev-remote watchdog: the hub at ${host} port ${port} did not answer a status request within ${status_timeout_s}s; stopping this build${count_reason}. Re-run with --config=dev-local to finish on this Mac. See tools/remote-execution/README.md, \"What bounds a stuck action\"."
       ;;
     503)
-      echo "dev-remote watchdog: the hub at ${host} port ${port} reports a failed or stalled store (status 503); stopping this build. Re-run with --config=dev-local to finish on this Mac. See tools/remote-execution/README.md, \"What bounds a stuck action\"."
+      echo "dev-remote watchdog: the hub at ${host} port ${port} reports a failed or stalled store (status 503); stopping this build${count_reason}. Re-run with --config=dev-local to finish on this Mac. See tools/remote-execution/README.md, \"What bounds a stuck action\"."
       ;;
     *)
-      echo "dev-remote watchdog: the hub at ${host} port ${port} is stuck (status ${status}); stopping this build. Re-run with --config=dev-local to finish on this Mac."
+      echo "dev-remote watchdog: the hub at ${host} port ${port} is stuck (status ${status}); stopping this build${count_reason}. Re-run with --config=dev-local to finish on this Mac."
       ;;
   esac
 }
@@ -151,7 +154,7 @@ watchdog_reason_for() {
   local endpoint host_port
   endpoint="$(watchdog_endpoint)" || return 1
   host_port="$(remote_status_endpoint_host_port "$endpoint")" || return 1
-  watchdog_reason "${host_port% *}" "${host_port##* }" "$1"
+  watchdog_reason "${host_port% *}" "${host_port##* }" "$1" "${2:-}"
 }
 
 # A single probe with no counting (--once). Prints the reason and returns 1
@@ -203,7 +206,7 @@ watchdog_loop() {
     if ((bad < stuck_after)); then
       continue
     fi
-    reason="$(watchdog_reason_for "$status") (${bad} consecutive bad status checks.)"
+    reason="$(watchdog_reason_for "$status" "$bad")"
     watchdog_deliver_reason "$target" "$reason"
     kill -TERM "$target" 2> /dev/null || true
     return 0

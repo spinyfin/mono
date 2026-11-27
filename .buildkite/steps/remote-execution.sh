@@ -167,24 +167,6 @@ ci_remote_watchdog_reason() {
   esac
 }
 
-# ci_remote_watchdog_tick <endpoint>
-#
-# One status probe. TCP first: an unreachable hub is not stuck (the step
-# already fell back, or Bazel will). Prints a reason and returns 1 when the
-# executor accepted a connection and then went silent or answered 503;
-# returns 0 when the bazel command should keep running.
-ci_remote_watchdog_tick() {
-  local endpoint="$1" host_port status
-  host_port="$(ci_remote_endpoint_host_port "$endpoint")" || return 0
-  status="$(remote_status_probe "$endpoint" "$(_ci_remote_os)" \
-    "$CI_REMOTE_PROBE_TIMEOUT_SECS" "$CI_REMOTE_STATUS_TIMEOUT_SECS")" || return 0
-  if ci_remote_stuck_status "$status"; then
-    ci_remote_watchdog_reason "$status"
-    return 1
-  fi
-  return 0
-}
-
 # ci_remote_watchdog_observe <endpoint> <bad so far>
 #
 # One status probe, counted. Prints "<new consecutive bad count> <token>".
@@ -194,8 +176,8 @@ ci_remote_watchdog_tick() {
 # CI_REMOTE_WATCHDOG_CONSECUTIVE_BAD (default REMOTE_STATUS_STUCK_AFTER_DEFAULT)
 # bad ticks in a row.
 ci_remote_watchdog_observe() {
-  local endpoint="$1" bad="$2" host_port status
-  host_port="$(ci_remote_endpoint_host_port "$endpoint")" || { echo "0 none"; return 0; }
+  local endpoint="$1" bad="$2" status
+  ci_remote_endpoint_host_port "$endpoint" > /dev/null || { echo "0 none"; return 0; }
   status="$(remote_status_probe "$endpoint" "$(_ci_remote_os)" \
     "$CI_REMOTE_PROBE_TIMEOUT_SECS" "$CI_REMOTE_STATUS_TIMEOUT_SECS")" || status=none
   echo "$(remote_status_count_bad "$bad" "$status") ${status}"

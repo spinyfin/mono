@@ -347,7 +347,7 @@ expect kept "$(loop_run 503 503 200 503 503)" "a good tick resets the count"
 expect kept "$(loop_run 000 000)" "N-1 timeouts then 200"
 expect stopped "$(loop_run 503 503 503)" "N consecutive 503s"
 if ! grep -q "stopping this build" "${tmp}"/dev-remote-watchdog-*.reason \
-  || ! grep -q "3 consecutive bad status checks" "${tmp}"/dev-remote-watchdog-*.reason; then
+  || ! grep -q "stopping this build after 3 consecutive bad status checks\. Re-run" "${tmp}"/dev-remote-watchdog-*.reason; then
   fail "N 503s: reason line missing: $(cat "${tmp}"/dev-remote-watchdog-*.reason 2>/dev/null)"
 fi
 if ! grep -q "bad status check (503), 3 of 3" "${tmp}/dev-remote-watchdog.log"; then

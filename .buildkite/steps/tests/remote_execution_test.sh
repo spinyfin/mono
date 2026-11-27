@@ -375,45 +375,33 @@ CI_BAZEL_REMOTE_EXECUTOR="$endpoint"
 curl_http=200
 curl_fail_exit=""
 : > "$curl_calls"
-if ! ci_remote_watchdog_tick "$endpoint" > /dev/null; then
-  fail "watchdog tick: a 200 hub was treated as stuck"
-fi
+expect_equal "0 200" "$(ci_remote_watchdog_observe "$endpoint" 2)" "watchdog observe: a 200 resets the count"
 curl_http=000
-reason=""
-if reason="$(ci_remote_watchdog_tick "$endpoint")"; then
-  fail "watchdog tick: a silent hub was not treated as stuck"
-fi
-if [[ "$reason" != *"executor.test port 50051"* ]] || [[ "$reason" != *"did not answer a status request"* ]]; then
-  fail "watchdog tick: timeout reason was '${reason}'"
+expect_equal "3 timeout" "$(ci_remote_watchdog_observe "$endpoint" 2)" "watchdog observe: a silent hub counts as stuck"
+reason="$(ci_remote_watchdog_verdict "$endpoint" 7)"
+if [[ "$reason" != 8$'\n'*"executor.test port 50051"*"did not answer a status request"* ]]; then
+  fail "watchdog verdict: timeout reason was '${reason}'"
 fi
 curl_http=503
-reason=""
-if reason="$(ci_remote_watchdog_tick "$endpoint")"; then
-  fail "watchdog tick: a 503 hub was not treated as stuck"
-fi
-if [[ "$reason" != *"status 503"* ]]; then
-  fail "watchdog tick: 503 reason was '${reason}'"
+expect_equal "3 503" "$(ci_remote_watchdog_observe "$endpoint" 2)" "watchdog observe: a 503 counts as stuck"
+reason="$(ci_remote_watchdog_verdict "$endpoint" 7)"
+if [[ "$reason" != 8$'\n'*"status 503"* ]]; then
+  fail "watchdog verdict: 503 reason was '${reason}'"
 fi
 curl_http=000
 curl_fail_exit=52
-if ! ci_remote_watchdog_tick "$endpoint" > /dev/null; then
-  fail "watchdog tick: curl 52 was treated as stuck"
-fi
+expect_equal "0 curl:52" "$(ci_remote_watchdog_observe "$endpoint" 2)" "watchdog observe: curl 52 resets the count"
 curl_fail_exit=""
 curl_http=404
-if ! ci_remote_watchdog_tick "$endpoint" > /dev/null; then
-  fail "watchdog tick: HTTP 404 was treated as stuck"
-fi
+expect_equal "0 404" "$(ci_remote_watchdog_observe "$endpoint" 2)" "watchdog observe: HTTP 404 resets the count"
 curl_http=200
 
 # A hub we cannot connect to is not stuck: Bazel falls back, and a
 # --config=dev-local / off-network build must not be killed.
 nc_status=1
 : > "$curl_calls"
-if ! ci_remote_watchdog_tick "$endpoint" > /dev/null; then
-  fail "watchdog tick: an unreachable hub was treated as stuck"
-fi
-expect_equal "" "$(cat "$curl_calls")" "watchdog tick unreachable: curl was run"
+expect_equal "0 unreachable" "$(ci_remote_watchdog_observe "$endpoint" 2)" "watchdog observe: an unreachable hub resets the count"
+expect_equal "" "$(cat "$curl_calls")" "watchdog observe unreachable: curl was run"
 nc_status=0
 
 # The loop signals the bazel pid when a tick is stuck. Interval 0 so the
