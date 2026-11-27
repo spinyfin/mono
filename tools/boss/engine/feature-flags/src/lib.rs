@@ -54,10 +54,10 @@ use serde::{Deserialize, Serialize};
 mod experiments;
 pub use experiments::{
     BATCHED_SEARCH_AB_SPLIT_FLAG, BATCHED_SEARCH_EXPERIMENT, EXPERIMENT_FLAG_CATEGORY, EXPERIMENTS, ExperimentArm,
-    WORKER_AUTOCOMPACT_AB_SPLIT_FLAG, WORKER_AUTOCOMPACT_EXPERIMENT,
     ExperimentArmSet, ExperimentLane, ExperimentSpec, ExperimentState, REVIEW_GUIDE_WHEN_READY_AB_SPLIT_FLAG,
-    REVIEW_GUIDE_WHEN_READY_EXPERIMENT, TOKEN_EXPERIMENTS_FLAG, TREATMENT_BUCKET_LIMIT, ab_split_flag_name, assign_arm,
-    experiment_state, resolve_arms,
+    REVIEW_GUIDE_WHEN_READY_EXPERIMENT, TOKEN_EXPERIMENTS_FLAG, TREATMENT_BUCKET_LIMIT,
+    WORKER_AUTOCOMPACT_AB_SPLIT_FLAG, WORKER_AUTOCOMPACT_EXPERIMENT, ab_split_flag_name, assign_arm, experiment_state,
+    resolve_arms,
 };
 
 /// One feature flag entry in the registry. The registry is the source

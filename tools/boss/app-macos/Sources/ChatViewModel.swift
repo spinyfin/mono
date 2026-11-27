@@ -866,6 +866,9 @@ final class ChatViewModel: ObservableObject {
     /// failure. `nil` when nothing was sent (`sendLine` returned nil).
     var pendingReviewGuideRequestId: String?
 
+    /// Request IDs for background generate-on-open calls, settled quietly.
+    var reviewGuideOpenRequests: Set<String> = []
+
     /// Root task ids for which `retry_review_guide` has been sent but
     /// `review_guide_retry_queued` (or `work_error`) has not yet arrived.
     /// Guards against a duplicate tap on the card's Retry affordance.

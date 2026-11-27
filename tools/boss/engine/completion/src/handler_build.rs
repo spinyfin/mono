@@ -44,6 +44,7 @@ impl WorkerCompletionHandler {
             merge_queue_timeline: None,
             branch_verifier_overridden: false,
             metrics: local_metrics,
+            review_guide_waits: Default::default(),
             merge_probe: Arc::new(NoopMergeProbe),
             pr_poll_state_writer: Arc::new(NoopPrPollStateWriter),
             conflict_unknown_backoff: conflict_stop_gate::DEFAULT_UNKNOWN_RETRY_BACKOFF,

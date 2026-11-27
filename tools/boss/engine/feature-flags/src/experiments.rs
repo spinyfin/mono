@@ -130,7 +130,12 @@ pub const EXPERIMENTS: &[ExperimentSpec] = &[
         requires: &[],
         splits: true,
     },
-    ExperimentSpec { key: WORKER_AUTOCOMPACT_EXPERIMENT, lane: None, requires: &[], splits: true },
+    ExperimentSpec {
+        key: WORKER_AUTOCOMPACT_EXPERIMENT,
+        lane: None,
+        requires: &[],
+        splits: true,
+    },
     ExperimentSpec {
         key: REVIEW_GUIDE_WHEN_READY_EXPERIMENT,
         lane: None,

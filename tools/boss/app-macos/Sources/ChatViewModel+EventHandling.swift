@@ -108,6 +108,7 @@ extension ChatViewModel {
             // coming for a request the disconnect killed in transit, so
             // without this the Retry button stays a permanent no-op for
             // that task for the rest of the session.
+            reviewGuideOpenRequests.removeAll()
             retryingReviewGuideRootTaskIDs.removeAll()
             // A `get_review_guide_content` request in flight when the link
             // drops can never complete; without this the viewer stays
@@ -232,6 +233,10 @@ extension ChatViewModel {
         case .workItemRefused(let id, let code, let message, let suggestedAction, let requestId):
             handleWorkItemRefused(id: id, code: code, message: message, suggestedAction: suggestedAction, requestId: requestId)
         case .workError(let message, let requestId):
+            if let requestId, reviewGuideOpenRequests.remove(requestId) != nil {
+                appendSystemMessage("Review guide open: \(message)")
+                return
+            }
             if receiveTokenUsageError(message: message, requestId: requestId) { return }
             if navigatorReviewGuides.fail(message: message, requestID: requestId) { return }
             failBoardRead(requestID: requestId)
@@ -485,7 +490,8 @@ extension ChatViewModel {
             if let requestId, requestId == pendingReviewGuideRequestId {
                 applyReviewGuideContent(versionId: versionId, content: content, requestId: requestId)
             }
-        case .reviewGuideRetryQueued(let rootTaskId, _, _):
+        case .reviewGuideRetryQueued(let rootTaskId, _, _, let requestId):
+            if let requestId, reviewGuideOpenRequests.remove(requestId) != nil { return }
             applyReviewGuideRetryQueued(rootTaskId: rootTaskId)
         case .conflictResolutionsList(let attempts):
             conflictResolutions = attempts.map(\.listEntry)

@@ -1059,7 +1059,32 @@ async fn opening_a_current_guide_counts_an_open_and_not_a_missing_guide() {
     assert_eq!(metric(&f, "review_guide.opens_without_current_guide"), None);
 
     // A request raced a publication: the guide was current when it arrived.
-    f.request_with(&f.root, "raced", true).await;
+    let reply = f.request_with(&f.root, "raced", true).await;
+    let FrontendEvent::ReviewGuideRetryQueued {
+        attempt,
+        already_requested: true,
+        ..
+    } = reply
+    else {
+        panic!("{reply:?}")
+    };
+    assert_eq!(attempt.id, first.id);
+    let conn = db.connect().unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM pr_review_guide_attempts", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM work_executions WHERE kind = ?1",
+            ["pr_review_guide"],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
     assert_eq!(metric(&f, "review_guide.opens"), Some(2));
     assert_eq!(metric(&f, "review_guide.opens_without_current_guide"), None);
 }
@@ -1067,22 +1092,35 @@ async fn opening_a_current_guide_counts_an_open_and_not_a_missing_guide() {
 #[tokio::test]
 async fn a_guide_for_an_older_comparison_is_not_current_when_the_pr_has_moved() {
     let f = Fixture::new(false);
-    let first = f.generate("first", false).await;
     let db = &f.state.work_db;
-    db.publish_pr_review_guide_version(&first.id, "# Guide", "raw").unwrap();
-    // The PR moved on: a newer comparison is now the selected one.
-    let newer = source_capture_packet(PR_URL, "base", "newer-head");
     db.persist_pr_review_guide_source_capture(
         &f.root,
         db.allocate_pr_review_guide_source_observation_sequence().unwrap(),
-        PrSourceCaptureTrigger::Poller,
-        &newer,
+        PrSourceCaptureTrigger::Creation,
+        &source_capture_packet(PR_URL, "base", "old-head"),
     )
     .unwrap();
-    assert!(!db.review_guide_is_current(&f.root).unwrap());
-    // `on_open` is set by an app that saw the stale guide; its generate request
-    // recaptures and counts an open that found no current guide.
-    f.request_with(&f.root, "stale-open", true).await;
+    let boss_work_db::RetryReviewGuideOutcome::Created(first) =
+        db.generate_pr_review_guide(&f.root, PR_URL, Some("first")).unwrap()
+    else {
+        panic!("expected attempt")
+    };
+    let PublishReviewGuideOutcome::Published(version) =
+        db.publish_pr_review_guide_version(&first.id, "# Guide", "raw").unwrap()
+    else {
+        panic!("expected publication")
+    };
+    // Loading the old version is a read; only the generate request marks this open.
+    get_content_with(&f, &version.id, false).await;
+    let reply = f.request_with(&f.root, "stale-open", true).await;
+    assert!(matches!(
+        reply,
+        FrontendEvent::ReviewGuideRetryQueued {
+            already_requested: false,
+            ..
+        }
+    ));
+    assert_eq!(metric(&f, "review_guide.opens"), Some(1));
     assert_eq!(metric(&f, "review_guide.opens_without_current_guide"), Some(1));
 }
 
@@ -1099,7 +1137,77 @@ async fn opens_are_counted_per_arm_while_the_experiment_runs() {
         .feature_flags
         .set(boss_feature_flags::REVIEW_GUIDE_WHEN_READY_AB_SPLIT_FLAG, false)
         .unwrap();
-    f.request_with(&f.root, "treated-open", true).await;
+    let reply = f.request_with(&f.root, "treated-open", true).await;
+    let FrontendEvent::ReviewGuideRetryQueued {
+        attempt,
+        already_requested: false,
+        ..
+    } = reply
+    else {
+        panic!("{reply:?}")
+    };
+    let stored = f
+        .state
+        .work_db
+        .get_pr_review_guide_attempt(&attempt.id)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(stored.status.as_str(), "queued" | "running"));
+    let summary = f
+        .state
+        .work_db
+        .get_pr_review_guide_summary_for_root(&f.root)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(summary.lifecycle.as_str(), "queued" | "generating"));
+    let dispatched = f
+        .state
+        .work_db
+        .dispatch_pr_review_guide_attempt(&attempt.id, &f.root)
+        .unwrap();
+    let execution = f
+        .state
+        .work_db
+        .get_execution(dispatched.execution_id.as_deref().unwrap())
+        .unwrap();
+    assert_eq!(execution.kind, boss_protocol::ExecutionKind::PrReviewGuide);
+    assert_eq!(f.state.work_db.experiment_family_root(&execution).unwrap(), f.root);
+    let db = &f.state.work_db;
+    let family = db.experiment_family_root(&execution).unwrap();
+    let arms = f
+        .state
+        .feature_flags
+        .resolve_experiment_arms(|key| boss_work_db::experiment_bucket(&family, key));
+    let composed = boss_engine_runtime::runner::compose_worker_spawn(
+        db,
+        "guide-fixture",
+        &execution,
+        &db.get_work_item(&f.root).unwrap(),
+        f._dir.path(),
+        None,
+        boss_execution_runner::WorkerSpawnOpts::builder()
+            .review_signal_checks(boss_engine_merge_poller::review_signal_checks_for_owner)
+            .experiment_arms(arms)
+            .build(),
+    )
+    .await
+    .unwrap();
+    let config = composed.spawn_config;
+    assert_eq!(config.effort_value, Some("medium"));
+    db.record_execution_launch(&boss_work_db::ExecutionLaunchRecord {
+        execution_id: &execution.id,
+        driver: &config.driver,
+        model: &config.model,
+        effort_level: config.effort_level,
+        experiment_arms: config.experiment_arms.as_deref(),
+    })
+    .unwrap();
+    let boss_work_db::StoredExperimentArms::Recorded(text) = db.stored_experiment_arms(&execution.id).unwrap() else {
+        panic!("missing launch arms")
+    };
+    let recorded_arms = boss_feature_flags::ExperimentArmSet::decode(&text).unwrap();
+    assert!(recorded_arms.is_treated(boss_feature_flags::REVIEW_GUIDE_WHEN_READY_EXPERIMENT));
+
     assert_eq!(metric(&f, "review_guide.opens"), Some(1));
     assert_eq!(metric(&f, "review_guide.opens.treatment"), Some(1));
     assert_eq!(
@@ -1107,4 +1215,120 @@ async fn opens_are_counted_per_arm_while_the_experiment_runs() {
         Some(1)
     );
     assert_eq!(metric(&f, "review_guide.opens.control"), None);
+}
+
+#[tokio::test]
+async fn opening_a_failed_guide_counts_once_without_retrying() {
+    let f = Fixture::new(false);
+    let first = f.generate("first", false).await;
+    f.state
+        .work_db
+        .fail_pr_review_guide_attempt(&first.id, "driver failed")
+        .unwrap();
+    let reply = f.request_with(&f.root, "failed-open", true).await;
+    assert!(matches!(reply, FrontendEvent::WorkError { .. }));
+    assert_eq!(metric(&f, "review_guide.opens"), Some(1));
+    assert_eq!(metric(&f, "review_guide.opens_without_current_guide"), Some(1));
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        f.state
+            .work_db
+            .get_pr_review_guide_summary_for_root(&f.root)
+            .unwrap()
+            .unwrap()
+            .lifecycle,
+        "failed"
+    );
+}
+
+#[tokio::test]
+async fn coalesced_opens_observe_wait_only_for_their_published_attempt_and_comparison() {
+    for arm in [
+        boss_feature_flags::ExperimentArm::Treatment,
+        boss_feature_flags::ExperimentArm::Control,
+    ] {
+        let f = Fixture::new(false);
+        let reply = f.request_with(&f.root, "first-open", true).await;
+        let FrontendEvent::ReviewGuideRetryQueued { attempt, .. } = reply else {
+            panic!("expected attempt")
+        };
+        let second = f.request_with(&f.root, "second-open", true).await;
+        let FrontendEvent::ReviewGuideRetryQueued {
+            attempt: coalesced,
+            already_requested: true,
+            ..
+        } = second
+        else {
+            panic!("expected coalesced attempt")
+        };
+        assert_eq!(coalesced.id, attempt.id);
+        let stored = f
+            .state
+            .work_db
+            .get_pr_review_guide_attempt(&attempt.id)
+            .unwrap()
+            .unwrap();
+        let opened = std::time::Instant::now() - std::time::Duration::from_secs(5);
+        f.state
+            .completion_handler
+            .record_review_guide_wait(&stored, opened, Some(arm));
+        f.state
+            .completion_handler
+            .record_review_guide_wait(&stored, opened, Some(arm));
+        let mut wrong = stored.clone();
+        wrong.comparison_id = "different-comparison".to_owned();
+        f.state.completion_handler.finish_review_guide_wait(&wrong, true);
+        assert_eq!(metric(&f, "review_guide.open_to_guide.count"), None);
+        f.state
+            .work_db
+            .publish_pr_review_guide_version(&attempt.id, "# Guide", "raw")
+            .unwrap();
+        f.state.completion_handler.finish_review_guide_wait(&stored, true);
+        let prefix = format!("review_guide.open_to_guide.{}", arm.as_str());
+        assert_eq!(metric(&f, &format!("{prefix}.count")), Some(2));
+        assert!(metric(&f, &format!("{prefix}.sum_ms")).unwrap() >= 10_000);
+        assert_eq!(metric(&f, &format!("{prefix}.seconds_le_1")), Some(0));
+        assert_eq!(metric(&f, &format!("{prefix}.seconds_le_inf")), Some(2));
+        assert_eq!(metric(&f, "review_guide.open_to_guide.count"), Some(4));
+        f.state.completion_handler.finish_review_guide_wait(&stored, true);
+        assert_eq!(metric(&f, "review_guide.open_to_guide.count"), Some(4));
+        let sink = make_session_sink();
+        let ctx = Dispatch::builder()
+            .server_state(f.state.clone())
+            .work_db(f.state.work_db.clone())
+            .sink(sink.clone())
+            .session_id("session")
+            .request_id("metrics")
+            .recv_instant(std::time::Instant::now())
+            .decode_ms(0.0)
+            .build();
+        crate::app::metrics::handle_metrics_list_live(ctx, FrontendRequest::MetricsListLive).await;
+        sink.close();
+        let FrontendEvent::MetricsListLiveResult { entries } = sink.next().await.unwrap().payload else {
+            panic!("expected metrics")
+        };
+        let entry = entries
+            .iter()
+            .find(|entry| entry.name == format!("{prefix}.count"))
+            .unwrap();
+        assert_eq!(entry.value, 2);
+        assert!(!entry.stale);
+        let failed = f.generate("failed", false).await;
+        let stored = f
+            .state
+            .work_db
+            .get_pr_review_guide_attempt(&failed.id)
+            .unwrap()
+            .unwrap();
+        f.state
+            .completion_handler
+            .record_review_guide_wait(&stored, opened, Some(arm));
+        f.state
+            .work_db
+            .fail_pr_review_guide_attempt(&failed.id, "driver failed")
+            .unwrap();
+        f.state.completion_handler.finish_review_guide_wait(&stored, false);
+        f.state.completion_handler.finish_review_guide_wait(&stored, true);
+        assert_eq!(metric(&f, "review_guide.open_to_guide.count"), Some(4));
+    }
 }

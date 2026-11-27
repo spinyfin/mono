@@ -923,6 +923,7 @@ impl WorkerCompletionHandler {
         // missed push only costs the card an unrelated refresh's worth of
         // latency (see `notify_review_guide_changed`), never correctness.
         if let Some(attempt) = &attempt {
+            self.finish_review_guide_wait(attempt, published);
             match self.work_db.root_task_id_for_review_guide_series(&attempt.series_id) {
                 Ok(Some(root_task_id)) => {
                     crate::execution_publisher::notify_review_guide_changed(

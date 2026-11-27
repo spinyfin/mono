@@ -128,6 +128,7 @@ async fn generate_review_guide(
     idempotency_token: Option<&str>,
     on_open: bool,
 ) -> anyhow::Result<(String, boss_work_db::RetryReviewGuideOutcome)> {
+    let opened_at = std::time::Instant::now();
     let db = &ctx.work_db;
     let root_id = {
         let conn = db.connect()?;
@@ -149,24 +150,64 @@ async fn generate_review_guide(
         "work item has no repository remote; cannot generate a review guide"
     );
     // A person opening a guide that is not there is the open the experiment
-    // counts. The comparison the capture selects decides whether the guide on
-    // hand is current, so it is read on both sides of the capture.
-    let current_before = on_open && db.review_guide_is_current(&root_id).unwrap_or(false);
+    // counts. The comparison selected by capture decides currentness.
+    if on_open
+        && db
+            .get_pr_review_guide_summary_for_root(&root_id)?
+            .is_some_and(|s| s.lifecycle == "failed")
+    {
+        record_review_guide_open(&ctx.server_state, db, &root_id, db.review_guide_is_current(&root_id)?);
+        anyhow::bail!("review guide failed; use Retry to request another attempt");
+    }
     let capture = ctx
         .server_state
         .completion_handler
         .capture_review_guide_source_manually(&root_id, pr_url)
         .await;
     if on_open {
-        let current = current_before && capture.is_ok() && db.review_guide_is_current(&root_id).unwrap_or(false);
+        let current = capture.is_ok() && db.review_guide_is_current(&root_id)?;
         record_review_guide_open(&ctx.server_state, db, &root_id, current);
     }
     capture?;
+    if on_open && db.review_guide_is_current(&root_id)? {
+        let summary = db
+            .get_pr_review_guide_summary_for_root(&root_id)?
+            .ok_or_else(|| anyhow::anyhow!("current review guide series disappeared"))?;
+        let version = db
+            .get_pr_review_guide_version(
+                summary
+                    .readable_version_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("current review guide has no readable version"))?,
+            )?
+            .ok_or_else(|| anyhow::anyhow!("current review guide version disappeared"))?;
+        let attempt = db
+            .get_pr_review_guide_attempt(&version.attempt_id)?
+            .ok_or_else(|| anyhow::anyhow!("current review guide attempt disappeared"))?;
+        return Ok((
+            root_id,
+            boss_work_db::RetryReviewGuideOutcome::AlreadyRequested(attempt),
+        ));
+    }
     let outcome = db.generate_pr_review_guide(&root_id, pr_url, idempotency_token)?;
     anyhow::ensure!(
         !matches!(outcome, boss_work_db::RetryReviewGuideOutcome::NoComparison),
         "source capture did not select a comparison; cannot generate a review guide"
     );
+    if on_open
+        && let boss_work_db::RetryReviewGuideOutcome::Created(attempt)
+        | boss_work_db::RetryReviewGuideOutcome::AlreadyRequested(attempt) = &outcome
+    {
+        ctx.server_state.completion_handler.record_review_guide_wait(
+            attempt,
+            opened_at,
+            boss_engine_completion::review_guide_capture::review_guide_when_ready_arm(
+                db,
+                &ctx.server_state.feature_flags,
+                &root_id,
+            ),
+        );
+    }
     Ok((root_id, outcome))
 }
 
@@ -219,7 +260,12 @@ pub(super) async fn handle_get_review_guide_content(ctx: Dispatch, req: Frontend
                 && let Some(version) = &version
                 && let Ok(Some(root_task_id)) = work_db.root_task_id_for_review_guide_series(&version.series_id)
             {
-                record_review_guide_open(&server_state, &work_db, &root_task_id, true);
+                record_review_guide_open(
+                    &server_state,
+                    &work_db,
+                    &root_task_id,
+                    work_db.review_guide_is_current(&root_task_id).unwrap_or(false),
+                );
             }
             send_response(
                 &sink,
@@ -268,14 +314,11 @@ fn count_review_guide_open(
             metrics.counter_inc_by_dynamic(&format!("{name}.{}", arm.as_str()), description, 1);
         }
     };
-    count(
-        REVIEW_GUIDE_OPENS_METRIC,
-        "Review guides a person opened (since engine start).",
-    );
+    count(REVIEW_GUIDE_OPENS_METRIC, "Review guides a person opened.");
     if !found_current_guide {
         count(
             REVIEW_GUIDE_OPENS_WITHOUT_GUIDE_METRIC,
-            "Review-guide opens that found no current guide for the PR's comparison (since engine start).",
+            "Review-guide opens that found no current guide for the PR's comparison.",
         );
     }
 }

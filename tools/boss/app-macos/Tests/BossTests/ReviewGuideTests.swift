@@ -173,6 +173,30 @@ final class ReviewGuideTests: XCTestCase {
         XCTAssertFalse(model.retryingReviewGuideRootTaskIDs.contains(task.id))
     }
 
+    func testOnOpenRefusalLeavesOtherLoadsAndExplicitRetryAlone() {
+        let model = makeModel()
+        model.reviewGuideOpenRequests = ["open-request", "other-open"]
+        model.retryingReviewGuideRootTaskIDs.insert("explicit")
+        model.attachmentsInFlightTaskIDs.insert("root")
+        model.applyEventForTest(.workError(message: "source access refused", requestId: "open-request"))
+        XCTAssertNil(model.workErrorMessage)
+        XCTAssertNil(model.attachmentsLoadFailureByTaskID["root"])
+        XCTAssertTrue(model.attachmentsInFlightTaskIDs.contains("root"))
+        XCTAssertEqual(model.retryingReviewGuideRootTaskIDs, ["explicit"])
+        XCTAssertEqual(model.reviewGuideOpenRequests, ["other-open"])
+    }
+
+    func testOnOpenReplySettlesOnlyItsOwnRequest() {
+        let model = makeModel()
+        model.reviewGuideOpenRequests = ["open-request", "other-open"]
+        model.retryingReviewGuideRootTaskIDs.insert("root")
+        let attempt = ReviewGuideAttempt(id: "attempt", seriesId: "series", comparisonId: "comparison", requestEpoch: 1, status: "queued", error: nil)
+        model.applyEventForTest(.reviewGuideRetryQueued(rootTaskId: "root", attempt: attempt, alreadyRequested: true, requestId: "open-request"))
+        XCTAssertEqual(model.reviewGuideOpenRequests, ["other-open"])
+        XCTAssertEqual(model.retryingReviewGuideRootTaskIDs, ["root"])
+        XCTAssertNil(model.workErrorMessage)
+    }
+
     // MARK: - Generate on open
 
     private func recordedRequests(_ model: ChatViewModel) -> RequestLog {
@@ -226,11 +250,12 @@ final class ReviewGuideTests: XCTestCase {
         model.openReviewGuide(for: task)
         // The old version opens, and the engine is asked for one for the new head.
         XCTAssertEqual(log.types(), ["get_review_guide_content", "generate_review_guide"])
-        XCTAssertEqual(log.sent[0]["on_open"] as? Bool, true)
+        XCTAssertNil(log.sent[0]["on_open"])
         XCTAssertEqual(log.sent[1]["on_open"] as? Bool, true)
+        XCTAssertEqual(log.sent.filter { ($0["on_open"] as? Bool) == true }.count, 1)
     }
 
-    func testGenerateOnOpenSkipsWorkThatGetsNoAutomaticGuideAndFailedGuides() {
+    func testGenerateOnOpenSkipsWorkThatGetsNoAutomaticGuideAndCountsFailedGuides() {
         let model = makeModel()
         let log = recordedRequests(model)
         for kind in ["design", "investigation"] {
@@ -245,7 +270,9 @@ final class ReviewGuideTests: XCTestCase {
         XCTAssertTrue(model.reviewGuideSurfaceOpened(root: noPR))
         let revision = Self.makeTask(id: "revision", readableVersionId: nil, kind: "revision")
         XCTAssertTrue(model.reviewGuideSurfaceOpened(root: revision))
-        XCTAssertEqual(log.sent.count, 0)
+        XCTAssertEqual(log.types(), ["generate_review_guide"])
+        XCTAssertEqual(log.sent[0]["root_task_id"] as? String, failed.id)
+        XCTAssertEqual(log.sent[0]["on_open"] as? Bool, true)
     }
 
     func testOnlyAnOpenMarksTheContentFetchAndTheMarkerIsOmittedOtherwise() {

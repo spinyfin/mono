@@ -1178,7 +1178,7 @@ final class EngineClient: @unchecked Sendable {
                 break
             }
             let alreadyRequested = (payload["already_requested"] as? NSNumber)?.boolValue ?? false
-            emit(.reviewGuideRetryQueued(rootTaskId: rootTaskId, attempt: attempt, alreadyRequested: alreadyRequested))
+            emit(.reviewGuideRetryQueued(rootTaskId: rootTaskId, attempt: attempt, alreadyRequested: alreadyRequested, requestId: envelopeRequestId))
         case "dispatch_admission_evaluated":
             guard let admissionPayload = payload["admission"] as? [String: Any],
                   let admissionData = try? JSONSerialization.data(withJSONObject: admissionPayload),

@@ -16,7 +16,7 @@ extension ChatViewModel {
     @MainActor
     func openReviewGuide(for task: WorkTask) {
         guard let versionId = task.reviewGuideReadableVersionId else { return }
-        openReviewGuide(versionId: versionId, rootTaskId: task.id)
+        openReviewGuide(versionId: versionId, rootTaskId: task.id, onOpen: !shouldRequestReviewGuideOnOpen(task))
         // The version on hand may be for an earlier head of the PR.
         requestReviewGuideOnOpen(for: task)
     }
@@ -61,12 +61,13 @@ extension ChatViewModel {
     /// engine counts it. A guide the reader already holds is not fetched
     /// again, so that open is reported with a fetch whose reply is not wanted.
     func loadNavigatorReviewGuide(for root: WorkTask, versionID: String? = nil, refresh: Bool = false, onOpen: Bool = false) {
+        let countContentOpen = onOpen && !shouldRequestReviewGuideOnOpen(root)
         var fetched = false
         navigatorReviewGuides.load(root: root, versionID: versionID, refresh: refresh) {
             fetched = true
-            return engine.sendGetReviewGuideContent(versionID: $0, onOpen: onOpen)
+            return engine.sendGetReviewGuideContent(versionID: $0, onOpen: countContentOpen)
         }
-        if onOpen, !fetched, hasCurrentReviewGuide(root),
+        if countContentOpen, !fetched,
            let heldVersionID = versionID ?? root.reviewGuideReadableVersionId {
             _ = engine.sendGetReviewGuideContent(versionID: heldVersionID, onOpen: true)
         }
@@ -102,19 +103,18 @@ extension ChatViewModel {
     /// engine runs one attempt per PR, so asking again while one is live is safe.
     ///
     /// Not asked for work that gets no automatic guide (design and
-    /// investigation PRs), for a guide whose last attempt failed (Retry is on
-    /// the card, and opening must not keep spending on a failing guide), or for
-    /// a PR with no URL.
+    /// investigation PRs), for a PR with no URL. Failed guides are reported too; the engine
+    /// counts the open without retrying the failed attempt.
+    func shouldRequestReviewGuideOnOpen(_ task: WorkTask) -> Bool {
+        task.generateReviewGuideMenuTitle != nil && !hasCurrentReviewGuide(task)
+            && !["design", "investigation"].contains(task.kind)
+    }
+
     @MainActor
     func requestReviewGuideOnOpen(for task: WorkTask) {
-        guard task.generateReviewGuideMenuTitle != nil,
-              !hasCurrentReviewGuide(task),
-              !["design", "investigation"].contains(task.kind),
-              task.reviewGuideLifecycle != "failed",
-              !retryingReviewGuideRootTaskIDs.contains(task.id) else { return }
-        retryingReviewGuideRootTaskIDs.insert(task.id)
-        if engine.sendGenerateReviewGuide(rootTaskID: task.id, idempotencyToken: UUID().uuidString, onOpen: true) == nil {
-            retryingReviewGuideRootTaskIDs.remove(task.id)
+        guard shouldRequestReviewGuideOnOpen(task) else { return }
+        if let requestID = engine.sendGenerateReviewGuide(rootTaskID: task.id, idempotencyToken: UUID().uuidString, onOpen: true) {
+            reviewGuideOpenRequests.insert(requestID)
         }
     }
 

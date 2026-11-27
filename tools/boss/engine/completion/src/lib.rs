@@ -154,6 +154,7 @@ mod metadata_gate;
 mod no_op;
 mod nudge;
 mod pending_finalize;
+mod review_guide_wait;
 pub use pending_finalize::{PendingFinalizeSweepOutcome, RUN_DONE_FINALIZE_STUCK_ATTENTION_KIND, finalize_resolved};
 mod pr_binding_guard;
 mod pr_transition;
@@ -1586,6 +1587,8 @@ pub struct WorkerCompletionHandler {
     /// call `with_metrics` still get valid increments. Production wires
     /// in the shared engine registry via `with_metrics` after construction.
     metrics: Arc<Registry>,
+    #[builder(skip)]
+    review_guide_waits: crate::review_guide_wait::ReviewGuideWaits,
     /// GitHub probe used for the on-transition CI-status pre-fetch.
     /// When a task moves to Review the handler spawns a background task
     /// that probes the new PR's CI state so the UI card has a real icon

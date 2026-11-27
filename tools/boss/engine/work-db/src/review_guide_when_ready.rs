@@ -85,7 +85,10 @@ impl WorkDb {
             "SELECT EXISTS(
                  SELECT 1 FROM pr_review_guide_source_series s
                  JOIN pr_review_guide_versions v ON v.id = s.readable_version_id
-                 WHERE s.root_task_id = ?1 AND v.comparison_id = s.selected_comparison_id)",
+                 WHERE s.id = (SELECT id FROM pr_review_guide_source_series
+                     WHERE root_task_id = ?1
+                     ORDER BY latest_observation_sequence DESC, id DESC LIMIT 1)
+                   AND v.comparison_id = s.selected_comparison_id)",
             [root_task_id],
             |row| row.get(0),
         )?)
@@ -192,5 +195,14 @@ mod tests {
         let (root, _) = seed_published_guide(&db, 9);
         assert!(db.review_guide_is_current(&root).unwrap());
         assert!(!db.review_guide_is_current("no-such-root").unwrap());
+        let mut replacement = crate::test_support::review_guide_source_packet("base", "replacement-head");
+        replacement.canonical_pr_url = "https://github.com/acme/widget/pull/10".to_owned();
+        replacement.pr_number = 10;
+        db.persist_pr_review_guide_source_capture(&root, 2, PrSourceCaptureTrigger::Creation, &replacement)
+            .unwrap();
+        assert!(
+            !db.review_guide_is_current(&root).unwrap(),
+            "a retired PR must not satisfy the latest series"
+        );
     }
 }
