@@ -254,6 +254,10 @@ pub struct StartWorkerInput {
     /// unless `worker_kind` is [`WorkerKind::AnswerAgent`].
     #[builder(default)]
     pub checkout_positioned_on_pr_head: bool,
+    /// Launch knobs the runner resolved from the arm set. The default is
+    /// today's launch: no auto-compact window and no compact instructions.
+    #[builder(default)]
+    pub launch_options: crate::driver::LaunchOptions,
     /// Badge type, project, host, and start-time stamps for the resulting
     /// `LiveWorkerState`. Production dispatch resolves these from the
     /// execution; tests may leave them empty.

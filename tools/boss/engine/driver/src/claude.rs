@@ -19,10 +19,11 @@ use boss_ssh_transport::shell_quote;
 
 use super::{
     AgentDriver, Capability, CapabilitySet, DriverDescriptor, EnvDirective, HookWiringDestination, InterruptDelivery,
-    InterruptGesture, InterruptPlan, MidTurnPaneInput, ModelMenu, PermissionArtifacts, PermissionInput, ProbeDelivery,
-    ProgressFidelity, ProgressIngress, ProgressObservationConfig, ProgressObservationWiring, ReapDelivery, SpawnPlan,
-    SpawnRequest, StopDelivery, StructuredOutputArtifacts, StructuredOutputRequest, ToolUseInterceptionConfig,
-    ToolUseInterceptionWiring, TurnEnd, TurnEndEvidence, WorkerErrorClass, default_structured_output_wiring,
+    InterruptGesture, InterruptPlan, LaunchOptions, MidTurnPaneInput, ModelMenu, PermissionArtifacts, PermissionInput,
+    ProbeDelivery, ProgressFidelity, ProgressIngress, ProgressObservationConfig, ProgressObservationWiring,
+    ReapDelivery, SpawnPlan, SpawnRequest, StopDelivery, StructuredOutputArtifacts, StructuredOutputRequest,
+    ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd, TurnEndEvidence, WorkerErrorClass,
+    default_structured_output_wiring,
 };
 
 pub mod structured_output;
@@ -810,6 +811,10 @@ impl AgentDriver for ClaudeDriver {
     }
 
     fn spawn_invocation(&self, request: SpawnRequest<'_>) -> SpawnPlan {
+        self.spawn_invocation_with_options(request, &LaunchOptions::default())
+    }
+
+    fn spawn_invocation_with_options(&self, request: SpawnRequest<'_>, options: &LaunchOptions) -> SpawnPlan {
         let SpawnRequest {
             model,
             effort,
@@ -855,6 +860,10 @@ impl AgentDriver for ClaudeDriver {
             // the pane's shell. Worker settings paths never contain a
             // single quote, so naive single-quoting is sufficient.
             cmd.push_str(&format!(" --settings '{}'", settings.display()));
+        }
+        if let Some(window) = options.auto_compact_window {
+            cmd.push_str(" --autocompact ");
+            cmd.push_str(window);
         }
         cmd.push('\n');
         let cmd = super::initial_prompt::launcher_command(CLAUDE_DESCRIPTOR.config_dir, &cmd);
@@ -2392,6 +2401,33 @@ mod tests {
                 "disallowedTools must be followed by another option, not a positional; got: {cmd}",
             );
         }
+    }
+
+    #[test]
+    fn spawn_invocation_with_options_appends_autocompact_and_default_matches_control() {
+        let control = ClaudeDriver.spawn_invocation(spawn_request("sonnet"));
+        assert!(
+            !control.command.contains("--autocompact"),
+            "control launch must not set an auto-compact window; got: {}",
+            control.command
+        );
+        assert_eq!(
+            ClaudeDriver
+                .spawn_invocation_with_options(spawn_request("sonnet"), &LaunchOptions::default())
+                .command,
+            control.command,
+            "default launch options must be byte-identical to spawn_invocation",
+        );
+
+        let treated = ClaudeDriver.spawn_invocation_with_options(
+            spawn_request("sonnet"),
+            &LaunchOptions {
+                auto_compact_window: Some(crate::CLAUDE_WORKER_AUTO_COMPACT_WINDOW),
+            },
+        );
+        let expected = control.command.trim_end_matches('\n').to_owned() + " --autocompact 200k\n";
+        assert_eq!(treated.command, expected);
+        assert_eq!(treated.env, control.env);
     }
 
     #[test]

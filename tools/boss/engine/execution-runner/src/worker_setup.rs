@@ -165,6 +165,35 @@ pub fn render_claude_md_with_invocation(
     rules
 }
 
+/// Heading of the compact-instructions block treated Claude workers receive.
+pub const COMPACT_INSTRUCTIONS_HEADING: &str = "## Compact summaries";
+
+const COMPACT_INSTRUCTIONS: &str = "\n\
+## Compact summaries\n\
+\n\
+If this session is compacted, keep the execution context, the task description, the open checklist, and the done-declaration command (`\"$BOSS_BIN\" propose done`) verbatim in the summary. Do not paraphrase or omit them.\n";
+
+/// Append compact-summary instructions to already-rendered worker rules.
+///
+/// Applied after the kind-specific body so every treated Claude worker
+/// kind (Standard, reviewer, triage, and the rest) carries the same
+/// instruction. Idempotent if the heading is already present.
+pub fn with_compact_instructions(rules: String) -> String {
+    if rules.contains(COMPACT_INSTRUCTIONS_HEADING) {
+        return rules;
+    }
+    let trailing_newline = rules.ends_with('\n');
+    let mut out = rules;
+    if trailing_newline {
+        out.pop();
+    }
+    out.push_str(COMPACT_INSTRUCTIONS);
+    if trailing_newline {
+        out.push('\n');
+    }
+    out
+}
+
 /// Minimal read-only agent rules for a review-guide worker. The Standard
 /// implementer file teaches PR creation; this kind inspects one captured
 /// comparison and submits a guide, and must never open or update a PR.

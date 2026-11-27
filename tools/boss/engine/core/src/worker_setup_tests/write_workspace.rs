@@ -89,6 +89,32 @@ fn write_workspace_files_creates_claude_dir_and_writes_all_files() {
 }
 
 #[test]
+fn write_workspace_files_with_autocompact_adds_compact_instructions() {
+    let _shared = lock_shared_settings_dir();
+    let _home = ClaudeConfigGuard::new();
+    let dir = TempDir::new().unwrap();
+    let input = WorkerSetupInput {
+        run_id: "run-compact".into(),
+        lease_id: "lease-compact".into(),
+        workspace_path: dir.path().to_path_buf(),
+        events_socket_path: PathBuf::from("/tmp/events.sock"),
+        boss_event_path: PathBuf::from("/tmp/boss-event"),
+        ..sample_input()
+    };
+    let options = crate::driver::LaunchOptions {
+        auto_compact_window: Some(crate::driver::CLAUDE_WORKER_AUTO_COMPACT_WINDOW),
+    };
+
+    let untreated = write_workspace_files(&input, &ClaudeDriver).unwrap();
+    let untreated_rules = std::fs::read_to_string(&untreated.claude_md_path).unwrap();
+    let treated = write_workspace_files_with_options(&input, &ClaudeDriver, &options).unwrap();
+    let treated_rules = std::fs::read_to_string(&treated.claude_md_path).unwrap();
+    assert!(!untreated_rules.contains(COMPACT_INSTRUCTIONS_HEADING));
+    assert!(treated_rules.contains(COMPACT_INSTRUCTIONS_HEADING));
+    assert_eq!(treated_rules, with_compact_instructions(untreated_rules));
+}
+
+#[test]
 fn write_workspace_files_pre_trusts_workspace_in_claude_json() {
     let _shared = lock_shared_settings_dir();
     let _home = ClaudeConfigGuard::new();

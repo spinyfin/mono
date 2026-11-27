@@ -33,7 +33,7 @@ use crate::driver::{AgentDriver, Capability, ProgressFidelity, ProgressIngress, 
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::protocol::{AttachWorkerPaneInput, EngineToAppError, EngineToAppRequest, EngineToAppResponse, EnvVar};
 use crate::worker_registry::WorkerRegistry;
-use crate::worker_setup::{WorkerKind, WorkerSetupInput, write_workspace_files};
+use crate::worker_setup::{WorkerKind, WorkerSetupInput, write_workspace_files_with_options};
 
 /// Sanitized PATH for worker panes. Excludes `~/bin` (where the
 /// `bossctl` symlink lives in this user's setup) and any other
@@ -720,7 +720,8 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
         .checkout_positioned_on_pr_head(input.checkout_positioned_on_pr_head)
         .build();
     let workspace_files_began = std::time::Instant::now();
-    let written = write_workspace_files(&setup, input.driver.as_ref()).map_err(StartWorkerError::WriteFiles)?;
+    let written = write_workspace_files_with_options(&setup, input.driver.as_ref(), &input.launch_options)
+        .map_err(StartWorkerError::WriteFiles)?;
     let workspace_files = workspace_files_began.elapsed();
     spawner
         .prepare_progress_ingress(&input.run_id, input.driver.clone(), progress_ingress)

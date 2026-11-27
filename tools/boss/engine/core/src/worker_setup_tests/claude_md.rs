@@ -645,3 +645,64 @@ fn shared_publication_and_ci_policy_lives_in_worker_rules() {
         assert!(rendered.contains(rule), "missing shared policy: {rule}");
     }
 }
+
+#[test]
+fn compact_instructions_keep_the_named_parts_and_are_the_only_difference() {
+    let untreated = claude_md_for(&sample_input());
+    let treated = with_compact_instructions(untreated.clone());
+    assert!(
+        !untreated.contains(COMPACT_INSTRUCTIONS_HEADING),
+        "control worker rules must not carry compact instructions"
+    );
+    assert_eq!(
+        treated,
+        with_compact_instructions(untreated.clone()),
+        "applying compact instructions twice must not duplicate the block"
+    );
+    assert!(treated.contains(COMPACT_INSTRUCTIONS_HEADING));
+    for wanted in [
+        "execution context",
+        "task description",
+        "open checklist",
+        "done-declaration command",
+        r#"`"$BOSS_BIN" propose done`"#,
+        "verbatim",
+    ] {
+        assert!(treated.contains(wanted), "missing {wanted}");
+    }
+    let lowered = treated.to_lowercase();
+    for hidden in ["experiment", "treatment", "control arm", "worker_autocompact", "a/b"] {
+        assert!(!lowered.contains(hidden), "the worker must not be told about {hidden}");
+    }
+    let without_block = treated.replacen(
+        "\n## Compact summaries\n\nIf this session is compacted, keep the execution context, the task description, the open checklist, and the done-declaration command (`\"$BOSS_BIN\" propose done`) verbatim in the summary. Do not paraphrase or omit them.\n",
+        "",
+        1,
+    );
+    assert_eq!(without_block, untreated);
+}
+
+#[test]
+fn compact_instructions_apply_to_every_worker_kind() {
+    for kind in [
+        WorkerKind::Standard,
+        WorkerKind::Reviewer,
+        WorkerKind::Triage,
+        WorkerKind::AnswerAgent,
+        WorkerKind::Progression,
+        WorkerKind::ReviewGuide,
+    ] {
+        let mut input = sample_input();
+        input.worker_kind = kind.clone();
+        let untreated = claude_md_for(&input);
+        let treated = with_compact_instructions(untreated.clone());
+        assert!(
+            treated.contains(COMPACT_INSTRUCTIONS_HEADING),
+            "{kind:?} must carry compact instructions when treated"
+        );
+        assert!(
+            !untreated.contains(COMPACT_INSTRUCTIONS_HEADING),
+            "{kind:?} control rules must not"
+        );
+    }
+}

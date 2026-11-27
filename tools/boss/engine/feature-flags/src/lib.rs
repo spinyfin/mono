@@ -55,7 +55,8 @@ mod experiments;
 pub use experiments::{
     BATCHED_SEARCH_AB_SPLIT_FLAG, BATCHED_SEARCH_EXPERIMENT, EXPERIMENT_FLAG_CATEGORY, EXPERIMENTS, ExperimentArm,
     ExperimentArmSet, ExperimentLane, ExperimentSpec, ExperimentState, TOKEN_EXPERIMENTS_FLAG, TREATMENT_BUCKET_LIMIT,
-    ab_split_flag_name, assign_arm, experiment_state, resolve_arms,
+    WORKER_AUTOCOMPACT_AB_SPLIT_FLAG, WORKER_AUTOCOMPACT_EXPERIMENT, ab_split_flag_name, assign_arm, experiment_state,
+    resolve_arms,
 };
 
 /// One feature flag entry in the registry. The registry is the source
@@ -526,6 +527,31 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
              one arm. On: half of families are treated and the rest are control. Off: every family is treated. Has \
              no effect while `batched_search` is off. DEFAULT ON, so switching `batched_search` on starts the \
              split; turn this off to treat every family.",
+        category: EXPERIMENT_FLAG_CATEGORY,
+        default_enabled: true,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
+        name: WORKER_AUTOCOMPACT_EXPERIMENT,
+        description: "Experiment `worker_autocompact` (token-consumption investigation R5 steps 1 and 2; no lane). \
+             Treated Claude workers launch with a 200k auto-compact window, and their worker rules tell a compact \
+             summary to keep the execution context, the task description, the open checklist and the \
+             done-declaration command verbatim. Control launches are unchanged. Which PR families are treated is \
+             decided by `worker_autocompact_ab_split`, and every launch records its family's arm in the \
+             execution's launch record so the arms can be compared in the Token Usage window. Has no effect while \
+             `token_experiments` is off. DEFAULT OFF: ships inert. Kill switch: set false and the next launch \
+             gets today's launch line and rules; a worker already running keeps the ones it started with.",
+        category: EXPERIMENT_FLAG_CATEGORY,
+        default_enabled: false,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
+        name: WORKER_AUTOCOMPACT_AB_SPLIT_FLAG,
+        description: "Run `worker_autocompact` as an A/B experiment on half of PR families, chosen by a stable hash \
+             of the PR family and the experiment key. A work item and all of its revisions, reviews and guides \
+             share one arm. On: half of families are treated and the rest are control. Off: every family is \
+             treated. Has no effect while `worker_autocompact` is off. DEFAULT ON, so switching \
+             `worker_autocompact` on starts the split; turn this off to treat every family.",
         category: EXPERIMENT_FLAG_CATEGORY,
         default_enabled: true,
         capability_id: None,

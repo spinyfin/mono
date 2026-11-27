@@ -1898,6 +1898,22 @@ pub fn default_structured_output_wiring(request: &StructuredOutputRequest<'_>) -
     }
 }
 
+/// Window treated Claude workers pass as `--autocompact`. Later launch
+/// experiments add fields to [`LaunchOptions`]; this token is the first.
+pub const CLAUDE_WORKER_AUTO_COMPACT_WINDOW: &str = "200k";
+
+/// Plain launch knobs the runner builds from a launch's experiment arms
+/// and hands to the driver. Drivers never see an experiment key: they
+/// apply these options, and the default (every field unset) is today's
+/// launch line. Later launch experiments append fields here, with
+/// [`Default`] leaving existing call sites on the control path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LaunchOptions {
+    /// Claude `--autocompact` window (for example `"200k"`). `None` keeps
+    /// today's launch line.
+    pub auto_compact_window: Option<&'static str>,
+}
+
 /// Driver-neutral inputs for the [`Capability::Spawn`] capability. Every
 /// field is a concept that holds across backends: the resolved model/effort,
 /// an optional rendered settings/config path, the corp-laptop
@@ -2032,6 +2048,15 @@ pub trait AgentDriver: Send + Sync {
     /// answer agent to guarantee `dontAsk` (deny-by-default allowlist), which
     /// must not be downgradable. `None` keeps the default per-model behaviour.
     fn spawn_invocation(&self, request: SpawnRequest<'_>) -> SpawnPlan;
+
+    /// [`Self::spawn_invocation`] with the launch knobs the runner resolved
+    /// from the arm set. The default ignores `options` and returns today's
+    /// launch line, so the many `SpawnRequest` struct-literal sites stay
+    /// on the control path. Claude applies [`LaunchOptions::auto_compact_window`].
+    fn spawn_invocation_with_options(&self, request: SpawnRequest<'_>, options: &LaunchOptions) -> SpawnPlan {
+        let _ = options;
+        self.spawn_invocation(request)
+    }
 
     /// Substrings the engine uses to screen-scrape this driver's tmux pane
     /// content — e.g. confirming a turn actually ended before declaring an

@@ -42,7 +42,7 @@ A PR family is assigned an arm at each of its executions' first launch, from the
 - **The unit is the PR family:** the chain root work item and everything under it (its revisions, reviews, CI and conflict fixes, and review guide). They share one arm, so per-PR measures such as revisions per PR and tokens per merged PR mean something.
 - **The draw is a stable hash.** A family's bucket in `[0, 100)` is a SHA-256 of `experiment:<key>:<family root id>`. Below 50 is treatment, 50 and above is control. Including the key makes two experiments' draws independent of each other. The same family gets the same arm at every launch for as long as the flags stay put.
 - **Remote workers are never enrolled.** The remote spawn path reads no feature flags, so a run on a remote host records an empty arm set and is never treated. If remote hosts take a meaningful share of work, a half-and-half split is no longer half of everything.
-- **Only Standard workers read the batched-search rule.** Every execution records the family's arm for every running experiment, whether or not that run's own launch differs; the per-experiment table below names the filters that isolate the runs an experiment changes.
+- **Only Standard workers read the batched-search rule. Only Claude workers get the auto-compact window.** Every execution records the family's arm for every running experiment, whether or not that run's own launch differs; the per-experiment table below names the filters that isolate the runs an experiment changes.
 
 ## What a launch records
 
@@ -99,6 +99,24 @@ Run at most four experiments at once. The fall-back read for a surprising result
 | Stop early when       | A treated run cannot start, or ends in a state the engine cannot classify. No other condition beyond the general rules below.                                                                                                                                                                                              |
 
 To run it: switch `batched_search` on (a half-and-half split starts), switch `batched_search_ab_split` off to treat every family, switch `batched_search` off to stop. To read it, once the usage dimension lands: `boss cost rows --experiment batched_search --group-by experiment_arm`.
+
+### `worker_autocompact`
+
+| Property              | Value                                                                                                                                                                                                                                  |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Source                | Steps 1 and 2 of recommendation R5 in [the token-consumption investigation](investigations/token-consumption-reduction-2026-11-19.md).                                                                                                 |
+| Lane                  | None. It may overlap any other experiment.                                                                                                                                                                                             |
+| Requires              | Nothing beyond `token_experiments`.                                                                                                                                                                                                    |
+| Runs it changes       | Claude workers of every kind. Other drivers in a treated family record the arm but launch as they do today.                                                                                                                            |
+| Treatment             | The launch line gains `--autocompact 200k`, and the worker rules gain a compact-summaries block telling the summary to keep the execution context, the task description, the open checklist and the done-declaration command verbatim. |
+| Control               | Today's launch line and worker rules, byte for byte.                                                                                                                                                                                   |
+| Estimated saving      | ≈0.4–0.5B tokens a week.                                                                                                                                                                                                               |
+| Risk                  | Low to medium. A summary can drop a constraint; the compact-instructions block and the existing nudges cover the protocol parts.                                                                                                       |
+| What shows the effect | Peak context, runs compacted and tokens per run, by arm, filtered to Claude. The arm is recorded for every execution in the family, treated or not.                                                                                    |
+| Guardrail             | End-status mix of compacted runs, and the share that ended without a done declaration.                                                                                                                                                 |
+| Stop early when       | A compacted run loses its task or its done declaration, or the undeclared rate is twice control. Also the general rule below.                                                                                                          |
+
+To run it: switch `worker_autocompact` on (a half-and-half split starts), switch `worker_autocompact_ab_split` off to treat every family, switch `worker_autocompact` off to stop. To read it, once the usage dimension lands: `boss cost rows --experiment worker_autocompact --group-by experiment_arm --filter driver=claude`.
 
 ## Rules for every experiment
 
