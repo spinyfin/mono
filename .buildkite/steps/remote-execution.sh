@@ -185,19 +185,57 @@ ci_remote_watchdog_tick() {
   return 0
 }
 
+# ci_remote_watchdog_observe <endpoint> <bad so far>
+#
+# One status probe, counted. Prints "<new consecutive bad count> <token>".
+# The count is 0 for any answer that is not stuck, so a good tick, an
+# unreachable hub or an unclassified probe failure resets the run. A single
+# slow store probe in the hub answers 503, so a build is stopped only after
+# CI_REMOTE_WATCHDOG_CONSECUTIVE_BAD (default REMOTE_STATUS_STUCK_AFTER_DEFAULT)
+# bad ticks in a row.
+ci_remote_watchdog_observe() {
+  local endpoint="$1" bad="$2" host_port status
+  host_port="$(ci_remote_endpoint_host_port "$endpoint")" || { echo "0 none"; return 0; }
+  status="$(remote_status_probe "$endpoint" "$(_ci_remote_os)" \
+    "$CI_REMOTE_PROBE_TIMEOUT_SECS" "$CI_REMOTE_STATUS_TIMEOUT_SECS")" || status=none
+  echo "$(remote_status_count_bad "$bad" "$status") ${status}"
+}
+
+# ci_remote_watchdog_verdict <endpoint> <bad so far>
+#
+# Runs one counted probe. Prints "<new count>" on the first line and, when
+# that count reaches the limit, the stop reason on the second. Logs every bad
+# tick to stderr.
+ci_remote_watchdog_verdict() {
+  local endpoint="$1" bad="$2" limit obs status
+  limit="$(remote_status_stuck_after "${CI_REMOTE_WATCHDOG_CONSECUTIVE_BAD:-}")"
+  obs="$(ci_remote_watchdog_observe "$endpoint" "$bad")"
+  bad="${obs%% *}"
+  status="${obs#* }"
+  echo "$bad"
+  ((bad > 0)) || return 0
+  echo "[ci-env] remote watchdog: bad status check (${status}), ${bad} of ${limit} consecutive before this command is stopped" >&2
+  if ((bad >= limit)); then
+    echo "$(ci_remote_watchdog_reason "$status"); ${bad} consecutive bad status checks"
+  fi
+}
+
 # ci_remote_watchdog_loop <pid> <reason_file> <endpoint>
 #
 # While <pid> lives, probe the endpoint every CI_REMOTE_WATCHDOG_INTERVAL_SECS.
-# On a stuck status, write the reason to <reason_file> and send SIGTERM to
-# <pid>. Returns once <pid> has exited or has been signalled.
+# After CI_REMOTE_WATCHDOG_CONSECUTIVE_BAD stuck statuses in a row, write the
+# reason to <reason_file> and send SIGTERM to <pid>. Returns once <pid> has
+# exited or has been signalled.
 ci_remote_watchdog_loop() {
-  local pid="$1" reason_file="$2" endpoint="$3" reason
+  local pid="$1" reason_file="$2" endpoint="$3" reason verdict bad=0
   while kill -0 "$pid" 2>/dev/null; do
     sleep "$CI_REMOTE_WATCHDOG_INTERVAL_SECS"
     kill -0 "$pid" 2>/dev/null || return 0
-    if reason="$(ci_remote_watchdog_tick "$endpoint")"; then
-      continue
-    fi
+    verdict="$(ci_remote_watchdog_verdict "$endpoint" "$bad")"
+    bad="${verdict%%$'\n'*}"
+    reason=""
+    [[ "$verdict" == *$'\n'* ]] && reason="${verdict#*$'\n'}"
+    [[ -n "$reason" ]] || continue
     printf '%s\n' "$reason" > "$reason_file"
     kill -TERM "$pid" 2>/dev/null || true
     return 0
@@ -294,18 +332,21 @@ ci_remote_signal_bazel_clients() {
 # ci_remote_watchdog_loop_tree <root_pid> <reason_file> <endpoint>
 #
 # While <root_pid> lives, probe the endpoint every
-# CI_REMOTE_WATCHDOG_INTERVAL_SECS. On a stuck status, write the reason,
+# CI_REMOTE_WATCHDOG_INTERVAL_SECS. After CI_REMOTE_WATCHDOG_CONSECUTIVE_BAD
+# stuck statuses in a row, write the reason,
 # call ci_remote_watchdog_stuck_hook if the caller defined it, and SIGTERM
 # bazel clients under <root_pid>. Covers bazel started by the shell wrapper
 # and by repobin/checkleft.
 ci_remote_watchdog_loop_tree() {
-  local root_pid="$1" reason_file="$2" endpoint="$3" reason
+  local root_pid="$1" reason_file="$2" endpoint="$3" reason verdict bad=0
   while kill -0 "$root_pid" 2> /dev/null; do
     sleep "$CI_REMOTE_WATCHDOG_INTERVAL_SECS"
     kill -0 "$root_pid" 2> /dev/null || return 0
-    if reason="$(ci_remote_watchdog_tick "$endpoint")"; then
-      continue
-    fi
+    verdict="$(ci_remote_watchdog_verdict "$endpoint" "$bad")"
+    bad="${verdict%%$'\n'*}"
+    reason=""
+    [[ "$verdict" == *$'\n'* ]] && reason="${verdict#*$'\n'}"
+    [[ -n "$reason" ]] || continue
     printf '%s\n' "$reason" > "$reason_file"
     if declare -F ci_remote_watchdog_stuck_hook > /dev/null 2>&1; then
       ci_remote_watchdog_stuck_hook "$reason_file"

@@ -94,13 +94,24 @@ nc() {
 curl_calls="${TEST_TMPDIR:?}/curl-calls"
 curl_http=200
 curl_fail_exit=""
+# curl_seq is a file of answers, one per request, consumed first; it works
+# across the command substitutions the watchdog loops run probes in. Once it
+# is empty, curl_http applies.
+curl_seq="${TEST_TMPDIR:?}/curl-seq"
+: > "$curl_seq"
 curl() {
   printf '%s\n' "$*" >> "$curl_calls"
-  printf '%s' "$curl_http"
+  local answer="$curl_http"
+  if [[ -s "$curl_seq" ]]; then
+    answer="$(head -n 1 "$curl_seq")"
+    tail -n +2 "$curl_seq" > "${curl_seq}.next"
+    mv "${curl_seq}.next" "$curl_seq"
+  fi
+  printf '%s' "$answer"
   if [[ -n "$curl_fail_exit" ]]; then
     return "$curl_fail_exit"
   fi
-  if [[ "$curl_http" == "000" ]]; then
+  if [[ "$answer" == "000" ]]; then
     return 28
   fi
   return 0
@@ -422,6 +433,82 @@ fi
 if [[ ! -s "$reason_file" ]] || ! grep -q "did not answer a status request" "$reason_file"; then
   fail "watchdog loop: missing reason file: $(cat "$reason_file" 2>/dev/null)"
 fi
+curl_http=200
+
+# Consecutive rule: one bad tick (503 or timeout) does not stop a command.
+# Only CI_REMOTE_WATCHDOG_CONSECUTIVE_BAD in a row does, and any other answer
+# resets the run.
+CI_REMOTE_WATCHDOG_INTERVAL_SECS=0
+CI_REMOTE_WATCHDOG_CONSECUTIVE_BAD=3
+
+# verdict_run <bad so far> <codes...>: one counted probe per code; prints the
+# final count, and "STOP" if a reason was produced on any step.
+verdict_run() {
+  local bad="$1" code out stopped=""
+  shift
+  : > "$curl_seq"
+  printf '%s\n' "$@" > "$curl_seq"
+  for code in "$@"; do
+    out="$(ci_remote_watchdog_verdict "$endpoint" "$bad" 2> /dev/null)"
+    bad="${out%%$'\n'*}"
+    [[ "$out" == *$'\n'* ]] && stopped=" STOP"
+  done
+  echo "${bad}${stopped}"
+}
+expect_equal "1" "$(verdict_run 0 503)" "consecutive: one 503"
+expect_equal "2" "$(verdict_run 0 503 503)" "consecutive: N-1 503s"
+expect_equal "0" "$(verdict_run 0 503 503 200)" "consecutive: 503s then 200 resets"
+expect_equal "3 STOP" "$(verdict_run 0 503 503 503)" "consecutive: N 503s stop"
+expect_equal "3 STOP" "$(verdict_run 0 000 000 000)" "consecutive: N timeouts stop"
+expect_equal "3 STOP" "$(verdict_run 0 503 000 503)" "consecutive: mixed 503 and timeout count together"
+expect_equal "1" "$(verdict_run 0 503 503 200 503)" "consecutive: the count restarts after a good tick"
+# A non-stuck answer (HTTP 404) also ends the run; an unreachable hub is
+# never counted at all.
+expect_equal "0" "$(verdict_run 0 503 503 404)" "consecutive: a non-stuck answer resets"
+nc_status=1
+expect_equal "0" "$(verdict_run 0 503 503 503 503)" "consecutive: an unreachable hub never stops"
+nc_status=0
+# The stop reason names the run length, and every bad tick is logged.
+: > "$curl_seq"
+printf '%s\n' 503 > "$curl_seq"
+verdict_text="$(ci_remote_watchdog_verdict "$endpoint" 2 2> "${TEST_TMPDIR}/verdict-stderr")"
+if [[ "$verdict_text" != *"status 503"*"3 consecutive bad status checks"* ]]; then
+  fail "consecutive: stop reason was '${verdict_text}'"
+fi
+if ! grep -q "bad status check (503), 3 of 3" "${TEST_TMPDIR}/verdict-stderr"; then
+  fail "consecutive: bad tick was not logged: $(cat "${TEST_TMPDIR}/verdict-stderr")"
+fi
+
+# loop_runs <codes...>: run the step-level loop against a command that
+# lives 1 s; prints "stopped" if the loop wrote a reason, else "kept".
+loop_runs() {
+  local rf="${TEST_TMPDIR}/consecutive-reason" target
+  rm -f "$rf"
+  printf '%s\n' "$@" > "$curl_seq"
+  sleep 1 &
+  target=$!
+  ci_remote_watchdog_loop "$target" "$rf" "$endpoint" 2> /dev/null
+  kill -KILL "$target" 2> /dev/null || true
+  wait "$target" 2> /dev/null || true
+  if [[ -s "$rf" ]]; then echo stopped; else echo kept; fi
+}
+expect_equal "kept" "$(loop_runs 503)" "loop: one 503 then 200 does not stop"
+expect_equal "kept" "$(loop_runs 503 503)" "loop: N-1 503s then 200 do not stop"
+expect_equal "kept" "$(loop_runs 000 000)" "loop: N-1 timeouts then 200 do not stop"
+expect_equal "stopped" "$(loop_runs 503 503 503)" "loop: N consecutive 503s stop"
+expect_equal "stopped" "$(loop_runs 000 000 000)" "loop: N consecutive timeouts stop"
+if ! grep -q "3 consecutive bad status checks" "${TEST_TMPDIR}/consecutive-reason"; then
+  fail "loop: reason line was '$(cat "${TEST_TMPDIR}/consecutive-reason")'"
+fi
+nc_status=1
+expect_equal "kept" "$(loop_runs 503 503 503 503)" "loop: an unreachable hub never stops"
+nc_status=0
+: > "$curl_seq"
+unset CI_REMOTE_WATCHDOG_CONSECUTIVE_BAD
+expect_equal "8" "$(remote_status_stuck_after "")" "default limit"
+expect_equal "8" "$(remote_status_stuck_after "0")" "default limit for 0"
+expect_equal "8" "$(remote_status_stuck_after "x")" "default limit for junk"
+expect_equal "5" "$(remote_status_stuck_after "5")" "configured limit"
 curl_http=200
 
 # SIGTERM diagnostic: the immediate line names the executor with no probe,

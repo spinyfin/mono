@@ -29,6 +29,9 @@
 #   DEV_REMOTE_WATCHDOG_INTERVAL_SECS     default 15
 #   DEV_REMOTE_WATCHDOG_STATUS_TIMEOUT_SECS  default 10
 #   DEV_REMOTE_WATCHDOG_CONNECT_TIMEOUT_SECS default 5
+#   DEV_REMOTE_WATCHDOG_CONSECUTIVE_BAD      consecutive bad ticks (503 or
+#                                  timeout) before the build is stopped;
+#                                  default 8. A good tick resets the count.
 #   DEV_REMOTE_WATCHDOG_TARGET_PID  process to stop when the hub is stuck.
 #                                  Unset: the bazel client connected to this
 #                                  server, or the server if none is visible.
@@ -43,6 +46,7 @@ original="${DEV_REMOTE_STAMP_COMMAND:-${here}/../boss/installer/workspace-status
 interval_s="${DEV_REMOTE_WATCHDOG_INTERVAL_SECS:-15}"
 status_timeout_s="${DEV_REMOTE_WATCHDOG_STATUS_TIMEOUT_SECS:-10}"
 connect_timeout_s="${DEV_REMOTE_WATCHDOG_CONNECT_TIMEOUT_SECS:-5}"
+stuck_after="$(remote_status_stuck_after "${DEV_REMOTE_WATCHDOG_CONSECUTIVE_BAD:-}")"
 
 watchdog_endpoint() {
   local line
@@ -132,15 +136,31 @@ watchdog_deliver_reason() {
   fi
 }
 
+# One status probe. Prints the token (`200`, `503`, `timeout`, `unreachable`,
+# ...) and succeeds, or fails with nothing printed when there is nothing to
+# probe (no endpoint, malformed endpoint).
+watchdog_status() {
+  local endpoint host_port
+  endpoint="$(watchdog_endpoint)" || return 1
+  host_port="$(remote_status_endpoint_host_port "$endpoint")" || return 1
+  remote_status_probe "$endpoint" "$(watchdog_os)" "$connect_timeout_s" "$status_timeout_s"
+}
+
+# The stop reason for a stuck <token>, naming the hub's host and port.
+watchdog_reason_for() {
+  local endpoint host_port
+  endpoint="$(watchdog_endpoint)" || return 1
+  host_port="$(remote_status_endpoint_host_port "$endpoint")" || return 1
+  watchdog_reason "${host_port% *}" "${host_port##* }" "$1"
+}
+
+# A single probe with no counting (--once). Prints the reason and returns 1
+# when the answer is stuck.
 watchdog_tick() {
-  local endpoint host_port host port status
-  endpoint="$(watchdog_endpoint)" || return 0
-  host_port="$(remote_status_endpoint_host_port "$endpoint")" || return 0
-  host="${host_port% *}"
-  port="${host_port##* }"
-  status="$(remote_status_probe "$endpoint" "$(watchdog_os)" "$connect_timeout_s" "$status_timeout_s")" || return 0
+  local status
+  status="$(watchdog_status)" || return 0
   if remote_status_stuck "$status"; then
-    watchdog_reason "$host" "$port" "$status"
+    watchdog_reason_for "$status"
     return 1
   fi
   return 0
@@ -158,8 +178,15 @@ watchdog_sweep_stale_pidfiles() {
   done
 }
 
+watchdog_log_bad_tick() {
+  printf '%s dev-remote watchdog: bad status check (%s), %s of %s consecutive before this build is stopped\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "$stuck_after" >> "$(watchdog_log_file)"
+}
+
+# Stops the target only after DEV_REMOTE_WATCHDOG_CONSECUTIVE_BAD bad ticks
+# in a row. Any other answer (including `unreachable`) resets the count.
 watchdog_loop() {
-  local target="${DEV_REMOTE_WATCHDOG_TARGET_PID:-}" reason
+  local target="${DEV_REMOTE_WATCHDOG_TARGET_PID:-}" reason status bad=0
   [[ -n "$target" ]] || target="$(watchdog_in_flight_pid "$PPID")"
   _watchdog_pidfile="$(watchdog_pidfile "$target")"
   trap 'rm -f "$_watchdog_pidfile"' EXIT
@@ -167,9 +194,16 @@ watchdog_loop() {
   while kill -0 "$target" 2> /dev/null; do
     sleep "$interval_s"
     kill -0 "$target" 2> /dev/null || return 0
-    if reason="$(watchdog_tick)"; then
+    status="$(watchdog_status)" || status=none
+    bad="$(remote_status_count_bad "$bad" "$status")"
+    if ((bad == 0)); then
       continue
     fi
+    watchdog_log_bad_tick "$status" "$bad"
+    if ((bad < stuck_after)); then
+      continue
+    fi
+    reason="$(watchdog_reason_for "$status") (${bad} consecutive bad status checks.)"
     watchdog_deliver_reason "$target" "$reason"
     kill -TERM "$target" 2> /dev/null || true
     return 0

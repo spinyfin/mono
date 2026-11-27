@@ -103,3 +103,39 @@ remote_status_stuck() {
     *) return 1 ;;
   esac
 }
+
+# How many consecutive stuck answers (`timeout` or `503`) a watchdog needs
+# before it stops a build. One slow `stat` in the hub's CAS store probe (a
+# hard-coded 2 s inside NativeLink) already produces a 503, and a stall on
+# 2026-11-27 produced 503s over about a minute that the hub's own once-a-minute
+# check never saw. At the 15 s tick, 8 consecutive bad ticks tolerates a stall
+# of 105 s or more (a whole minute of bad ticks is 4 or 5) and still ends a hub
+# that stays stuck in about 2 minutes (503) to 3.3 minutes (`timeout`, whose
+# ticks are 15 s + the 10 s probe). tools/remote-execution/README.md, "What
+# bounds a stuck action", has the derivation.
+REMOTE_STATUS_STUCK_AFTER_DEFAULT=8
+
+# remote_status_stuck_after <configured value>
+#
+# Prints the consecutive-bad-tick limit: the value when it is a positive
+# integer, otherwise REMOTE_STATUS_STUCK_AFTER_DEFAULT.
+remote_status_stuck_after() {
+  if [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s\n' "$1"
+  else
+    printf '%s\n' "$REMOTE_STATUS_STUCK_AFTER_DEFAULT"
+  fi
+}
+
+# remote_status_count_bad <count so far> <token>
+#
+# Prints the new run length of consecutive stuck answers: one more when
+# <token> is stuck, 0 for any other answer (a good tick, `unreachable`, an
+# unknown probe failure all end the run).
+remote_status_count_bad() {
+  if remote_status_stuck "$2"; then
+    printf '%s\n' "$(($1 + 1))"
+  else
+    printf '%s\n' 0
+  fi
+}
