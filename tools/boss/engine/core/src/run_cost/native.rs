@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use super::context_shape::CallContext;
 use super::{RunCostSnapshot, nonnegative_i64};
 
 #[derive(Debug, Default)]
@@ -17,14 +18,7 @@ pub(super) struct NativeUsage {
 impl NativeUsage {
     pub(super) fn ingest(&mut self, path: &Path, value: &Value) {
         let parsed = if value.get("type").and_then(Value::as_str) == Some("PLANNER_RESPONSE") {
-            if value
-                .get("source")
-                .and_then(Value::as_str)
-                .is_some_and(|source| source != "MODEL")
-            {
-                return;
-            }
-            let Some(index) = value.get("step_index").and_then(nonnegative_i64) else {
+            let Some(index) = planner_step_index(value) else {
                 return;
             };
             let snapshot = RunCostSnapshot {
@@ -88,6 +82,65 @@ impl NativeUsage {
 
 fn count(value: &Value, key: &str) -> Option<i64> {
     value.get(key).and_then(nonnegative_i64)
+}
+
+/// The step index of a model-authored planner response, which is the only
+/// Antigravity row that carries usage. A row some other source wrote is not a
+/// model call.
+fn planner_step_index(value: &Value) -> Option<i64> {
+    if value
+        .get("source")
+        .and_then(Value::as_str)
+        .is_some_and(|source| source != "MODEL")
+    {
+        return None;
+    }
+    value.get("step_index").and_then(nonnegative_i64)
+}
+
+/// The prompt of one Antigravity model call. `input_tokens` is fresh input, so
+/// the prompt is that plus the cache reads; with either missing the call's
+/// size is unknown. Antigravity does not report cache writes.
+pub(super) fn planner_call_context(value: &Value) -> Option<(i64, CallContext)> {
+    if value.get("type").and_then(Value::as_str) != Some("PLANNER_RESPONSE") {
+        return None;
+    }
+    let index = planner_step_index(value)?;
+    let context_tokens = count(value, "input_tokens")
+        .zip(count(value, "cache_read_tokens"))
+        .map(|(input, cached)| input.saturating_add(cached));
+    Some((
+        index,
+        CallContext {
+            context_tokens,
+            cache_write_tokens: None,
+        },
+    ))
+}
+
+/// The prompt of one Grok turn, keyed by prompt id.
+///
+/// A `turn_completed` row sums every model call the turn made, so it gives one
+/// call's prompt size only when the turn made exactly one call (ACP
+/// `inputTokens` already contains the cache reads). A turn with several calls
+/// is a call whose size is unknown rather than an average, and a turn that made
+/// none is not a call at all. Grok does not report cache writes.
+pub(super) fn grok_call_context(value: &Value) -> Option<(String, CallContext)> {
+    if !boss_engine_driver::grok::is_turn_completed(value) {
+        return None;
+    }
+    let update = value.pointer("/params/update")?;
+    let id = update.get("prompt_id")?.as_str()?;
+    let usage = &update["usage"];
+    let call = match count(usage, "modelCalls") {
+        Some(0) => return None,
+        Some(1) => CallContext {
+            context_tokens: count(usage, "inputTokens"),
+            cache_write_tokens: None,
+        },
+        _ => CallContext::UNKNOWN,
+    };
+    Some((id.to_owned(), call))
 }
 
 fn grok(value: &Value) -> Option<(String, RunCostSnapshot)> {

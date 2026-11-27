@@ -17,6 +17,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::transcript_tail::{TailError, TranscriptTail};
+use context_shape::{CallContext, ContextShape};
 
 pub(crate) use boss_engine_storage_values::RunCostSnapshot;
 
@@ -60,6 +61,7 @@ impl From<TailError> for CaptureError {
     }
 }
 
+mod context_shape;
 mod native;
 
 /// Placeholder model Claude stamps on locally synthesized assistant records;
@@ -93,13 +95,23 @@ struct MessageUsage {
 #[builder(on(String, into))]
 struct CostAccumulator {
     native: native::NativeUsage,
+    /// Call-by-call context size and compactions of this transcript alone.
+    /// Never merged across transcripts: a subagent's context is its own, and the
+    /// run's context shape is the parent session's.
+    context: ContextShape,
     provider_usage: std::collections::BTreeMap<String, Value>,
     model: Option<String>,
     observed_models: BTreeSet<String>,
     saw_subagent_delegation: bool,
     messages: HashMap<String, Option<MessageUsage>>,
     codex_usage_by_transcript: HashMap<PathBuf, MessageUsage>,
-    codex_rounds: std::collections::HashSet<String>,
+    codex_turns: std::collections::HashSet<String>,
+    /// Distinct Codex model calls from top-level `token_usage_record` rows,
+    /// keyed by `(transcript_path, response_id)`.
+    codex_usage_record_calls: BTreeSet<(PathBuf, String)>,
+    /// Distinct Codex model calls from `event_msg/token_count` rows carrying an
+    /// `info` object, used when no `token_usage_record` rows are present.
+    codex_token_count_calls: BTreeSet<(PathBuf, String)>,
     duration_by_id: HashMap<String, i64>,
     anonymous_duration_ms: i64,
     saw_anonymous_duration: bool,
@@ -108,6 +120,7 @@ struct CostAccumulator {
 impl CostAccumulator {
     fn ingest(&mut self, transcript_path: &Path, value: &Value, capture_provider_usage: bool) {
         self.native.ingest(transcript_path, value);
+        self.ingest_context_shape(value);
         // Raw provider objects are only consumed by pr_review_guide_attempts.
         // Ordinary executions still fold token totals below; skip the clone
         // and per-run cache of unused JSON.
@@ -160,6 +173,32 @@ impl CostAccumulator {
                 }
             }
             Some("event_msg") => self.ingest_codex_event(transcript_path, value),
+            Some("token_usage_record") => self.ingest_codex_usage_record(transcript_path, value),
+            _ => {}
+        }
+    }
+
+    /// Feed the dialects whose records are not otherwise parsed here. Claude
+    /// calls and Codex calls are read where their usage is, in
+    /// [`Self::ingest_assistant`] and [`Self::ingest_codex_event`].
+    fn ingest_context_shape(&mut self, value: &Value) {
+        if let Some((prompt_id, call)) = native::grok_call_context(value) {
+            self.context.observe_grok_turn(&prompt_id, call);
+        }
+        if let Some((step_index, call)) = native::planner_call_context(value) {
+            self.context.observe_agy_step(step_index, call);
+        }
+        match value.get("type").and_then(Value::as_str) {
+            Some("system")
+                if value.get("subtype").and_then(Value::as_str) == Some("compact_boundary")
+                    && value.get("isSidechain").and_then(Value::as_bool) != Some(true) =>
+            {
+                self.context
+                    .observe_claude_compaction(value.get("uuid").and_then(Value::as_str));
+            }
+            Some("compacted") => self
+                .context
+                .observe_codex_compacted_item(value.get("timestamp").and_then(Value::as_str)),
             _ => {}
         }
     }
@@ -188,6 +227,21 @@ impl CostAccumulator {
         {
             self.model = Some(model.to_owned());
             self.observed_models.insert(model.to_owned());
+        }
+
+        // A synthesized assistant record is not a model call, and a sidechain
+        // record belongs to a subagent's own context. Reserve the message id in
+        // transcript order even when a record omits `usage`, so an absent-usage
+        // first call is not replaced by the second and a later absent-usage call
+        // makes the peak unknown; a later usage-bearing split record fills it
+        // in, and a later usage-less split record never erases a known one.
+        if value.get("isSidechain").and_then(Value::as_bool) != Some(true)
+            && message.get("model").and_then(Value::as_str).map(str::trim) != Some(SYNTHETIC_MODEL)
+        {
+            match message.get("usage").and_then(Value::as_object) {
+                Some(usage) => self.context.observe_claude_call(message_id, claude_call_context(usage)),
+                None => self.context.reserve_claude_call(message_id),
+            }
         }
 
         let usage = message.get("usage").and_then(Value::as_object).map(|usage| {
@@ -229,9 +283,34 @@ impl CostAccumulator {
         }
     }
 
+    fn ingest_codex_usage_record(&mut self, transcript_path: &Path, value: &Value) {
+        let Some(key) = codex_usage_record_key(value) else {
+            return;
+        };
+        self.codex_usage_record_calls
+            .insert((transcript_path.to_owned(), key.clone()));
+        match value.pointer("/payload/usage").and_then(Value::as_object) {
+            Some(usage) => self.context.observe_codex_usage_record(&key, codex_call_context(usage)),
+            None => self.context.reserve_codex_usage_record(&key),
+        }
+    }
+
     fn ingest_codex_event(&mut self, transcript_path: &Path, value: &Value) {
         match value.pointer("/payload/type").and_then(Value::as_str) {
             Some("token_count") => {
+                if let Some(key) = codex_token_count_key(value) {
+                    self.codex_token_count_calls
+                        .insert((transcript_path.to_owned(), key.clone()));
+                    // `last_token_usage` is the call that just finished; its
+                    // `input_tokens` already contains the cached reads, so it
+                    // is the whole prompt.
+                    if let Some(last) = value
+                        .pointer("/payload/info/last_token_usage")
+                        .and_then(Value::as_object)
+                    {
+                        self.context.observe_codex_legacy_call(&key, codex_call_context(last));
+                    }
+                }
                 let Some(usage) = value.pointer("/payload/info/total_token_usage") else {
                     return;
                 };
@@ -252,11 +331,14 @@ impl CostAccumulator {
                     },
                 );
             }
+            Some("context_compacted") => self
+                .context
+                .observe_codex_compaction_event(value.get("timestamp").and_then(Value::as_str)),
             Some("task_complete") => {
                 let Some(turn_id) = value.pointer("/payload/turn_id").and_then(Value::as_str) else {
                     return;
                 };
-                if self.codex_rounds.insert(turn_id.to_owned())
+                if self.codex_turns.insert(turn_id.to_owned())
                     && let Some(duration_ms) = value.pointer("/payload/duration_ms").and_then(nonnegative_i64)
                 {
                     self.duration_by_id.insert(format!("codex:{turn_id}"), duration_ms);
@@ -267,11 +349,24 @@ impl CostAccumulator {
     }
 
     fn snapshot(&self) -> Option<RunCostSnapshot> {
+        let mut snapshot = self.usage_snapshot()?;
+        let figures = self.context.figures();
+        snapshot.first_call_context_tokens = figures.first_call_context_tokens;
+        snapshot.first_call_cache_write_tokens = figures.first_call_cache_write_tokens;
+        snapshot.peak_context_tokens = figures.peak_context_tokens;
+        snapshot.compactions = figures.compactions;
+        Some(snapshot)
+    }
+
+    /// The token, round and duration part of [`Self::snapshot`].
+    fn usage_snapshot(&self) -> Option<RunCostSnapshot> {
         if let Some(snapshot) = self.native.snapshot() {
             return Some(snapshot);
         }
         if self.messages.is_empty()
-            && self.codex_rounds.is_empty()
+            && self.codex_turns.is_empty()
+            && self.codex_usage_record_calls.is_empty()
+            && self.codex_token_count_calls.is_empty()
             && self.codex_usage_by_transcript.is_empty()
             && self.duration_by_id.is_empty()
             && !self.saw_anonymous_duration
@@ -296,6 +391,11 @@ impl CostAccumulator {
             .fold(self.anonymous_duration_ms, |total, duration| {
                 total.saturating_add(*duration)
             });
+        let codex_calls = if !self.codex_usage_record_calls.is_empty() {
+            self.codex_usage_record_calls.len()
+        } else {
+            self.codex_token_count_calls.len()
+        };
 
         Some(RunCostSnapshot {
             provider_usage_json: (!self.provider_usage.is_empty())
@@ -313,9 +413,10 @@ impl CostAccumulator {
             cache_creation_1h_tokens: (saw_usage && ttl_split_known)
                 .then(|| sum(|usage| usage.cache_creation_1h_tokens)),
             cache_creation_ttl_split_known: saw_usage.then_some(ttl_split_known),
-            rounds: Some((self.messages.len() + self.codex_rounds.len()) as i64),
+            rounds: Some((self.messages.len() + codex_calls) as i64),
             agent_active_ms: (!self.duration_by_id.is_empty() || self.saw_anonymous_duration)
                 .then_some(agent_active_ms),
+            ..Default::default()
         })
     }
 
@@ -339,10 +440,85 @@ impl CostAccumulator {
         }
         self.codex_usage_by_transcript
             .extend(other.codex_usage_by_transcript.clone());
-        self.codex_rounds.extend(other.codex_rounds.iter().cloned());
+        self.codex_turns.extend(other.codex_turns.iter().cloned());
+        self.codex_usage_record_calls
+            .extend(other.codex_usage_record_calls.iter().cloned());
+        self.codex_token_count_calls
+            .extend(other.codex_token_count_calls.iter().cloned());
         self.duration_by_id.extend(other.duration_by_id.clone());
         self.anonymous_duration_ms = self.anonymous_duration_ms.saturating_add(other.anonymous_duration_ms);
         self.saw_anonymous_duration |= other.saw_anonymous_duration;
+    }
+}
+
+/// The prompt of one Codex call: `input_tokens` already contains cached reads,
+/// so it is the whole prompt.
+fn codex_call_context(usage: &serde_json::Map<String, Value>) -> CallContext {
+    CallContext {
+        context_tokens: usage.get("input_tokens").and_then(nonnegative_i64),
+        cache_write_tokens: usage.get("cache_write_input_tokens").and_then(nonnegative_i64),
+    }
+}
+
+/// Stable deduplication key for a top-level Codex `token_usage_record`:
+/// prefers `payload.response_id`, falling back to `ordinal` or `timestamp`.
+fn codex_usage_record_key(value: &Value) -> Option<String> {
+    if let Some(id) = value
+        .pointer("/payload/response_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    {
+        return Some(id.to_owned());
+    }
+    if let Some(ordinal) = value.get("ordinal").and_then(nonnegative_i64) {
+        return Some(format!("ordinal:{ordinal}"));
+    }
+    value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .filter(|ts| !ts.is_empty())
+        .map(|ts| format!("ts:{ts}"))
+}
+
+/// Stable deduplication key for an `event_msg/token_count` carrying an `info`
+/// object (events with `info: null` are not model calls). Prefers `timestamp`,
+/// falling back to the cumulative/last usage tuple so synthetic records without
+/// timestamps still deduplicate on replay.
+fn codex_token_count_key(value: &Value) -> Option<String> {
+    let info = value.pointer("/payload/info").and_then(Value::as_object)?;
+    if let Some(ts) = value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .filter(|ts| !ts.is_empty())
+    {
+        return Some(format!("ts:{ts}"));
+    }
+    for (prefix, key) in [("total", "total_token_usage"), ("last", "last_token_usage")] {
+        if let Some(usage) = info.get(key).and_then(Value::as_object) {
+            return Some(format!(
+                "{prefix}:{}:{}:{}:{}",
+                field(usage.get("input_tokens")),
+                field(usage.get("cached_input_tokens")),
+                field(usage.get("cache_write_input_tokens")),
+                field(usage.get("output_tokens")),
+            ));
+        }
+    }
+    None
+}
+
+/// The prompt of one Claude call: fresh input plus cache writes plus cache
+/// reads. A call missing any of the three has an unknown prompt size rather
+/// than a smaller one.
+fn claude_call_context(usage: &serde_json::Map<String, Value>) -> CallContext {
+    let count = |key: &str| usage.get(key).and_then(nonnegative_i64);
+    let cache_write_tokens = count("cache_creation_input_tokens");
+    CallContext {
+        context_tokens: count("input_tokens")
+            .zip(cache_write_tokens)
+            .zip(count("cache_read_input_tokens"))
+            .map(|((fresh, written), read)| fresh.saturating_add(written).saturating_add(read)),
+        cache_write_tokens,
     }
 }
 
@@ -512,6 +688,10 @@ impl RunCostTail {
             && let Some(parent_state) = self.tails.get(parent_path)
         {
             combined.merge_from(&parent_state.accumulator);
+            // Usage sums every transcript; the context shape is the parent
+            // session's alone, so a subagent's small or large prompt cannot
+            // become the run's first call or peak.
+            combined.context = parent_state.accumulator.context.clone();
         }
         let mut snapshot = combined.snapshot();
         if let Some(reason) = &self.subagents_unreadable_reason {
@@ -1353,3 +1533,7 @@ mod tests {
 #[cfg(test)]
 #[path = "run_cost/native_tests.rs"]
 mod native_tests;
+
+#[cfg(test)]
+#[path = "run_cost/context_shape_tests.rs"]
+mod context_shape_tests;

@@ -1,5 +1,25 @@
 use super::*;
 
+/// Migration id for [`migrate_run_context_shape`].
+pub(super) const RUN_CONTEXT_SHAPE_MIGRATION_ID: &str = "20261127_2052_run_context_shape";
+
+/// Adds the nullable per-run context-shape columns. NULL means the driver's
+/// transcript did not expose the figure, so existing rows stay NULL: nothing
+/// is backfilled, and an old run is never presented as having zero compactions.
+pub(super) fn migrate_run_context_shape(conn: &Connection) -> Result<()> {
+    for column in [
+        "first_call_context_tokens",
+        "first_call_cache_write_tokens",
+        "peak_context_tokens",
+        "compactions",
+    ] {
+        if !crate::schema_init::table_has_column(conn, "work_runs", column)? {
+            conn.execute_batch(&format!("ALTER TABLE work_runs ADD COLUMN {column} INTEGER"))?;
+        }
+    }
+    Ok(())
+}
+
 /// Maximum age of local PID records used to prevent duplicate dispatch.
 /// Older records may refer to recycled process IDs.
 pub const REDISPATCH_PID_TRUST_SECS: i64 = 3600;
@@ -313,7 +333,11 @@ impl WorkDb {
     /// is `model_mixed`, and otherwise falls back to the execution's recorded
     /// launch model when the snapshot observed none. Cache-write TTL splits
     /// additionally carry an observed/known signal because NULL also means
-    /// "usage observed but the provider omitted its TTL breakdown".
+    /// "usage observed but the provider omitted its TTL breakdown". The
+    /// context-shape columns (first-call context and cache write, peak
+    /// context, compactions) are assigned verbatim whenever the snapshot
+    /// observed any of them, because NULL there means "not exposed" and a
+    /// figure may revert to NULL; they are never coalesced.
     pub fn set_run_cost_snapshot(
         &self,
         execution_id: &str,
@@ -334,6 +358,18 @@ impl WorkDb {
         let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
             return Ok(attempt_updated > 0);
         };
+        // The context-shape columns are cumulative facts about the whole
+        // transcript, not increments, and a figure can legitimately become
+        // unknown (a later response with an unreadable count makes the peak
+        // unknowable). So they are assigned verbatim whenever the snapshot
+        // observed any of them, which lets NULL replace a stale lower bound,
+        // and left alone otherwise, so a snapshot that carries only a usage
+        // reason or turn duration cannot erase them.
+        let assign_context_shape = snapshot.full_replacement
+            || snapshot.first_call_context_tokens.is_some()
+            || snapshot.first_call_cache_write_tokens.is_some()
+            || snapshot.peak_context_tokens.is_some()
+            || snapshot.compactions.is_some();
         let updated = conn.execute(
             "UPDATE work_runs
              SET usage_unavailable = CASE
@@ -373,7 +409,11 @@ impl WorkDb {
                  agent_active_ms = CASE
                      WHEN ?12 = 1 THEN ?11
                      ELSE COALESCE(?11, agent_active_ms)
-                 END
+                 END,
+                 first_call_context_tokens = CASE WHEN ?20 = 1 THEN ?16 ELSE first_call_context_tokens END,
+                 first_call_cache_write_tokens = CASE WHEN ?20 = 1 THEN ?17 ELSE first_call_cache_write_tokens END,
+                 peak_context_tokens = CASE WHEN ?20 = 1 THEN ?18 ELSE peak_context_tokens END,
+                 compactions = CASE WHEN ?20 = 1 THEN ?19 ELSE compactions END
              WHERE id = ?1",
             params![
                 run_id,
@@ -391,6 +431,11 @@ impl WorkDb {
                 snapshot.usage_unavailable,
                 snapshot.model_mixed,
                 execution_id,
+                snapshot.first_call_context_tokens,
+                snapshot.first_call_cache_write_tokens,
+                snapshot.peak_context_tokens,
+                snapshot.compactions,
+                assign_context_shape,
             ],
         )?;
         Ok(updated > 0 || attempt_updated > 0)

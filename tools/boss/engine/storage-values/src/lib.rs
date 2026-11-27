@@ -110,6 +110,19 @@ pub struct RunCostSnapshot {
     pub cache_creation_ttl_split_known: Option<bool>,
     pub rounds: Option<i64>,
     pub agent_active_ms: Option<i64>,
+    /// Tokens the run's first model call sent as its prompt (fresh input, cache
+    /// writes and cache reads). `None` where the transcript does not expose a
+    /// single call's prompt size, never zero.
+    pub first_call_context_tokens: Option<i64>,
+    /// Tokens the first model call wrote to the prompt cache. `None` where the
+    /// driver does not report cache writes.
+    pub first_call_cache_write_tokens: Option<i64>,
+    /// The largest prompt any model call sent. `None` unless every call's prompt
+    /// size is known, because an unseen call could hold the peak.
+    pub peak_context_tokens: Option<i64>,
+    /// Context compactions the transcript records. `None` where the driver
+    /// records none, which is not the same as a recorded zero.
+    pub compactions: Option<i64>,
     /// Provider usage objects, keyed by provider and transcript/message identity.
     /// Preserve missing fields and provider-specific categories verbatim.
     pub provider_usage_json: Option<String>,

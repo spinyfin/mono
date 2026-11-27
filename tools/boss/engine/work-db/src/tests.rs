@@ -608,6 +608,7 @@ mod review_verdicts_tests;
 mod revision_ai_review_tests;
 mod revision_recovery;
 mod revision_sequencing;
+mod run_context_shape_tests;
 mod semantic_progress_tests;
 mod short_id_alloc_tests;
 mod t06;

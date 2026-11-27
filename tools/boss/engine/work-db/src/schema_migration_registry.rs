@@ -571,6 +571,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: review_guide_sources::migrate_retention_indexes,
         },
         Migration {
+            id: run_rows::RUN_CONTEXT_SHAPE_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: run_rows::migrate_run_context_shape,
+        },
+        Migration {
             id: "20261120_1630_run_usage_unavailable".into(),
             legacy_version: None,
             apply: |conn| {
@@ -729,6 +734,80 @@ mod tests {
             )
             .unwrap();
         assert_eq!(new_flag, 0, "new admissions default to ordinary dispatch");
+    }
+
+    #[test]
+    fn run_context_shape_migration_adds_unknown_columns_without_inventing_values() {
+        let (dir, db) = crate::test_support::open_db();
+        let path = db.path().to_path_buf();
+        const COLUMNS: [&str; 4] = [
+            "first_call_context_tokens",
+            "first_call_cache_write_tokens",
+            "peak_context_tokens",
+            "compactions",
+        ];
+        {
+            let conn = db.connect().unwrap();
+            for column in COLUMNS {
+                assert!(
+                    super::super::table_has_column(&conn, "work_runs", column).unwrap(),
+                    "the current fixture already includes {column}"
+                );
+            }
+            conn.execute_batch(
+                "INSERT INTO products (id, name, slug, status, created_at, updated_at)
+                    VALUES ('p', 'p', 'p', 'active', '1', '1');
+                 INSERT INTO tasks (id, product_id, kind, name, status, created_at, updated_at)
+                    VALUES ('t', 'p', 'chore', 't', 'done', '1', '1');
+                 INSERT INTO work_executions (id, work_item_id, kind, status, repo_remote_url, created_at)
+                    VALUES ('e', 't', 'chore_implementation', 'completed', 'r', '1');
+                 INSERT INTO work_runs (id, execution_id, agent_id, status, created_at)
+                    VALUES ('r', 'e', 'a', 'completed', '1');
+                 ALTER TABLE work_runs DROP COLUMN first_call_context_tokens;
+                 ALTER TABLE work_runs DROP COLUMN first_call_cache_write_tokens;
+                 ALTER TABLE work_runs DROP COLUMN peak_context_tokens;
+                 ALTER TABLE work_runs DROP COLUMN compactions;
+                 DELETE FROM schema_migrations WHERE id = '20261127_2052_run_context_shape';",
+            )
+            .unwrap();
+            for column in COLUMNS {
+                assert!(
+                    !super::super::table_has_column(&conn, "work_runs", column).unwrap(),
+                    "the upgrade fixture must start from main's schema without {column}"
+                );
+            }
+        }
+        drop(db);
+        let upgraded = crate::WorkDb::open(path).unwrap();
+        let conn = upgraded.connect().unwrap();
+        for column in COLUMNS {
+            assert!(
+                super::super::table_has_column(&conn, "work_runs", column).unwrap(),
+                "opening an older database must add {column}"
+            );
+        }
+        let shape: (Option<i64>, Option<i64>, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT first_call_context_tokens, first_call_cache_write_tokens, peak_context_tokens, compactions
+                 FROM work_runs WHERE id = 'r'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            shape,
+            (None, None, None, None),
+            "an existing run is unknown, not zero compactions"
+        );
+        let applied: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE id = '20261127_2052_run_context_shape'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(applied, 1, "the upgrade must record the named migration");
+        drop(dir);
     }
 
     #[test]

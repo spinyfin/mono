@@ -1215,6 +1215,18 @@ mod floor_tests {
             }),
         ));
         steps.push((
+            "20261127_2052_run_context_shape",
+            Box::new(|c| {
+                c.execute_batch(
+                    "ALTER TABLE work_runs ADD COLUMN first_call_context_tokens INTEGER;
+                     ALTER TABLE work_runs ADD COLUMN first_call_cache_write_tokens INTEGER;
+                     ALTER TABLE work_runs ADD COLUMN peak_context_tokens INTEGER;
+                     ALTER TABLE work_runs ADD COLUMN compactions INTEGER;",
+                )
+                .unwrap();
+            }),
+        ));
+        steps.push((
             "20261122_0745_operator_question_supersede_close",
             Box::new(|c| {
                 c.execute_batch("ALTER TABLE operator_questions ADD COLUMN supersede_close_json TEXT")

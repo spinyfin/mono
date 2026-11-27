@@ -24,6 +24,9 @@
 //!   direct only, so nothing is counted twice.
 //! * **Caveats are data.** [`UsageCaveat::code`] is an open string so an
 //!   engine ahead of its client still says something true.
+//! * **A ratio needs a denominator.** [`CallStats`] ratios are `None`, never
+//!   zero, when no run contributes to them, and each carries the count of runs
+//!   it was computed over so a figure over two of forty runs reads as such.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -250,6 +253,58 @@ pub struct UsageCaveat {
     pub detail: Option<String>,
 }
 
+/// Engine-computed call statistics for one set of runs: how many model calls
+/// they made, how large their prompts were, and how often they compacted.
+///
+/// Every figure is taken only over the runs that recorded it, and says how many
+/// those were (`runs_with_*`), because a driver whose transcript does not expose
+/// a figure leaves it NULL on the run and a NULL is never folded in as zero.
+/// A ratio is `None` when no run contributes to it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, bon::Builder)]
+pub struct CallStats {
+    /// Runs whose round count is recorded; a recorded zero counts.
+    #[serde(default)]
+    #[builder(default)]
+    pub runs_with_rounds: u32,
+    /// Rounds (model calls) summed over `runs_with_rounds`.
+    #[serde(default)]
+    #[builder(default)]
+    pub rounds: i64,
+    /// `rounds / runs_with_rounds`; `None` when no run recorded rounds.
+    pub rounds_per_run: Option<f64>,
+    /// The normalised token classes each run reported, summed, over those
+    /// rounds, taken over the runs that have both tokens and rounds. For
+    /// `InputConvention::Gross` runs (such as Codex), `cache_read` is
+    /// subtracted from `input` before summing so cached reads are counted once;
+    /// runs with `InputConvention::Unknown` are excluded from both numerator
+    /// and denominator. A floor when any contributing run is `partial`. `None`
+    /// when no such run exists or they made no rounds.
+    pub tokens_per_round: Option<f64>,
+    /// Runs whose first call's prompt size is recorded.
+    #[serde(default)]
+    #[builder(default)]
+    pub runs_with_first_call_context: u32,
+    /// Median of the first call's prompt size over `runs_with_first_call_context`.
+    pub median_first_call_context: Option<f64>,
+    /// Runs whose peak prompt size is recorded.
+    #[serde(default)]
+    #[builder(default)]
+    pub runs_with_peak_context: u32,
+    /// Median of the peak prompt size over `runs_with_peak_context`.
+    pub median_peak_context: Option<f64>,
+    /// The largest peak prompt size among `runs_with_peak_context`.
+    pub max_peak_context: Option<i64>,
+    /// Runs whose compaction count is recorded; a recorded zero counts, and a
+    /// driver that records none contributes no run here.
+    #[serde(default)]
+    #[builder(default)]
+    pub runs_with_compactions_recorded: u32,
+    /// Of those, the runs that compacted at least once.
+    #[serde(default)]
+    #[builder(default)]
+    pub runs_compacted: u32,
+}
+
 /// One `work_runs` row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
@@ -270,6 +325,24 @@ pub struct RunUsageRow {
     pub tokens: Option<TokenClasses>,
     pub agent_active_ms: Option<i64>,
     pub finished_at_epoch_s: Option<i64>,
+    /// Tokens the first model call sent as its prompt: fresh input, cache
+    /// writes and cache reads. `None` where the driver's transcript does not
+    /// expose a single call's prompt size (never zero), and for every run that
+    /// predates the capture.
+    #[serde(default)]
+    pub first_call_context_tokens: Option<i64>,
+    /// Tokens the first model call wrote to the prompt cache. `None` where the
+    /// driver does not report cache writes.
+    #[serde(default)]
+    pub first_call_cache_write_tokens: Option<i64>,
+    /// The largest prompt any model call sent. `None` unless every call's
+    /// prompt size is known.
+    #[serde(default)]
+    pub peak_context_tokens: Option<i64>,
+    /// Context compactions the transcript records. `None` where the driver
+    /// records none, which is not a recorded zero.
+    #[serde(default)]
+    pub compactions: Option<i64>,
     /// `work_runs.model` verbatim, `<synthetic>` included.
     pub model_observed: Option<String>,
     pub rounds: Option<i64>,
@@ -302,6 +375,10 @@ pub struct ExecutionUsageNode {
     pub measurement: CostMeasurement,
     pub spend_class: SpendClass,
     pub status: String,
+    /// Call statistics over the same runs as `measurement`.
+    #[serde(default)]
+    #[builder(default)]
+    pub calls: CallStats,
     #[serde(default)]
     #[builder(default)]
     pub runs: Vec<RunUsageRow>,
@@ -321,6 +398,10 @@ pub struct TaskUsageNode {
     pub task_id: String,
     pub chain_root_id: String,
     pub direct: CostMeasurement,
+    /// Call statistics over the same runs as `direct`.
+    #[serde(default)]
+    #[builder(default)]
+    pub calls: CallStats,
     pub is_chain_root: bool,
     pub kind: String,
     pub name: String,
@@ -347,6 +428,9 @@ pub struct TaskUsageNode {
     /// Chain roots only: `direct` plus the `direct` of every revision in the
     /// chain. Never summed across a list.
     pub inclusive: Option<CostMeasurement>,
+    /// Chain roots only: call statistics over the same runs as `inclusive`.
+    #[serde(default)]
+    pub inclusive_calls: Option<CallStats>,
     pub pr_url: Option<String>,
     pub project_id: Option<String>,
     /// The task's *current* reasoning setting; historical values are not recorded.
@@ -373,6 +457,10 @@ pub struct UsageGroup {
     pub key: Vec<UsageGroupKey>,
     /// Direct sum of the runs in this group.
     pub measurement: CostMeasurement,
+    /// Call statistics over the same runs as `measurement`.
+    #[serde(default)]
+    #[builder(default)]
+    pub calls: CallStats,
     /// Next grouping level; empty at the leaf level.
     #[serde(default)]
     #[builder(default)]
@@ -453,6 +541,10 @@ pub struct TokenUsageRowsReport {
     pub generated_at_epoch_s: i64,
     /// Direct sum of every run in this reply, taskless included.
     pub overall: CostMeasurement,
+    /// Call statistics over the same runs as `overall`.
+    #[serde(default)]
+    #[builder(default)]
+    pub overall_calls: CallStats,
     /// The engine's cap on runs in one reply.
     pub run_cap: u32,
     pub since_epoch_s: i64,
