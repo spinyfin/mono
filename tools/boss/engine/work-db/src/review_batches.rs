@@ -522,7 +522,7 @@ fn leaf_member_inputs(
 /// [`resolve_member_input`]'s shared `medium` leaf/supervisor policy, a
 /// post-merge review has no corroborating leaves to catch what it misses —
 /// it is dispatched at the driver's strongest reasoning tier available for
-/// review work (`large` resolves to Claude's `high` reasoning effort; the
+/// review work (`large` resolves to Claude's `xhigh` reasoning effort; the
 /// `Deep`-only eligibility gate that creates this batch already resolves
 /// `classification.profile.model_tier()` to `Strong`, i.e. Opus).
 fn post_merge_member_input(

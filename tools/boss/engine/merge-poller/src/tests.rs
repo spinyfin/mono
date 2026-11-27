@@ -164,6 +164,8 @@ impl PopulationRequests for NoopSweepHost {
     fn enqueue_from_merge(&self, _: &WorkDb, _: PopulationRequest) {}
 }
 
+impl crate::host::SweepHost for NoopSweepHost {}
+
 impl LoopPasses for NoopSweepHost {
     fn start_passes(&self) -> Box<dyn SweepPasses> {
         Box::new(NoopSweepPasses)

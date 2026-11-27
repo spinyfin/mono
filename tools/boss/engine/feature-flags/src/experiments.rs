@@ -58,6 +58,11 @@ pub const WORKER_AUTOCOMPACT_EXPERIMENT: &str = "worker_autocompact";
 /// Splits [`WORKER_AUTOCOMPACT_EXPERIMENT`] between half of families and all.
 pub const WORKER_AUTOCOMPACT_AB_SPLIT_FLAG: &str = "worker_autocompact_ab_split";
 
+/// Slim the post-merge review and prevent recursive follow-up reviews.
+pub const POST_MERGE_REVIEW_SLIM_EXPERIMENT: &str = "post_merge_review_slim";
+/// Split slim post-merge reviews between half of families and all.
+pub const POST_MERGE_REVIEW_SLIM_AB_SPLIT_FLAG: &str = "post_merge_review_slim_ab_split";
+
 /// A surface on which at most one experiment may be assigned at a time.
 ///
 /// Two experiments that rewrite the same instructions, or reshape the same
@@ -127,6 +132,12 @@ pub const EXPERIMENTS: &[ExperimentSpec] = &[
         key: WORKER_AUTOCOMPACT_EXPERIMENT,
         lane: None,
         requires: &[],
+        splits: true,
+    },
+    ExperimentSpec {
+        key: POST_MERGE_REVIEW_SLIM_EXPERIMENT,
+        lane: Some(ExperimentLane::PostMergeReview),
+        requires: &["review_batch_fanout"],
         splits: true,
     },
 ];
@@ -858,6 +869,29 @@ mod tests {
         let store = FeatureFlagsStore::new(tmp.path().join("feature-flags.toml"));
         store.load().unwrap();
         (tmp, store)
+    }
+
+    #[test]
+    fn slim_post_merge_requires_fanout_and_honours_split_and_stop() {
+        let (_tmp, store) = store();
+        let key = POST_MERGE_REVIEW_SLIM_EXPERIMENT;
+        let spec = EXPERIMENTS.iter().find(|spec| spec.key == key).unwrap();
+        assert_eq!(spec.lane, Some(ExperimentLane::PostMergeReview));
+        store.set(key, true).unwrap();
+        assert_eq!(store.experiment_state(key), ExperimentState::Off);
+        store.set("review_batch_fanout", true).unwrap();
+        assert_eq!(
+            store.resolve_experiment_arms(|_| 0).get(key),
+            Some(ExperimentArm::Treatment)
+        );
+        assert_eq!(
+            store.resolve_experiment_arms(|_| 99).get(key),
+            Some(ExperimentArm::Control)
+        );
+        store.set(POST_MERGE_REVIEW_SLIM_AB_SPLIT_FLAG, false).unwrap();
+        assert!(store.resolve_experiment_arms(|_| 99).is_treated(key));
+        store.set(TOKEN_EXPERIMENTS_FLAG, false).unwrap();
+        assert_eq!(store.experiment_state(key), ExperimentState::Off);
     }
 
     #[test]

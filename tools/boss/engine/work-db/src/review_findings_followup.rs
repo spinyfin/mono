@@ -229,6 +229,33 @@ pub(crate) fn insert_review_findings_followup(conn: &Connection, input: ReviewFi
 
 #[work_db_boundary::instrument]
 impl WorkDb {
+    /// Whether the PR family was minted by a post-merge review verdict.
+    pub fn family_minted_by_post_merge_review(&self, cycle_root_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let root = crate::chain_helpers::chain_root(&conn, cycle_root_id)?;
+        let Some(task) = query_task(&conn, &root)? else {
+            return Ok(false);
+        };
+        if task.created_via.starts_with(CREATED_VIA_PR_REVIEW_POST_MERGE_PREFIX) {
+            return Ok(true);
+        }
+        // Older follow-ups used the generic prefix. Recover their origin
+        // through the verdict proposal and its review batch.
+        let Some(proposal_id) = task.created_via.strip_prefix(CREATED_VIA_PR_REVIEW_PREFIX) else {
+            return Ok(false);
+        };
+        Ok(conn.query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM worker_proposals p
+                JOIN pr_review_batch_members m ON m.execution_id = p.execution_id
+                JOIN pr_review_batches b ON b.id = m.batch_id
+                WHERE p.id = ?1 AND b.phase = 'post_merge'
+            )",
+            [proposal_id],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Create a review-findings follow-up against `main` for a merged (or
     /// closed) origin PR. Idempotent on `created_via`.
     pub fn create_review_findings_followup(&self, input: ReviewFindingsFollowupInsert) -> Result<Task> {

@@ -935,7 +935,9 @@ pub(crate) async fn sweep_one(
             // Runs for a parked row too: the merge is a terminal fact, the row
             // is `done` now and no later path would trigger this review, so
             // skipping it would drop the review permanently.
-            maybe_trigger_post_merge_review(work_db, publisher, candidate, &probe_result).await;
+            let cycle_root_id = work_db.review_cycle_root_id(&candidate.work_item_id);
+            let slim = host.is_some_and(|host| host.slim_post_merge_review(work_db, &cycle_root_id));
+            maybe_trigger_post_merge_review(work_db, publisher, candidate, &probe_result, slim).await;
         }
         // Only parked rows probed in full reach this arm (blocked, or with a
         // merge in flight). Parked `in_review` rows without a merge in flight

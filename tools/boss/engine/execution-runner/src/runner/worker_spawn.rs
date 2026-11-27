@@ -237,22 +237,27 @@ async fn fetch_pr_review_context(pr_url: &str) -> Option<crate::pr_review::PrRev
     })
 }
 
-/// Fetch the raw diff for a PR via `gh pr diff <pr_url>`.
+/// Fetch a PR diff, or the immutable merged commit diff for a treated post-merge review.
 ///
 /// Returns the full diff text on success. Returns `None` on any error —
 /// callers fall back gracefully (reviewer fetches the diff itself). The
 /// caller is responsible for deciding whether the diff is small enough to
 /// embed.
-async fn fetch_pr_diff(pr_url: &str) -> Option<String> {
-    let output = gh_scope(callers::WORKER_SPAWN, gh_output(&["pr", "diff", pr_url]))
-        .await
-        .ok()?;
+async fn fetch_pr_diff(pr_url: &str, merged_commit: Option<(&str, &str)>) -> Option<String> {
+    let endpoint;
+    let args = if let Some((repo, sha)) = merged_commit {
+        endpoint = format!("repos/{repo}/commits/{sha}");
+        vec!["api", &endpoint, "-H", "Accept: application/vnd.github.diff"]
+    } else {
+        vec!["pr", "diff", pr_url]
+    };
+    let output = gh_scope(callers::WORKER_SPAWN, gh_output(&args)).await.ok()?;
 
     if !output.status.success() {
         tracing::warn!(
             pr_url,
             stderr = %String::from_utf8_lossy(&output.stderr).trim(),
-            "fetch_pr_diff: gh pr diff failed; reviewer will fetch diff itself",
+            "fetch_pr_diff: diff fetch failed; reviewer will fetch diff itself",
         );
         return None;
     }
@@ -490,6 +495,7 @@ fn resolve_batch_reviewer_spawn(
     registry: &crate::driver::DriverRegistry,
     member: &ReviewBatchMember,
     work_item_kind: Option<&TaskKind>,
+    slim_post_merge: bool,
 ) -> anyhow::Result<SpawnConfig> {
     let effort = member.provider_effort.parse::<EffortLevel>().map_err(|error| {
         anyhow::anyhow!(
@@ -497,6 +503,13 @@ fn resolve_batch_reviewer_spawn(
             member.provider_effort
         )
     })?;
+    // Use the launch arm, including sticky retries and stopped experiments,
+    // rather than changing the batch's persisted ordinary policy.
+    let effort = if slim_post_merge && member.role == ReviewBatchMemberRole::PostMergeReviewer {
+        EffortLevel::Medium
+    } else {
+        effort
+    };
     let input = SpawnResolutionInput::builder()
         .effort_level(effort)
         .model_override(member.resolved_model.as_str())
@@ -654,7 +667,29 @@ pub async fn compose_worker_spawn(
         remote_workspace,
         experiment_arms,
     } = editorial_opts;
-    // Experiments reach the composer as plain options, never as keys.
+    let batch_member = if execution.kind == ExecutionKind::PrReview {
+        work_db
+            .review_batch_member_for_execution(&execution.id)
+            .map_err(|error| anyhow::anyhow!("loading review batch member for spawn: {error}"))?
+    } else {
+        None
+    };
+    let slim_post_merge = experiment_arms.is_treated(crate::feature_flags::POST_MERGE_REVIEW_SLIM_EXPERIMENT);
+    let landed_batch = if slim_post_merge
+        && batch_member
+            .as_ref()
+            .is_some_and(|member| member.role == ReviewBatchMemberRole::PostMergeReviewer)
+    {
+        let member = batch_member.as_ref().expect("post-merge member checked");
+        Some(
+            work_db
+                .review_batch(&member.batch_id)?
+                .context("post-merge review batch is missing")?,
+        )
+    } else {
+        None
+    };
+    let landed_repo = git_utils::repo_slug::parse_github_slug(&execution.repo_remote_url);
     let batched_search = experiment_arms.is_treated(crate::feature_flags::BATCHED_SEARCH_EXPERIMENT);
     // For any project-scoped task (the synthetic `kind = 'design'`
     // task and ordinary `project_task` rows alike), the richer
@@ -980,7 +1015,14 @@ pub async fn compose_worker_spawn(
             // the reviewer's initial prompt is still gated on
             // max_embed_diff_lines so operators can disable that separately.
             if let Some(ref mut ctx) = pr_review_context
-                && let Some(diff) = fetch_pr_diff(pr_url).await
+                && (landed_batch.is_none() || landed_repo.is_some())
+                && let Some(diff) = fetch_pr_diff(
+                    pr_url,
+                    landed_batch
+                        .as_ref()
+                        .and_then(|batch| landed_repo.as_deref().map(|repo| (repo, batch.target_sha.as_str()))),
+                )
+                .await
             {
                 // Mechanical assist for the agent-isms "Boss-construct
                 // references" sub-rule: sweep the diff's added lines for bare
@@ -992,7 +1034,9 @@ pub async fn compose_worker_spawn(
                     .extend(crate::boss_construct_scan::hit_lines(&diff_hits));
 
                 let line_count = diff.lines().count() as u64;
-                if max_embed_diff_lines > 0 && line_count <= max_embed_diff_lines {
+                if let Some(embedded) =
+                    crate::pr_review::bounded_review_diff(&diff, max_embed_diff_lines, landed_batch.is_some())
+                {
                     tracing::info!(
                         execution_id = %execution.id,
                         pr_url,
@@ -1000,7 +1044,7 @@ pub async fn compose_worker_spawn(
                         max_embed_diff_lines,
                         "pr_review execution: embedding diff in reviewer prompt",
                     );
-                    ctx.diff_content = Some(diff);
+                    ctx.diff_content = Some(embedded);
                 } else {
                     tracing::debug!(
                         execution_id = %execution.id,
@@ -1142,6 +1186,9 @@ pub async fn compose_worker_spawn(
                         destination,
                         scope,
                         &reviewer_repo_slug,
+                        landed_batch
+                            .as_ref()
+                            .and_then(|_| pr_review_context.as_ref()?.diff_content.as_deref()),
                     )
                 }
                 Some((_, destination)) => crate::pr_review::render_batch_reviewer_initial_prompt(
@@ -1238,13 +1285,6 @@ pub async fn compose_worker_spawn(
     };
     let work_item_kind = work_item_task_kind_enum(work_item);
     let registry = crate::driver::DriverRegistry::default();
-    let batch_member = if execution.kind == ExecutionKind::PrReview {
-        work_db
-            .review_batch_member_for_execution(&execution.id)
-            .map_err(|error| anyhow::anyhow!("loading review batch member for spawn: {error}"))?
-    } else {
-        None
-    };
     // Fail closed when persisted batch ownership and this execution disagree.
     // Legacy admission rejects live batches transactionally, but retain this
     // last safety check for older inconsistent rows or another producer that
@@ -1319,7 +1359,7 @@ pub async fn compose_worker_spawn(
         config
     } else {
         match batch_member.as_ref() {
-            Some(member) => resolve_batch_reviewer_spawn(&registry, member, work_item_kind)?,
+            Some(member) => resolve_batch_reviewer_spawn(&registry, member, work_item_kind, slim_post_merge)?,
             None => {
                 let spawn_input = SpawnResolutionInput::builder()
                     .execution_kind(&execution.kind)

@@ -275,6 +275,41 @@ mod reviewer_pool_policy_tests {
     }
 
     #[test]
+    fn slim_effort_changes_only_the_post_merge_reviewer() {
+        use boss_protocol::{EffortLevel, ReviewBatchMemberRole};
+        let registry = crate::driver::DriverRegistry::default();
+        for role in [
+            ReviewBatchMemberRole::PostMergeReviewer,
+            ReviewBatchMemberRole::ClaudeReviewer,
+            ReviewBatchMemberRole::Supervisor,
+        ] {
+            let member = boss_protocol::ReviewBatchMember::builder()
+                .id("member")
+                .batch_id("batch")
+                .attempt(1)
+                .created_at("1")
+                .provider_effort("large")
+                .requested_driver("claude")
+                .resolved_model("opus")
+                .role(role)
+                .status(boss_protocol::ReviewBatchMemberStatus::Pending)
+                .updated_at("1")
+                .execution_id("execution")
+                .build();
+            for treated in [false, true] {
+                let config = super::resolve_batch_reviewer_spawn(&registry, &member, None, treated).unwrap();
+                let slim = treated && role == ReviewBatchMemberRole::PostMergeReviewer;
+                assert_eq!(
+                    config.effort_level,
+                    Some(if slim { EffortLevel::Medium } else { EffortLevel::Large })
+                );
+                assert_eq!(config.effort_value, Some(if slim { "high" } else { "xhigh" }));
+                assert_eq!(config.model, "opus");
+            }
+        }
+    }
+
+    #[test]
     fn persisted_batch_member_overrides_the_legacy_claude_review_pool() {
         let registry = crate::driver::DriverRegistry::default();
         let member = boss_protocol::ReviewBatchMember::builder()
@@ -291,7 +326,7 @@ mod reviewer_pool_policy_tests {
             .execution_id("execution")
             .build();
 
-        let config = super::resolve_batch_reviewer_spawn(&registry, &member, None).unwrap();
+        let config = super::resolve_batch_reviewer_spawn(&registry, &member, None, false).unwrap();
         assert_eq!(config.driver, "codex");
         assert_eq!(config.model, "gpt-5.6-terra");
         assert_eq!(config.effort_level, Some(boss_protocol::EffortLevel::Medium));
