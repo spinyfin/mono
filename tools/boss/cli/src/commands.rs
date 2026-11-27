@@ -314,9 +314,11 @@ pub(crate) enum Commands {
     },
     /// Read-only reporting over recorded per-run token spend
     /// (`work_runs.input_tokens` / `output_tokens` / `cache_creation_tokens`
-    /// / `cache_read_tokens`). Token counts are the measured figures the
-    /// system recorded; `--usd` adds an optional, clearly-labelled estimate
-    /// against a human-maintained pricing table — never billing truth.
+    /// / `cache_read_tokens`), plus `boss cost quota` which prints provider
+    /// quota change beside those token totals for the same intervals.
+    /// Token counts are the measured figures the system recorded; `--usd`
+    /// adds an optional, clearly-labelled estimate against a
+    /// human-maintained pricing table — never billing truth.
     Cost {
         #[command(subcommand)]
         command: CostCommand,

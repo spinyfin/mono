@@ -82,6 +82,52 @@ pub struct CostRunRecord {
     pub started_at_epoch_s: Option<i64>,
 }
 
+/// One persisted provider quota sample paired with its surrogate row id so
+/// multiple readings in the same epoch second stay distinct.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuotaSampleRow {
+    pub sample_id: i64,
+    pub entry: boss_protocol::DriverQuotaEntry,
+}
+
+/// One run's cumulative token counters observed at a quota reading.
+/// Stored normalized in `driver_quota_token_capture_runs` and enriched
+/// with `model` and `created_at_epoch_s` from `work_runs` on read.
+#[derive(Debug, Clone, PartialEq, Eq, Default, bon::Builder)]
+#[builder(on(String, into))]
+pub struct QuotaRunCounterSnapshot {
+    pub run_id: String,
+    pub model: Option<String>,
+    #[builder(default)]
+    pub created_at_epoch_s: i64,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_creation_tokens: Option<i64>,
+    pub cache_creation_5m_tokens: Option<i64>,
+    pub cache_creation_1h_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub agent_active_ms: Option<i64>,
+    #[builder(default)]
+    pub usage_unavailable: bool,
+    #[builder(default)]
+    pub finished: bool,
+}
+
+impl QuotaRunCounterSnapshot {
+    /// Whether all observed counter fields (including the unavailable flag)
+    /// match another observation of the same run.
+    pub fn counters_equal(&self, other: &Self) -> bool {
+        self.input_tokens == other.input_tokens
+            && self.output_tokens == other.output_tokens
+            && self.cache_creation_tokens == other.cache_creation_tokens
+            && self.cache_creation_5m_tokens == other.cache_creation_5m_tokens
+            && self.cache_creation_1h_tokens == other.cache_creation_1h_tokens
+            && self.cache_read_tokens == other.cache_read_tokens
+            && self.agent_active_ms == other.agent_active_ms
+            && self.usage_unavailable == other.usage_unavailable
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct RunCostSnapshot {

@@ -11,9 +11,15 @@ pub(in crate::app) fn key_id(request: &FrontendRequest) -> u64 {
 pub(in crate::app) fn key(request: &FrontendRequest) -> String {
     // Refresh changes how a listing is loaded, not its destination view.
     match request {
-        FrontendRequest::GetDriverQuotaUsage { .. } => {
-            serde_json::to_string(&FrontendRequest::GetDriverQuotaUsage { refresh: false })
-        }
+        FrontendRequest::GetDriverQuotaUsage {
+            since_epoch_s,
+            until_epoch_s,
+            ..
+        } => serde_json::to_string(&FrontendRequest::GetDriverQuotaUsage {
+            refresh: false,
+            since_epoch_s: *since_epoch_s,
+            until_epoch_s: *until_epoch_s,
+        }),
         FrontendRequest::ListProductDesignDocs { product_id, .. } => {
             serde_json::to_string(&FrontendRequest::ListProductDesignDocs {
                 product_id: product_id.clone(),

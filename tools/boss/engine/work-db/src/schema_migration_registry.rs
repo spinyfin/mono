@@ -304,6 +304,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: pre_start_failure::migrate_dispatch_failure_history,
         },
         Migration {
+            id: driver_quota_history::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: driver_quota_history::migrate,
+        },
+        Migration {
             id: task_status_audit::EXECUTION_ABANDON_MIGRATION_ID.into(),
             legacy_version: None,
             apply: task_status_audit::migrate_execution_abandon,
@@ -546,6 +551,11 @@ pub(super) fn all() -> Vec<Migration> {
                 }
                 Ok(())
             },
+        },
+        Migration {
+            id: "20261127_2230_quota_token_captures".into(),
+            legacy_version: None,
+            apply: quota_token_captures::migrate,
         },
         Migration {
             id: "20261102_2105_recovery_fresh_start".into(),

@@ -26,11 +26,12 @@ metrics registry (`bossctl metrics list --prefix <sweep>`; values flush to
 | `terminal_work_sweep` | the candidate-gathering phase of one 60 s terminal-work pass                     | live worker slots inspected                                                        |
 | `dead_pane_terminal`  | the terminal execution scan plus the process probes of one pane-death sweep pass | recent terminal execution rows probed                                              |
 | `agent_jsonl_stream`  | one 50 ms tail poll iteration of any live JSONL stream                           | sessions-root revalidations (`lstat` + `canonicalize`) performed in that iteration |
+| `driver_quota_sample` | one 15-minute token-free provider-quota sample plus retention prune              | drivers probed in that pass (zero when the kill-switch is off)                     |
 
-Only the singleton envelope and terminal-work sweeps publish tick intervals.
-`dead_pane_terminal` has no `tick_interval_ms`. Concurrent tails and bookmark
-operations have no shared cadence. Root revalidation counts are isolated per
-tail, excluding discovery and other tails.
+Only the singleton envelope, terminal-work, and provider-quota sample sweeps
+publish tick intervals. `dead_pane_terminal` has no `tick_interval_ms`.
+Concurrent tails and bookmark operations have no shared cadence. Root
+revalidation counts are isolated per tail, excluding discovery and other tails.
 
 One extra counter:
 
@@ -87,3 +88,5 @@ candidate reads run on the blocking pool via `db_diagnostics::spawn_blocking`.
 
 Sweep intervals, item limits and the review-badge projection are
 unchanged; the gauges above are what to read before changing any of them.
+
+The quota sampler waits 15 minutes before its first pass so startup recovery does not compete with provider probes. Each scheduled pass samples independently of the Preferences cache TTL; probe duration does not skip the next pass. Retained token totals subtract immutable per-run counter captures at consecutive quota readings, including taskless and already active runs. Missing boundary captures are unknown; intervals crossing the provider reset are labelled without a percent delta. `boss cost quota --since 24h` groups compact rows by driver and window; `--by-model` adds interval model details. Counter capture measures usage observed by Boss at each boundary, so provider hook delivery lag can move reported usage into the next interval.

@@ -184,7 +184,27 @@ fn execution_options_do_not_change_diagnostic_view_identity() {
     };
     assert_eq!(key_id(&tree(false, None)), key_id(&tree(true, Some(2))));
     assert_eq!(
-        key_id(&R::GetDriverQuotaUsage { refresh: false }),
-        key_id(&R::GetDriverQuotaUsage { refresh: true })
+        key_id(&R::GetDriverQuotaUsage {
+            refresh: false,
+            since_epoch_s: None,
+            until_epoch_s: None,
+        }),
+        key_id(&R::GetDriverQuotaUsage {
+            refresh: true,
+            since_epoch_s: None,
+            until_epoch_s: None,
+        })
+    );
+    assert_ne!(
+        key_id(&R::GetDriverQuotaUsage {
+            refresh: false,
+            since_epoch_s: Some(1),
+            until_epoch_s: None,
+        }),
+        key_id(&R::GetDriverQuotaUsage {
+            refresh: false,
+            since_epoch_s: Some(2),
+            until_epoch_s: None,
+        })
     );
 }

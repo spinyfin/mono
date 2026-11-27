@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 /// its own limit period differently; this normalises the common case
 /// (a rolling week — what the drivers currently report) while keeping
 /// anything else expressible rather than silently relabelled as weekly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DriverQuotaWindow {
     /// A rolling seven-day window.
@@ -121,6 +121,19 @@ impl DriverQuotaFailureKind {
             Self::Timeout => "timeout",
         }
     }
+
+    /// Inverse of [`Self::as_str`]. `None` when the slug is unknown.
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        match slug {
+            "not_installed" => Some(Self::NotInstalled),
+            "not_reported" => Some(Self::NotReported),
+            "not_authenticated" => Some(Self::NotAuthenticated),
+            "probe_failed" => Some(Self::ProbeFailed),
+            "unparseable" => Some(Self::Unparseable),
+            "timeout" => Some(Self::Timeout),
+            _ => None,
+        }
+    }
 }
 
 /// The result of one probe attempt: a real figure, or a typed failure.
@@ -177,6 +190,52 @@ pub struct DriverQuotaSnapshot {
     /// treats an empty list as "nothing left to wait for".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_drivers: Vec<String>,
+    /// Retained probe outcomes and engine-computed token totals for the
+    /// window named on the request. Absent when the caller did not ask
+    /// for history (`since_epoch_s` unset) and on partial progress
+    /// pushes while a cycle is still running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<DriverQuotaHistory>,
+}
+
+/// Retained quota readings plus the per-interval token totals computed
+/// from Boss's own cost records for the same windows.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DriverQuotaHistory {
+    /// Consecutive-reading intervals, one per driver and quota window.
+    /// Failures are not interval endpoints; they stay in [`Self::samples`].
+    #[serde(default)]
+    pub intervals: Vec<DriverQuotaHistoryInterval>,
+    /// Every stored probe outcome in the requested window, including
+    /// failures, oldest first.
+    #[serde(default)]
+    pub samples: Vec<DriverQuotaEntry>,
+}
+
+/// One pair of consecutive successful readings for the same driver and
+/// quota window, with Boss-side token totals for `[start, end)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+pub struct DriverQuotaHistoryInterval {
+    /// Driver slug — same vocabulary as [`DriverQuotaEntry::driver`].
+    pub driver: String,
+    /// The provider window reset between the two readings; no delta is meaningful.
+    #[serde(default)]
+    #[builder(default)]
+    pub crossed_reset: bool,
+    /// One boundary predates token capture; totals are not a complete measurement.
+    #[serde(default)]
+    #[builder(default)]
+    pub tokens_unknown: bool,
+    /// Token totals by model for `[start_epoch_s, end_epoch_s)`.
+    #[builder(default)]
+    pub by_model: Vec<super::CostBucket>,
+    pub end_epoch_s: i64,
+    pub end_used_percent: f64,
+    pub start_epoch_s: i64,
+    pub start_used_percent: f64,
+    pub tokens: super::CostMeasurement,
+    pub window: DriverQuotaWindow,
 }
 
 /// Display and probe order for the four implemented drivers. Alphabetical
@@ -267,10 +326,71 @@ mod tests {
             generated_at_epoch_s: Some(1_787_000_002),
             refresh_throttled: true,
             pending_drivers: vec!["grok".to_owned()],
+            history: None,
         };
         let json = serde_json::to_string(&snapshot).expect("serialize");
         let back: DriverQuotaSnapshot = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, snapshot);
+    }
+
+    #[test]
+    fn failure_kind_slug_round_trips() {
+        for kind in [
+            DriverQuotaFailureKind::NotInstalled,
+            DriverQuotaFailureKind::NotReported,
+            DriverQuotaFailureKind::NotAuthenticated,
+            DriverQuotaFailureKind::ProbeFailed,
+            DriverQuotaFailureKind::Unparseable,
+            DriverQuotaFailureKind::Timeout,
+        ] {
+            assert_eq!(DriverQuotaFailureKind::from_slug(kind.as_str()), Some(kind));
+        }
+        assert_eq!(DriverQuotaFailureKind::from_slug("unknown"), None);
+    }
+
+    #[test]
+    fn history_round_trips_over_the_wire() {
+        let history = DriverQuotaHistory {
+            samples: vec![DriverQuotaEntry {
+                driver: "claude".to_owned(),
+                observed_at_epoch_s: 1_787_000_000,
+                outcome: DriverQuotaOutcome::Reading(DriverQuotaReading {
+                    used_percent: 3.0,
+                    window: DriverQuotaWindow::Weekly,
+                    resets_at_epoch_s: None,
+                    resets_at_text: None,
+                    source: "probe".to_owned(),
+                }),
+            }],
+            intervals: vec![
+                DriverQuotaHistoryInterval::builder()
+                    .driver("claude")
+                    .end_epoch_s(1_787_000_900)
+                    .end_used_percent(4.0)
+                    .start_epoch_s(1_787_000_000)
+                    .start_used_percent(3.0)
+                    .tokens(
+                        crate::CostMeasurement::builder()
+                            .agent_active_ms(0)
+                            .cache_creation_tokens(0)
+                            .cache_read_tokens(0)
+                            .estimated_usd_partial(false)
+                            .input_tokens(10)
+                            .output_tokens(5)
+                            .runs_measured(1)
+                            .runs_total(1)
+                            .runs_unmeasured(0)
+                            .runs_zero(0)
+                            .total_tokens(15)
+                            .build(),
+                    )
+                    .window(DriverQuotaWindow::Weekly)
+                    .build(),
+            ],
+        };
+        let json = serde_json::to_string(&history).expect("serialize");
+        let back: DriverQuotaHistory = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, history);
     }
 
     #[test]

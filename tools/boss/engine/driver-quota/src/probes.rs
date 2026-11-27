@@ -82,6 +82,12 @@ pub mod claude {
             DRIVER_SLUG_CLAUDE
         }
 
+        /// `claude -p /usage` is a local slash command: the envelope comes
+        /// back with `num_turns: 0` and `total_cost_usd: 0`.
+        fn spends_model_tokens(&self) -> bool {
+            false
+        }
+
         async fn probe(&self) -> DriverQuotaOutcome {
             // Remaining environment is inherited so the CLI can resolve
             // OAuth credentials from the macOS keychain / `~/.claude`.
@@ -249,6 +255,12 @@ pub mod codex {
     impl DriverQuotaProbe for CodexQuotaProbe {
         fn driver(&self) -> &'static str {
             DRIVER_SLUG_CODEX
+        }
+
+        /// `account/rateLimits/read` is a first-class app-server method:
+        /// one handshake, no thread, no model turn.
+        fn spends_model_tokens(&self) -> bool {
+            false
         }
 
         async fn probe(&self) -> DriverQuotaOutcome {
@@ -703,6 +715,12 @@ pub mod grok {
     impl DriverQuotaProbe for GrokQuotaProbe {
         fn driver(&self) -> &'static str {
             DRIVER_SLUG_GROK
+        }
+
+        /// HTTPS GET of the CLI's billing endpoint. Headless `grok -p /usage`
+        /// would treat the text as a model prompt; this probe does not.
+        fn spends_model_tokens(&self) -> bool {
+            false
         }
 
         async fn probe(&self) -> DriverQuotaOutcome {

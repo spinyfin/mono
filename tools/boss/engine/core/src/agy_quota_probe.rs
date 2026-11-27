@@ -18,6 +18,12 @@ impl DriverQuotaProbe for AgyQuotaProbe {
         boss_protocol::DRIVER_SLUG_AGY
     }
 
+    /// `agy --print /usage` is a local command; captured fixtures show
+    /// `num_turns: 0`.
+    fn spends_model_tokens(&self) -> bool {
+        false
+    }
+
     async fn probe(&self) -> DriverQuotaOutcome {
         outcome_from_usage_result(tokio::task::spawn_blocking(boss_engine_driver::agy::quota::usage_json).await)
     }

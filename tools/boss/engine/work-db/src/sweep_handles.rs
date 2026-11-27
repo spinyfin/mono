@@ -86,6 +86,27 @@ boss_metrics::register_counter!(
     "Total terminal execution scans since engine start.",
 );
 
+boss_metrics::register_gauge!(
+    DRIVER_QUOTA_SAMPLE_PASS_DURATION_MS,
+    "driver_quota_sample.pass_duration_ms",
+    "Wall-clock duration in milliseconds of the most recent provider-quota background sample pass.",
+);
+boss_metrics::register_gauge!(
+    DRIVER_QUOTA_SAMPLE_ITEMS_PER_PASS,
+    "driver_quota_sample.items_per_pass",
+    "Drivers the most recent provider-quota background sample pass probed.",
+);
+boss_metrics::register_gauge!(
+    DRIVER_QUOTA_SAMPLE_TICK_INTERVAL_MS,
+    "driver_quota_sample.tick_interval_ms",
+    "Milliseconds between the starts of the two most recent provider-quota background sample passes.",
+);
+boss_metrics::register_counter!(
+    DRIVER_QUOTA_SAMPLE_PASSES,
+    "driver_quota_sample.passes",
+    "Total provider-quota background sample passes since engine start.",
+);
+
 /// Register the sweep handles a standalone `WorkDb` registry must expose.
 pub fn register_metrics(registry: &Registry) {
     registry.register_gauge(&ENVELOPE_WATCH_PASS_DURATION_MS);
@@ -103,4 +124,8 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_gauge(&DEAD_PANE_TERMINAL_PASS_DURATION_MS);
     registry.register_gauge(&DEAD_PANE_TERMINAL_ITEMS_PER_PASS);
     registry.register_counter(&DEAD_PANE_TERMINAL_PASSES);
+    registry.register_gauge(&DRIVER_QUOTA_SAMPLE_PASS_DURATION_MS);
+    registry.register_gauge(&DRIVER_QUOTA_SAMPLE_ITEMS_PER_PASS);
+    registry.register_gauge(&DRIVER_QUOTA_SAMPLE_TICK_INTERVAL_MS);
+    registry.register_counter(&DRIVER_QUOTA_SAMPLE_PASSES);
 }

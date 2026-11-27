@@ -16,6 +16,10 @@ pub(crate) enum CostCommand {
     /// kind, model, reasoning mode, and effort level — the groupings
     /// that answer "where did the budget go."
     Window(CostWindowArgs),
+    /// Provider quota change over a window, per driver and quota window,
+    /// beside engine-computed token totals by class and model for the
+    /// same intervals.
+    Quota(CostQuotaArgs),
     /// The highest-token-cost runs recorded in a time window, ranked
     /// descending.
     Top(CostTopArgs),
@@ -110,6 +114,27 @@ pub(crate) struct CostWindowArgs {
     /// Print report timestamps in UTC instead of this host's local time.
     #[arg(long)]
     pub(crate) utc: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct CostQuotaArgs {
+    /// Start of the window: an RFC3339 timestamp (e.g.
+    /// `2026-07-01T00:00:00Z`) or a relative duration ago (`24h`, `7d`,
+    /// `2w`).
+    #[arg(long)]
+    pub(crate) since: String,
+
+    /// End of the window, same accepted formats as `--since`. Defaults
+    /// to now.
+    #[arg(long)]
+    pub(crate) until: Option<String>,
+
+    /// Print report timestamps in UTC instead of this host's local time.
+    #[arg(long)]
+    pub(crate) utc: bool,
+    /// Show per-model token details for each interval.
+    #[arg(long)]
+    pub(crate) by_model: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -313,6 +338,28 @@ pub(crate) async fn run_cost_command(command: CostCommand, ctx: &RunContext) -> 
             let tz = resolve_display_tz(args.utc);
             print_entity(ctx, &serde_json::json!({ "report": report }), || {
                 print_window_cost_report(&report, &tz)
+            })
+        }
+        CostCommand::Quota(args) => {
+            let (since_epoch_s, until_epoch_s) = resolve_window(&args.since, args.until.as_deref())?;
+            let response = client
+                .send_request(&FrontendRequest::GetDriverQuotaUsage {
+                    refresh: false,
+                    since_epoch_s: Some(since_epoch_s),
+                    until_epoch_s: Some(until_epoch_s),
+                })
+                .await
+                .map_err(CliError::internal)?;
+            let snapshot = match response {
+                FrontendEvent::DriverQuotaUsageResult { snapshot } => snapshot,
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    return Err(CliError::application(message));
+                }
+                other => return Err(unexpected_event("cost quota", &other)),
+            };
+            let tz = resolve_display_tz(args.utc);
+            print_entity(ctx, &serde_json::json!({ "snapshot": snapshot }), || {
+                print_quota_history(&snapshot, since_epoch_s, until_epoch_s, &tz, args.by_model)
             })
         }
         CostCommand::Rows(args) => {
@@ -581,6 +628,109 @@ fn print_cost_buckets(title: &str, buckets: &[CostBucket], caveat: Option<&str>)
         ]);
     }
     print_table(table);
+}
+
+fn quota_window_label(window: DriverQuotaWindow) -> String {
+    match window {
+        DriverQuotaWindow::Weekly => "weekly".to_owned(),
+        DriverQuotaWindow::Other { minutes } => format!("{minutes}m"),
+    }
+}
+
+fn quota_token_count(value: Option<i64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn print_quota_history(
+    snapshot: &DriverQuotaSnapshot,
+    since_epoch_s: i64,
+    until_epoch_s: i64,
+    tz: &DisplayTz,
+    by_model: bool,
+) {
+    println!(
+        "Provider quota from {} to {} ({})",
+        format_epoch(since_epoch_s, tz),
+        format_epoch(until_epoch_s, tz),
+        tz.label
+    );
+    let Some(history) = &snapshot.history else {
+        println!();
+        println!("  No retained quota history in this window.");
+        return;
+    };
+    if history.intervals.is_empty() {
+        println!();
+        println!("  No consecutive quota readings in this window yet.");
+    }
+    let mut groups = std::collections::BTreeMap::new();
+    for interval in &history.intervals {
+        groups
+            .entry((interval.driver.as_str(), quota_window_label(interval.window)))
+            .or_insert_with(Vec::new)
+            .push(interval);
+    }
+    for ((driver, window), intervals) in groups {
+        println!("\n{driver} {window}");
+        for interval in intervals {
+            let quota = if interval.crossed_reset {
+                "reset crossed; delta unknown".to_owned()
+            } else {
+                format!("{:+.1}%", interval.end_used_percent - interval.start_used_percent)
+            };
+            let tokens = if interval.tokens_unknown {
+                "tokens unknown (missing boundary capture)".to_owned()
+            } else {
+                format!(
+                    "{} tokens (input {}, output {}, cache write {}, cache read {}); {} unmeasured runs{}",
+                    interval.tokens.total_tokens,
+                    quota_token_count(interval.tokens.input_tokens),
+                    quota_token_count(interval.tokens.output_tokens),
+                    quota_token_count(interval.tokens.cache_creation_tokens),
+                    quota_token_count(interval.tokens.cache_read_tokens),
+                    interval.tokens.runs_unmeasured,
+                    if interval.tokens.tokens_partial {
+                        "; partial"
+                    } else {
+                        ""
+                    }
+                )
+            };
+            println!(
+                "  {} → {}  {:.1}% → {:.1}% ({quota}); {tokens}",
+                format_epoch(interval.start_epoch_s, tz),
+                format_epoch(interval.end_epoch_s, tz),
+                interval.start_used_percent,
+                interval.end_used_percent
+            );
+            if by_model && !interval.tokens_unknown {
+                print_cost_buckets("  By model", &interval.by_model, None);
+            }
+        }
+    }
+    let failures: Vec<_> = history
+        .samples
+        .iter()
+        .filter_map(|sample| match &sample.outcome {
+            DriverQuotaOutcome::Unavailable { kind, reason } => Some((sample, kind, reason)),
+            DriverQuotaOutcome::Reading(_) => None,
+        })
+        .collect();
+    if !failures.is_empty() {
+        println!();
+        println!("Failures (not used as interval endpoints):");
+        for (sample, kind, reason) in failures {
+            println!(
+                "  {} at {}: {} — {}",
+                sample.driver,
+                format_epoch(sample.observed_at_epoch_s, tz),
+                kind.as_str(),
+                reason
+            );
+        }
+    }
 }
 
 fn print_window_cost_report(report: &WindowCostReport, tz: &DisplayTz) {
