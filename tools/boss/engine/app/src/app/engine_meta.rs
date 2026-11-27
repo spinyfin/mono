@@ -639,7 +639,16 @@ pub(super) async fn handle_get_driver_quota_usage(ctx: Dispatch, req: FrontendRe
     };
     let lookup = server_state.driver_quota.lookup(refresh).await;
     let mut snapshot = lookup.snapshot;
-    attach_quota_history(&work_db, &mut snapshot, since_epoch_s, until_epoch_s);
+    if let Err(err) = attach_quota_history(&work_db, &mut snapshot, since_epoch_s, until_epoch_s) {
+        send_response(
+            &sink,
+            &request_id,
+            FrontendEvent::WorkError {
+                message: format!("Loading quota history: {err:#}"),
+            },
+        );
+        return;
+    }
     send_response(&sink, &request_id, FrontendEvent::DriverQuotaUsageResult { snapshot });
     if lookup.should_probe {
         let quota = Arc::clone(&server_state.driver_quota);
@@ -656,7 +665,15 @@ pub(super) async fn handle_get_driver_quota_usage(ctx: Dispatch, req: FrontendRe
                 })
                 .await;
             let mut snapshot = snapshot;
-            attach_quota_history(&work_db, &mut snapshot, since_epoch_s, until_epoch_s);
+            if let Err(err) = attach_quota_history(&work_db, &mut snapshot, since_epoch_s, until_epoch_s) {
+                send_push(
+                    &sink,
+                    FrontendEvent::WorkError {
+                        message: format!("Loading quota history: {err:#}"),
+                    },
+                );
+                return;
+            }
             send_push(&sink, FrontendEvent::DriverQuotaUsageResult { snapshot });
         });
     }
@@ -667,28 +684,17 @@ fn attach_quota_history(
     snapshot: &mut boss_protocol::DriverQuotaSnapshot,
     since_epoch_s: Option<i64>,
     until_epoch_s: Option<i64>,
-) {
+) -> anyhow::Result<()> {
     let Some(since_epoch_s) = since_epoch_s else {
-        return;
+        return Ok(());
     };
     let until_epoch_s = until_epoch_s.unwrap_or_else(boss_engine_utils::epoch_time::now_epoch_secs);
-    let samples = match work_db.driver_quota_samples_in_range(since_epoch_s, until_epoch_s) {
-        Ok(samples) => samples,
-        Err(err) => {
-            tracing::warn!(?err, "driver_quota: loading snapshot history failed");
-            return;
-        }
-    };
-    let records = match work_db.cost_records_for_window(since_epoch_s, until_epoch_s) {
-        Ok(records) => records,
-        Err(err) => {
-            tracing::warn!(?err, "driver_quota: loading cost records for quota history failed");
-            return;
-        }
-    };
+    let samples = work_db.driver_quota_samples_in_range(since_epoch_s, until_epoch_s)?;
+    let captures = work_db.quota_token_captures(since_epoch_s, until_epoch_s)?;
     snapshot.history = Some(boss_engine_runtime::cost_report::build_quota_history(
-        &samples, &records,
+        &samples, &captures,
     ));
+    Ok(())
 }
 
 /// Persist adapter: the quota cache never depends on the work DB.
@@ -709,7 +715,10 @@ impl boss_engine_driver_quota::QuotaSnapshotSink for WorkDbQuotaSink {
 /// grow without bound.
 pub(super) fn spawn_driver_quota_sampler(server_state: Arc<ServerState>) -> tokio::task::JoinHandle<()> {
     boss_task_scope::spawn(async move {
-        let mut interval = tokio::time::interval(boss_engine_driver_quota::DEFAULT_TTL);
+        let mut interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + boss_engine_driver_quota::DEFAULT_TTL,
+            boss_engine_driver_quota::DEFAULT_TTL,
+        );
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut previous = None;
         loop {

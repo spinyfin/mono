@@ -219,6 +219,14 @@ pub struct DriverQuotaHistory {
 pub struct DriverQuotaHistoryInterval {
     /// Driver slug — same vocabulary as [`DriverQuotaEntry::driver`].
     pub driver: String,
+    /// The provider window reset between the two readings; no delta is meaningful.
+    #[serde(default)]
+    #[builder(default)]
+    pub crossed_reset: bool,
+    /// One boundary predates token capture; totals are not a complete measurement.
+    #[serde(default)]
+    #[builder(default)]
+    pub tokens_unknown: bool,
     /// Token totals by model for `[start_epoch_s, end_epoch_s)`.
     #[builder(default)]
     pub by_model: Vec<super::CostBucket>,

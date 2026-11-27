@@ -553,6 +553,11 @@ pub(super) fn all() -> Vec<Migration> {
             },
         },
         Migration {
+            id: "20261127_2230_quota_token_captures".into(),
+            legacy_version: None,
+            apply: quota_token_captures::migrate,
+        },
+        Migration {
             id: "20261102_2105_recovery_fresh_start".into(),
             legacy_version: None,
             apply: execution_recovery_rearm::migrate_fresh_start,

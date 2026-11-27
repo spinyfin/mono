@@ -132,6 +132,9 @@ pub(crate) struct CostQuotaArgs {
     /// Print report timestamps in UTC instead of this host's local time.
     #[arg(long)]
     pub(crate) utc: bool,
+    /// Show per-model token details for each interval.
+    #[arg(long)]
+    pub(crate) by_model: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -356,7 +359,7 @@ pub(crate) async fn run_cost_command(command: CostCommand, ctx: &RunContext) -> 
             };
             let tz = resolve_display_tz(args.utc);
             print_entity(ctx, &serde_json::json!({ "snapshot": snapshot }), || {
-                print_quota_history(&snapshot, since_epoch_s, until_epoch_s, &tz)
+                print_quota_history(&snapshot, since_epoch_s, until_epoch_s, &tz, args.by_model)
             })
         }
         CostCommand::Rows(args) => {
@@ -634,7 +637,19 @@ fn quota_window_label(window: DriverQuotaWindow) -> String {
     }
 }
 
-fn print_quota_history(snapshot: &DriverQuotaSnapshot, since_epoch_s: i64, until_epoch_s: i64, tz: &DisplayTz) {
+fn quota_token_count(value: Option<i64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn print_quota_history(
+    snapshot: &DriverQuotaSnapshot,
+    since_epoch_s: i64,
+    until_epoch_s: i64,
+    tz: &DisplayTz,
+    by_model: bool,
+) {
     println!(
         "Provider quota from {} to {} ({})",
         format_epoch(since_epoch_s, tz),
@@ -650,21 +665,49 @@ fn print_quota_history(snapshot: &DriverQuotaSnapshot, since_epoch_s: i64, until
         println!();
         println!("  No consecutive quota readings in this window yet.");
     }
+    let mut groups = std::collections::BTreeMap::new();
     for interval in &history.intervals {
-        let delta = interval.end_used_percent - interval.start_used_percent;
-        println!();
-        println!(
-            "{} {}  {} → {}  {:.1}% → {:.1}%  ({delta:+.1}%)",
-            interval.driver,
-            quota_window_label(interval.window),
-            format_epoch(interval.start_epoch_s, tz),
-            format_epoch(interval.end_epoch_s, tz),
-            interval.start_used_percent,
-            interval.end_used_percent,
-        );
-        print_measurement_summary(&interval.tokens);
-        if !interval.by_model.is_empty() {
-            print_cost_buckets("  By model", &interval.by_model, None);
+        groups
+            .entry((interval.driver.as_str(), quota_window_label(interval.window)))
+            .or_insert_with(Vec::new)
+            .push(interval);
+    }
+    for ((driver, window), intervals) in groups {
+        println!("\n{driver} {window}");
+        for interval in intervals {
+            let quota = if interval.crossed_reset {
+                "reset crossed; delta unknown".to_owned()
+            } else {
+                format!("{:+.1}%", interval.end_used_percent - interval.start_used_percent)
+            };
+            let tokens = if interval.tokens_unknown {
+                "tokens unknown (missing boundary capture)".to_owned()
+            } else {
+                format!(
+                    "{} tokens (input {}, output {}, cache write {}, cache read {}); {} unmeasured runs{}",
+                    interval.tokens.total_tokens,
+                    quota_token_count(interval.tokens.input_tokens),
+                    quota_token_count(interval.tokens.output_tokens),
+                    quota_token_count(interval.tokens.cache_creation_tokens),
+                    quota_token_count(interval.tokens.cache_read_tokens),
+                    interval.tokens.runs_unmeasured,
+                    if interval.tokens.tokens_partial {
+                        "; partial"
+                    } else {
+                        ""
+                    }
+                )
+            };
+            println!(
+                "  {} → {}  {:.1}% → {:.1}% ({quota}); {tokens}",
+                format_epoch(interval.start_epoch_s, tz),
+                format_epoch(interval.end_epoch_s, tz),
+                interval.start_used_percent,
+                interval.end_used_percent
+            );
+            if by_model && !interval.tokens_unknown {
+                print_cost_buckets("  By model", &interval.by_model, None);
+            }
         }
     }
     let failures: Vec<_> = history

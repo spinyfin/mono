@@ -275,61 +275,8 @@ fn label_or_none(value: Option<&str>) -> String {
     value.map(str::to_owned).unwrap_or_else(|| NO_VALUE_LABEL.to_owned())
 }
 
-/// Pair consecutive successful quota readings per driver and window, and
-/// fold Boss-side cost records into each `[start, end)` interval.
-///
-/// Failures stay in `samples` and are not interval endpoints; a later
-/// reading of the same window pairs across a failure. Token totals are
-/// filtered to the interval's driver.
-pub fn build_quota_history(samples: &[DriverQuotaEntry], records: &[CostRunRecord]) -> DriverQuotaHistory {
-    let mut intervals = Vec::new();
-    let mut last_reading: HashMap<(String, DriverQuotaWindow), (i64, f64)> = HashMap::new();
-    for sample in samples {
-        let DriverQuotaOutcome::Reading(reading) = &sample.outcome else {
-            continue;
-        };
-        let key = (sample.driver.clone(), reading.window);
-        if let Some((start_epoch_s, start_used_percent)) = last_reading.get(&key).copied()
-            && sample.observed_at_epoch_s > start_epoch_s
-        {
-            let mut fold = RunFold::default();
-            let mut by_model: BTreeMap<String, RunFold> = BTreeMap::new();
-            let mut gaps = BTreeSet::new();
-            for record in records {
-                if record.created_at_epoch_s < start_epoch_s
-                    || record.created_at_epoch_s >= sample.observed_at_epoch_s
-                    || record.driver.as_deref() != Some(sample.driver.as_str())
-                {
-                    continue;
-                }
-                fold_record(&mut fold, record, false, &mut gaps);
-                fold_record(
-                    by_model.entry(label_or_none(record.model.as_deref())).or_default(),
-                    record,
-                    false,
-                    &mut gaps,
-                );
-            }
-            intervals.push(
-                DriverQuotaHistoryInterval::builder()
-                    .driver(&sample.driver)
-                    .by_model(finish_buckets(by_model))
-                    .end_epoch_s(sample.observed_at_epoch_s)
-                    .end_used_percent(reading.used_percent)
-                    .start_epoch_s(start_epoch_s)
-                    .start_used_percent(start_used_percent)
-                    .tokens(fold.finish())
-                    .window(reading.window)
-                    .build(),
-            );
-        }
-        last_reading.insert(key, (sample.observed_at_epoch_s, reading.used_percent));
-    }
-    DriverQuotaHistory {
-        intervals,
-        samples: samples.to_vec(),
-    }
-}
+mod quota_history;
+pub use quota_history::build_quota_history;
 
 fn finish_buckets(map: BTreeMap<String, RunFold>) -> Vec<CostBucket> {
     let mut buckets: Vec<CostBucket> = map
@@ -962,7 +909,13 @@ mod tests {
         let mut codex_run = measured(record("run_x", "exec_x"), 20, 10, 0, 0);
         codex_run.driver = Some("codex".to_owned());
         codex_run.created_at_epoch_s = 150;
-        let history = build_quota_history(&samples, &[claude_run, codex_run]);
+        let captures = BTreeMap::from([
+            (("claude".to_owned(), 100), vec![]),
+            (("codex".to_owned(), 100), vec![]),
+            (("claude".to_owned(), 200), vec![claude_run]),
+            (("codex".to_owned(), 200), vec![codex_run]),
+        ]);
+        let history = build_quota_history(&samples, &captures);
         assert_eq!(history.samples.len(), 4);
         assert_eq!(history.intervals.len(), 2);
         let claude = history
@@ -989,7 +942,7 @@ mod tests {
             quota_failure("claude", 150),
             quota_reading("claude", 200, 5.0, DriverQuotaWindow::Weekly),
         ];
-        let history = build_quota_history(&samples, &[]);
+        let history = build_quota_history(&samples, &BTreeMap::new());
         assert_eq!(history.samples.len(), 3);
         assert_eq!(history.intervals.len(), 1);
         assert_eq!(history.intervals[0].start_epoch_s, 100);
@@ -1004,10 +957,64 @@ mod tests {
             quota_reading("claude", 200, 40.0, DriverQuotaWindow::Other { minutes: 300 }),
             quota_reading("claude", 300, 41.0, DriverQuotaWindow::Other { minutes: 300 }),
         ];
-        let history = build_quota_history(&samples, &[]);
+        let history = build_quota_history(&samples, &BTreeMap::new());
         assert_eq!(history.intervals.len(), 1);
         assert_eq!(history.intervals[0].window, DriverQuotaWindow::Other { minutes: 300 });
         assert_eq!(history.intervals[0].start_epoch_s, 200);
         assert_eq!(history.intervals[0].end_epoch_s, 300);
+    }
+    #[test]
+    fn quota_history_uses_boundary_deltas_for_old_spanning_runs_and_is_immutable() {
+        let samples: Vec<_> = [100, 200, 300]
+            .into_iter()
+            .map(|at| quota_reading("claude", at, 3.0, DriverQuotaWindow::Weekly))
+            .collect();
+        let mut run = measured(record("old", "answer"), 10, 5, 0, 0);
+        run.created_at_epoch_s = 50;
+        run.driver = Some("claude".to_owned());
+        let mut captures = BTreeMap::new();
+        for (at, input) in [(100, 10), (200, 30), (300, 60)] {
+            run.input_tokens = Some(input);
+            captures.insert(("claude".to_owned(), at), vec![run.clone()]);
+        }
+        let before = build_quota_history(&samples, &captures);
+        assert_eq!(before.intervals[0].tokens.total_tokens, 20);
+        assert_eq!(before.intervals[1].tokens.total_tokens, 30);
+        assert!(!before.intervals[0].tokens_unknown);
+        run.input_tokens = Some(1000);
+        captures.insert(("claude".to_owned(), 400), vec![run]);
+        let mut later_samples = samples.clone();
+        later_samples.push(quota_reading("claude", 400, 4.0, DriverQuotaWindow::Weekly));
+        let later = build_quota_history(&later_samples, &captures);
+        assert_eq!(before.intervals, later.intervals[..2]);
+        captures.remove(&("claude".to_owned(), 100));
+        assert!(build_quota_history(&samples, &captures).intervals[0].tokens_unknown);
+    }
+
+    #[test]
+    fn quota_history_marks_provider_reset() {
+        let mut start = quota_reading("claude", 100, 92.0, DriverQuotaWindow::Weekly);
+        if let DriverQuotaOutcome::Reading(reading) = &mut start.outcome {
+            reading.resets_at_epoch_s = Some(150);
+        }
+        let end = quota_reading("claude", 200, 3.0, DriverQuotaWindow::Weekly);
+        let history = build_quota_history(&[start, end], &BTreeMap::new());
+        assert!(history.intervals[0].crossed_reset);
+    }
+    #[test]
+    fn quota_history_does_not_turn_unchanged_missing_counters_into_known_zero() {
+        let samples = [
+            quota_reading("claude", 100, 3.0, DriverQuotaWindow::Weekly),
+            quota_reading("claude", 200, 4.0, DriverQuotaWindow::Weekly),
+        ];
+        let mut run = record("unmeasured", "answer");
+        run.created_at_epoch_s = 50;
+        let captures = BTreeMap::from([
+            (("claude".to_owned(), 100), vec![run.clone()]),
+            (("claude".to_owned(), 200), vec![run]),
+        ]);
+        let history = build_quota_history(&samples, &captures);
+        assert_eq!(history.intervals[0].tokens.runs_unmeasured, 1);
+        assert_eq!(history.intervals[0].tokens.input_tokens, None);
     }
 }

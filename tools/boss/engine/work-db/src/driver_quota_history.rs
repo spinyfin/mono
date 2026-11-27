@@ -111,7 +111,18 @@ fn map_entry(row: &Row<'_>) -> rusqlite::Result<DriverQuotaEntry> {
 impl WorkDb {
     /// Append one probe outcome. Failures are stored as failures.
     pub fn driver_quota_insert(&self, entry: &DriverQuotaEntry) -> Result<()> {
-        let conn = self.connect()?;
+        let records = self.quota_token_records(
+            entry
+                .observed_at_epoch_s
+                .saturating_sub(DRIVER_QUOTA_RETENTION_DAYS.saturating_mul(86_400)),
+        )?;
+        let records: Vec<_> = records
+            .into_iter()
+            .filter(|record| record.driver.as_deref() == Some(entry.driver.as_str()))
+            .collect();
+        let counters = serde_json::to_string(&records)?;
+        let mut conn = self.connect()?;
+        let conn = conn.transaction()?;
         let (
             state,
             used_percent,
@@ -168,6 +179,11 @@ impl WorkDb {
                 failure_reason,
             ],
         )?;
+        conn.execute(
+            "INSERT INTO driver_quota_token_captures (sample_id, counters) VALUES (?1, ?2)",
+            params![conn.last_insert_rowid(), counters],
+        )?;
+        conn.commit()?;
         Ok(())
     }
 
@@ -175,6 +191,11 @@ impl WorkDb {
     /// how many went. A single indexed range delete.
     pub fn driver_quota_prune(&self, older_than_epoch_s: i64) -> Result<usize> {
         let conn = self.connect()?;
+        conn.execute(
+            "DELETE FROM driver_quota_token_captures WHERE sample_id IN
+            (SELECT id FROM driver_quota_snapshots WHERE observed_at_epoch_s < ?1)",
+            [older_than_epoch_s],
+        )?;
         Ok(conn.execute(
             "DELETE FROM driver_quota_snapshots WHERE observed_at_epoch_s < ?1",
             [older_than_epoch_s],

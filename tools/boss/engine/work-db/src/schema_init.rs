@@ -1158,6 +1158,10 @@ mod floor_tests {
                 Box::new(|c| pre_start_failure::migrate_dispatch_failure_history(c).unwrap()),
             ),
             (
+                "20261127_2230_quota_token_captures",
+                Box::new(|c| super::super::quota_token_captures::migrate(c).unwrap()),
+            ),
+            (
                 super::super::driver_quota_history::MIGRATION_ID,
                 Box::new(|c| super::super::driver_quota_history::migrate(c).unwrap()),
             ),

@@ -950,6 +950,7 @@ mod description_guard;
 mod driver_quota_history;
 mod guide_comments;
 mod guide_feedback;
+mod quota_token_captures;
 pub use driver_quota_history::DRIVER_QUOTA_RETENTION_DAYS;
 mod host_load_db;
 mod host_reconcile_queries;

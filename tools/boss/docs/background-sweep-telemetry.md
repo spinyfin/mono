@@ -88,3 +88,5 @@ candidate reads run on the blocking pool via `db_diagnostics::spawn_blocking`.
 
 Sweep intervals, item limits and the review-badge projection are
 unchanged; the gauges above are what to read before changing any of them.
+
+The quota sampler waits 15 minutes before its first pass so startup recovery does not compete with provider probes. Each scheduled pass samples independently of the Preferences cache TTL; probe duration does not skip the next pass. Retained token totals subtract immutable per-run counter captures at consecutive quota readings, including taskless and already active runs. Missing boundary captures are unknown; intervals crossing the provider reset are labelled without a percent delta. `boss cost quota --since 24h` groups compact rows by driver and window; `--by-model` adds interval model details. Counter capture measures usage observed by Boss at each boundary, so provider hook delivery lag can move reported usage into the next interval.

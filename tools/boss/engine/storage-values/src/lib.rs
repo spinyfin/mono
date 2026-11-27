@@ -55,7 +55,7 @@ pub struct ProjectPropertyAuditEntry {
 /// rank it. The `work` DB layer's production mapper builds these with a
 /// struct literal (every column named explicitly, per this repo's DB
 /// mapper convention); tests may use the builder.
-#[derive(Debug, Clone, PartialEq, bon::Builder)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct CostRunRecord {
     pub driver: Option<String>,

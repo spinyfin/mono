@@ -214,6 +214,8 @@ impl QuotaCache {
     /// snapshot as a whole — unsampled drivers keep their last reading.
     /// `generated_at_epoch_s` moves only when every probe in the set was
     /// eligible, so a skipped driver cannot look fresh until its own TTL.
+    /// The scheduler controls background cadence independently of app cache age;
+    /// probe completion time must not cause the next scheduled tick to be skipped.
     pub async fn sample_token_free(&self) -> usize {
         let probes: Vec<Arc<dyn DriverQuotaProbe>> = self
             .probes
@@ -227,10 +229,6 @@ impl QuotaCache {
         let _cycle = self.locks.cycle.lock().await;
         {
             let mut state = self.locks.state.lock().await;
-            let (should_probe, _) = self.decide(state.snapshot.generated_at_epoch_s, false, now_epoch_s());
-            if !should_probe {
-                return 0;
-            }
             state.pending = probes.iter().map(|probe| probe.driver().to_owned()).collect();
         }
         let mut join_set = tokio::task::JoinSet::new();
@@ -412,6 +410,7 @@ mod tests {
             self.spends_model_tokens
         }
         async fn probe(&self) -> DriverQuotaOutcome {
+            tokio::time::sleep(Duration::from_millis(1)).await;
             self.calls.fetch_add(1, Ordering::SeqCst);
             DriverQuotaOutcome::Reading(DriverQuotaReading {
                 used_percent: self.percent,
@@ -700,6 +699,21 @@ mod tests {
         match &stored[0].outcome {
             DriverQuotaOutcome::Reading(reading) => assert_eq!(reading.used_percent, 7.0),
             other => panic!("expected a reading, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn background_sampling_is_independent_of_completion_ttl() {
+        let probe = CountingProbe::token_free("codex", 2.0);
+        let cache = QuotaCache::new(vec![probe.clone()]);
+        assert_eq!(cache.sample_token_free().await, 1);
+        // Simulate a probe completing after its scheduled tick. The next tick
+        // sees an app snapshot younger than DEFAULT_TTL, but must still sample.
+        for expected_calls in 2..=3 {
+            cache.locks.state.lock().await.snapshot.generated_at_epoch_s =
+                Some(now_epoch_s() - (DEFAULT_TTL.as_secs() as i64 - 1));
+            assert_eq!(cache.sample_token_free().await, 1);
+            assert_eq!(probe.calls.load(Ordering::SeqCst), expected_calls);
         }
     }
 

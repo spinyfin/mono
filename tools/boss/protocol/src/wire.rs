@@ -780,8 +780,8 @@ pub enum FrontendRequest {
     /// subscription window. Served from the engine's cache; a probe cycle
     /// runs only when the cache is older than the service's TTL, or when
     /// `refresh` is set and the anti-hammer floor has elapsed. A 15-minute
-    /// background sampler also probes token-free drivers. Never triggered
-    /// by engine startup. Replies with
+    /// background sampler also probes token-free drivers, with its first
+    /// cycle delayed by 15 minutes after startup. Replies with
     /// [`FrontendEvent::DriverQuotaUsageResult`]. When `since_epoch_s` is
     /// set, the snapshot includes retained history and engine-computed
     /// token totals for each interval.
