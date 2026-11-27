@@ -170,9 +170,7 @@ struct TokenUsageOverTimeView: View {
         let bars = mapper.workBars(metric: effective)
         return UsageChartCard(
             title: "Work volume",
-            subtitle: effective == nil
-                ? "Runs, completed executions, completed tasks and distinct PRs"
-                : "\(effective?.title ?? "") by group"
+            subtitle: mapper.workCaption(metric: effective)
         ) {
             Picker("Measure", selection: Binding(get: { effective }, set: { workMetric = $0 })) {
                 if !mapper.isGrouped {

@@ -59,6 +59,7 @@ pub fn coordinator_session_label(id: &str) -> String {
     };
     format!("Coordinator session {short}")
 }
+
 /// A way to slice usage: filter by it, group by it, or list its observed values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -502,6 +503,11 @@ pub struct UsageGroup {
     #[serde(default)]
     #[builder(default)]
     pub taskless: Vec<ExecutionUsageNode>,
+    /// Direct sum of coordinator runs in this group when present. Always
+    /// included in `measurement`; carried so clients can render a top-level
+    /// Coordinator row without summing executions themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_measurement: Option<CostMeasurement>,
 }
 
 /// One observed value of a dimension and how many runs carry it.
@@ -602,6 +608,11 @@ pub struct TokenUsageRowsReport {
     #[serde(default)]
     #[builder(default)]
     pub tasks: Vec<TaskUsageNode>,
+    /// Direct sum of coordinator runs in this reply when present. Always
+    /// included in `overall`; carried so clients can render a top-level
+    /// Coordinator row without summing executions themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_measurement: Option<CostMeasurement>,
 }
 
 // ── Bucketed usage series (`GetTokenUsageSeries`) ─────────────────────────

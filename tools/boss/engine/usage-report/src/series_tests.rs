@@ -1162,4 +1162,12 @@ fn coordinator_hour_slices_stay_out_of_the_tokens_per_run_normalizer() {
         Some(150.0),
         "per-run is over worker runs only"
     );
+    let note = report
+        .coverage
+        .notes
+        .iter()
+        .find(|note| note.code == "coordinator_hour_slices")
+        .unwrap();
+    assert!(note.detail.contains("hourly/model slices"));
+    assert!(note.detail.contains("worker runs only"));
 }

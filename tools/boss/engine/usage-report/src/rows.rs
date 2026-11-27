@@ -194,6 +194,7 @@ pub fn build_usage_rows_report(
         .pricing_gaps(gaps.into_iter().collect())
         .taskless(taskless)
         .tasks(task_nodes)
+        .maybe_coordinator_measurement(coordinator_measurement)
         .build()
 }
 
@@ -223,6 +224,7 @@ fn coordinator_measure(runs: &[&RunFacts<'_>]) -> Option<CostMeasurement> {
         .collect();
     (!coord.is_empty()).then(|| measure(&coord))
 }
+
 fn spend_class_buckets(runs: &[&RunFacts<'_>]) -> Vec<CostBucket> {
     let mut by_class: BTreeMap<SpendClass, RunFold> = BTreeMap::new();
     for facts in runs {
@@ -435,6 +437,7 @@ fn build_groups(
                     .measurement(measurement)
                     .calls(calls)
                     .subgroups(build_groups(ctx, &members, &dims[1..], &key))
+                    .maybe_coordinator_measurement(coordinator_measurement)
                     .build()
             } else {
                 let (tasks, taskless) = build_tree(ctx, &members);
@@ -444,6 +447,7 @@ fn build_groups(
                     .calls(calls)
                     .tasks(tasks)
                     .taskless(taskless)
+                    .maybe_coordinator_measurement(coordinator_measurement)
                     .build()
             }
         })

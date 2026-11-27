@@ -58,7 +58,7 @@ enum UsageWorkMetric: String, CaseIterable, Identifiable, Sendable {
 
     var title: String {
         switch self {
-        case .runs: return "Runs"
+        case .runs: return "Runs + slices"
         case .executionsCompleted: return "Executions completed"
         case .tasksCompleted: return "Tasks completed"
         case .distinctPrs: return "Distinct PRs"
@@ -449,6 +449,14 @@ struct UsageSeriesMapper {
 
     // MARK: - Work volume card
 
+    func workCaption(metric: UsageWorkMetric?) -> String {
+        let scope = metric.map { "\($0.title) by group." }
+            ?? "Runs, completed executions, completed tasks and distinct PRs."
+        return metric == nil || metric == .runs
+            ? scope + " Runs + slices includes worker runs and coordinator hourly/model slices."
+            : scope
+    }
+
     /// Ungrouped overview: the four counts as side-by-side bars per bucket.
     /// With a metric: one stacked bar per group.
     func workBars(metric: UsageWorkMetric?) -> [UsageBarPoint] {
@@ -507,7 +515,7 @@ struct UsageSeriesMapper {
     func normalizerCaption(_ normalizer: UsageNormalizer) -> String {
         switch normalizer {
         case .perRun:
-            return "Measured tokens divided by measured runs in the bucket."
+            return "Measured worker tokens divided by measured worker runs in the bucket. Coordinator hourly/model slices are excluded."
         case .perCompletedExecution:
             return "Measured tokens in the bucket divided by executions that completed in it."
         case .perActiveHour:

@@ -68,6 +68,7 @@ impl ServerState {
         }
     }
 }
+
 pub(super) async fn handle_stuck_report(ctx: Dispatch, req: FrontendRequest) {
     let FrontendRequest::GetStuckReport { minimum_age_secs } = req else {
         unreachable!()
@@ -137,6 +138,7 @@ pub(super) async fn handle_get_work_item_cost_report(ctx: Dispatch, req: Fronten
 
 pub(super) async fn handle_get_cost_window_report(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
+        server_state,
         work_db,
         sink,
         request_id,
@@ -170,6 +172,7 @@ pub(super) async fn handle_get_cost_window_report(ctx: Dispatch, req: FrontendRe
 
 pub(super) async fn handle_get_top_cost_consumers(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
+        server_state,
         work_db,
         sink,
         request_id,
@@ -235,6 +238,7 @@ const ENGINE_USD_ESTIMATOR: EngineUsdEstimator = EngineUsdEstimator;
 /// pure builder as data, so the builder crate owns none of them.
 pub(super) async fn handle_get_token_usage_rows(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
+        server_state,
         work_db,
         sink,
         request_id,
@@ -277,6 +281,7 @@ pub(super) async fn handle_get_token_usage_rows(ctx: Dispatch, req: FrontendRequ
 /// range coverage notes.
 pub(super) async fn handle_get_token_usage_series(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
+        server_state,
         work_db,
         sink,
         request_id,
