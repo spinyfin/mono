@@ -1108,6 +1108,12 @@ struct ServerState {
     /// it. See [`selected_product`].
     #[builder(default)]
     selected_product: StdMutex<Option<selected_product::SelectedProductReport>>,
+    /// The chat service for the coordinator's native chat backend, if one is
+    /// running. Empty in production until the coordinator lifecycle starts a
+    /// chat-backed coordinator; the `CoordinatorChat` RPC answers "not
+    /// running" while it is. See [`coordinator_chat`].
+    #[builder(default)]
+    coordinator_chat: StdMutex<Option<Arc<dyn boss_engine_coordinator_chat::ChatBackend>>>,
     /// Liveness signal for the engine→app push channel. Tracks the
     /// consecutive-send-failure streak so a wedged/saturated outbound
     /// queue surfaces as a single engine-health issue instead of only
@@ -1352,6 +1358,20 @@ impl ServerState {
 
     fn set_hub_stream(&self, stream: Option<boss_engine_runtime::hub::HubStream>) {
         *self.hub_stream.lock().expect("hub_stream lock") = stream;
+    }
+
+    /// The running coordinator chat service, if there is one.
+    fn coordinator_chat(&self) -> Option<Arc<dyn boss_engine_coordinator_chat::ChatBackend>> {
+        self.coordinator_chat.lock().expect("coordinator_chat lock").clone()
+    }
+
+    /// Makes `backend` the chat service the `CoordinatorChat` RPC talks to.
+    /// Nothing in the engine starts one yet, so only tests install one; the
+    /// coordinator lifecycle will install and clear it as the coordinator's
+    /// chat backend starts and stops.
+    #[cfg(test)]
+    fn set_coordinator_chat(&self, backend: Option<Arc<dyn boss_engine_coordinator_chat::ChatBackend>>) {
+        *self.coordinator_chat.lock().expect("coordinator_chat lock") = backend;
     }
 
     /// Construct `ServerState` with optional collaborator overrides.

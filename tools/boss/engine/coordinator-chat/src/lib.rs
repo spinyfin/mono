@@ -1,5 +1,5 @@
-//! Conversation reducer, turn queue, intent log, replay snapshot, and
-//! credential redaction for the native coordinator chat backend.
+//! Conversation reducer, turn queue, intent log, replay snapshot, credential
+//! redaction, and the live service for the native coordinator chat backend.
 //!
 //! This crate reduces the frozen wire journal (`boss_agent_host::journal::WireRecord`)
 //! joined with the engine's append-only intent log ([`intent::IntentLog`]) into
@@ -11,11 +11,19 @@
 //! Every text-bearing field — including streamed text with a held-back tail —
 //! is scrubbed of the coordinator generation's write credential before it
 //! leaves the reducer.
+//!
+//! [`service::ChatService`] runs all of that live against an agent host's
+//! socket: it verifies the host, drives the queue, writes the intent log
+//! before acknowledging a send, publishes items and streaming deltas, serves
+//! fetches, and reconnects with replay. [`retention`] creates and prunes the
+//! per-generation directories the files live in.
 
 pub mod intent;
 pub mod queue;
 pub mod redact;
 pub mod reducer;
+pub mod retention;
+pub mod service;
 pub mod snapshot;
 
 #[cfg(test)]
@@ -26,6 +34,8 @@ mod queue_tests;
 mod redact_tests;
 #[cfg(test)]
 mod reducer_tests;
+#[cfg(test)]
+mod retention_tests;
 
 pub use boss_agent_host::journal::{Direction, WireRecord, read_records};
 pub use intent::{
@@ -36,6 +46,14 @@ pub use queue::{InFlightPrompt, PromptContent, PromptImageRef, PromptOrigin, Que
 pub use redact::{CredentialRedactor, REDACTED_PLACEHOLDER, StreamingRedactor};
 pub use reducer::{
     ConversationReducer, DEFAULT_TOOL_TEXT_LIMIT, ReduceDelta, replay_reader, replay_records, replay_with_intent_log,
+};
+pub use retention::{
+    DEFAULT_MAX_AGE, DEFAULT_MAX_TOTAL_BYTES, Generation, GenerationStore, PruneReason, PruneReport, PrunedGeneration,
+    RetentionPolicy,
+};
+pub use service::{
+    CancelOutcome, ChatBackend, ChatError, ChatPush, ChatService, ConnectionStatus, DELTA_PUBLISH_INTERVAL,
+    HostEndpoint, ReturnedDraft, ServiceConfig, ServiceTuning,
 };
 pub use snapshot::{
     DEFAULT_SNAPSHOT_INTERVAL_RECORDS, RecoveryResult, ReducerSnapshot, SNAPSHOT_SCHEMA_VERSION, SnapshotCursor,

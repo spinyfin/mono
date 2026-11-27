@@ -31,8 +31,10 @@ pub enum CoordinatorChatOperation {
     Cancel,
     /// Choose one option on a pending permission request.
     AnswerPermission { request_id: String, option_id: String },
-    /// Return conversation items with `seq > after_seq`, plus the current
-    /// connection state and any in-progress streaming snapshot.
+    /// Return the conversation items created or changed after journal record
+    /// `after_seq` (items with `updated_seq > after_seq`, so a tool call
+    /// started before that record and finished after it is included), plus the
+    /// current connection state and any in-progress streaming snapshot.
     Fetch { after_seq: u64 },
 }
 

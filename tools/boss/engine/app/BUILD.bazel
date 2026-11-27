@@ -21,6 +21,7 @@ APP_DEPS = [
     "//tools/boss/engine/board-gesture",
     "//tools/boss/engine/comment-classifier",
     "//tools/boss/engine/completion",
+    "//tools/boss/engine/coordinator-chat",
     "//tools/boss/engine/design-docs",
     "//tools/boss/engine/dispatch",
     "//tools/boss/engine/dispatch-events",

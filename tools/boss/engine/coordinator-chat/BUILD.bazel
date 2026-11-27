@@ -1,11 +1,13 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 
 exports_files(["Cargo.toml"])
 
-# Coordinator chat conversation reducer and credential redaction.
-# No other target links this crate yet, so its visibility is private; widen it
-# to specific consumers when they are added.
+# Coordinator chat conversation reducer, turn queue, intent log, replay
+# snapshot, credential redaction, and the service that runs them live against
+# an agent host socket. The engine app links it for the RPC handler; the
+# coordinator lifecycle will widen this to its own consumers when it starts the
+# service.
 rust_library(
     name = "coordinator-chat",
     srcs = glob(["src/**/*.rs"]),
@@ -14,10 +16,11 @@ rust_library(
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    visibility = ["//visibility:private"],
+    visibility = ["//tools/boss/engine/app:__pkg__"],
     deps = [
         "//tools/boss/acp_client",
         "//tools/boss/agent-host:agent_host",
+        "//tools/boss/backoff",
         "//tools/boss/engine/utils",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
@@ -36,9 +39,70 @@ rust_test(
     deps = [
         "//tools/boss/acp_client",
         "//tools/boss/agent-host:agent_host",
+        "//tools/boss/backoff",
         "//tools/boss/engine/utils",
         "//tools/boss/protocol",
         "@mono_crates//:tempfile",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# The service end to end: the real `boss-agent-host` binary relaying a scripted
+# child, with the service attached through the host's socket. Covers send,
+# streaming, a permission answer, cancel, a fetch after a dropped push, and a
+# reconnect with replay in which a queued message survives.
+rust_test(
+    name = "service_test",
+    size = "small",
+    srcs = ["tests/service.rs"],
+    crate_root = "tests/service.rs",
+    data = [
+        "//tools/boss/agent-host:boss-agent-host",
+        "//tools/boss/agent-host:boss-agent-host-scripted-child",
+    ],
+    edition = "2024",
+    env = {
+        "BOSS_AGENT_HOST_TEST_BIN": "$(rootpath //tools/boss/agent-host:boss-agent-host)",
+        "BOSS_AGENT_HOST_TEST_CHILD": "$(rootpath //tools/boss/agent-host:boss-agent-host-scripted-child)",
+    },
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":coordinator-chat",
+        "//tools/boss/acp_client",
+        "//tools/boss/agent-host:agent_host",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# Manual harness, not a test: the service against the real Claude ACP adapter,
+# the real `claude` binary and the real login, restarting mid-turn. The
+# hermetic test sandbox cannot reach a login and a real session spends plan
+# usage, so build it and launch it by path (see the header of the source for
+# the arguments).
+rust_binary(
+    name = "live_adapter_probe",
+    testonly = True,
+    srcs = ["tests/live_adapter.rs"],
+    crate_root = "tests/live_adapter.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    tags = ["manual"],
+    visibility = ["//visibility:private"],
+    deps = [
+        ":coordinator-chat",
+        "//tools/boss/agent-host:agent_host",
+        "//tools/boss/protocol",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,

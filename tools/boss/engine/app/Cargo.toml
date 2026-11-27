@@ -32,6 +32,7 @@ boss-editorial = { path = "../editorial" }
 boss-engine-board-gesture = { path = "../board-gesture" }
 boss-engine-design-docs = { path = "../design-docs" }
 boss-engine-completion = { path = "../completion" }
+boss-engine-coordinator-chat = { path = "../coordinator-chat" }
 boss-engine-dispatch = { path = "../dispatch" }
 boss-engine-driver = { path = "../driver" }
 boss-engine-live-worker-state = { path = "../live-worker-state" }
