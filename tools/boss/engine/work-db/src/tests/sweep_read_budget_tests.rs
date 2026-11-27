@@ -309,6 +309,15 @@ fn recurring_reads() -> Vec<Read> {
             db.list_pr_binding_repair_candidates().unwrap();
         }),
         (
+            "driver quota sampler: capture counters",
+            "900 s",
+            READ_BUDGET_PAGES,
+            |db| {
+                db.quota_capture_candidates("claude", boss_engine_utils::epoch_time::now_epoch_secs())
+                    .unwrap();
+            },
+        ),
+        (
             "run budget watch: live cost snapshots",
             "60 s",
             READ_BUDGET_PAGES,

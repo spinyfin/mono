@@ -418,35 +418,6 @@ impl WorkDb {
         Ok(out)
     }
 
-    /// Recent and still active runs, including executions without a task.
-    pub(super) fn quota_token_records(&self, since: i64) -> Result<Vec<CostRunRecord>> {
-        let conn = self.connect()?;
-        let columns = COST_RECORD_COLUMNS.replace("t.name,", "COALESCE(t.name, we.kind),");
-        let mut records = conn
-            .prepare(&format!(
-                "SELECT {columns} FROM work_runs wr
-             JOIN work_executions we ON we.id = wr.execution_id
-             LEFT JOIN tasks t ON t.id = we.work_item_id
-             WHERE CAST(wr.created_at AS INTEGER) >= ?1
-                OR wr.finished_at IS NULL OR CAST(wr.finished_at AS INTEGER) >= ?1"
-            ))?
-            .query_map([since], map_cost_run_record)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(conn);
-        let ids: Vec<&str> = records
-            .iter()
-            .filter(|r| r.driver.is_none())
-            .map(|r| r.execution_id.as_str())
-            .collect();
-        let drivers = self.get_execution_driver_slugs_lenient(&ids)?;
-        for record in &mut records {
-            if record.driver.is_none() {
-                record.driver = drivers.get(&record.execution_id).cloned().flatten();
-            }
-        }
-        Ok(records)
-    }
-
     /// Every `work_runs` row created in `[since_epoch_s, until_epoch_s)`
     /// with its execution, launch tuple and task context, for the usage rows
     /// request. Executions whose work item has no `tasks` row (answer agent,
@@ -1116,43 +1087,6 @@ mod tests {
             params![run_id, execution_id, created.to_string()],
         )
         .unwrap();
-    }
-
-    #[test]
-    fn quota_captures_keep_taskless_and_pre_window_runs_and_freeze_counters() {
-        let (_dir, db) = open_db();
-        let conn = db.connect().unwrap();
-        insert_run(&conn, "run_answer", "exec_answer", "answer", "answer_agent", 50);
-        drop(conn);
-        let reading = |at| boss_protocol::DriverQuotaEntry {
-            driver: "claude".into(),
-            observed_at_epoch_s: at,
-            outcome: boss_protocol::DriverQuotaOutcome::Reading(boss_protocol::DriverQuotaReading {
-                used_percent: 2.0,
-                window: boss_protocol::DriverQuotaWindow::Weekly,
-                resets_at_epoch_s: None,
-                resets_at_text: None,
-                source: "test".into(),
-            }),
-        };
-        db.driver_quota_insert(&reading(100)).unwrap();
-        db.connect()
-            .unwrap()
-            .execute("UPDATE work_runs SET input_tokens=20 WHERE id='run_answer'", [])
-            .unwrap();
-        db.driver_quota_insert(&reading(200)).unwrap();
-        db.connect()
-            .unwrap()
-            .execute("UPDATE work_runs SET input_tokens=99 WHERE id='run_answer'", [])
-            .unwrap();
-        let captures = db.quota_token_captures(100, 200).unwrap();
-        let start = &captures[&("claude".into(), 100)][0];
-        let end = &captures[&("claude".into(), 200)][0];
-        assert_eq!(start.input_tokens, Some(5));
-        assert_eq!(end.input_tokens, Some(20));
-        assert_eq!(end.execution_kind, "answer_agent");
-        assert_eq!(db.driver_quota_prune(200).unwrap(), 1);
-        assert_eq!(db.quota_token_captures(0, 300).unwrap().len(), 1);
     }
 
     #[test]

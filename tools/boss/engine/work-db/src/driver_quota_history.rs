@@ -6,6 +6,7 @@
 //! percentage is `NULL`, never zero. Writes are one small `INSERT` per
 //! outcome and one indexed range `DELETE` per pruning pass.
 
+use boss_engine_storage_values::QuotaSampleRow;
 use boss_protocol::{
     DriverQuotaEntry, DriverQuotaFailureKind, DriverQuotaOutcome, DriverQuotaReading, DriverQuotaWindow,
 };
@@ -39,7 +40,9 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
              failure_reason       TEXT
          );
          CREATE INDEX IF NOT EXISTS idx_driver_quota_snapshots_observed_driver
-             ON driver_quota_snapshots (observed_at_epoch_s, driver);",
+             ON driver_quota_snapshots (observed_at_epoch_s, driver);
+         CREATE INDEX IF NOT EXISTS idx_driver_quota_snapshots_driver_id
+             ON driver_quota_snapshots (driver, id);",
     )?;
     Ok(())
 }
@@ -66,18 +69,19 @@ fn window_from_row(kind: Option<&str>, minutes: Option<i64>) -> DriverQuotaWindo
     }
 }
 
-fn map_entry(row: &Row<'_>) -> rusqlite::Result<DriverQuotaEntry> {
-    let driver: String = row.get(0)?;
-    let observed_at_epoch_s: i64 = row.get(1)?;
-    let state: String = row.get(2)?;
-    let used_percent: Option<f64> = row.get(3)?;
-    let window_kind: Option<String> = row.get(4)?;
-    let window_minutes: Option<i64> = row.get(5)?;
-    let resets_at_epoch_s: Option<i64> = row.get(6)?;
-    let resets_at_text: Option<String> = row.get(7)?;
-    let source: Option<String> = row.get(8)?;
-    let failure_kind: Option<String> = row.get(9)?;
-    let failure_reason: Option<String> = row.get(10)?;
+fn map_sample_row(row: &Row<'_>) -> rusqlite::Result<QuotaSampleRow> {
+    let sample_id: i64 = row.get(0)?;
+    let driver: String = row.get(1)?;
+    let observed_at_epoch_s: i64 = row.get(2)?;
+    let state: String = row.get(3)?;
+    let used_percent: Option<f64> = row.get(4)?;
+    let window_kind: Option<String> = row.get(5)?;
+    let window_minutes: Option<i64> = row.get(6)?;
+    let resets_at_epoch_s: Option<i64> = row.get(7)?;
+    let resets_at_text: Option<String> = row.get(8)?;
+    let source: Option<String> = row.get(9)?;
+    let failure_kind: Option<String> = row.get(10)?;
+    let failure_reason: Option<String> = row.get(11)?;
     let outcome = if state == "reading" {
         match used_percent {
             Some(used_percent) => DriverQuotaOutcome::Reading(DriverQuotaReading {
@@ -101,26 +105,27 @@ fn map_entry(row: &Row<'_>) -> rusqlite::Result<DriverQuotaEntry> {
             reason: failure_reason.unwrap_or_else(|| "quota probe failed".to_owned()),
         }
     };
-    Ok(DriverQuotaEntry {
-        driver,
-        observed_at_epoch_s,
-        outcome,
+    Ok(QuotaSampleRow {
+        sample_id,
+        entry: DriverQuotaEntry {
+            driver,
+            observed_at_epoch_s,
+            outcome,
+        },
     })
 }
 
 impl WorkDb {
-    /// Append one probe outcome. Failures are stored as failures.
+    /// Append one probe outcome. Failures are stored as failures without
+    /// capturing run counters; readings record sparse counter observations for
+    /// unfinished or newly-changed runs of this driver.
     pub fn driver_quota_insert(&self, entry: &DriverQuotaEntry) -> Result<()> {
-        let records = self.quota_token_records(
-            entry
-                .observed_at_epoch_s
-                .saturating_sub(DRIVER_QUOTA_RETENTION_DAYS.saturating_mul(86_400)),
-        )?;
-        let records: Vec<_> = records
-            .into_iter()
-            .filter(|record| record.driver.as_deref() == Some(entry.driver.as_str()))
-            .collect();
-        let counters = serde_json::to_string(&records)?;
+        let capture_rows = match &entry.outcome {
+            DriverQuotaOutcome::Reading(_) => {
+                Some(self.quota_capture_candidates(&entry.driver, entry.observed_at_epoch_s)?)
+            }
+            DriverQuotaOutcome::Unavailable { .. } => None,
+        };
         let mut conn = self.connect()?;
         let conn = conn.transaction()?;
         let (
@@ -179,10 +184,10 @@ impl WorkDb {
                 failure_reason,
             ],
         )?;
-        conn.execute(
-            "INSERT INTO driver_quota_token_captures (sample_id, counters) VALUES (?1, ?2)",
-            params![conn.last_insert_rowid(), counters],
-        )?;
+        let sample_id = conn.last_insert_rowid();
+        if let Some(rows) = capture_rows {
+            quota_token_captures::insert_capture(&conn, sample_id, &rows)?;
+        }
         conn.commit()?;
         Ok(())
     }
@@ -190,16 +195,34 @@ impl WorkDb {
     /// Delete snapshots strictly older than `older_than_epoch_s`; returns
     /// how many went. A single indexed range delete.
     pub fn driver_quota_prune(&self, older_than_epoch_s: i64) -> Result<usize> {
-        let conn = self.connect()?;
-        conn.execute(
-            "DELETE FROM driver_quota_token_captures WHERE sample_id IN
-            (SELECT id FROM driver_quota_snapshots WHERE observed_at_epoch_s < ?1)",
-            [older_than_epoch_s],
-        )?;
-        Ok(conn.execute(
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        quota_token_captures::prune_captures(&tx, older_than_epoch_s)?;
+        let deleted = tx.execute(
             "DELETE FROM driver_quota_snapshots WHERE observed_at_epoch_s < ?1",
             [older_than_epoch_s],
-        )?)
+        )?;
+        tx.commit()?;
+        Ok(deleted)
+    }
+
+    /// Snapshots in `[since_epoch_s, until_epoch_s]`, oldest first, paired
+    /// with their surrogate row id.
+    pub fn driver_quota_samples_with_ids_in_range(
+        &self,
+        since_epoch_s: i64,
+        until_epoch_s: i64,
+    ) -> Result<Vec<QuotaSampleRow>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, {COLUMNS} FROM driver_quota_snapshots
+             WHERE observed_at_epoch_s >= ?1 AND observed_at_epoch_s <= ?2
+             ORDER BY observed_at_epoch_s ASC, id ASC"
+        ))?;
+        let rows = stmt
+            .query_map(params![since_epoch_s, until_epoch_s], map_sample_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Snapshots in `[since_epoch_s, until_epoch_s]`, oldest first.
@@ -208,16 +231,11 @@ impl WorkDb {
         since_epoch_s: i64,
         until_epoch_s: i64,
     ) -> Result<Vec<DriverQuotaEntry>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {COLUMNS} FROM driver_quota_snapshots
-             WHERE observed_at_epoch_s >= ?1 AND observed_at_epoch_s <= ?2
-             ORDER BY observed_at_epoch_s ASC, id ASC"
-        ))?;
-        let rows = stmt
-            .query_map(params![since_epoch_s, until_epoch_s], map_entry)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+        Ok(self
+            .driver_quota_samples_with_ids_in_range(since_epoch_s, until_epoch_s)?
+            .into_iter()
+            .map(|row| row.entry)
+            .collect())
     }
 }
 

@@ -639,15 +639,18 @@ pub(super) async fn handle_get_driver_quota_usage(ctx: Dispatch, req: FrontendRe
     };
     let lookup = server_state.driver_quota.lookup(refresh).await;
     let mut snapshot = lookup.snapshot;
-    if let Err(err) = attach_quota_history(&work_db, &mut snapshot, since_epoch_s, until_epoch_s) {
-        send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::WorkError {
-                message: format!("Loading quota history: {err:#}"),
-            },
-        );
-        return;
+    match load_quota_history(&work_db, since_epoch_s, until_epoch_s).await {
+        Ok(history) => snapshot.history = history,
+        Err(err) => {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::WorkError {
+                    message: format!("Loading quota history: {err:#}"),
+                },
+            );
+            return;
+        }
     }
     send_response(&sink, &request_id, FrontendEvent::DriverQuotaUsageResult { snapshot });
     if lookup.should_probe {
@@ -665,36 +668,42 @@ pub(super) async fn handle_get_driver_quota_usage(ctx: Dispatch, req: FrontendRe
                 })
                 .await;
             let mut snapshot = snapshot;
-            if let Err(err) = attach_quota_history(&work_db, &mut snapshot, since_epoch_s, until_epoch_s) {
-                send_push(
-                    &sink,
-                    FrontendEvent::WorkError {
-                        message: format!("Loading quota history: {err:#}"),
-                    },
-                );
-                return;
+            match load_quota_history(&work_db, since_epoch_s, until_epoch_s).await {
+                Ok(history) => snapshot.history = history,
+                Err(err) => {
+                    send_push(
+                        &sink,
+                        FrontendEvent::WorkError {
+                            message: format!("Loading quota history: {err:#}"),
+                        },
+                    );
+                    return;
+                }
             }
             send_push(&sink, FrontendEvent::DriverQuotaUsageResult { snapshot });
         });
     }
 }
 
-fn attach_quota_history(
+async fn load_quota_history(
     work_db: &WorkDb,
-    snapshot: &mut boss_protocol::DriverQuotaSnapshot,
     since_epoch_s: Option<i64>,
     until_epoch_s: Option<i64>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<boss_protocol::DriverQuotaHistory>> {
     let Some(since_epoch_s) = since_epoch_s else {
-        return Ok(());
+        return Ok(None);
     };
     let until_epoch_s = until_epoch_s.unwrap_or_else(boss_engine_utils::epoch_time::now_epoch_secs);
-    let samples = work_db.driver_quota_samples_in_range(since_epoch_s, until_epoch_s)?;
-    let captures = work_db.quota_token_captures(since_epoch_s, until_epoch_s)?;
-    snapshot.history = Some(boss_engine_runtime::cost_report::build_quota_history(
-        &samples, &captures,
-    ));
-    Ok(())
+    let reader = work_db.reader()?;
+    boss_work_db::db_diagnostics::spawn_blocking(move || {
+        let samples = reader.driver_quota_samples_with_ids_in_range(since_epoch_s, until_epoch_s)?;
+        let captures = reader.quota_token_captures(since_epoch_s, until_epoch_s)?;
+        Ok(Some(boss_engine_runtime::cost_report::build_quota_history(
+            &samples, &captures,
+        )))
+    })
+    .await
+    .map_err(|err| anyhow::anyhow!("quota history load task failed: {err}"))?
 }
 
 /// Persist adapter: the quota cache never depends on the work DB.
