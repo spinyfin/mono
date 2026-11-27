@@ -205,8 +205,55 @@ fn run_done_gate_exception_slim(conflict_resolution: bool, bazel_workspace: Opti
     }
 }
 
-/// Control terminal run-done declaration directive — byte-identical to the
-/// pre-experiment text.
+/// Control terminal run-done declaration directive — the worker-facing half of the
+/// `run_done_proposals_seam` migration. `seam_enabled` mirrors the flag the
+/// engine's read path checks; with it off this contributes nothing, keeping
+/// the prompt at today's baseline.
+///
+/// Emitted for **every** execution kind, unlike every other seam directive,
+/// because revisions, CI fixes, conflict resolutions and reviewer passes all
+/// terminate without creating anything the engine can point at — precisely
+/// the runs whose ending was previously guessed at.
+///
+/// The declaration ends the run synchronously the instant it is accepted
+/// (`completion::run_done_declaration` finalizes it at submit, no turn
+/// boundary needed) — the worker gets no turn after the call commits, not
+/// even to see the response. It must therefore come *after* the push, as
+/// the very last tool call of the run: declaring first would end the run
+/// before the push ever happens (see [`pr_terminal_directive`](super::pr_terminal_directive)). And not
+/// declaring is no shortcut to being left alone: the wording states the
+/// real consequence — held, then asked, then failed visibly, never
+/// quietly successful.
+///
+/// `worker_signal_seam_enabled` mirrors `worker_signal_proposals_seam`.
+/// Teaching `"$BOSS_BIN" propose blocked` is that flag's job (see
+/// [`worker_escalation_protocol_directive`](super::worker_escalation_protocol_directive)); this directive must not
+/// teach the verb when that flag is off, even if `run_done_proposals_seam`
+/// is on — the two flags are independently defaulted off, and a worker
+/// must never be taught a verb the engine won't yet read proposals-first
+/// for. The `propose done` verb itself remains gated only on `seam_enabled`.
+///
+/// `conflict_resolution` is true when this prompt also carries a
+/// conflict-resolution merge-correctness gate (Bazel or non-Bazel). That
+/// gate is an absolute compile-or-do-not-push stop and never receives the
+/// unattributable-failure exception; the closing paragraph here must not
+/// read as overriding it.
+/// The marker fallback (`worker_signal_seam_enabled` off) must also not
+/// claim a `[blocked]` marker records synchronously: that parser runs only
+/// at the Stop boundary (`completion::stop`), never from
+/// `finalize_declared_run_done`, so a marker emitted immediately before
+/// this terminal call is lost. The mixed-flag path therefore stores the
+/// blocker in `--summary` instead.
+///
+/// `standard_worker` is true when
+/// [`crate::worker_setup::worker_kind_for_execution`] maps this execution to
+/// [`crate::worker_setup::WorkerKind::Standard`]. Question flags
+/// (`--question` / `--explanation`) and the pointer to the generated-rules
+/// writing contract are Standard-only: that contract lives in Standard
+/// workers' rules, and Reviewer / Triage / AnswerAgent / ReviewGuide
+/// workers cannot file those questions. Non-standard fallbacks of this
+/// generic composer (a PrReview without a PR URL, an AutomationTriage
+/// without an automation row) still get `propose done`.
 fn run_done_directive(
     seam_enabled: bool,
     worker_signal_seam_enabled: bool,
@@ -323,6 +370,11 @@ fn run_done_directive(
 /// `slim_worker_brief`: lists only the outcomes, flags, question types, and
 /// build-gate exception applicable to `params.execution_kind`, pointing to the
 /// long-form question contract and file-count protocol in the worker rules.
+///
+/// Must keep every invariant documented on [`run_done_directive`]: the
+/// declaration comes after the push, `propose blocked` is taught only when
+/// `worker_signal_seam_enabled` is on (the mixed-flag path stores the blocker in
+/// `--summary`), and question flags are Standard-only.
 fn run_done_directive_slim(params: &RunDoneParams<'_>) -> String {
     let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
     let kind_str = params.execution_kind.as_str();
@@ -390,7 +442,7 @@ fn run_done_directive_slim(params: &RunDoneParams<'_>) -> String {
     );
     let file_count_pointer = if supports_file_count {
         "If the change would exceed the `change/file-count` limit (or an earlier approved bound), stop \
-         adding scope and follow the Split-vs-Bypass-limit protocol in the worker rules.\n\n"
+         adding scope and follow the \"Exceeding the `change/file-count` limit\" section in the worker rules.\n\n"
     } else {
         ""
     };

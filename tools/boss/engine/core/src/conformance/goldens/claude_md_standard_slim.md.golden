@@ -100,11 +100,12 @@ the description without a `gh pr view` round trip. If the
 response's `body` is null (`--json`) or says "(none stored)"
 (text), it means this run began a brand-new PR flow — there is
 nothing to diff against yet, you are about to write the first
-description via `"$CUBE_BIN" pr create --body-file`. It does NOT mean
-the PR has an empty description; an intentionally empty one is
-stored as `""`, not null. Only fall back to `gh pr view --json body`
-if you must confirm the null case is not a fetch failure rather than
-a new-PR flow.
+description via `"$CUBE_BIN" pr
+create --body-file`. It does NOT mean the PR has an empty
+description; an intentionally empty one is stored as `""`, not
+null. Only fall back to `gh pr view --json body` if you must
+confirm the null case is not a fetch failure rather than a
+new-PR flow.
 
 If a `"$BOSS_BIN"` command fails to run at all — not found, or it exits
 non-zero without answering — that is a finding, not noise. Say so

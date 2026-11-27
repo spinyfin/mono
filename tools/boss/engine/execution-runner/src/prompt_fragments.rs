@@ -73,11 +73,36 @@ pub(crate) fn check_bypass_prohibition_pointer() -> &'static str {
 /// Long-form details of the no-`timeout` and command-diagnosis rules for
 /// treated build-gate Standard worker rules. Expands on the driver preamble's
 /// opening no-`timeout` line without repeating that sentence verbatim.
-pub(crate) fn long_running_commands_rules() -> &'static str {
-    "## Long-running build and test commands\n\
-     \n\
-     Bazel's own per-test timeouts (test size and timeout attributes) are what bound tests; do not wrap other build or test commands in a shell `timeout` either. A build that is still compiling with no errors is making progress, even when it is slow because other builds share the machine. If a wait bound is needed (for example a polling yield), keep polling the running command instead of killing it. If a hard cap is ever unavoidable for some other command, it must be at least two hours, and a timeout must never be treated as a reason to rerun the same command under the same cap. To diagnose a command, inspect only this invocation's output base and logs; never infer ownership or blockage from global process-name matches.\n"
+///
+/// `preamble` is the driver's agent-rules preamble, which sits directly above
+/// this section in the rules. A driver whose preamble already states the
+/// still-compiling rule or the two-hour hard-cap rule (Codex does) keeps that
+/// statement; this section omits its own copy so each rule appears once.
+pub(crate) fn long_running_commands_rules(preamble: &str) -> String {
+    let still_compiling = if preamble.contains(STILL_COMPILING_RULE_MARKER) {
+        ""
+    } else {
+        " A build that is still compiling with no errors is making progress, even when it is slow because other builds share the machine."
+    };
+    let hard_cap = if preamble.contains(HARD_CAP_RULE_MARKER) {
+        ""
+    } else {
+        " If a hard cap is ever unavoidable for some other command, it must be at least two hours, and a timeout must never be treated as a reason to rerun the same command under the same cap."
+    };
+    format!(
+        "## Long-running build and test commands\n\
+         \n\
+         Bazel's own per-test timeouts (test size and timeout attributes) are what bound tests; do not wrap other build or test commands in a shell `timeout` either.{still_compiling} If a wait bound is needed (for example a polling yield), keep polling the running command instead of killing it.{hard_cap} To diagnose a command, inspect only this invocation's output base and logs; never infer ownership or blockage from global process-name matches.\n"
+    )
 }
+
+/// Phrase by which a driver preamble is recognised as already carrying the
+/// still-compiling-is-progress rule.
+const STILL_COMPILING_RULE_MARKER: &str = "still compiling is making progress";
+
+/// Phrase by which a driver preamble is recognised as already carrying the
+/// two-hour hard-cap rule.
+const HARD_CAP_RULE_MARKER: &str = "at least two hours";
 
 /// One-line pointer for treated pre-push build gates when
 /// [`long_running_commands_rules`] lives in the worker rules.

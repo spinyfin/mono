@@ -560,8 +560,8 @@ fn every_control_rule_appears_exactly_once_in_treated_rules_plus_brief_across_ki
                     "{ctx} file-count command template must appear exactly once"
                 );
                 assert!(
-                    slim_brief.contains("Split-vs-Bypass-limit protocol in the worker rules"),
-                    "{ctx} multi-file brief must point to Split-vs-Bypass-limit protocol in rules"
+                    slim_brief.contains("\"Exceeding the `change/file-count` limit\" section in the worker rules"),
+                    "{ctx} multi-file brief must point to the file-count section in rules"
                 );
             }
 
@@ -586,6 +586,107 @@ fn every_control_rule_appears_exactly_once_in_treated_rules_plus_brief_across_ki
     }
 }
 
+/// Names a pointer in `text` sends the worker to: every capitalised
+/// double-quoted name on a line that mentions "worker rules".
+fn pointer_targets(text: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    for line in text.lines().filter(|line| line.contains("worker rules")) {
+        targets.extend(
+            line.split('"')
+                .skip(1)
+                .step_by(2)
+                .filter(|name| name.starts_with(|c: char| c.is_ascii_uppercase()))
+                .map(str::to_owned),
+        );
+    }
+    targets
+}
+
+/// Whether `rules` carries a section heading beginning with `name`.
+fn rules_have_section(rules: &str, name: &str) -> bool {
+    rules
+        .lines()
+        .any(|line| line.trim_start_matches(['#', '*', ' ']).starts_with(name))
+}
+
+/// Seam-off and mixed-seam branches of the treated text (the revisions marker
+/// wording, prerequisite guidance, the empty-diff blocked pointer, the bazel
+/// gate's other-timeout wording, the question companion) are exercised under
+/// all four `(run_done, worker_signal)` combinations: every pointer in the
+/// treated brief and rules must name a section the rules carry, and the
+/// seam-independent rules must still appear exactly once.
+#[test]
+fn pointer_targets_exist_and_single_occurrence_holds_across_all_seam_combinations() {
+    let ws = bazel_workspace();
+    let registry = DriverRegistry::default();
+    let drivers: Vec<&str> = registry.slugs().collect();
+    for case in standard_cases() {
+        let has_build_gate = matches!(
+            case.execution.kind,
+            ExecutionKind::TaskImplementation
+                | ExecutionKind::ChoreImplementation
+                | ExecutionKind::RevisionImplementation
+                | ExecutionKind::ConflictResolution
+        );
+        for slug in &drivers {
+            for (run_done_seam, worker_signal_seam) in [(false, false), (false, true), (true, false), (true, true)] {
+                let (rules, brief) = render_pair(&case, slug, ws.path(), run_done_seam, worker_signal_seam, true);
+                let combined = format!("{rules}\n{brief}");
+                let ctx = format!(
+                    "[{} / driver={slug} / run_done={run_done_seam} worker_signal={worker_signal_seam}]",
+                    case.label
+                );
+
+                for text in [&brief, &rules] {
+                    for target in pointer_targets(text) {
+                        assert!(
+                            rules_have_section(&rules, &target),
+                            "{ctx} pointer names `{target}` but the worker rules carry no such section"
+                        );
+                    }
+                }
+
+                for needle in [
+                    "Classify a CI failure by cause, then act",
+                    "## Always use absolute paths",
+                    "## Reuse before you build",
+                    "## Boundaries",
+                    "## Capturing a screenshot for your own verification",
+                    "## Probes",
+                    "**Trust Bazel's caching.**",
+                    "**Write in project terms.**",
+                    "Never run raw `git` against cube's shared source store",
+                ] {
+                    assert_eq!(
+                        combined.matches(needle).count(),
+                        1,
+                        "{ctx} universal rule `{needle}` must appear exactly once"
+                    );
+                }
+
+                // The two-hour hard cap and the still-compiling rule: stated
+                // once on every driver, including those whose preamble
+                // already carries them.
+                let hard_cap = combined.matches("at least two hours").count();
+                let still_compiling = combined.matches("still compiling").count();
+                if has_build_gate {
+                    assert_eq!(hard_cap, 1, "{ctx} two-hour hard cap must appear exactly once");
+                    assert_eq!(
+                        still_compiling, 1,
+                        "{ctx} still-compiling rule must appear exactly once"
+                    );
+                } else {
+                    assert!(hard_cap <= 1, "{ctx} two-hour hard cap repeated ({hard_cap})");
+                    assert!(
+                        still_compiling <= 1,
+                        "{ctx} still-compiling rule repeated ({still_compiling})"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn file_count_protocol_is_gated_to_multi_file_implementation_kinds_only() {
     let ws = bazel_workspace();
@@ -604,7 +705,7 @@ fn file_count_protocol_is_gated_to_multi_file_implementation_kinds_only() {
             "Bypass limit",
             "BYPASS_CHANGE_FILE_COUNT",
             "Split:",
-            "Split-vs-Bypass-limit",
+            "Exceeding the `change/file-count` limit",
         ] {
             assert_eq!(
                 combined.contains(marker),

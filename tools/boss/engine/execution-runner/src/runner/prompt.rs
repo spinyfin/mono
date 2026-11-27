@@ -101,7 +101,7 @@ pub(super) struct ExecutionPromptParams<'a> {
     followup_proposals_seam_enabled: bool,
     /// Whether `run_done_proposals_seam` is on — gates the worker-facing
     /// prompt half of the terminal-declaration migration:
-    /// [`run_done_directive`], and the sentence
+    /// [`run_done::render`], and the sentence
     /// [`pr_terminal_directive`] adds about declaring before the terminal
     /// push. `false` (the flag's registry default) omits the general
     /// "Declaring your run finished" section (the no-op prompts still teach
@@ -720,7 +720,7 @@ fn bazel_no_shell_timeout_clause(run_done_seam_enabled: bool) -> &'static str {
 /// `run_done_seam_enabled` mirrors `run_done_proposals_seam`. When off, a
 /// real failure or timeout is an absolute stop: do not push red code.
 /// When on, that absolute stop is replaced by the same evidence-gated
-/// unattributable-failure exception [`run_done_directive`] teaches for the
+/// unattributable-failure exception [`run_done::render`] teaches for the
 /// terminal outcome, so a worker who reaches this gate is told they MAY
 /// push a still-red target that is evidenced as pre-existing or
 /// environmental — not merely which outcome to declare after the fact.
@@ -1012,7 +1012,7 @@ fn render_editorial_rules_block(
 /// the PR was created, so the review was never consumed. This universal
 /// guidance applies to every execution kind and prevents that pattern.
 ///
-/// `seam_enabled` mirrors `run_done_proposals_seam`. When on, [`run_done_directive`]'s
+/// `seam_enabled` mirrors `run_done_proposals_seam`. When on, [`run_done::render`]'s
 /// declaration — not PR creation — is the act that is ALWAYS terminal:
 /// `boss propose done` ends the run synchronously the instant it is accepted
 /// (`completion::run_done_declaration` finalizes it at submit, no Stop
