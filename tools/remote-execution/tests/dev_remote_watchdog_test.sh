@@ -244,6 +244,64 @@ fi
 kill -KILL "$local_target" 2> /dev/null || true
 printf '%s\n' 0 > "${tmp}/nc-status"
 
+# Pidfile cleanup on normal watchdog exit: when the target exits, the
+# watchdog exits and removes its own pidfile.
+printf '%s\n' 200 > "${tmp}/http-code"
+printf '%s\n' 0 > "${tmp}/nc-status"
+sleep 1 &
+short_target=$!
+DEV_REMOTE_WATCHDOG_ENDPOINT="grpc://hub.test:50051" \
+  DEV_REMOTE_WATCHDOG_TARGET_PID="$short_target" \
+  DEV_REMOTE_WATCHDOG_INTERVAL_SECS=1 \
+  DEV_REMOTE_WATCHDOG_CONNECT_TIMEOUT_SECS=1 \
+  "$watchdog" > /dev/null
+short_pidfile="${tmp}/dev-remote-watchdog-${short_target}.pid"
+if [[ ! -f "$short_pidfile" ]]; then
+  fail "pidfile cleanup: pidfile was not created"
+fi
+wait "$short_target" 2> /dev/null || true
+removed=0
+for _ in 1 2 3 4 5; do
+  if [[ ! -f "$short_pidfile" ]]; then
+    removed=1
+    break
+  fi
+  sleep 1
+done
+if [[ "$removed" != "1" ]]; then
+  kill -KILL "$(cat "$short_pidfile" 2> /dev/null)" 2> /dev/null || true
+  fail "pidfile cleanup: pidfile remained after target exited"
+fi
+
+# Startup sweep: removes stale pidfiles whose process is gone, keeps live ones.
+true &
+dead_pid=$!
+wait "$dead_pid" 2> /dev/null || true
+stale_pidfile="${tmp}/dev-remote-watchdog-stale-${dead_pid}.pid"
+printf '%s\n' "$dead_pid" > "$stale_pidfile"
+
+sleep 60 &
+live_pid=$!
+live_pidfile="${tmp}/dev-remote-watchdog-live-${live_pid}.pid"
+printf '%s\n' "$live_pid" > "$live_pidfile"
+
+sleep 60 &
+sweep_target=$!
+DEV_REMOTE_WATCHDOG_ENDPOINT="grpc://hub.test:50051" \
+  DEV_REMOTE_WATCHDOG_TARGET_PID="$sweep_target" \
+  DEV_REMOTE_WATCHDOG_INTERVAL_SECS=30 \
+  DEV_REMOTE_WATCHDOG_CONNECT_TIMEOUT_SECS=1 \
+  "$watchdog" > /dev/null
+if [[ -f "$stale_pidfile" ]]; then
+  fail "startup sweep: stale pidfile was not removed"
+fi
+if [[ ! -f "$live_pidfile" ]]; then
+  fail "startup sweep: live pidfile was removed"
+fi
+sweep_pidfile="${tmp}/dev-remote-watchdog-${sweep_target}.pid"
+kill -KILL "$(cat "$sweep_pidfile" 2> /dev/null)" "$live_pid" "$sweep_target" 2> /dev/null || true
+wait "$live_pid" "$sweep_target" 2> /dev/null || true
+
 if [[ "$failures" -ne 0 ]]; then
   echo "${failures} assertion(s) failed" >&2
   exit 1
