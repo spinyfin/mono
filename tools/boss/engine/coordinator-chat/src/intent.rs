@@ -21,6 +21,7 @@ use boss_acp_client::schema::RequestId;
 use boss_agent_host::journal::now_ms;
 use serde::{Deserialize, Serialize};
 
+use crate::jsonl::scan_jsonl;
 use crate::queue::{PromptImageRef, PromptOrigin};
 
 /// Read buffer capacity for replaying intent logs and wire journals.
@@ -260,50 +261,8 @@ impl IntentLog {
 /// blank lines are skipped, a final line cut off mid-write (including mid-UTF-8
 /// codepoint) is ignored, and any corrupt or invalid-UTF-8 line before the end
 /// returns `io::ErrorKind::InvalidData`.
-pub fn read_intent_records(mut reader: impl BufRead) -> io::Result<Vec<IntentRecord>> {
-    let mut records = Vec::new();
-    let mut buf = Vec::new();
-    let mut offset: u64 = 0;
-
-    loop {
-        buf.clear();
-        let read = reader.read_until(b'\n', &mut buf)?;
-        if read == 0 {
-            break;
-        }
-        let line_start = offset;
-        offset += read as u64;
-        let has_newline = buf.ends_with(b"\n");
-
-        let Ok(line_str) = std::str::from_utf8(&buf) else {
-            if !has_newline || reader_at_eof(&mut reader)? {
-                // Torn final record (cut off mid-UTF-8 sequence).
-                break;
-            }
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("intent log contains invalid UTF-8 at byte offset {line_start}"),
-            ));
-        };
-
-        let trimmed = line_str.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        match serde_json::from_str::<IntentRecord>(trimmed) {
-            Ok(record) => records.push(record),
-            Err(_) if !has_newline || reader_at_eof(&mut reader)? => break,
-            Err(err) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("intent record after seq {}: {err}", records.len()),
-                ));
-            }
-        }
-    }
-
-    Ok(records)
+pub fn read_intent_records(reader: impl BufRead) -> io::Result<Vec<IntentRecord>> {
+    Ok(scan_jsonl::<IntentRecord>(reader, "intent log")?.records)
 }
 
 /// Reads all intent records from `path` using a buffer sized from the spike's
@@ -328,73 +287,17 @@ pub fn read_intent_file_if_exists(path: &Path) -> io::Result<Vec<IntentRecord>> 
 /// (so any torn final bytes can be truncated before appending).
 fn scan_existing_file(file: &mut File) -> io::Result<(Vec<IntentRecord>, u64)> {
     file.seek(SeekFrom::Start(0))?;
-    let mut reader = BufReader::with_capacity(REPLAY_READ_BUFFER_BYTES, file.try_clone()?);
-    let mut records = Vec::new();
-    let mut offset: u64 = 0;
-    let mut valid_end: u64 = 0;
-    let mut buf = Vec::new();
-
-    loop {
-        buf.clear();
-        let read = reader.read_until(b'\n', &mut buf)?;
-        if read == 0 {
-            break;
-        }
-        let line_start = offset;
-        offset += read as u64;
-        let has_newline = buf.ends_with(b"\n");
-
-        let Ok(line_str) = std::str::from_utf8(&buf) else {
-            if !has_newline || reader_at_eof(&mut reader)? {
-                // Torn final record (cut off mid-UTF-8 sequence).
-                return Ok((records, valid_end));
-            }
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("intent log contains invalid UTF-8 at byte offset {line_start}"),
-            ));
-        };
-
-        let trimmed = line_str.trim();
-        if trimmed.is_empty() {
-            if has_newline {
-                valid_end = offset;
-            }
-            continue;
-        }
-
-        match serde_json::from_str::<IntentRecord>(trimmed) {
-            Ok(record) => {
-                if !has_newline {
-                    // The final line parsed as a complete record but lacks its
-                    // trailing newline (the crash came between the JSON bytes
-                    // and the `\n`). Keep the record and write the missing
-                    // newline so the next append starts on its own line.
-                    records.push(record);
-                    file.seek(SeekFrom::Start(offset))?;
-                    file.write_all(b"\n")?;
-                    offset += 1;
-                    valid_end = offset;
-                    break;
-                }
-                records.push(record);
-                valid_end = offset;
-            }
-            Err(err) => {
-                if !has_newline || reader_at_eof(&mut reader)? {
-                    return Ok((records, valid_end));
-                }
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("intent record after seq {}: {err}", records.len()),
-                ));
-            }
-        }
+    let reader = BufReader::with_capacity(REPLAY_READ_BUFFER_BYTES, file.try_clone()?);
+    let scan = scan_jsonl::<IntentRecord>(reader, "intent log")?;
+    let mut valid_end = scan.valid_end;
+    if scan.missing_final_newline {
+        // The final line parsed as a complete record but lacks its trailing
+        // newline (the crash came between the JSON bytes and the `\n`). Keep
+        // the record and write the missing newline so the next append starts
+        // on its own line.
+        file.seek(SeekFrom::Start(valid_end))?;
+        file.write_all(b"\n")?;
+        valid_end += 1;
     }
-
-    Ok((records, valid_end))
-}
-
-fn reader_at_eof(reader: &mut impl BufRead) -> io::Result<bool> {
-    Ok(reader.fill_buf()?.is_empty())
+    Ok((scan.records, valid_end))
 }
