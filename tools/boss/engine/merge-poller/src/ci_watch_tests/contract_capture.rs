@@ -22,7 +22,8 @@ async fn capture_persists_declared_sibling_alongside_unresolved_checks() {
             &db,
             crate::queue_ci_contract::DetectionContext {
                 publisher: &publisher,
-                fetcher: &fetcher
+                fetcher: &fetcher,
+                ci_fix: None,
             },
             &candidate(&product, &chore, pr),
             "head",
@@ -58,7 +59,8 @@ async fn snapshot_error_surfaces_one_attention_without_spending_attempt_budget()
                 &db,
                 crate::queue_ci_contract::DetectionContext {
                     publisher: &publisher,
-                    fetcher: &fetcher
+                    fetcher: &fetcher,
+                    ci_fix: None,
                 },
                 &candidate(&product, &chore, pr),
                 "head",
@@ -103,7 +105,8 @@ async fn slow_build_lookups_still_mint_remediation() {
             &db,
             crate::queue_ci_contract::DetectionContext {
                 publisher: &publisher,
-                fetcher: &fetcher
+                fetcher: &fetcher,
+                ci_fix: None,
             },
             &candidate(&product, &chore, pr),
             "head",

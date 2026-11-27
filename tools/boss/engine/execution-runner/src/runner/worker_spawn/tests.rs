@@ -291,7 +291,7 @@ mod reviewer_pool_policy_tests {
             .execution_id("execution")
             .build();
 
-        let config = super::resolve_batch_reviewer_spawn(&registry, &member, None).unwrap();
+        let config = super::resolve_batch_reviewer_spawn(&registry, &member, None, false).unwrap();
         assert_eq!(config.driver, "codex");
         assert_eq!(config.model, "gpt-5.6-terra");
         assert_eq!(config.effort_level, Some(boss_protocol::EffortLevel::Medium));
@@ -308,6 +308,67 @@ mod reviewer_pool_policy_tests {
             super::prompt_addendum_to_prepend(&boss_protocol::ExecutionKind::PrReview, config.prompt_addendum),
             None,
         );
+    }
+}
+
+#[cfg(test)]
+mod supervisor_tier_tests {
+    //! The `supervisor_standard_tier` treatment moves only a review supervisor,
+    //! only onto the driver's Balanced review tier, and only when treated.
+
+    use boss_protocol::{ReviewBatchMember, ReviewBatchMemberRole, ReviewBatchMemberStatus};
+
+    fn member(role: ReviewBatchMemberRole, driver: &str, model: &str) -> ReviewBatchMember {
+        ReviewBatchMember::builder()
+            .id("member")
+            .batch_id("batch")
+            .attempt(1)
+            .created_at("1")
+            .provider_effort("medium")
+            .requested_driver(driver)
+            .resolved_model(model)
+            .role(role)
+            .status(ReviewBatchMemberStatus::Pending)
+            .updated_at("1")
+            .execution_id("execution")
+            .build()
+    }
+
+    fn resolve(member: &ReviewBatchMember, treated: bool) -> crate::effort::SpawnConfig {
+        let registry = crate::driver::DriverRegistry::default();
+        super::super::resolve_batch_reviewer_spawn(&registry, member, None, treated).unwrap()
+    }
+
+    #[test]
+    fn a_treated_supervisor_created_on_the_strong_tier_runs_on_sonnet() {
+        let supervisor = member(ReviewBatchMemberRole::Supervisor, "claude", "opus");
+        let treated = resolve(&supervisor, true);
+        assert_eq!(treated.model, "sonnet");
+        assert_eq!(treated.driver, "claude");
+        assert_eq!(treated.effort_value, resolve(&supervisor, false).effort_value);
+    }
+
+    #[test]
+    fn control_and_inert_supervisors_keep_the_model_their_profile_chose() {
+        let strong = member(ReviewBatchMemberRole::Supervisor, "claude", "opus");
+        assert_eq!(resolve(&strong, false).model, "opus");
+        let light = member(ReviewBatchMemberRole::Supervisor, "claude", "sonnet");
+        assert_eq!(resolve(&light, false).model, "sonnet");
+        assert_eq!(resolve(&light, true).model, "sonnet", "already on the Balanced tier");
+    }
+
+    #[test]
+    fn leaf_and_post_merge_reviewers_are_never_moved() {
+        for role in [
+            ReviewBatchMemberRole::ClaudeReviewer,
+            ReviewBatchMemberRole::PostMergeReviewer,
+        ] {
+            let reviewer = member(role, "claude", "opus");
+            assert_eq!(resolve(&reviewer, true), resolve(&reviewer, false), "{role:?}");
+            assert_eq!(resolve(&reviewer, true).model, "opus", "{role:?}");
+        }
+        let codex = member(ReviewBatchMemberRole::CodexReviewer, "codex", "gpt-5.6-terra");
+        assert_eq!(resolve(&codex, true), resolve(&codex, false));
     }
 }
 
@@ -2348,6 +2409,111 @@ mod experiment_arm_tests {
         let mut arms = ExperimentArmSet::new();
         arms.insert(BATCHED_SEARCH_EXPERIMENT, arm);
         arms
+    }
+
+    /// Compose a design or investigation task at `effort` under `arm` of the
+    /// `investigation_routing` experiment, and return what it launches with.
+    async fn compose_tiered(
+        kind: TaskKind,
+        reasoning: Option<boss_protocol::ReasoningMode>,
+        effort: boss_protocol::EffortLevel,
+        arm: Option<ExperimentArm>,
+        workspace: &Path,
+    ) -> crate::effort::SpawnConfig {
+        let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
+        let execution = WorkExecution::builder()
+            .id("exec_route_01")
+            .work_item_id("task-route")
+            .kind(ExecutionKind::ChoreImplementation)
+            .status(ExecutionStatus::Running)
+            .repo_remote_url("git@github.com:org/repo.git")
+            .workspace_path(workspace.to_string_lossy())
+            .created_at("2026-05-15T00:00:00Z")
+            .build();
+        let task = Task::builder()
+            .id("task-route")
+            .product_id("prod-route")
+            .kind(kind)
+            .name("Investigate")
+            .description("Investigate the thing.")
+            .status(TaskStatus::Todo)
+            .effort_level(effort)
+            .maybe_reasoning(reasoning)
+            .created_at("2026-05-15T00:00:00Z")
+            .updated_at("2026-05-15T00:00:00Z")
+            .build();
+        let mut arms = ExperimentArmSet::new();
+        if let Some(arm) = arm {
+            arms.insert(crate::feature_flags::INVESTIGATION_ROUTING_EXPERIMENT, arm);
+        }
+        compose_worker_spawn(
+            &db,
+            "worker-route",
+            &execution,
+            &WorkItem::Chore(task),
+            workspace,
+            None,
+            WorkerSpawnOpts::builder()
+                .review_signal_checks(|_| &[])
+                .experiment_arms(arms)
+                .build(),
+        )
+        .await
+        .unwrap()
+        .spawn_config
+    }
+
+    #[tokio::test]
+    async fn investigation_routing_reaches_the_launch_only_for_a_treated_family_at_each_level() {
+        use boss_protocol::{EffortLevel, ReasoningMode};
+        let workspace = tempfile::tempdir().unwrap();
+        // (level, treated model, treated effort, control model, control effort)
+        let cases = [
+            (EffortLevel::Small, "opus", "medium", "fable", "medium"),
+            (EffortLevel::Medium, "opus", "high", "fable", "high"),
+            (EffortLevel::Large, "fable", "high", "fable", "xhigh"),
+        ];
+        for (level, treated_model, treated_effort, control_model, control_effort) in cases {
+            let treated = compose_tiered(
+                TaskKind::Chore,
+                Some(ReasoningMode::Investigation),
+                level,
+                Some(ExperimentArm::Treatment),
+                workspace.path(),
+            )
+            .await;
+            assert_eq!(treated.model, treated_model, "{level:?}");
+            assert_eq!(treated.effort_value, Some(treated_effort), "{level:?}");
+
+            for arm in [None, Some(ExperimentArm::Control), Some(ExperimentArm::Stopped)] {
+                let untreated = compose_tiered(
+                    TaskKind::Chore,
+                    Some(ReasoningMode::Investigation),
+                    level,
+                    arm,
+                    workspace.path(),
+                )
+                .await;
+                assert_eq!(untreated.model, control_model, "{level:?} {arm:?}");
+                assert_eq!(untreated.effort_value, Some(control_effort), "{level:?} {arm:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn investigation_routing_does_not_touch_an_ordinary_task() {
+        use boss_protocol::{EffortLevel, ReasoningMode};
+        let workspace = tempfile::tempdir().unwrap();
+        let treated = compose_tiered(
+            TaskKind::Chore,
+            Some(ReasoningMode::Standard),
+            EffortLevel::Large,
+            Some(ExperimentArm::Treatment),
+            workspace.path(),
+        )
+        .await;
+        assert_eq!(treated.model, "sonnet");
+        assert_eq!(treated.effort_value, Some("xhigh"));
     }
 
     #[tokio::test]

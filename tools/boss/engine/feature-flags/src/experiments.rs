@@ -58,6 +58,28 @@ pub const WORKER_AUTOCOMPACT_EXPERIMENT: &str = "worker_autocompact";
 /// Splits [`WORKER_AUTOCOMPACT_EXPERIMENT`] between half of families and all.
 pub const WORKER_AUTOCOMPACT_AB_SPLIT_FLAG: &str = "worker_autocompact_ab_split";
 
+/// Key of the experiment that runs a treated family's review supervisor on the
+/// Balanced model tier whatever the batch's review profile.
+pub const SUPERVISOR_STANDARD_TIER_EXPERIMENT: &str = "supervisor_standard_tier";
+
+/// Splits [`SUPERVISOR_STANDARD_TIER_EXPERIMENT`] between half of families and all.
+pub const SUPERVISOR_STANDARD_TIER_AB_SPLIT_FLAG: &str = "supervisor_standard_tier_ab_split";
+
+/// Key of the experiment that gives a treated family's CI-fix revision, minted
+/// with no failure evidence, standard reasoning at `medium` effort.
+pub const CI_FIX_STANDARD_TIER_EXPERIMENT: &str = "ci_fix_standard_tier";
+
+/// Splits [`CI_FIX_STANDARD_TIER_EXPERIMENT`] between half of families and all.
+pub const CI_FIX_STANDARD_TIER_AB_SPLIT_FLAG: &str = "ci_fix_standard_tier_ab_split";
+
+/// Key of the experiment that routes a treated family's Claude design and
+/// investigation runs one step down: `large` effort at `high`, and `small` or
+/// `medium` effort on the investigation model instead of the design model.
+pub const INVESTIGATION_ROUTING_EXPERIMENT: &str = "investigation_routing";
+
+/// Splits [`INVESTIGATION_ROUTING_EXPERIMENT`] between half of families and all.
+pub const INVESTIGATION_ROUTING_AB_SPLIT_FLAG: &str = "investigation_routing_ab_split";
+
 /// A surface on which at most one experiment may be assigned at a time.
 ///
 /// Two experiments that rewrite the same instructions, or reshape the same
@@ -116,6 +138,11 @@ pub fn ab_split_flag_name(key: &str) -> String {
 /// Every experiment. Append in the order the experiments should win a lane:
 /// when two experiments in one lane are switched on, the one registered first
 /// runs and the other is held.
+///
+/// The three routing experiments hold no lane: they change the model or the
+/// reasoning tier of disjoint populations (a review supervisor, a CI-fix
+/// revision with no failure evidence, a Claude design or investigation run), so
+/// no run can receive two of them and independent assignment is enough.
 pub const EXPERIMENTS: &[ExperimentSpec] = &[
     ExperimentSpec {
         key: BATCHED_SEARCH_EXPERIMENT,
@@ -125,6 +152,24 @@ pub const EXPERIMENTS: &[ExperimentSpec] = &[
     },
     ExperimentSpec {
         key: WORKER_AUTOCOMPACT_EXPERIMENT,
+        lane: None,
+        requires: &[],
+        splits: true,
+    },
+    ExperimentSpec {
+        key: SUPERVISOR_STANDARD_TIER_EXPERIMENT,
+        lane: None,
+        requires: &[],
+        splits: true,
+    },
+    ExperimentSpec {
+        key: CI_FIX_STANDARD_TIER_EXPERIMENT,
+        lane: None,
+        requires: &[],
+        splits: true,
+    },
+    ExperimentSpec {
+        key: INVESTIGATION_ROUTING_EXPERIMENT,
         lane: None,
         requires: &[],
         splits: true,
@@ -426,6 +471,15 @@ impl FeatureFlagsStore {
     /// What `key` is doing right now, from the live flag values.
     pub fn experiment_state(&self, key: &str) -> ExperimentState {
         experiment_state(EXPERIMENTS, key, &|name| self.is_enabled(name))
+    }
+
+    /// Whether a family whose bucket for `key` is `bucket` is treated by `key`
+    /// right now, from the live flags. For a policy decision made away from a
+    /// launch, such as the reasoning a revision is minted with, where no arm
+    /// set is resolved. It reads the same flags and the same bucket a launch
+    /// does, so the decision and the arm the family's launches record agree.
+    pub fn is_experiment_treated(&self, key: &str, bucket: u8) -> bool {
+        assign_arm(self.experiment_state(key), bucket) == Some(ExperimentArm::Treatment)
     }
 
     /// The arm set a family launches under right now. `bucket_for_key` is the
@@ -851,6 +905,65 @@ mod tests {
         let resolved = resolve_arms(EXPERIMENTS, &flag, &|_| 0);
         assert!(resolved.is_treated(BATCHED_SEARCH_EXPERIMENT));
         assert!(resolved.is_treated(WORKER_AUTOCOMPACT_EXPERIMENT));
+    }
+
+    #[test]
+    fn the_routing_experiments_hold_no_lane_and_split() {
+        for key in [
+            SUPERVISOR_STANDARD_TIER_EXPERIMENT,
+            CI_FIX_STANDARD_TIER_EXPERIMENT,
+            INVESTIGATION_ROUTING_EXPERIMENT,
+        ] {
+            let spec = EXPERIMENTS.iter().find(|spec| spec.key == key).expect(key);
+            assert_eq!(spec.lane, None, "{key}");
+            assert!(spec.splits, "{key}");
+            assert!(spec.requires.is_empty(), "{key}");
+        }
+        assert_eq!(
+            ab_split_flag_name(SUPERVISOR_STANDARD_TIER_EXPERIMENT),
+            SUPERVISOR_STANDARD_TIER_AB_SPLIT_FLAG
+        );
+        assert_eq!(
+            ab_split_flag_name(CI_FIX_STANDARD_TIER_EXPERIMENT),
+            CI_FIX_STANDARD_TIER_AB_SPLIT_FLAG
+        );
+        assert_eq!(
+            ab_split_flag_name(INVESTIGATION_ROUTING_EXPERIMENT),
+            INVESTIGATION_ROUTING_AB_SPLIT_FLAG
+        );
+    }
+
+    #[test]
+    fn the_routing_experiments_run_together_and_stop_independently() {
+        let (_tmp, store) = store();
+        let keys = [
+            SUPERVISOR_STANDARD_TIER_EXPERIMENT,
+            CI_FIX_STANDARD_TIER_EXPERIMENT,
+            INVESTIGATION_ROUTING_EXPERIMENT,
+        ];
+        for key in keys {
+            assert!(!store.is_experiment_treated(key, 0), "{key} ships inert");
+            store.set(key, true).unwrap();
+        }
+        for key in keys {
+            assert_eq!(store.experiment_state(key), ExperimentState::Split, "{key}");
+            assert!(store.is_experiment_treated(key, 49), "{key}");
+            assert!(!store.is_experiment_treated(key, 50), "{key}");
+        }
+        store.set(CI_FIX_STANDARD_TIER_EXPERIMENT, false).unwrap();
+        assert!(!store.is_experiment_treated(CI_FIX_STANDARD_TIER_EXPERIMENT, 0));
+        assert!(store.is_experiment_treated(SUPERVISOR_STANDARD_TIER_EXPERIMENT, 0));
+        assert!(store.is_experiment_treated(INVESTIGATION_ROUTING_EXPERIMENT, 0));
+
+        store.set(INVESTIGATION_ROUTING_AB_SPLIT_FLAG, false).unwrap();
+        assert!(store.is_experiment_treated(INVESTIGATION_ROUTING_EXPERIMENT, 99));
+        store.set(TOKEN_EXPERIMENTS_FLAG, false).unwrap();
+        for key in keys {
+            assert!(
+                !store.is_experiment_treated(key, 0),
+                "{key} stops with the master switch"
+            );
+        }
     }
 
     fn store() -> (tempfile::TempDir, FeatureFlagsStore) {

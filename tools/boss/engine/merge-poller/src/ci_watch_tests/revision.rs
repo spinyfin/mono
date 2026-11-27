@@ -152,6 +152,137 @@ async fn evidence_free_trunk_eviction_spawns_an_investigation_revision() {
     );
 }
 
+/// A host policy that answers with a fixed tier and counts how often it is asked.
+struct FixedCiFixPolicy {
+    tier: crate::host::NoEvidenceCiFixTier,
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+impl FixedCiFixPolicy {
+    fn new(tier: crate::host::NoEvidenceCiFixTier) -> Self {
+        Self {
+            tier,
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn asked(&self) -> usize {
+        self.asked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl crate::host::CiFixPolicy for FixedCiFixPolicy {
+    fn no_evidence_ci_fix_tier(&self, _: &WorkDb, _: &PendingMergeCheck) -> crate::host::NoEvidenceCiFixTier {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.tier
+    }
+}
+
+/// Mint a trunk-eviction CI-fix revision for a fresh PR under `policy` and
+/// return it, with the failures the poller had to hand the worker.
+async fn eviction_revision(
+    policy: Option<&FixedCiFixPolicy>,
+    failures: &[crate::RequiredCheckFailure],
+    pr_number: u32,
+) -> boss_protocol::Task {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = format!("https://github.com/foo/bar/pull/{pr_number}");
+    let (product, chore) = make_in_review(&db, "C-tier", &pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let context = crate::queue_ci_contract::DetectionContext {
+        publisher: pub_.as_ref(),
+        fetcher: &crate::queue_ci_contract::NoContractFetcher,
+        ci_fix: policy.map(|policy| policy as &dyn crate::host::CiFixPolicy),
+    };
+
+    let flipped = on_trunk_queue_eviction_detected(
+        &db,
+        context,
+        &candidate(&product, &chore, &pr),
+        Some("feature-branch"),
+        "entry-tier",
+        "2026-09-03T00:00:00.000Z",
+        failures,
+    )
+    .await;
+    assert!(flipped);
+    let attempt = db.active_ci_remediation_for_work_item(&chore).unwrap().unwrap();
+    match db.get_work_item(attempt.revision_task_id.as_deref().unwrap()).unwrap() {
+        WorkItem::Task(t) => t,
+        other => panic!("expected revision task, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_treated_family_gets_standard_reasoning_at_medium_when_there_is_no_evidence() {
+    let policy = FixedCiFixPolicy::new(crate::host::NoEvidenceCiFixTier::StandardMedium);
+    let revision = eviction_revision(Some(&policy), &[], 110).await;
+    assert_eq!(revision.reasoning, Some(boss_protocol::ReasoningMode::Standard));
+    assert_eq!(revision.effort_level, Some(boss_protocol::EffortLevel::Medium));
+    assert_eq!(policy.asked(), 1);
+}
+
+#[tokio::test]
+async fn a_control_family_or_a_host_with_no_policy_keeps_the_investigation_pin() {
+    let control = FixedCiFixPolicy::new(crate::host::NoEvidenceCiFixTier::Investigation);
+    let from_control = eviction_revision(Some(&control), &[], 111).await;
+    let from_no_host = eviction_revision(None, &[], 112).await;
+    for revision in [&from_control, &from_no_host] {
+        assert_eq!(revision.reasoning, Some(boss_protocol::ReasoningMode::Investigation));
+    }
+    // A control revision is minted exactly as before: same effort too.
+    assert_eq!(from_control.effort_level, from_no_host.effort_level);
+    assert_ne!(from_control.effort_level, Some(boss_protocol::EffortLevel::Medium));
+    assert_eq!(control.asked(), 1);
+}
+
+#[tokio::test]
+async fn a_revision_with_evidence_is_never_retiered_and_the_host_is_not_asked() {
+    // The failed check is attached, so the revision is already standard
+    // reasoning at the default effort whatever the family's arm.
+    let policy = FixedCiFixPolicy::new(crate::host::NoEvidenceCiFixTier::StandardMedium);
+    let with_policy = eviction_revision(Some(&policy), &one_failure(), 113).await;
+    let without = eviction_revision(None, &one_failure(), 114).await;
+    assert_eq!(with_policy.reasoning, Some(boss_protocol::ReasoningMode::Standard));
+    assert_eq!(with_policy.effort_level, without.effort_level);
+    assert_ne!(with_policy.effort_level, Some(boss_protocol::EffortLevel::Medium));
+    assert_eq!(policy.asked(), 0);
+}
+
+#[tokio::test]
+async fn a_merge_queue_rebounce_with_no_evidence_is_tiered_by_the_same_policy() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/115";
+    let (product, chore) = make_in_review(&db, "C-rebounce-tier", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let policy = FixedCiFixPolicy::new(crate::host::NoEvidenceCiFixTier::StandardMedium);
+
+    let flipped = on_merge_queue_rebounce_detected(
+        &db,
+        crate::queue_ci_contract::DetectionContext {
+            publisher: pub_.as_ref(),
+            fetcher: &crate::queue_ci_contract::NoContractFetcher,
+            ci_fix: Some(&policy),
+        },
+        &candidate(&product, &chore, pr),
+        "pr-head",
+        "synthetic-sha",
+        None,
+        &[],
+    )
+    .await;
+    assert!(flipped);
+    let attempt = db.active_ci_remediation_for_work_item(&chore).unwrap().unwrap();
+    let revision = match db.get_work_item(attempt.revision_task_id.as_deref().unwrap()).unwrap() {
+        WorkItem::Task(t) => t,
+        other => panic!("expected revision task, got {other:?}"),
+    };
+    assert_eq!(revision.reasoning, Some(boss_protocol::ReasoningMode::Standard));
+    assert_eq!(revision.effort_level, Some(boss_protocol::EffortLevel::Medium));
+}
+
 #[tokio::test]
 async fn detection_idempotent_does_not_double_spawn_revision() {
     // Re-firing on the same head sha reuses the existing attempt (whose

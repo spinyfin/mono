@@ -1048,6 +1048,7 @@ pub async fn run_one_pass_tracked(
                                 run_merge_queue_rebounce_pass(
                                     work_db,
                                     publisher,
+                                    host,
                                     &rebounce_in_review,
                                     &blocked_ci,
                                     Some(&parked_ids),

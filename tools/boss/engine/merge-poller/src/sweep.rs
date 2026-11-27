@@ -276,7 +276,7 @@ pub async fn reconcile_batch(
     // dequeue/eviction signal is owned by the Trunk queue poller, not
     // GitHub's merge-queue timeline. One batched dequeue query for the whole
     // due set, exactly like the full sweep's.
-    run_merge_queue_rebounce_pass(work_db, publisher, &in_review, &blocked_ci, None, &mut outcome).await;
+    run_merge_queue_rebounce_pass(work_db, publisher, host, &in_review, &blocked_ci, None, &mut outcome).await;
 
     let reviewer_stale_secs: u64 = 10 * 60;
     let skip_unbatched_review_holds = completion_handler
@@ -1216,6 +1216,7 @@ pub(crate) async fn sweep_one(
             crate::queue_ci_contract::DetectionContext {
                 publisher,
                 fetcher: &crate::queue_ci_contract::ProviderFetcher,
+                ci_fix: host.map(|host| host as &dyn crate::host::CiFixPolicy),
             },
             candidate,
             &probe_result,

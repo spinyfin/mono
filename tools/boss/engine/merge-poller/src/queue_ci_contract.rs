@@ -157,6 +157,9 @@ pub(crate) mod tests;
 pub struct DetectionContext<'a> {
     pub publisher: &'a dyn boss_execution_contracts::ExecutionPublisher,
     pub fetcher: &'a dyn ContractFetcher,
+    /// Tiers the revision minted when a queue rejection carries no failing
+    /// check. `None` (a caller with no engine host) mints it as it always was.
+    pub ci_fix: Option<&'a dyn crate::host::CiFixPolicy>,
 }
 
 /// Fetcher for a product that declares no queue CI contract, so detection
@@ -181,5 +184,6 @@ pub fn test_context(publisher: &dyn boss_execution_contracts::ExecutionPublisher
     DetectionContext {
         publisher,
         fetcher: &NoContractFetcher,
+        ci_fix: None,
     }
 }

@@ -1111,6 +1111,7 @@ async fn rebased_head_still_red_on_trunk_cancels_the_queue_entry() {
                 work_db: &state.work_db,
                 publisher: state.publisher.as_ref(),
                 api: &state.trunk_client,
+                ci_fix: None,
             },
             Instant::now(),
         )
@@ -1457,6 +1458,7 @@ async fn rebase_conflict_on_trunk_with_failed_intent_stamps_superseded_and_resub
                 work_db: &state.work_db,
                 publisher: state.publisher.as_ref(),
                 api: &state.trunk_client,
+                ci_fix: None,
             },
             Instant::now(),
         )

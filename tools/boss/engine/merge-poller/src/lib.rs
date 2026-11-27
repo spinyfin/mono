@@ -93,8 +93,8 @@ pub(crate) use boss_work_db as work;
 pub(crate) use boss_execution_contracts::stub_cube_client;
 
 pub use host::{
-    ActiveProducts, ConflictCleared, ConflictHandling, ConflictResponse, EveryProductActive, LoopPasses,
-    PopulationRequest, PopulationRequests, SweepHost, SweepPasses,
+    ActiveProducts, CiFixPolicy, ConflictCleared, ConflictHandling, ConflictResponse, EveryProductActive, LoopPasses,
+    NoEvidenceCiFixTier, PopulationRequest, PopulationRequests, SweepHost, SweepPasses,
 };
 
 mod classify;

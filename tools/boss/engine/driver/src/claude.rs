@@ -65,6 +65,48 @@ fn claude_model_for_reasoning(reasoning: ReasoningMode) -> &'static str {
     }
 }
 
+/// One step down for a design or investigation run on Claude, for the
+/// `investigation_routing` experiment.
+///
+/// The design/investigation tier launches on Fable, and its `large` effort
+/// resolves to Claude's `xhigh`. Anthropic's guidance for Fable is to start at
+/// `high` and use `xhigh` only where a gain is measured, and a `small` or
+/// `medium` run rarely needs the most expensive model. A field that is `None`
+/// leaves what the ordinary tier resolution chose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvestigationRouting {
+    /// The model to launch on instead of the design/investigation tier's.
+    pub model: Option<&'static str>,
+    /// The `--effort` value to launch with instead of the level's own.
+    pub effort_value: Option<&'static str>,
+}
+
+/// The routing the `investigation_routing` treatment applies at `level`:
+/// `large` effort at the `medium` level's value (`high`), and `small` or
+/// `medium` effort on the investigation reasoning model (Opus). `trivial`,
+/// `max` and a row with no level are not routed: the first two are the
+/// extremes the experiment does not test, and a row with no level launches
+/// without an effort flag.
+///
+/// Both values come from this driver's own tables, so the experiment cannot
+/// name a model or an effort the Claude CLI does not accept.
+pub fn investigation_routing_for_level(level: Option<EffortLevel>) -> InvestigationRouting {
+    match level {
+        Some(EffortLevel::Large) => InvestigationRouting {
+            model: None,
+            effort_value: claude_effort_value_for_level(EffortLevel::Medium),
+        },
+        Some(EffortLevel::Small | EffortLevel::Medium) => InvestigationRouting {
+            model: Some(claude_model_for_reasoning(ReasoningMode::Investigation)),
+            effort_value: None,
+        },
+        Some(EffortLevel::Trivial | EffortLevel::Max) | None => InvestigationRouting {
+            model: None,
+            effort_value: None,
+        },
+    }
+}
+
 /// Concrete model mapping for metadata-derived review tiers. This is kept
 /// distinct from the task reasoning menu: reviews are sized from the PR,
 /// never from the work item's classification.
@@ -138,8 +180,11 @@ fn claude_model_belongs_to_driver(model: &str) -> bool {
     lower.contains("claude") || matches!(lower.as_str(), "opus" | "sonnet" | "haiku" | "fable")
 }
 
+/// The Claude driver's slug: `tasks.driver`, `--driver`, and the registry key.
+pub const DRIVER_SLUG: &str = "claude";
+
 static CLAUDE_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
-    name: "claude",
+    name: DRIVER_SLUG,
     label: "Claude Code",
     binary: "claude",
     config_dir: ".claude",
@@ -1508,6 +1553,39 @@ mod tests {
             assert!(
                 !claude_model_belongs_to_driver(model),
                 "{model:?} should not be recognised as a Claude model"
+            );
+        }
+    }
+
+    #[test]
+    fn investigation_routing_steps_large_down_to_high_and_small_and_medium_to_opus() {
+        use boss_protocol::EffortLevel::{Large, Max, Medium, Small, Trivial};
+        let routed = |level| investigation_routing_for_level(level);
+        assert_eq!(
+            routed(Some(Large)),
+            InvestigationRouting {
+                model: None,
+                effort_value: Some("high")
+            }
+        );
+        for level in [Small, Medium] {
+            assert_eq!(
+                routed(Some(level)),
+                InvestigationRouting {
+                    model: Some("opus"),
+                    effort_value: None
+                },
+                "{level:?}"
+            );
+        }
+        for level in [Some(Trivial), Some(Max), None] {
+            assert_eq!(
+                routed(level),
+                InvestigationRouting {
+                    model: None,
+                    effort_value: None
+                },
+                "{level:?}"
             );
         }
     }

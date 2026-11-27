@@ -362,6 +362,7 @@ async fn rebounce_pass_confirms_and_retires_only_candidates_with_events() {
                     run_merge_queue_rebounce_pass(
                         &db,
                         &publisher,
+                        None,
                         &candidates,
                         &[],
                         Some(&Default::default()),

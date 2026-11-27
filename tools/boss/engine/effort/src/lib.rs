@@ -199,6 +199,9 @@ pub enum ModelResolutionSource {
     ExecutionKind,
     TaskOverride,
     DesignInvestigationTier,
+    /// The `investigation_routing` treatment moved a design or investigation
+    /// run off the design model onto the investigation model.
+    InvestigationRouting,
     PoolStrongTier,
     /// The cheap standard tier requested by [`PoolModelTier::Standard`].
     PoolStandardTier,
@@ -218,6 +221,7 @@ impl ModelResolutionSource {
             Self::ExecutionKind => "execution_kind",
             Self::TaskOverride => "task_override",
             Self::DesignInvestigationTier => "design_investigation_tier",
+            Self::InvestigationRouting => "investigation_routing",
             Self::PoolStrongTier => "pool_strong_tier",
             Self::PoolStandardTier => "pool_standard_tier",
             Self::Reasoning => "reasoning",
@@ -585,6 +589,14 @@ pub struct SpawnResolutionInput<'a> {
     pub reasoning: Option<ReasoningMode>,
     #[builder(default)]
     pub design_reasoning_effort_xhigh: bool,
+    /// The `investigation_routing` treatment: a design or investigation run on
+    /// the Claude driver goes one step down (see
+    /// [`boss_engine_driver::claude::investigation_routing_for_level`]). Applies
+    /// only where the design/investigation tier itself chose the model, so a
+    /// model pin, a pool tier and every other driver resolve as they always did.
+    /// The explicit design `xhigh` setting still wins over the effort step.
+    #[builder(default)]
+    pub investigation_routing: bool,
 }
 
 /// [`resolve_spawn_config`], resolved against a caller-supplied registry
@@ -680,6 +692,18 @@ pub fn resolve_spawn_config_in(
         (menu.engine_default.to_owned(), ModelResolutionSource::DriverDefault)
     };
 
+    // The `investigation_routing` treatment. Gated on the model having come
+    // from the design/investigation tier, so every pin and pool tier that
+    // outranks it is untouched, and on the driver the routing is written for.
+    let routing = (input.investigation_routing
+        && model_source == ModelResolutionSource::DesignInvestigationTier
+        && driver == boss_engine_driver::claude::DRIVER_SLUG)
+        .then(|| boss_engine_driver::claude::investigation_routing_for_level(effort_level));
+    if let Some(routed_model) = routing.and_then(|routing| routing.model) {
+        model = routed_model.to_owned();
+        model_source = ModelResolutionSource::InvestigationRouting;
+    }
+
     // A product model is a default, not a row-level pin. When traffic
     // allocation or a live driver pin selects a driver with a different
     // model vocabulary, the driver takes precedence and supplies its own
@@ -726,6 +750,8 @@ pub fn resolve_spawn_config_in(
         && input.pool_model_override.is_none()
     {
         Some("xhigh")
+    } else if let Some(routed) = routing.and_then(|routing| routing.effort_value) {
+        Some(routed)
     } else {
         effort_level.and_then(|l| (menu.effort_value_for_level)(l))
     };
@@ -2571,3 +2597,6 @@ mod tests {
 
 #[cfg(test)]
 mod work_type_tests;
+
+#[cfg(test)]
+mod investigation_routing_tests;

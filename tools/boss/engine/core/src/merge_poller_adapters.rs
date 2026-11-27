@@ -14,10 +14,11 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use boss_engine_merge_poller::{
-    ConflictCleared, ConflictHandling, ConflictResponse, LoopPasses, PopulationRequest, PopulationRequests, SweepPasses,
+    CiFixPolicy, ConflictCleared, ConflictHandling, ConflictResponse, LoopPasses, NoEvidenceCiFixTier,
+    PopulationRequest, PopulationRequests, SweepPasses,
 };
 use boss_execution_contracts::{CubeClient, ExecutionPublisher};
-use boss_feature_flags::{ConflictDeferralArm, FeatureFlagsStore};
+use boss_feature_flags::{CI_FIX_STANDARD_TIER_EXPERIMENT, ConflictDeferralArm, FeatureFlagsStore};
 use boss_observation_contracts::{DesignDetection, PrLifecycleProbe};
 
 use crate::completion_adapters::CoreDocDetection;
@@ -232,6 +233,25 @@ impl DesignDetection for CoreSweepHost {
     }
 }
 
+/// The `ci_fix_standard_tier` experiment. The family is the chain root of the
+/// PR's work item and the bucket is the one a launch draws, so the tier a
+/// revision is minted with and the arm its own launch records come from the same
+/// flags and the same family. A host built without flags is never in the experiment.
+impl CiFixPolicy for CoreSweepHost {
+    fn no_evidence_ci_fix_tier(&self, work_db: &WorkDb, candidate: &PendingMergeCheck) -> NoEvidenceCiFixTier {
+        let Some(flags) = self.feature_flags.as_deref() else {
+            return NoEvidenceCiFixTier::Investigation;
+        };
+        let family = work_db.review_cycle_root_id(&candidate.work_item_id);
+        let bucket = crate::work::experiment_bucket(&family, CI_FIX_STANDARD_TIER_EXPERIMENT);
+        if flags.is_experiment_treated(CI_FIX_STANDARD_TIER_EXPERIMENT, bucket) {
+            NoEvidenceCiFixTier::StandardMedium
+        } else {
+            NoEvidenceCiFixTier::Investigation
+        }
+    }
+}
+
 impl PopulationRequests for CoreSweepHost {
     fn enqueue_from_merge(&self, work_db: &WorkDb, request: PopulationRequest) {
         populator::enqueue_from_merge(
@@ -293,5 +313,111 @@ impl SweepPasses for CorePasses {
             candidates,
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{create_product, create_test_chore, open_db};
+    use boss_feature_flags::{CI_FIX_STANDARD_TIER_AB_SPLIT_FLAG, TOKEN_EXPERIMENTS_FLAG};
+
+    const KEY: &str = CI_FIX_STANDARD_TIER_EXPERIMENT;
+
+    fn host_with_flags() -> (tempfile::TempDir, Arc<FeatureFlagsStore>, CoreSweepHost) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let flags = Arc::new(FeatureFlagsStore::new(dir.path().join("feature-flags.toml")));
+        flags.load().unwrap();
+        let host = CoreSweepHost::with_remediation(None).with_feature_flags(flags.clone());
+        (dir, flags, host)
+    }
+
+    fn candidate(work_db: &WorkDb) -> PendingMergeCheck {
+        let task = create_test_chore(work_db, create_product(work_db), "ci fix");
+        PendingMergeCheck {
+            work_item_id: task.id,
+            product_id: task.product_id,
+            pr_url: "https://github.com/spinyfin/mono/pull/1".to_owned(),
+        }
+    }
+
+    fn treated_by_hash(candidate: &PendingMergeCheck) -> bool {
+        crate::work::experiment_bucket(&candidate.work_item_id, KEY) < 50
+    }
+
+    #[test]
+    fn the_experiment_ships_inert_so_no_family_is_tiered_down() {
+        let (_db_dir, db) = open_db();
+        let (_dir, _flags, host) = host_with_flags();
+        for _ in 0..8 {
+            assert_eq!(
+                host.no_evidence_ci_fix_tier(&db, &candidate(&db)),
+                NoEvidenceCiFixTier::Investigation
+            );
+        }
+    }
+
+    #[test]
+    fn a_split_treats_exactly_the_families_the_hash_draws() {
+        let (_db_dir, db) = open_db();
+        let (_dir, flags, host) = host_with_flags();
+        flags.set(KEY, true).unwrap();
+        let (mut treated, mut control) = (0, 0);
+        for _ in 0..16 {
+            let candidate = candidate(&db);
+            let expected = treated_by_hash(&candidate);
+            let tier = host.no_evidence_ci_fix_tier(&db, &candidate);
+            assert_eq!(
+                tier == NoEvidenceCiFixTier::StandardMedium,
+                expected,
+                "{}",
+                candidate.work_item_id
+            );
+            if expected {
+                treated += 1;
+            } else {
+                control += 1;
+            }
+        }
+        assert!(
+            treated > 0 && control > 0,
+            "the sample must exercise both arms: {treated}/{control}"
+        );
+    }
+
+    #[test]
+    fn with_the_split_off_every_family_is_tiered_down_and_the_kill_switches_stop_it() {
+        let (_db_dir, db) = open_db();
+        let (_dir, flags, host) = host_with_flags();
+        flags.set(KEY, true).unwrap();
+        flags.set(CI_FIX_STANDARD_TIER_AB_SPLIT_FLAG, false).unwrap();
+        let candidate = candidate(&db);
+        assert_eq!(
+            host.no_evidence_ci_fix_tier(&db, &candidate),
+            NoEvidenceCiFixTier::StandardMedium
+        );
+
+        flags.set(TOKEN_EXPERIMENTS_FLAG, false).unwrap();
+        assert_eq!(
+            host.no_evidence_ci_fix_tier(&db, &candidate),
+            NoEvidenceCiFixTier::Investigation,
+            "the master switch acts on the very next revision"
+        );
+        flags.set(TOKEN_EXPERIMENTS_FLAG, true).unwrap();
+        flags.set(KEY, false).unwrap();
+        assert_eq!(
+            host.no_evidence_ci_fix_tier(&db, &candidate),
+            NoEvidenceCiFixTier::Investigation
+        );
+    }
+
+    #[test]
+    fn a_host_built_without_flags_is_never_in_the_experiment() {
+        let (_db_dir, db) = open_db();
+        let host = CoreSweepHost::with_remediation(None);
+        assert_eq!(
+            host.no_evidence_ci_fix_tier(&db, &candidate(&db)),
+            NoEvidenceCiFixTier::Investigation
+        );
     }
 }

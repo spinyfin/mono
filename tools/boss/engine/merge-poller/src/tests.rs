@@ -160,6 +160,8 @@ impl DesignDetection for NoopSweepHost {
     async fn on_design_pr_merged(&self, _: &WorkDb, _: &str, _: &str, _: &str, _: &str, _: Option<&str>) {}
 }
 
+impl crate::host::CiFixPolicy for NoopSweepHost {}
+
 impl PopulationRequests for NoopSweepHost {
     fn enqueue_from_merge(&self, _: &WorkDb, _: PopulationRequest) {}
 }
