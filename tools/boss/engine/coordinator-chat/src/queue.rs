@@ -352,6 +352,9 @@ impl TurnQueue {
             let was_idle = !self.has_active_turn();
             let mut entry = self.dispatched_awaiting_wire.remove(pos);
             entry.wire_seq = Some(wire_seq);
+            // Once the prompt is on the wire a withdrawal no longer means anything;
+            // clearing it keeps live and replayed queue state identical.
+            entry.withdrawn = false;
             if was_idle {
                 self.cancel_requested = false;
             }
