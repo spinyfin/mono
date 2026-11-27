@@ -1147,6 +1147,7 @@ pub use output_types::AutomationDedupSuppression;
 pub use output_types::AutomationSiblingTask;
 pub use output_types::HostBoundExecution;
 pub use output_types::LatePrCandidate;
+pub use output_types::LiveRunCostSnapshot;
 pub use output_types::PendingMergeCheck;
 pub use output_types::RemoteRunHandle;
 pub use output_types::SetRunTranscriptPathOutcome;

@@ -192,6 +192,7 @@ pub mod review_guide_validation;
 mod review_guide_workspace;
 pub mod review_verdict_apply_sweep;
 pub mod rotating_file;
+pub mod run_budget_watch;
 pub mod run_done_finalize_sweep;
 pub mod run_reconcile;
 pub mod runner;

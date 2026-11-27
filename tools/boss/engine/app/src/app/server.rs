@@ -2103,6 +2103,17 @@ async fn serve_scoped(
         boss_engine_runtime::envelope_watch::DEFAULT_RECONCILE_INTERVAL,
     );
 
+    // Runaway-run budget alarm: signals (never stops) once per execution when a
+    // live run passes 25M tokens or 150 rounds, read from the tailed cost
+    // snapshot. Gated by `run_budget_alarm` (default on). Runs every 60s.
+    let _run_budget_watch_handle = boss_engine_runtime::run_budget_watch::spawn_loop(
+        server_state.work_db.clone(),
+        server_state.live_worker_states.clone(),
+        server_state.feature_flags.clone(),
+        boss_engine_runtime::run_budget_watch::RunBudgetThresholds::default(),
+        Duration::from_secs(60),
+    );
+
     // Periodic spawn-ack sweep: detects worker slots whose pane came up
     // but never produced a driver-originated signal (the 2026-07-30
     // login-shell class). Distinct from `mark_stalled_spawns`, which only

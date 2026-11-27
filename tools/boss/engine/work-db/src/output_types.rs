@@ -93,6 +93,16 @@ pub struct TmuxRunHandle {
     pub tmux_pane_pid: Option<i64>,
 }
 
+/// Narrow cost-snapshot projection for one live execution's active run row,
+/// used by the runaway-run budget watch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveRunCostSnapshot {
+    pub execution_id: String,
+    pub work_item_id: String,
+    pub total_tokens: Option<i64>,
+    pub rounds: Option<i64>,
+}
+
 /// A tmux-hosted run's durable identity as needed for token-verified
 /// teardown ([`WorkDb::tmux_identity_for_execution`]). Unlike
 /// [`TmuxRunHandle`], reading this applies no status filtering — teardown
