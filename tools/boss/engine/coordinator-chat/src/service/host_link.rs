@@ -12,10 +12,8 @@
 //! engine's user, and the process at the other end must be the one the caller
 //! expects.
 
-use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
-use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::PathBuf;
 
 use boss_acp_client::framing::{Frame, LineFramer};
 use boss_agent_host::Handshake;
@@ -74,7 +72,7 @@ impl HostConnection {
     /// Connects, verifies the peer, and asks for the journal from `replay_from`.
     pub(super) async fn connect(endpoint: &HostEndpoint, replay_from: u64) -> Result<Self, ConnectError> {
         if let Some(dir) = endpoint.socket_path.parent()
-            && let Some(problem) = private_directory_problem(dir)?
+            && let Some(problem) = boss_engine_utils::host::private_directory_problem(dir)?
         {
             return Err(ConnectError::Refused(format!(
                 "the agent host's socket directory must be private and owned by the engine user, but {problem}"
@@ -123,6 +121,9 @@ impl HostConnection {
     /// Writes one line for the agent. The host journals it and echoes it back
     /// as a record, which is how the reducer sees what the service sent.
     pub(super) async fn write_line(&mut self, line: &str) -> Result<(), LinkError> {
+        if let Some(error) = drop_write_for_test(line) {
+            return Err(error);
+        }
         let mut framed = Vec::with_capacity(line.len() + 1);
         framed.extend_from_slice(line.as_bytes());
         framed.push(b'\n');
@@ -132,40 +133,36 @@ impl HostConnection {
     }
 }
 
-/// Why `path` is not a directory owned by the engine's user that no one else
-/// can enter or list, or `None` if it is one. Does not follow a symbolic link
-/// at `path`.
-pub(super) fn private_directory_problem(path: &Path) -> io::Result<Option<String>> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    let shown = path.display();
-    Ok(if !metadata.is_dir() {
-        Some(format!("{shown} is not a directory"))
-    } else if metadata.uid() != effective_uid() {
-        Some(format!("{shown} is owned by uid {}", metadata.uid()))
-    } else if metadata.mode() & 0o077 != 0 {
-        Some(format!("{shown} has mode {:04o}", metadata.mode() & 0o7777))
-    } else {
-        None
-    })
-}
-
-fn effective_uid() -> u32 {
-    // SAFETY: `geteuid` has no preconditions and cannot fail.
-    unsafe { libc::geteuid() }
+/// Test-only: drop a write whose text contains
+/// `BOSS_COORDINATOR_CHAT_TEST_DROP_WRITE_CONTAINING`, once. Production
+/// never sets the variable.
+fn drop_write_for_test(line: &str) -> Option<LinkError> {
+    const ENV: &str = "BOSS_COORDINATOR_CHAT_TEST_DROP_WRITE_CONTAINING";
+    let needle = std::env::var(ENV).ok()?;
+    if needle.is_empty() || !line.contains(&needle) {
+        return None;
+    }
+    unsafe {
+        std::env::remove_var(ENV);
+    }
+    Some(LinkError::Write(io::Error::new(
+        io::ErrorKind::BrokenPipe,
+        "test dropped the write before the host journalled it",
+    )))
 }
 
 fn verify_peer(stream: &UnixStream, expected_pid: libc::pid_t) -> Result<(), ConnectError> {
-    let credentials = stream.peer_cred()?;
-    if credentials.uid() != effective_uid() {
+    let credentials = boss_engine_utils::host::unix_peer_cred(stream).map_err(ConnectError::Io)?;
+    if credentials.uid != boss_engine_utils::host::effective_uid() {
         return Err(ConnectError::Refused(
             "the agent host socket is served by another user".to_owned(),
         ));
     }
-    if credentials.pid() != Some(expected_pid) {
+    if credentials.pid != Some(expected_pid) {
         return Err(ConnectError::Refused(format!(
             "the agent host socket is served by process {}, not the coordinator pane process {expected_pid}",
             credentials
-                .pid()
+                .pid
                 .map_or_else(|| "(unknown)".to_owned(), |pid| pid.to_string()),
         )));
     }
@@ -177,10 +174,12 @@ fn verify_peer(stream: &UnixStream, expected_pid: libc::pid_t) -> Result<(), Con
 ///
 /// A record being written when this runs is not counted: the host appends a
 /// record with one write, and a reader can see its first bytes before its
-/// last. The service uses this as the replay boundary, the point it has
-/// caught up to after reconnecting; it reads from the end so that finding the
-/// boundary of a large journal does not cost a replay of it.
-pub(super) fn last_journal_seq(path: &Path) -> io::Result<u64> {
+/// last. Catch-up waits for the host's takeover record rather than this
+/// sample; the helper remains for tests that inspect a journal file.
+#[cfg(test)]
+fn last_journal_seq(path: &std::path::Path) -> io::Result<u64> {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
@@ -213,6 +212,7 @@ pub(super) fn last_journal_seq(path: &Path) -> io::Result<u64> {
 /// The last newline-terminated line in `bytes`, if `bytes` holds all of it.
 /// `from_file_start` says `bytes` begins at the start of the file, so the
 /// first line needs no earlier newline to be whole.
+#[cfg(test)]
 fn last_whole_line(bytes: &[u8], from_file_start: bool) -> Option<&[u8]> {
     let end = bytes.iter().rposition(|byte| *byte == b'\n')?;
     let head = &bytes[..end];
@@ -226,7 +226,7 @@ fn last_whole_line(bytes: &[u8], from_file_start: bool) -> Option<&[u8]> {
 #[cfg(test)]
 mod tests {
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
 
     use boss_agent_host::journal::{Direction, Journal};
 
@@ -278,31 +278,35 @@ mod tests {
         assert_eq!(last_journal_seq(&path).unwrap(), 1);
     }
 
-    #[test]
-    fn a_private_directory_is_owned_by_the_engine_user_and_closed_to_others() {
+    #[tokio::test]
+    async fn an_invalid_journal_line_is_a_protocol_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use tokio::io::AsyncBufReadExt;
+        use tokio::net::UnixListener;
+
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert_eq!(private_directory_problem(dir.path()).unwrap(), None);
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
-        let problem = private_directory_problem(dir.path())
-            .unwrap()
-            .expect("a group-readable directory");
-        assert!(problem.contains("mode 0750"), "{problem}");
-        let file = dir.path().join("f");
-        std::fs::write(&file, b"").unwrap();
-        let problem = private_directory_problem(&file)
-            .unwrap()
-            .expect("a file is not a directory");
-        assert!(problem.contains("not a directory"), "{problem}");
-    }
-
-    #[test]
-    fn a_symlink_to_a_private_directory_is_not_one() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("real");
-        std::fs::create_dir(&target).unwrap();
-        let link = dir.path().join("link");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(private_directory_problem(&link).unwrap().is_some());
+        let socket = dir.path().join("h.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = tokio::io::BufReader::new(read).lines();
+            let _ = lines.next_line().await;
+            write.write_all(b"this is not a journal record\n").await.unwrap();
+        });
+        let mut connection = HostConnection::connect(
+            &HostEndpoint {
+                socket_path: socket,
+                peer_pid: i32::try_from(std::process::id()).unwrap(),
+            },
+            1,
+        )
+        .await
+        .unwrap();
+        let error = connection.read_records().await.unwrap_err();
+        assert!(matches!(error, LinkError::Protocol(_)), "{error}");
+        server.await.unwrap();
     }
 }

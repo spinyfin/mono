@@ -28,7 +28,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant as TokioInstant, sleep_until};
 
-use super::host_link::{ConnectError, HostConnection, HostEndpoint, LinkError, last_journal_seq};
+use super::host_link::{ConnectError, HostConnection, HostEndpoint, LinkError};
 use super::lines::{self, PermissionAnswer};
 use super::push::{ChatPush, PushQueue};
 use super::{CancelOutcome, ChatError, ConnectionStatus, ReturnedDraft, ServiceTuning};
@@ -137,9 +137,15 @@ struct LinkState {
     /// been applied. Nothing is sent before that: the reducer does not yet
     /// know what the agent is doing.
     caught_up: bool,
-    /// The last record the host's journal held when this connection was made.
-    boundary_seq: u64,
+    /// The host has sent this connection's takeover record, which it writes
+    /// only after fencing the previous client. Catch-up waits for this rather
+    /// than sampling the journal file, so a prompt the old connection still
+    /// had buffered is journalled before anything is resent.
+    saw_takeover: bool,
     failures: u32,
+    /// Stop wrote `session/cancel` (and cancelled permission answers) but
+    /// they did not reach the host. `finish_catch_up` writes them again.
+    cancel_pending: bool,
 }
 
 /// Everything the task starts from.
@@ -186,8 +192,9 @@ impl Actor {
                     retry_at: Instant::now(),
                 },
                 caught_up: false,
-                boundary_seq: 0,
+                saw_takeover: false,
                 failures: 0,
+                cancel_pending: false,
             },
             upkeep: Upkeep {
                 records_since_snapshot: 0,
@@ -215,6 +222,7 @@ impl Actor {
                 }
                 records = read_link(&mut self.link_state.link) => match records {
                     Ok(records) => self.apply_records(records).await,
+                    Err(LinkError::Protocol(reason)) => self.protocol_failed(&reason),
                     Err(error) => self.link_lost(&error),
                 },
                 () = until(retry_at) => self.connect().await,
@@ -348,19 +356,28 @@ impl Actor {
                 text: self.wiring.redactor.redact_str(prompt.text()),
             });
         }
-        if plan.send_cancel {
-            for id in self.convo.reducer.pending_permission_request_ids() {
-                self.write(&lines::permission_response_line(&id, PermissionAnswer::Cancelled))
-                    .await;
-            }
-            if let Some(session_id) = self.convo.reducer.state().session_id.clone() {
-                self.write(&lines::cancel_line(&session_id)).await;
-            }
+        if plan.send_cancel && self.write_cancel_on_wire().await.is_err() {
+            self.link_state.cancel_pending = true;
         }
         Ok(CancelOutcome {
             cancelled_turn: plan.send_cancel,
             returned_to_composer: returned,
         })
+    }
+
+    /// Answers every pending permission request as cancelled, then sends
+    /// `session/cancel`. Records those ids so a later app answer cannot send
+    /// a second response to the same request.
+    async fn write_cancel_on_wire(&mut self) -> Result<(), ChatError> {
+        for id in self.convo.reducer.pending_permission_request_ids() {
+            self.write(&lines::permission_response_line(&id, PermissionAnswer::Cancelled))
+                .await?;
+            self.convo.answered_permissions.insert(id.to_string());
+        }
+        if let Some(session_id) = self.convo.reducer.state().session_id.clone() {
+            self.write(&lines::cancel_line(&session_id)).await?;
+        }
+        Ok(())
     }
 
     /// Answers a permission request the agent is waiting on.
@@ -413,12 +430,12 @@ impl Actor {
                 self.wiring.redactor.redact_str(request_id)
             )));
         }
-        self.convo.answered_permissions.insert(request_id.to_owned());
         self.write(&lines::permission_response_line(
             &id,
             PermissionAnswer::Selected(option_id),
         ))
-        .await;
+        .await?;
+        self.convo.answered_permissions.insert(request_id.to_owned());
         Ok(())
     }
 
@@ -450,6 +467,10 @@ impl Actor {
     async fn apply_records(&mut self, records: Vec<WireRecord>) {
         let now = Instant::now();
         for record in records {
+            if is_takeover_record(&record) {
+                self.link_state.saw_takeover = true;
+                continue;
+            }
             // The host replays from the sequence number asked for, so this is
             // only a guard against applying a record twice.
             if record.seq <= self.convo.reducer.last_wire_seq() {
@@ -467,7 +488,7 @@ impl Actor {
             self.publish_state_if_changed(now);
             self.upkeep.records_since_snapshot += 1;
         }
-        self.finish_catch_up();
+        self.finish_catch_up().await;
         self.maybe_snapshot();
         self.dispatch().await;
     }
@@ -483,15 +504,20 @@ impl Actor {
         self.publish.published_state = state.clone();
     }
 
-    /// Once the host's records up to the boundary are applied, a prompt the
-    /// intent log says was sent but that never reached the journal (the
-    /// previous engine died between the two, or the line was cut short) is
-    /// sent again, under a new request id.
-    fn finish_catch_up(&mut self) {
-        if self.link_state.caught_up || self.convo.reducer.last_wire_seq() < self.link_state.boundary_seq {
+    /// Once the host has fenced the previous connection and sent the
+    /// takeover record, a prompt the intent log says was sent but that never
+    /// reached the journal is sent again, under a new request id. Permission
+    /// answers that were written but never echoed are forgotten so they can
+    /// be answered again.
+    async fn finish_catch_up(&mut self) {
+        if self.link_state.caught_up || !self.link_state.saw_takeover {
             return;
         }
         self.link_state.caught_up = true;
+        self.convo.answered_permissions.clear();
+        if self.link_state.cancel_pending && self.write_cancel_on_wire().await.is_ok() {
+            self.link_state.cancel_pending = false;
+        }
         for prompt in self.convo.reducer.reconcile_unsent_dispatches() {
             match self.convo.intent.append_requeued(prompt.intent_id) {
                 Ok(record) => {
@@ -540,16 +566,18 @@ impl Actor {
             }
         };
         self.convo.reducer.apply_intent_record(&record);
-        self.write(&lines::prompt_line(id, &session_id, next.text())).await;
+        let _ = self.write(&lines::prompt_line(id, &session_id, next.text())).await;
     }
 
-    async fn write(&mut self, line: &str) {
+    async fn write(&mut self, line: &str) -> Result<(), ChatError> {
         let Link::Up(connection) = &mut self.link_state.link else {
-            return;
+            return Err(ChatError::Disconnected);
         };
         if let Err(error) = connection.write_line(line).await {
             self.link_lost(&error);
+            return Err(ChatError::Disconnected);
         }
+        Ok(())
     }
 
     // ---- the connection -----------------------------------------------------
@@ -558,28 +586,20 @@ impl Actor {
         let replay_from = self.convo.reducer.last_wire_seq() + 1;
         match HostConnection::connect(&self.wiring.endpoint, replay_from).await {
             Ok(connection) => {
-                let wire_path = self.wiring.generation.wire_path();
-                let boundary = tokio::task::spawn_blocking(move || last_journal_seq(&wire_path)).await;
-                let boundary = match boundary {
-                    Ok(Ok(seq)) => seq,
-                    Ok(Err(error)) => return self.connect_failed(format!("reading the host's journal: {error}")),
-                    Err(error) => return self.connect_failed(format!("reading the host's journal: {error}")),
-                };
                 tracing::info!(
                     generation = self.wiring.generation.id(),
                     replay_from,
-                    boundary,
                     "attached to the agent host"
                 );
+                let cancel_pending = self.link_state.cancel_pending;
                 self.link_state = LinkState {
                     link: Link::Up(connection),
                     caught_up: false,
-                    boundary_seq: boundary,
+                    saw_takeover: false,
                     failures: 0,
+                    cancel_pending,
                 };
                 self.set_status(ConnectionStatus::CatchingUp);
-                self.finish_catch_up();
-                self.dispatch().await;
             }
             Err(ConnectError::Refused(reason)) => {
                 tracing::error!(generation = self.wiring.generation.id(), %reason, "refusing the agent host socket");
@@ -598,8 +618,17 @@ impl Actor {
         self.go_down(&error.to_string());
     }
 
+    fn protocol_failed(&mut self, reason: &str) {
+        let reason = self.wiring.redactor.redact_str(&format!(
+            "the agent host sent a line that is not a journal record: {reason}"
+        ));
+        tracing::error!(generation = self.wiring.generation.id(), %reason, "stopping the chat service");
+        self.set_status(ConnectionStatus::Stopped { reason });
+    }
+
     fn go_down(&mut self, reason: &str) {
         let failures = self.link_state.failures;
+        let cancel_pending = self.link_state.cancel_pending;
         // Capped doubling from the engine's shared backoff, with the usual
         // jitter. Not a measured limit: only a way not to spin on a host that
         // is not there.
@@ -613,8 +642,9 @@ impl Actor {
                 retry_at: Instant::now() + delay,
             },
             caught_up: false,
-            boundary_seq: 0,
+            saw_takeover: false,
             failures: failures.saturating_add(1),
+            cancel_pending,
         };
         self.set_status(ConnectionStatus::Reconnecting {
             reason: self.wiring.redactor.redact_str(reason),
@@ -702,6 +732,11 @@ impl Actor {
         }
         // Closing the connection and the command channel is the drop of `self`.
     }
+}
+
+/// The host's socket-only takeover record, whose `invalid` is `"takeover"`.
+fn is_takeover_record(record: &WireRecord) -> bool {
+    record.invalid.as_deref() == Some("takeover")
 }
 
 async fn read_link(link: &mut Link) -> Result<Vec<WireRecord>, LinkError> {

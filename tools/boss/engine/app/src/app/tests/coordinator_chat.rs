@@ -169,7 +169,7 @@ async fn an_installed_chat_service_answers_each_operation() {
             CoordinatorChatOperation::Send { client_message_id, .. } => CoordinatorChatOutcome::Sent {
                 client_message_id: client_message_id.clone(),
             },
-            CoordinatorChatOperation::Cancel => CoordinatorChatOutcome::Cancelled,
+            CoordinatorChatOperation::Cancel => CoordinatorChatOutcome::cancelled(std::iter::empty()),
             CoordinatorChatOperation::AnswerPermission { request_id, .. } => {
                 CoordinatorChatOutcome::PermissionAnswered {
                     request_id: request_id.clone(),
@@ -185,7 +185,7 @@ async fn an_installed_chat_service_answers_each_operation() {
             CoordinatorChatOperation::Send { client_message_id, .. } => CoordinatorChatOutcome::Sent {
                 client_message_id: client_message_id.clone(),
             },
-            CoordinatorChatOperation::Cancel => CoordinatorChatOutcome::Cancelled,
+            CoordinatorChatOperation::Cancel => CoordinatorChatOutcome::cancelled(std::iter::empty()),
             CoordinatorChatOperation::AnswerPermission { request_id, .. } => {
                 CoordinatorChatOutcome::PermissionAnswered {
                     request_id: request_id.clone(),
@@ -226,7 +226,6 @@ async fn a_request_the_service_refuses_is_an_error_the_app_can_show() {
     for error in [
         ChatError::Rejected("the message is empty".to_owned()),
         ChatError::Disconnected,
-        ChatError::Storage("the intent log could not be written".to_owned()),
     ] {
         let shown = error.to_string();
         let error = std::sync::Mutex::new(Some(error));
@@ -240,8 +239,22 @@ async fn a_request_the_service_refuses_is_an_error_the_app_can_show() {
 }
 
 #[tokio::test]
+async fn a_storage_failure_is_the_not_running_outcome() {
+    let backend = FakeBackend::answering(Box::new(|_| {
+        Err(ChatError::Storage("the intent log could not be written".to_owned()))
+    }));
+    let (state, _dir) = app_state_with(Some(backend)).await;
+    match ask(&state, "session-app", CoordinatorChatOperation::Cancel).await {
+        FrontendEvent::CoordinatorChatResult {
+            outcome: CoordinatorChatOutcome::BackendNotRunning { reason },
+        } => assert_eq!(reason, "the intent log could not be written"),
+        other => panic!("expected backend-not-running, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn an_installed_chat_service_is_still_closed_to_every_session_but_the_app() {
-    let backend = FakeBackend::answering(Box::new(|_| Ok(CoordinatorChatOutcome::Cancelled)));
+    let backend = FakeBackend::answering(Box::new(|_| Ok(CoordinatorChatOutcome::cancelled(std::iter::empty()))));
     let (state, _dir) = app_state_with(Some(backend.clone())).await;
     for operation in operations() {
         match ask(&state, "session-cli", operation).await {
@@ -254,7 +267,7 @@ async fn an_installed_chat_service_is_still_closed_to_every_session_but_the_app(
 
 #[tokio::test]
 async fn removing_the_chat_service_goes_back_to_not_running() {
-    let backend = FakeBackend::answering(Box::new(|_| Ok(CoordinatorChatOutcome::Cancelled)));
+    let backend = FakeBackend::answering(Box::new(|_| Ok(CoordinatorChatOutcome::cancelled(std::iter::empty()))));
     let (state, _dir) = app_state_with(Some(backend)).await;
     state.set_coordinator_chat(None);
     match ask(&state, "session-app", CoordinatorChatOperation::Cancel).await {

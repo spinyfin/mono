@@ -32,16 +32,16 @@
 //! | total           | 3,458,728 B    | 13.8 KB   |
 //!
 //! The cost is linear in turns, and the wire journal is most of it. The
-//! numbers are from a synthetic generation, not from a real coordinator: this
-//! sandbox cannot read a real engine's state, and the spike recorded 25
-//! conversations, not a long-lived one. What is not measured is how many
-//! turns a day a real coordinator takes; the defaults assume at most 1,000
-//! (`ASSUMED_MAX_TURNS_PER_DAY`), which the test pins:
+//! numbers are from a synthetic generation: no long-lived real generation
+//! has been measured, and the spike sampled 25 short conversations. What
+//! is not measured is how many turns a day a real coordinator takes; the
+//! defaults assume at most 1,000 (`ASSUMED_MAX_TURNS_PER_DAY`), which the
+//! test pins:
 //!
-//! - [`DEFAULT_MAX_AGE`] is 14 days: two weeks of resets to look back over
-//!   for what the operator saw. This one is chosen, not measured: nothing
-//!   measures how far back anyone looks. It is cheap to keep because the
-//!   size cap, not this, is what protects the disk.
+//! - [`DEFAULT_MAX_AGE`] is 14 days: two weeks of conversation history.
+//!   This one is chosen, not measured: nothing measures how far back
+//!   anyone looks. It is cheap to keep because the size cap, not this, is
+//!   what protects the disk.
 //! - [`DEFAULT_MAX_TOTAL_BYTES`] is 256 MiB: 14 days at the assumed ceiling
 //!   is about 194 MB at the measured per-turn cost, so the cap does not cut
 //!   in before the age rule in normal use. It is the bound for a runaway
@@ -56,6 +56,8 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use boss_engine_driver_home_retention::{OwnedHome, plan_reclaim};
 
 /// The agent host's journal, written by `boss-agent-host --journal`.
 pub const WIRE_FILE_NAME: &str = "wire.jsonl";
@@ -260,31 +262,42 @@ impl GenerationStore {
             candidates.push((id, footprint));
         }
 
-        // Oldest first, so the size rule removes the oldest.
-        candidates.sort_by_key(|(_, footprint)| footprint.last_activity);
-
-        let mut kept = Vec::new();
-        for (id, footprint) in candidates {
-            let age = now.duration_since(footprint.last_activity).unwrap_or_default();
-            if age > policy.max_age {
-                self.remove(&id, footprint.bytes, PruneReason::Age, &mut report);
-            } else {
-                kept.push((id, footprint));
-            }
-        }
-        let mut kept_bytes: u64 = kept.iter().map(|(_, footprint)| footprint.bytes).sum();
-        let mut survivors = Vec::new();
-        for (id, footprint) in kept {
-            if kept_bytes > policy.max_total_bytes && self.remove(&id, footprint.bytes, PruneReason::Size, &mut report)
-            {
-                kept_bytes -= footprint.bytes;
+        let homes: Vec<OwnedHome> = candidates
+            .iter()
+            .map(|(id, footprint)| OwnedHome {
+                path: self.root.join(id),
+                execution_id: id.clone(),
+                is_live: false,
+                age_anchor_epoch: system_time_epoch_secs(footprint.last_activity),
+                size_bytes: footprint.bytes,
+            })
+            .collect();
+        let shared_policy =
+            boss_engine_driver_home_retention::RetentionPolicy::new(policy.max_age, policy.max_total_bytes);
+        let plan = plan_reclaim(&homes, system_time_epoch_secs(now), &shared_policy);
+        let planned: std::collections::HashSet<PathBuf> = plan.to_delete.into_iter().collect();
+        let now_epoch = system_time_epoch_secs(now);
+        let max_age_secs = i64::try_from(policy.max_age.as_secs()).unwrap_or(i64::MAX);
+        for (id, footprint) in &candidates {
+            if !planned.contains(&self.root.join(id)) {
                 continue;
             }
-            survivors.push((id, footprint));
+            let age_secs = now_epoch.saturating_sub(system_time_epoch_secs(footprint.last_activity));
+            let reason = if age_secs > max_age_secs {
+                PruneReason::Age
+            } else {
+                PruneReason::Size
+            };
+            self.remove(id, footprint.bytes, reason, &mut report);
         }
+        let surviving: Vec<&Footprint> = candidates
+            .iter()
+            .filter(|(id, _)| !report.removed.iter().any(|removed| removed.id == *id))
+            .map(|(_, footprint)| footprint)
+            .collect();
         // A generation that could not be removed is still on disk.
-        report.kept = survivors.len() + report.failed.len();
-        report.kept_bytes = survivors.iter().map(|(_, footprint)| footprint.bytes).sum();
+        report.kept = surviving.len() + report.failed.len();
+        report.kept_bytes = surviving.iter().map(|footprint| footprint.bytes).sum();
         Ok(report)
     }
 
@@ -347,6 +360,12 @@ fn new_generation_id() -> String {
         .map_or(0, |elapsed| elapsed.as_millis());
     let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{ms:013}-{:x}-{counter:08x}", std::process::id())
+}
+
+fn system_time_epoch_secs(time: SystemTime) -> i64 {
+    time.duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn is_generation_id(id: &str) -> bool {

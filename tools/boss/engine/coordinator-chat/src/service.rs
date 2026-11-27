@@ -329,8 +329,13 @@ impl ChatBackend for ChatService {
                 Ok(CoordinatorChatOutcome::Sent { client_message_id })
             }
             CoordinatorChatOperation::Cancel => {
-                self.cancel().await?;
-                Ok(CoordinatorChatOutcome::Cancelled)
+                let outcome = self.cancel().await?;
+                Ok(CoordinatorChatOutcome::cancelled(
+                    outcome
+                        .returned_to_composer
+                        .into_iter()
+                        .map(|draft| (draft.client_message_id, draft.text)),
+                ))
             }
             CoordinatorChatOperation::AnswerPermission { request_id, option_id } => {
                 self.answer_permission(&request_id, &option_id).await?;

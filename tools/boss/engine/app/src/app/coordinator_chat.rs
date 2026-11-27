@@ -55,6 +55,8 @@ pub(super) async fn handle_coordinator_chat(ctx: Dispatch, req: FrontendRequest)
         Some(backend) => match backend.handle(operation).await {
             Ok(outcome) => FrontendEvent::CoordinatorChatResult { outcome },
             Err(ChatError::NotRunning(reason)) => not_running(reason),
+            // The intent log could not be written; the service has stopped.
+            Err(ChatError::Storage(reason)) => not_running(reason),
             // A request that could not be honoured: the app shows it inline.
             Err(error) => FrontendEvent::Error {
                 message: format!("coordinator_chat: {error}"),

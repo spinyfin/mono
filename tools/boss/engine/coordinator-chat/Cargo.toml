@@ -10,6 +10,7 @@ bon = { workspace = true }
 boss-acp-client = { path = "../../acp_client" }
 boss-agent-host = { path = "../../agent-host" }
 boss-backoff = { path = "../../backoff" }
+boss-engine-driver-home-retention = { path = "../driver-home-retention" }
 boss-engine-utils = { path = "../utils" }
 boss-protocol = { path = "../../protocol" }
 libc = { workspace = true }

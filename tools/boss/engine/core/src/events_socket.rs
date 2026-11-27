@@ -10,7 +10,6 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::io;
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -73,13 +72,6 @@ const MAX_HOOK_BYTES: usize = 256 * 1024;
 /// Bound on remembered `(run_id, delivery_id)` pairs so a long-lived
 /// engine cannot grow the duplicate ledger without limit.
 const MAX_DELIVERY_LEDGER: usize = 8192;
-
-/// `level` for `getsockopt(SOL_LOCAL, LOCAL_PEERPID)` on macOS.
-#[cfg(target_os = "macos")]
-const SOL_LOCAL: libc::c_int = 0;
-/// `optname` for the LOCAL_PEERPID getsockopt on macOS.
-#[cfg(target_os = "macos")]
-const LOCAL_PEERPID: libc::c_int = 0x002;
 
 /// One hook event after peer-pid lookup, payload extraction, and
 /// normalization.
@@ -458,62 +450,9 @@ pub fn path_has_a_live_listener(path: &Path) -> bool {
     }
 }
 
-/// Look up the peer pid of a connected stream socket via
-/// `getsockopt(SOL_LOCAL, LOCAL_PEERPID)` on macOS.
-#[cfg(target_os = "macos")]
+/// Look up the peer pid of a connected stream socket.
 pub fn peer_pid(stream: &UnixStream) -> io::Result<libc::pid_t> {
-    let fd = stream.as_raw_fd();
-    let mut pid: libc::pid_t = 0;
-    let mut len: libc::socklen_t = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
-    // SAFETY: `fd` is borrowed from the caller's UnixStream and remains
-    // valid for this call; `pid` and `len` are stack-local mutables and
-    // their addresses are passed only to `getsockopt`.
-    let rc = unsafe {
-        libc::getsockopt(
-            fd,
-            SOL_LOCAL,
-            LOCAL_PEERPID,
-            &mut pid as *mut _ as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(pid)
-}
-
-/// Look up the peer pid of a connected stream socket via
-/// `getsockopt(SO_PEERCRED)` on Linux.
-#[cfg(target_os = "linux")]
-pub fn peer_pid(stream: &UnixStream) -> io::Result<libc::pid_t> {
-    let fd = stream.as_raw_fd();
-    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
-    let mut len: libc::socklen_t = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: `fd` is borrowed from the caller's UnixStream and remains
-    // valid for this call; `cred` and `len` are stack-local mutables and
-    // their addresses are passed only to `getsockopt`.
-    let rc = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            &mut cred as *mut _ as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(cred.pid)
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub fn peer_pid(_stream: &UnixStream) -> io::Result<libc::pid_t> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "peer pid lookup is not supported on this platform",
-    ))
+    boss_engine_utils::host::unix_peer_pid(stream)
 }
 
 /// Decode one shim connection into an [`IncomingHookEvent`].

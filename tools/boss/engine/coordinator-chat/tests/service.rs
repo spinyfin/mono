@@ -678,6 +678,11 @@ async fn stop_answers_the_permission_cancels_the_turn_and_returns_queued_message
         Some("cm-b")
     );
     assert_eq!(stopped.returned_to_composer[0].text, "second draft");
+    let duplicate = service.answer_permission("0", "allow-once").await;
+    assert!(
+        matches!(duplicate, Err(ChatError::Rejected(_))),
+        "Stop already answered the permission: {duplicate:?}"
+    );
 
     let engine_turn = wait_fetch(&service, "the engine's prompt to run", |fetched| {
         turns_ended(fetched) == 2
@@ -1149,7 +1154,7 @@ async fn the_rpc_backend_maps_operations_to_outcomes() {
 
     assert_eq!(
         backend.handle(CoordinatorChatOperation::Cancel).await.unwrap(),
-        CoordinatorChatOutcome::Cancelled
+        CoordinatorChatOutcome::cancelled(std::iter::empty())
     );
     let fetched = backend
         .handle(CoordinatorChatOperation::Fetch { after_seq: 0 })
@@ -1197,6 +1202,119 @@ async fn a_socket_served_by_the_wrong_process_is_refused() {
         harness.intent_log().is_empty(),
         "nothing was accepted for a host that was refused"
     );
+}
+
+#[tokio::test]
+async fn stop_through_the_rpc_returns_queued_operator_messages() {
+    let mut script = session_setup();
+    script.extend([
+        expects(prompt_request(3, "running")),
+        says(chunk("Working.")),
+        says(permission_request(0, "toolu_1", "touch x")),
+        expects(permission_cancelled(0)),
+        expects(cancel_notification()),
+        says(prompt_response(3, "cancelled")),
+        expects("never sent".to_owned()),
+    ]);
+    let harness = Harness::start(&script, &[]).await;
+    harness.establish_session().await;
+    let service = harness.start_service().await;
+    wait_live(&service).await;
+    service
+        .send_operator_message("running".to_owned(), "cm-run".to_owned())
+        .await
+        .unwrap();
+    wait_fetch(&service, "the permission request", |fetched| {
+        pending_permission(fetched).is_some()
+    })
+    .await;
+    service
+        .send_operator_message("queued draft".to_owned(), "cm-queued".to_owned())
+        .await
+        .unwrap();
+    let backend: &dyn ChatBackend = &service;
+    match backend.handle(CoordinatorChatOperation::Cancel).await.unwrap() {
+        CoordinatorChatOutcome::Cancelled { returned_to_composer } => {
+            assert_eq!(returned_to_composer.len(), 1);
+            assert_eq!(returned_to_composer[0].text, "queued draft");
+            assert_eq!(returned_to_composer[0].client_message_id.as_deref(), Some("cm-queued"));
+        }
+        other => panic!("expected cancelled with drafts, got {other:?}"),
+    }
+    service.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_permission_answer_dropped_before_the_journal_can_be_retried() {
+    let mut script = session_setup();
+    script.extend([
+        expects(prompt_request(3, "retry permission")),
+        says(permission_request(99, "toolu_1", "touch x")),
+        expects(permission_selected(99, "allow-once")),
+        says(prompt_response(3, "end_turn")),
+    ]);
+    let harness = Harness::start(&script, &[]).await;
+    harness.establish_session().await;
+    let service = harness.start_service().await;
+    wait_live(&service).await;
+    service
+        .send_operator_message("retry permission".to_owned(), "cm-1".to_owned())
+        .await
+        .unwrap();
+    wait_fetch(&service, "the permission request", |fetched| {
+        pending_permission(fetched).is_some()
+    })
+    .await;
+    unsafe {
+        std::env::set_var("BOSS_COORDINATOR_CHAT_TEST_DROP_WRITE_CONTAINING", "\"id\":99");
+    }
+    let first = service.answer_permission("99", "allow-once").await;
+    assert!(
+        matches!(first, Err(ChatError::Disconnected)),
+        "the dropped write must surface as disconnected: {first:?}"
+    );
+    wait_live(&service).await;
+    service.answer_permission("99", "allow-once").await.unwrap();
+    wait_fetch(&service, "the turn to end", |fetched| turns_ended(fetched) == 1).await;
+    service.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_malformed_journal_line_stops_the_service() {
+    use tokio::net::UnixListener;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let store = GenerationStore::new(dir.path().join("chat"));
+    let generation = store.create().unwrap();
+    let socket = dir.path().join("h.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut buf = Vec::new();
+        let _ = tokio::io::AsyncBufReadExt::read_until(&mut BufReader::new(read), b'\n', &mut buf).await;
+        let _ = write.write_all(b"this is not a journal record\n").await;
+        std::future::pending::<()>().await
+    });
+    let service = ChatService::start(ServiceConfig {
+        generation,
+        endpoint: HostEndpoint {
+            socket_path: socket,
+            peer_pid: i32::try_from(std::process::id()).unwrap(),
+        },
+        redactor: CredentialRedactor::new(CREDENTIAL),
+        tuning: tuning(),
+    })
+    .await
+    .unwrap();
+    wait_status(
+        &service,
+        "a protocol failure to stop the service",
+        |status| matches!(status, ConnectionStatus::Stopped { reason } if reason.contains("not a journal record")),
+    )
+    .await;
+    server.abort();
 }
 
 #[tokio::test]

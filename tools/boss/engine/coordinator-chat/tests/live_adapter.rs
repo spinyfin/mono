@@ -1,7 +1,7 @@
 //! Manual harness: the chat service against the real Claude ACP adapter, the
 //! real `claude` binary and the real login. It is not a test and is not run by
 //! `bazel test`: the hermetic test sandbox cannot reach a login, and a real
-//! session spends the operator's plan usage. Build it and launch it by path.
+//! session consumes account plan usage. Build it and launch it by path.
 //!
 //! ```text
 //! live_adapter_probe --host <boss-agent-host> --adapter <claude-agent-acp> \

@@ -134,13 +134,24 @@ impl Client {
         }
     }
 
-    /// The next record, or `None` when the host closed the connection.
+    /// The next journal record, or `None` when the host closed the connection.
+    ///
+    /// Skips the host's socket-only takeover record. That record is the
+    /// replay boundary, not a journal line, and these tests assert the
+    /// journal the child and client share.
     async fn next(&mut self) -> Option<WireRecord> {
-        let line = tokio::time::timeout(STEP_TIMEOUT, self.read.next_line())
-            .await
-            .expect("the host sends a record or closes")
-            .ok()??;
-        Some(serde_json::from_str(&line).expect("the host sends journal records"))
+        loop {
+            let line = tokio::time::timeout(STEP_TIMEOUT, self.read.next_line())
+                .await
+                .expect("the host sends a record or closes")
+                .ok()??;
+            let record: WireRecord = serde_json::from_str(&line)
+                .unwrap_or_else(|err| panic!("the host sends journal records, got {line:?}: {err}"));
+            if record.invalid.as_deref() == Some("takeover") {
+                continue;
+            }
+            return Some(record);
+        }
     }
 
     async fn expect(&mut self, seq: u64, dir: Direction, line: &str) {
@@ -289,6 +300,33 @@ async fn a_new_connection_replaces_the_older_one() {
     newer.expect(2, Direction::ToAgent, "go").await;
     newer.expect(3, Direction::FromAgent, "two").await;
     assert_eq!(host.finish().await, 0);
+}
+
+#[tokio::test]
+async fn a_complete_prompt_still_in_the_old_reader_is_journalled_once() {
+    const LINE: &str = "hold-prompt-for-takeover-test";
+    unsafe {
+        std::env::set_var("BOSS_AGENT_HOST_TEST_HOLD_CLIENT_LINE", LINE);
+    }
+    let host = Host::start(&[to_agent(LINE), from_agent("ack")], &[]).await;
+    let mut first = host.connect(1).await;
+    first.send(LINE).await;
+    // Replacement handshake while the old reader still holds the complete
+    // line (the host sleeps before journaling when the line matches).
+    let mut second = host.connect(1).await;
+    second.expect(1, Direction::ToAgent, LINE).await;
+    second.expect(2, Direction::FromAgent, "ack").await;
+    assert!(second.next().await.is_none());
+    let records = host.journal_records();
+    assert_eq!(
+        records.iter().filter(|record| record.line == LINE).count(),
+        1,
+        "the child must see the prompt once: {records:?}"
+    );
+    assert_eq!(host.finish().await, 0);
+    unsafe {
+        std::env::remove_var("BOSS_AGENT_HOST_TEST_HOLD_CLIENT_LINE");
+    }
 }
 
 #[tokio::test]
