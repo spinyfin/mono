@@ -537,3 +537,157 @@ async fn moving_a_critical_task_to_doing_starts_it_under_an_operator_pause() {
 
     assert_move_starts_a_worker(&state, &seeded).await;
 }
+
+#[tokio::test]
+async fn a_progression_reservation_refuses_the_move_even_at_the_interactive_cap() {
+    for at_cap in [false, true] {
+        let (state, _dir) = test_server_state_with_fakes();
+        let seeded = seed(&state);
+        if at_cap {
+            state
+                .execution_coordinator
+                .worker_pool()
+                .claim_working("occupant", None)
+                .await
+                .unwrap();
+            state
+                .execution_coordinator
+                .set_max_concurrent_interactive_workers(1)
+                .unwrap();
+        }
+        let progression = state
+            .work_db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(seeded.task.id.clone())
+                    .kind(ExecutionKind::Progression)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        let reservation = state
+            .execution_coordinator
+            .reserve_board_dispatch_for_test(&progression);
+        assert_refused(drop_on_doing(&state, &seeded.task.id).await, &seeded.task.id);
+        assert_eq!(current_task(&state, &seeded.task.id).status, TaskStatus::Blocked);
+        assert!(!launch_recorded(&state, &seeded, &seeded.task.id));
+        assert!(
+            executions(&state, &seeded.task.id)
+                .iter()
+                .filter(|e| e.kind != ExecutionKind::Progression)
+                .all(|e| e.status.is_terminal())
+        );
+        drop(reservation);
+    }
+}
+
+#[tokio::test]
+async fn a_failed_launch_intent_write_refuses_and_releases_the_claim_and_slot() {
+    let (state, _dir) = test_server_state_with_fakes();
+    let seeded = seed(&state);
+    let occupied = state.execution_coordinator.worker_pool().occupancy().await;
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER refuse_launch BEFORE UPDATE OF explicitly_launched ON tasks
+         BEGIN SELECT RAISE(ABORT, 'launch intent unavailable'); END;",
+        )
+        .unwrap();
+
+    assert_refused(drop_on_doing(&state, &seeded.task.id).await, &seeded.task.id);
+
+    assert_nothing_left_behind(&state, &seeded);
+    assert_eq!(
+        state.execution_coordinator.worker_pool().occupancy().await.working,
+        occupied.working
+    );
+    let cancelled = executions(&state, &seeded.task.id).pop().unwrap();
+    assert_eq!(cancelled.status, ExecutionStatus::Cancelled);
+    // A retry on the same item proves the reservation and repo permit were released too.
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER refuse_launch")
+        .unwrap();
+    assert_move_starts_a_worker(&state, &seeded).await;
+}
+
+#[tokio::test]
+async fn a_board_launch_durably_claims_before_recording_intent_and_replying() {
+    let (state, _dir) = test_server_state_with_fakes();
+    let seeded = seed(&state);
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER require_claim BEFORE UPDATE OF explicitly_launched ON tasks
+         WHEN NOT EXISTS (SELECT 1 FROM work_executions
+                          WHERE work_item_id = NEW.id AND status = 'claimed')
+         BEGIN SELECT RAISE(ABORT, 'launch must already hold durable claim'); END;",
+        )
+        .unwrap();
+
+    assert_move_starts_a_worker(&state, &seeded).await;
+}
+
+#[tokio::test]
+async fn a_refused_move_restores_a_reused_waiting_dependency_execution() {
+    let (state, _dir) = test_server_state_with_fakes();
+    let seeded = seed(&state);
+    let queued = state
+        .work_db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(seeded.task.id.clone())
+                .kind(ExecutionKind::TaskImplementation)
+                .status(ExecutionStatus::WaitingDependency)
+                .build(),
+        )
+        .unwrap();
+    fill_pool_to_its_hard_cap(&state).await;
+
+    assert_refused(drop_on_doing(&state, &seeded.task.id).await, &seeded.task.id);
+
+    assert_eq!(
+        state.work_db.get_execution(&queued.id).unwrap().status,
+        ExecutionStatus::WaitingDependency
+    );
+    assert_eq!(current_task(&state, &seeded.task.id).status, TaskStatus::Blocked);
+    assert!(!launch_recorded(&state, &seeded, &seeded.task.id));
+}
+
+#[tokio::test]
+async fn a_rejected_durable_claim_refuses_before_replying_and_releases_the_slot() {
+    let (state, _dir) = test_server_state_with_fakes();
+    let seeded = seed(&state);
+    let occupied = state.execution_coordinator.worker_pool().occupancy().await.working;
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER repark_before_claim BEFORE UPDATE OF status ON work_executions
+         WHEN NEW.status = 'claimed'
+         BEGIN
+             UPDATE work_executions SET status = 'waiting_dependency' WHERE id = OLD.id;
+             SELECT RAISE(IGNORE);
+         END;",
+        )
+        .unwrap();
+
+    assert_refused(drop_on_doing(&state, &seeded.task.id).await, &seeded.task.id);
+
+    assert_nothing_left_behind(&state, &seeded);
+    assert_eq!(
+        state.execution_coordinator.worker_pool().occupancy().await.working,
+        occupied
+    );
+    assert_eq!(
+        executions(&state, &seeded.task.id).pop().unwrap().status,
+        ExecutionStatus::Cancelled
+    );
+}
