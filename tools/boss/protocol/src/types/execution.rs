@@ -869,13 +869,16 @@ pub struct WorkExecution {
     pub work_item_id: String,
     /// The task this execution should be filed under in a task-scoped
     /// executions/transcripts view, when that differs from `work_item_id`.
-    /// `None` means `work_item_id` already names the owning task (every
-    /// kind except [`ExecutionKind::PrReviewGuide`], whose `work_item_id`
-    /// is a `pr_review_guide_source_comparisons` id, not a task). Resolved
-    /// and populated only by read paths that join comparison -> series ->
-    /// root task (`WorkDb::list_executions`,
-    /// `WorkDb::list_executions_for_chain`); never persisted, and never the
-    /// canonical owner of the run — the comparison id remains that.
+    /// For [`ExecutionKind::PrReviewGuide`] this is the stored
+    /// `work_executions.owner_task_id` (the task that owns the PR the guide
+    /// explains). `None` means `work_item_id` already names the owning task
+    /// (every other kind), the execution has no task, or a guide's owner
+    /// was never recorded (the comparison was already pruned before the
+    /// owner column was backfilled, or the root task row no longer exists).
+    /// Read paths that list executions for a task (`WorkDb::list_executions`,
+    /// `WorkDb::list_executions_for_chain`) populate this from the stored
+    /// column; the comparison id in `work_item_id` remains the run's owner
+    /// for dedup and finalize.
     #[serde(default)]
     pub owning_task_id: Option<String>,
     /// The agent driver that actually launched this execution. `None` means

@@ -83,6 +83,75 @@ fn set_run_created_at(db: &WorkDb, run_id: &str, created: i64) {
         .unwrap();
 }
 
+fn owner_task_id(db: &WorkDb, execution_id: &str) -> Option<String> {
+    db.connect()
+        .unwrap()
+        .query_row(
+            "SELECT owner_task_id FROM work_executions WHERE id = ?1",
+            params![execution_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn comparison_exists(db: &WorkDb, comparison_id: &str) -> bool {
+    db.connect()
+        .unwrap()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pr_review_guide_source_comparisons WHERE id = ?1)",
+            params![comparison_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn foreign_keys_on(db: &WorkDb) -> bool {
+    db.connect()
+        .unwrap()
+        .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+        .unwrap()
+}
+
+fn rows_report(db: &WorkDb, since: i64, until: i64) -> boss_protocol::TokenUsageRowsReport {
+    let records = db.usage_records_for_window(since, until).unwrap();
+    boss_usage_report::build_usage_rows_report(
+        &boss_usage_report::UsageRowsQuery::builder()
+            .since_epoch_s(since)
+            .until_epoch_s(until)
+            .generated_at_epoch_s(until)
+            .capture_start_epoch_s(0)
+            .retention_max_age_secs(14 * 86_400)
+            .build(),
+        &records,
+        None,
+    )
+}
+
+fn series_report(db: &WorkDb, since: i64, until: i64) -> boss_protocol::TokenUsageSeriesReport {
+    let records = db.usage_series_records_for_window(since, until).unwrap();
+    boss_usage_report::build_usage_series_report(
+        &boss_usage_report::UsageSeriesQuery::builder()
+            .since_epoch_s(since)
+            .until_epoch_s(until)
+            .generated_at_epoch_s(until)
+            .capture_start_epoch_s(0)
+            .completed_at_start_epoch_s(0)
+            .retention_max_age_secs(14 * 86_400)
+            .bucket(boss_protocol::UsageBucketWidth::Week)
+            .build(),
+        &records,
+        None,
+    )
+}
+
+fn series_completed_cost(report: &boss_protocol::TokenUsageSeriesReport) -> (i64, u32) {
+    let cells = report.buckets.iter().flat_map(|b| b.cells.iter());
+    (
+        cells.clone().map(|c| c.tasks_completed_cost.total_tokens).sum(),
+        cells.map(|c| c.tasks_completed_cost.runs_total).sum(),
+    )
+}
+
 fn query_plan(db: &WorkDb, sql: &str) -> String {
     db.connect()
         .unwrap()
@@ -324,49 +393,130 @@ fn usage_series_records_pull_a_completed_tasks_review_guide_runs_from_outside_th
     assert!(records.tasks.iter().any(|t| t.task_id == task));
 }
 
-/// The owning task is stored on the guide's execution, so deleting the
-/// comparison (what source retention does to aged and surplus comparisons)
-/// must not move the run's spend.
+/// The owning task is stored on the guide's execution, so the real source
+/// retention collector deleting an eligible comparison must not move the
+/// run's spend, the task-grouped rows, or the completed-task series cost.
 #[test]
 fn a_review_guide_runs_task_attribution_survives_source_retention() {
     let (_dir, db) = open_db();
     let (task, comparison) = task_with_guide_series(&db, "Fix cursor flicker");
-    let (_, run) = completed_guide_run(&db, &comparison, Some(guide_usage()));
-    db.connect()
-        .unwrap()
-        .execute(
-            "UPDATE tasks SET status = 'done', completed_at = '1000' WHERE id = ?1",
+    let (execution, run) = completed_guide_run(&db, &comparison, Some(guide_usage()));
+    let captured_at = boss_engine_utils::epoch_time::now_epoch_secs() - 31 * 24 * 60 * 60;
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'done', created_at = '400', completed_at = '1800' WHERE id = ?1",
             params![task],
         )
         .unwrap();
-    let before_cost = db.cost_records_for_work_item(&task).unwrap();
-    let before_usage = db.usage_records_for_window(0, i64::MAX).unwrap();
-    assert_eq!(before_cost.len(), 1);
-
-    // Source retention at its most aggressive: the comparison row is gone.
-    {
-        let conn = db.connect().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
         conn.execute(
-            "DELETE FROM pr_review_guide_source_comparisons WHERE id = ?1",
-            params![comparison],
+            "UPDATE work_executions SET created_at = '500', finished_at = '600' WHERE id = ?1",
+            params![execution],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE pr_review_guide_source_comparisons SET captured_at = ?2 WHERE id = ?1",
+            params![comparison, captured_at.to_string()],
         )
         .unwrap();
     }
+    set_run_created_at(&db, &run, 500);
+
+    let before_cost = db.cost_records_for_work_item(&task).unwrap();
+    assert_eq!(before_cost.len(), 1);
+    assert_eq!(before_cost[0].run_id, run);
+    assert_eq!(before_cost[0].work_item_id, task);
+    let before_rows = rows_report(&db, 0, i64::MAX);
+    assert_eq!(before_rows.tasks.len(), 1);
+    assert_eq!(before_rows.tasks[0].task_id, task);
+    assert_eq!(before_rows.tasks[0].direct.total_tokens, 71_800);
+    assert_eq!(before_rows.tasks[0].direct.runs_total, 1);
+    assert_eq!(before_rows.taskless.len(), 0);
+    // Completion window excludes the guide run's `created_at`; the extra-run
+    // fetch still has to pull it for `tasks_completed_cost`.
+    let before_series = series_report(&db, 1_000, 2_000);
+    let before_completed = series_completed_cost(&before_series);
+    assert_eq!(before_completed, (71_800, 1));
+
+    assert!(foreign_keys_on(&db), "prune must run with foreign keys on");
+    db.prune_pr_review_guide_sources(crate::review_guide_sources::SourceRetentionPolicy::default())
+        .unwrap();
+    assert!(
+        !comparison_exists(&db, &comparison),
+        "an aged comparison on a done task with no versions or attempts is collected"
+    );
 
     assert_eq!(db.cost_records_for_work_item(&task).unwrap(), before_cost);
+    let after_rows = rows_report(&db, 0, i64::MAX);
+    assert_eq!(after_rows.tasks[0].task_id, before_rows.tasks[0].task_id);
+    assert_eq!(after_rows.tasks[0].direct, before_rows.tasks[0].direct);
+    assert_eq!(after_rows.tasks[0].executions.len(), 1);
+    assert_eq!(after_rows.tasks[0].executions[0].kind, "pr_review_guide");
+    assert_eq!(after_rows.taskless.len(), 0);
     let after_usage = db.usage_records_for_window(0, i64::MAX).unwrap();
-    assert_eq!(after_usage.runs, before_usage.runs);
     assert_eq!(after_usage.runs[0].run_id, run);
     assert_eq!(after_usage.runs[0].owning_task_id.as_deref(), Some(task.as_str()));
     assert_eq!(after_usage.tasks[0].run_count_all_time, 1);
-    let series = db.usage_series_records_for_window(0, i64::MAX).unwrap();
-    assert!(
-        series
-            .runs
-            .iter()
-            .any(|r| r.run_id == run && r.owning_task_id.as_deref() == Some(task.as_str()))
+    assert_eq!(
+        series_completed_cost(&series_report(&db, 1_000, 2_000)),
+        before_completed
     );
+}
+
+/// Transient recovery clones a stalled guide into a new `ready` row; the
+/// successor must keep the stored owner so its runs still charge the root.
+#[test]
+fn a_resumed_review_guide_execution_keeps_the_owning_task() {
+    let (_dir, db) = open_db();
+    let (task, comparison) = task_with_guide_series(&db, "Fix cursor flicker");
+    let predecessor = db.create_pr_review_guide_execution(&comparison, REPO).unwrap();
+    assert_eq!(owner_task_id(&db, &predecessor.id).as_deref(), Some(task.as_str()));
+
+    let successor = db
+        .request_resume_execution(&predecessor.id, 1, 0, "transient API failure")
+        .unwrap()
+        .expect("a stalled guide is resumable");
+    assert_ne!(successor.id, predecessor.id);
+    assert_eq!(successor.work_item_id, comparison);
+    assert_eq!(owner_task_id(&db, &successor.id).as_deref(), Some(task.as_str()));
+
+    let (_, run) = db
+        .start_execution_run(&successor.id, "guide-1", "widget", "lease-1", "ws-1", "/tmp/ws-1")
+        .unwrap();
+    assert!(db.set_run_cost_snapshot(&successor.id, guide_usage()).unwrap());
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs SET status = 'completed' WHERE id = ?1",
+            params![run.id],
+        )
+        .unwrap();
+
+    let for_task = db.cost_records_for_work_item(&task).unwrap();
+    assert_eq!(for_task.len(), 1);
+    assert_eq!(for_task[0].run_id, run.id);
+    assert_eq!(for_task[0].execution_id, successor.id);
+    assert_eq!(for_task[0].execution_kind, "pr_review_guide");
+    assert_eq!(for_task[0].work_item_id, task);
+    assert_eq!(
+        (
+            for_task[0].input_tokens,
+            for_task[0].output_tokens,
+            for_task[0].cache_read_tokens
+        ),
+        (Some(40_000), Some(1_800), Some(30_000))
+    );
+
+    let usage = db.usage_records_for_window(0, i64::MAX).unwrap();
+    let successor_run = usage
+        .runs
+        .iter()
+        .find(|record| record.run_id == run.id)
+        .expect("the successor's run is in the window");
+    assert_eq!(successor_run.work_item_id, comparison);
+    assert_eq!(successor_run.owning_task_id.as_deref(), Some(task.as_str()));
+    assert_eq!(usage.tasks.len(), 1);
+    assert_eq!(usage.tasks[0].task_id, task);
 }
 
 /// A database from before the column: the migration fills the owner for

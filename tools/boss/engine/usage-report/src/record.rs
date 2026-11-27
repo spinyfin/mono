@@ -97,10 +97,13 @@ pub struct UsageRunRecord {
     pub execution_effort: Option<String>,
     /// The task this run's spend belongs to when the execution binds to
     /// something else: a review guide execution's `work_item_id` is a source
-    /// comparison, and this is the task that owns the PR the guide explains
-    /// (the same relation as `WorkExecution::owning_task_id`). `None` for
-    /// every execution that binds to its task directly, for one that has no
-    /// task, and for a guide whose comparison row has since been pruned.
+    /// comparison, and this is `work_executions.owner_task_id` — the task
+    /// that owns the PR the guide explains, written when the execution is
+    /// created (the same value as `WorkExecution::owning_task_id` on list
+    /// paths). `None` for every execution that binds to its task directly,
+    /// for one that has no task, and for a guide whose owner was never
+    /// recorded: the comparison was already pruned before the owner column
+    /// was backfilled, or the root task row no longer exists.
     pub owning_task_id: Option<String>,
 }
 

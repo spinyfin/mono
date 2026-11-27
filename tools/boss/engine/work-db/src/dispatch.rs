@@ -1999,19 +1999,18 @@ impl WorkDb {
 const REVIEW_GUIDE_EXECUTIONS_FOR_TASK_FROM: &str = "FROM work_executions we
          WHERE we.kind = 'pr_review_guide' AND we.owner_task_id = ?1";
 
-/// Executions whose `kind` is `pr_review_guide` and whose comparison
-/// belongs to a review-guide series rooted at `task_id` — joined via
-/// `pr_review_guide_source_comparisons.series_id ->
-/// pr_review_guide_source_series.root_task_id`. A review-guide execution's
+/// Executions whose `kind` is `pr_review_guide` and whose stored
+/// `work_executions.owner_task_id` is `task_id`. A review-guide execution's
 /// own `work_item_id` is the comparison id (`prgc_…`), not `task_id`, so
 /// the plain `WHERE work_item_id = ?1` queries in [`WorkDb::list_executions`]
 /// and [`WorkDb::list_executions_for_chain`] never see it; both union this
 /// in per requested task so a review-guide run appears alongside the task/PR
 /// it reviewed instead of being reachable only by its opaque comparison id.
-/// Each returned row's `owning_task_id` is set to `task_id` for the
-/// caller's display grouping — the row's own `work_item_id` is left
-/// untouched as the comparison id, which remains the run's correct owner
-/// for dedup and finalize lookups.
+/// The owner is written when the guide execution is created and survives
+/// source retention deleting the comparison. Each returned row's
+/// `owning_task_id` is set to `task_id` for the caller's display grouping —
+/// the row's own `work_item_id` is left untouched as the comparison id,
+/// which remains the run's correct owner for dedup and finalize lookups.
 fn review_guide_executions_for_task(conn: &Connection, task_id: &str) -> Result<Vec<WorkExecution>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT we.id, we.work_item_id, we.kind, we.status, we.repo_remote_url, we.cube_repo_id, we.cube_lease_id,
