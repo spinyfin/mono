@@ -44,6 +44,10 @@ pub mod caveat {
     /// Attached to every run that carries a USD figure: it is an estimate
     /// against an uncited rate table, not billing truth.
     pub const ESTIMATE_ONLY: &str = "estimate_only";
+    /// Non-zero cache-write tokens were priced at the single 5m `cache_write`
+    /// rate rather than distinct 5m/1h rates — either because the run recorded
+    /// no 5m/1h split, or because the model entry has no separate 1h rate.
+    pub const UNSPLIT_CACHE_WRITE: &str = "unsplit_cache_write";
 }
 
 /// Why a run has no USD estimate. Closed for this engine build.
@@ -70,12 +74,22 @@ pub const NONE_VALUE: &str = "(none)";
 const SYNTHETIC_MODEL: &str = "<synthetic>";
 
 /// The token classes a USD estimate is made from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bon::Builder)]
 pub struct PricedTokens {
     pub input: i64,
     pub output: i64,
     pub cache_creation: i64,
+    pub cache_creation_5m: Option<i64>,
+    pub cache_creation_1h: Option<i64>,
     pub cache_read: i64,
+}
+
+/// One run's USD estimate plus whether non-zero cache-write tokens used the
+/// single 5-minute fallback rate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UsdEstimateResult {
+    pub usd: f64,
+    pub unsplit_cache_write: bool,
 }
 
 /// Prices one run. Implemented by the engine over its rate table; kept behind
@@ -83,6 +97,20 @@ pub struct PricedTokens {
 /// the table. Returns `None` when the model has no complete price.
 pub trait UsdEstimator {
     fn estimate_usd(&self, model: &str, tokens: PricedTokens) -> Option<f64>;
+
+    /// Detailed estimate carrying whether non-zero cache-write tokens fell
+    /// back to the single 5-minute `cache_write` rate (either because the run
+    /// recorded no 5m/1h split or because the model entry has no separate 1h
+    /// rate).
+    fn estimate_usd_detailed(&self, model: &str, tokens: PricedTokens) -> Option<UsdEstimateResult> {
+        let usd = self.estimate_usd(model, tokens)?;
+        let unsplit_cache_write =
+            tokens.cache_creation > 0 && (tokens.cache_creation_5m.is_none() || tokens.cache_creation_1h.is_none());
+        Some(UsdEstimateResult {
+            usd,
+            unsplit_cache_write,
+        })
+    }
 }
 
 impl<F: Fn(&str, PricedTokens) -> Option<f64>> UsdEstimator for F {
@@ -258,16 +286,21 @@ fn price_run(
     let Some(model) = rec.run_model.as_deref() else {
         return UsdOutcome::Unpriceable(cause::UNKNOWN_MODEL);
     };
-    match pricer.estimate_usd(
+    match pricer.estimate_usd_detailed(
         model,
         PricedTokens {
             input,
             output,
             cache_creation,
+            cache_creation_5m: rec.cache_creation_5m_tokens,
+            cache_creation_1h: rec.cache_creation_1h_tokens,
             cache_read,
         },
     ) {
-        Some(usd) => UsdOutcome::Estimate(usd),
+        Some(est) => UsdOutcome::Estimate {
+            usd: est.usd,
+            unsplit_cache_write: est.unsplit_cache_write,
+        },
         None => UsdOutcome::Unpriceable(cause::UNKNOWN_MODEL),
     }
 }
@@ -317,7 +350,14 @@ fn visit_caveats(
         visit(caveat::USAGE_UNAVAILABLE, &|| Some(reason.clone()));
     }
     match facts.usd {
-        UsdOutcome::Estimate(_) => visit(caveat::ESTIMATE_ONLY, &|| None),
+        UsdOutcome::Estimate {
+            unsplit_cache_write, ..
+        } => {
+            visit(caveat::ESTIMATE_ONLY, &|| None);
+            if unsplit_cache_write {
+                visit(caveat::UNSPLIT_CACHE_WRITE, &|| None);
+            }
+        }
         UsdOutcome::Unpriceable(cause::UNKNOWN_MODEL) => {
             visit(caveat::UNPRICED_MODEL, &|| Some(model_label(rec)));
         }
@@ -534,13 +574,13 @@ mod tests {
         r_codex.input_tokens = Some(100);
         r_codex.output_tokens = Some(20);
 
-        // 3. Claude subagents_excluded + estimate_only (priced USD)
+        // 3. Claude subagents_excluded + estimate_only + unsplit_cache_write (priced USD)
         let mut r_claude_priced = base_run("r_claude_priced", capture_start + 20);
         r_claude_priced.driver = RecordedDriver::LaunchTuple(DRIVER_SLUG_CLAUDE.to_owned());
         r_claude_priced.run_model = Some("claude-sonnet-4".to_owned());
         r_claude_priced.input_tokens = Some(100);
         r_claude_priced.output_tokens = Some(20);
-        r_claude_priced.cache_creation_tokens = Some(0);
+        r_claude_priced.cache_creation_tokens = Some(50);
         r_claude_priced.cache_read_tokens = Some(0);
 
         // 4. Claude synthetic_model + unpriced_model (unknown model USD)
@@ -577,6 +617,7 @@ mod tests {
             caveat::TOKENS_PARTIAL,
             caveat::USAGE_UNAVAILABLE,
             caveat::ESTIMATE_ONLY,
+            caveat::UNSPLIT_CACHE_WRITE,
             caveat::UNPRICED_MODEL,
         ]
         .into_iter()

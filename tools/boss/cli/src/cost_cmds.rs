@@ -445,6 +445,33 @@ fn format_tokens(n: i64) -> String {
     result
 }
 
+fn format_measurement_usd_summary(m: &CostMeasurement) -> Option<String> {
+    let usd = m.estimated_usd?;
+    let mut notes = Vec::new();
+    if m.estimated_usd_partial {
+        notes.push("PARTIAL — see pricing gaps".to_owned());
+    }
+    if m.unsplit_cache_write_runs > 0 {
+        notes.push(format!(
+            "unsplit_cache_write ×{} — priced at single 5m cache-write rate",
+            m.unsplit_cache_write_runs
+        ));
+    }
+    if notes.is_empty() {
+        Some(format!("${usd:.2} (ESTIMATE, not billing truth)"))
+    } else {
+        Some(format!("${usd:.2}, {} (ESTIMATE, not billing truth)", notes.join("; ")))
+    }
+}
+
+fn format_top_row_usd(row: &boss_protocol::CostTopRow) -> String {
+    match row.estimated_usd {
+        Some(value) if row.unsplit_cache_write => format!("${value:.2} (unsplit_cache_write)"),
+        Some(value) => format!("${value:.2}"),
+        None => "—".to_owned(),
+    }
+}
+
 fn print_measurement_summary(m: &CostMeasurement) {
     if m.runs_measured == 0 && m.runs_unmeasured > 0 {
         println!(
@@ -471,13 +498,8 @@ fn print_measurement_summary(m: &CostMeasurement) {
         "  Runs: {} measured, {} unmeasured (no token data recorded), {} recorded zero",
         m.runs_measured, m.runs_unmeasured, m.runs_zero,
     );
-    if let Some(usd) = m.estimated_usd {
-        let partial = if m.estimated_usd_partial {
-            ", PARTIAL — see pricing gaps"
-        } else {
-            ""
-        };
-        println!("  Estimated cost: ${usd:.2}{partial} (ESTIMATE, not billing truth)");
+    if let Some(summary) = format_measurement_usd_summary(m) {
+        println!("  Estimated cost: {summary}");
     }
 }
 
@@ -650,18 +672,21 @@ fn print_top_cost_report(report: &TopCostReport, tz: &DisplayTz) {
             started,
             row.status.clone(),
         ];
-        let usd = row
-            .estimated_usd
-            .map(|value| format!("${value:.2}"))
-            .unwrap_or_else(|| "—".to_owned());
         if include_usd {
-            cells.push(usd);
+            cells.push(format_top_row_usd(row));
         }
         table.add_row(cells);
     }
     print_table(table);
     if include_usd {
-        println!("  USD figures: (ESTIMATE, not billing truth)");
+        let unsplit_count = report.rows.iter().filter(|row| row.unsplit_cache_write).count();
+        if unsplit_count > 0 {
+            println!(
+                "  USD figures: (ESTIMATE, not billing truth; {unsplit_count} row(s) labelled unsplit_cache_write used the single 5m cache-write rate)"
+            );
+        } else {
+            println!("  USD figures: (ESTIMATE, not billing truth)");
+        }
     }
     if report.truncated {
         println!();
@@ -1348,6 +1373,53 @@ mod tests {
         assert_eq!(format_usd_estimate(0.0018), "<$0.01");
         assert_eq!(format_usd_estimate(0.0), "$0.00", "only a priced zero prints as zero");
         assert_eq!(format_usd_estimate(15.54366), "$15.54");
+    }
+
+    #[test]
+    fn usd_summaries_label_unsplit_cache_writes_for_task_window_and_top() {
+        let mut clean = measurement(1, 1, 1_000_000);
+        clean.estimated_usd = Some(13.60);
+        assert_eq!(
+            format_measurement_usd_summary(&clean).as_deref(),
+            Some("$13.60 (ESTIMATE, not billing truth)")
+        );
+
+        let mut unsplit = measurement(2, 2, 2_000_000);
+        unsplit.estimated_usd = Some(23.60);
+        unsplit.unsplit_cache_write_runs = 1;
+        assert_eq!(
+            format_measurement_usd_summary(&unsplit).as_deref(),
+            Some("$23.60, unsplit_cache_write ×1 — priced at single 5m cache-write rate (ESTIMATE, not billing truth)")
+        );
+
+        let mut partial_and_unsplit = unsplit.clone();
+        partial_and_unsplit.estimated_usd_partial = true;
+        assert_eq!(
+            format_measurement_usd_summary(&partial_and_unsplit).as_deref(),
+            Some(
+                "$23.60, PARTIAL — see pricing gaps; unsplit_cache_write ×1 — priced at single 5m cache-write rate (ESTIMATE, not billing truth)"
+            )
+        );
+
+        let top_row = |estimated_usd: Option<f64>, unsplit_cache_write: bool| {
+            boss_protocol::CostTopRow::builder()
+                .execution_id("e1")
+                .run_id("r1")
+                .work_item_id("t1")
+                .kind("chore_implementation")
+                .name("Test")
+                .status("completed")
+                .total_tokens(1_000_000)
+                .maybe_estimated_usd(estimated_usd)
+                .unsplit_cache_write(unsplit_cache_write)
+                .build()
+        };
+        assert_eq!(format_top_row_usd(&top_row(Some(13.60), false)), "$13.60");
+        assert_eq!(
+            format_top_row_usd(&top_row(Some(10.00), true)),
+            "$10.00 (unsplit_cache_write)"
+        );
+        assert_eq!(format_top_row_usd(&top_row(None, false)), "—");
     }
 
     #[test]

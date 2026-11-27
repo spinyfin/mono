@@ -23,6 +23,10 @@
 
 use serde::{Deserialize, Serialize};
 
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
 /// Aggregate token/cost figures for a set of `work_runs` rows. Shared
 /// shape used at every granularity — a single bucket, a task's
 /// overall total, a report's grand total.
@@ -78,6 +82,14 @@ pub struct CostMeasurement {
     /// estimate in CLI output — never treated as billing truth.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_usd: Option<f64>,
+    /// Number of priced runs folded into this measurement whose non-zero
+    /// cache-write tokens used the single 5-minute `cache_write` fallback
+    /// rate (either because no 5m/1h split was recorded or because the model
+    /// entry has no separate 1h rate). `0` when no USD estimate was requested
+    /// or every non-zero cache write was priced at its own lifetime rate.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    #[builder(default)]
+    pub unsplit_cache_write_runs: u32,
 }
 
 /// One labelled slice of a [`WindowCostReport`] breakdown (by
@@ -175,6 +187,12 @@ pub struct CostTopRow {
     pub effort_level: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_usd: Option<f64>,
+    /// `true` when `estimated_usd` priced non-zero cache-write tokens at the
+    /// single 5-minute `cache_write` fallback rate rather than distinct 5m/1h
+    /// rates.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[builder(default)]
+    pub unsplit_cache_write: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
