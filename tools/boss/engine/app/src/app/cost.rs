@@ -146,6 +146,19 @@ pub(super) async fn handle_get_top_cost_consumers(ctx: Dispatch, req: FrontendRe
     }
 }
 
+fn estimate_run_usd(model: &str, tokens: PricedTokens) -> Option<f64> {
+    let price = boss_engine_runtime::cost_pricing::price_for_model(model)?;
+    boss_engine_runtime::cost_pricing::estimate_usd_with_cache_split(
+        price,
+        tokens.input,
+        tokens.output,
+        tokens.cache_creation,
+        tokens.cache_creation_5m,
+        tokens.cache_creation_1h,
+        tokens.cache_read,
+    )
+}
+
 /// Run-grain usage rows for the window. The engine constants the report
 /// depends on (capture start, retention bound, rate table) are handed to the
 /// pure builder as data, so the builder crate owns none of them.
@@ -184,17 +197,7 @@ pub(super) async fn handle_get_token_usage_rows(ctx: Dispatch, req: FrontendRequ
         Ok(records) => records,
         Err(err) => return send_work_error(&sink, &request_id, &err),
     };
-    let price = |model: &str, tokens: PricedTokens| {
-        let price = boss_engine_runtime::cost_pricing::price_for_model(model)?;
-        boss_engine_runtime::cost_pricing::estimate_usd(
-            price,
-            tokens.input,
-            tokens.output,
-            tokens.cache_creation,
-            tokens.cache_read,
-        )
-    };
-    let report = build_usage_rows_report(&query, &records, estimate_usd.then_some(&price));
+    let report = build_usage_rows_report(&query, &records, estimate_usd.then_some(&estimate_run_usd));
     send_response(&sink, &request_id, FrontendEvent::TokenUsageRows { report });
 }
 
@@ -236,17 +239,7 @@ pub(super) async fn handle_get_token_usage_series(ctx: Dispatch, req: FrontendRe
         Ok(records) => records,
         Err(err) => return send_work_error(&sink, &request_id, &err),
     };
-    let price = |model: &str, tokens: PricedTokens| {
-        let price = boss_engine_runtime::cost_pricing::price_for_model(model)?;
-        boss_engine_runtime::cost_pricing::estimate_usd(
-            price,
-            tokens.input,
-            tokens.output,
-            tokens.cache_creation,
-            tokens.cache_read,
-        )
-    };
-    let report = build_usage_series_report(&query, &records, estimate_usd.then_some(&price));
+    let report = build_usage_series_report(&query, &records, estimate_usd.then_some(&estimate_run_usd));
     send_response(&sink, &request_id, FrontendEvent::TokenUsageSeries { report });
 }
 
@@ -357,6 +350,54 @@ mod tests {
             panic!("expected WorkError, got {payload:?}");
         };
         assert!(message.contains("at most 2"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn token_usage_rows_usd_prices_cache_write_split_and_labels_unsplit() {
+        let (state, _dir) = test_server_state();
+        let conn = state.work_db.connect().unwrap();
+        conn.execute_batch(
+            "INSERT INTO products (id, name, slug, status, created_at, updated_at) VALUES ('p', 'P', 'p', 'active', '1', '1');
+             INSERT INTO tasks (id, product_id, kind, name, status, created_at, updated_at) VALUES ('t', 'p', 'chore', 'T', 'done', '1', '1');
+             INSERT INTO work_executions (id, work_item_id, kind, status, repo_remote_url, created_at, driver)
+               VALUES ('e1', 't', 'chore_implementation', 'completed', 'u', '2000', 'claude'),
+                      ('e2', 't', 'chore_implementation', 'completed', 'u', '3000', 'claude');
+             INSERT INTO work_runs (id, execution_id, agent_id, status, created_at, model, input_tokens, output_tokens, cache_creation_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, cache_read_tokens)
+               VALUES ('r1', 'e1', 'w', 'completed', '2000', 'claude-fable-5-2', 0, 0, 1000000, 400000, 600000, 0);
+             INSERT INTO work_runs (id, execution_id, agent_id, status, created_at, model, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens)
+               VALUES ('r2', 'e2', 'w', 'completed', '3000', 'claude-fable-5-2', 0, 0, 1000000, 0);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let req = FrontendRequest::GetTokenUsageRows(boss_protocol::TokenUsageRowsRequest {
+            since_epoch_s: 1_000,
+            until_epoch_s: 9_000,
+            filters: Vec::new(),
+            group_by: Vec::new(),
+            roll_up_revisions: true,
+            estimate_usd: true,
+        });
+        let (_, payload) = ask(&state, req, "req-usage-usd").await;
+        let FrontendEvent::TokenUsageRows { report } = payload else {
+            panic!("expected TokenUsageRows, got {payload:?}");
+        };
+        let r1 = &report.tasks[0].executions[0].runs[0];
+        let r2 = &report.tasks[0].executions[1].runs[0];
+        // r1: 0.4M * $10 + 0.6M * $16 = $13.60; no unsplit_cache_write caveat.
+        assert!((r1.estimated_usd.unwrap() - 13.60).abs() < 1e-9);
+        assert!(
+            !r1.caveats
+                .iter()
+                .any(|c| c.code == boss_usage_report::caveat::UNSPLIT_CACHE_WRITE)
+        );
+        // r2: 1M * $10 = $10.00; carries unsplit_cache_write caveat.
+        assert!((r2.estimated_usd.unwrap() - 10.00).abs() < 1e-9);
+        assert!(
+            r2.caveats
+                .iter()
+                .any(|c| c.code == boss_usage_report::caveat::UNSPLIT_CACHE_WRITE)
+        );
     }
     async fn ask_series(
         state: &Arc<ServerState>,

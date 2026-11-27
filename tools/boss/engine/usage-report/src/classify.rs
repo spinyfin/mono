@@ -44,6 +44,9 @@ pub mod caveat {
     /// Attached to every run that carries a USD figure: it is an estimate
     /// against an uncited rate table, not billing truth.
     pub const ESTIMATE_ONLY: &str = "estimate_only";
+    /// The run carried a non-zero cache-write count without a 5m/1h split, so
+    /// its USD estimate priced all cache writes at the single 5m rate.
+    pub const UNSPLIT_CACHE_WRITE: &str = "unsplit_cache_write";
 }
 
 /// Why a run has no USD estimate. Closed for this engine build.
@@ -70,11 +73,13 @@ pub const NONE_VALUE: &str = "(none)";
 const SYNTHETIC_MODEL: &str = "<synthetic>";
 
 /// The token classes a USD estimate is made from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bon::Builder)]
 pub struct PricedTokens {
     pub input: i64,
     pub output: i64,
     pub cache_creation: i64,
+    pub cache_creation_5m: Option<i64>,
+    pub cache_creation_1h: Option<i64>,
     pub cache_read: i64,
 }
 
@@ -264,6 +269,8 @@ fn price_run(
             input,
             output,
             cache_creation,
+            cache_creation_5m: rec.cache_creation_5m_tokens,
+            cache_creation_1h: rec.cache_creation_1h_tokens,
             cache_read,
         },
     ) {
@@ -317,7 +324,14 @@ fn visit_caveats(
         visit(caveat::USAGE_UNAVAILABLE, &|| Some(reason.clone()));
     }
     match facts.usd {
-        UsdOutcome::Estimate(_) => visit(caveat::ESTIMATE_ONLY, &|| None),
+        UsdOutcome::Estimate(_) => {
+            visit(caveat::ESTIMATE_ONLY, &|| None);
+            if rec.cache_creation_tokens.is_some_and(|n| n > 0)
+                && (rec.cache_creation_5m_tokens.is_none() || rec.cache_creation_1h_tokens.is_none())
+            {
+                visit(caveat::UNSPLIT_CACHE_WRITE, &|| None);
+            }
+        }
         UsdOutcome::Unpriceable(cause::UNKNOWN_MODEL) => {
             visit(caveat::UNPRICED_MODEL, &|| Some(model_label(rec)));
         }
@@ -534,13 +548,13 @@ mod tests {
         r_codex.input_tokens = Some(100);
         r_codex.output_tokens = Some(20);
 
-        // 3. Claude subagents_excluded + estimate_only (priced USD)
+        // 3. Claude subagents_excluded + estimate_only + unsplit_cache_write (priced USD)
         let mut r_claude_priced = base_run("r_claude_priced", capture_start + 20);
         r_claude_priced.driver = RecordedDriver::LaunchTuple(DRIVER_SLUG_CLAUDE.to_owned());
         r_claude_priced.run_model = Some("claude-sonnet-4".to_owned());
         r_claude_priced.input_tokens = Some(100);
         r_claude_priced.output_tokens = Some(20);
-        r_claude_priced.cache_creation_tokens = Some(0);
+        r_claude_priced.cache_creation_tokens = Some(50);
         r_claude_priced.cache_read_tokens = Some(0);
 
         // 4. Claude synthetic_model + unpriced_model (unknown model USD)
@@ -577,6 +591,7 @@ mod tests {
             caveat::TOKENS_PARTIAL,
             caveat::USAGE_UNAVAILABLE,
             caveat::ESTIMATE_ONLY,
+            caveat::UNSPLIT_CACHE_WRITE,
             caveat::UNPRICED_MODEL,
         ]
         .into_iter()

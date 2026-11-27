@@ -1188,6 +1188,45 @@ fn every_usd_figure_carries_the_estimate_caveat_and_no_usd_is_made_unasked() {
     assert_eq!(unasked.coverage.runs_priceable, None);
 }
 
+#[test]
+fn usd_prices_split_cache_writes_when_present_and_labels_unsplit_cache_writes() {
+    let split_pricer = |_model: &str, tokens: PricedTokens| {
+        Some(match (tokens.cache_creation_5m, tokens.cache_creation_1h) {
+            (Some(c5m), Some(c1h)) => (c5m as f64 * 10.0 + c1h as f64 * 16.0) / 1_000_000.0,
+            _ => (tokens.cache_creation as f64 * 10.0) / 1_000_000.0,
+        })
+    };
+    let mut split = with_model(
+        tokens(run("r_split", "e1", "t1", BASE_EPOCH_S), 0, 0, 1_000_000, 0),
+        "claude-fable-5-2",
+    );
+    split.cache_creation_5m_tokens = Some(400_000);
+    split.cache_creation_1h_tokens = Some(600_000);
+
+    let unsplit = with_model(
+        tokens(run("r_unsplit", "e2", "t1", BASE_EPOCH_S + 1), 0, 0, 1_000_000, 0),
+        "claude-fable-5-2",
+    );
+
+    let report = build_usage_rows_report(
+        &window(),
+        &records(vec![split, unsplit], vec![task("t1", "t1", 2)]),
+        Some(&split_pricer),
+    );
+    let rows = &report.tasks[0].executions;
+    let split_row = &rows[0].runs[0];
+    let unsplit_row = &rows[1].runs[0];
+    assert!((split_row.estimated_usd.unwrap() - 13.60).abs() < 1e-9);
+    assert!(!split_row.caveats.iter().any(|c| c.code == caveat::UNSPLIT_CACHE_WRITE));
+    assert!((unsplit_row.estimated_usd.unwrap() - 10.00).abs() < 1e-9);
+    assert!(
+        unsplit_row
+            .caveats
+            .iter()
+            .any(|c| c.code == caveat::UNSPLIT_CACHE_WRITE)
+    );
+}
+
 // ── Wire shape ────────────────────────────────────────────────────────────
 
 #[test]

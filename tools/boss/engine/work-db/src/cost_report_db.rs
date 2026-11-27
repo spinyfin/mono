@@ -34,6 +34,8 @@ const COST_RECORD_COLUMNS: &str = "
     wr.input_tokens,
     wr.output_tokens,
     wr.cache_creation_tokens,
+    wr.cache_creation_5m_tokens,
+    wr.cache_creation_1h_tokens,
     wr.cache_read_tokens,
     wr.agent_active_ms,
     CAST(wr.started_at AS INTEGER),
@@ -58,11 +60,13 @@ fn map_cost_run_record(row: &Row) -> rusqlite::Result<CostRunRecord> {
         input_tokens: row.get(12)?,
         output_tokens: row.get(13)?,
         cache_creation_tokens: row.get(14)?,
-        cache_read_tokens: row.get(15)?,
-        agent_active_ms: row.get(16)?,
-        started_at_epoch_s: row.get(17)?,
-        driver: row.get(18)?,
-        usage_unavailable: row.get(19)?,
+        cache_creation_5m_tokens: row.get(15)?,
+        cache_creation_1h_tokens: row.get(16)?,
+        cache_read_tokens: row.get(17)?,
+        agent_active_ms: row.get(18)?,
+        started_at_epoch_s: row.get(19)?,
+        driver: row.get(20)?,
+        usage_unavailable: row.get(21)?,
     })
 }
 
@@ -327,7 +331,7 @@ fn cost_row_mapping_preserves_every_owned_field_and_null() {
         .query_row(
             "SELECT 'run-a', 'exec-a', 'task-a', 'Work name', 'task_implementation',
                     'completed', 'orphaned', 100, 42, 'model-a', 'high', 'medium',
-                    0, 11, 12, 13, 14, 99, 'grok', NULL",
+                    0, 11, 12, 5, 7, 13, 14, 99, 'grok', NULL",
             [],
             map_cost_run_record,
         )
@@ -350,6 +354,8 @@ fn cost_row_mapping_preserves_every_owned_field_and_null() {
         .input_tokens(0)
         .output_tokens(11)
         .cache_creation_tokens(12)
+        .cache_creation_5m_tokens(5)
+        .cache_creation_1h_tokens(7)
         .cache_read_tokens(13)
         .agent_active_ms(14)
         .started_at_epoch_s(99)
@@ -361,7 +367,7 @@ fn cost_row_mapping_preserves_every_owned_field_and_null() {
         .query_row(
             "SELECT 'run-a', 'exec-a', 'task-a', 'Work name', 'task_implementation',
                     'completed', 'orphaned', 100, NULL, NULL, NULL, NULL,
-                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL",
+                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL",
             [],
             map_cost_run_record,
         )

@@ -3,12 +3,15 @@
 // Retain the original module paths so test filters and names stay stable.
 mod cost_pricing {
     mod tests {
-        use boss_engine::cost_pricing::{ModelPriceUsdPerMillion, estimate_usd, price_for_model};
+        use boss_engine::cost_pricing::{
+            ModelPriceUsdPerMillion, estimate_usd, estimate_usd_with_cache_split, price_for_model,
+        };
 
         #[test]
         fn matches_family_substring_case_insensitively() {
             assert_eq!(price_for_model("claude-sonnet-5-20260101"), price_for_model("SONNET"));
             assert!(price_for_model("claude-opus-5").is_some());
+            assert!(price_for_model("claude-fable-5").is_some());
             assert!(price_for_model("claude-haiku-4-5-20251001").is_some());
         }
 
@@ -21,15 +24,31 @@ mod cost_pricing {
         #[test]
         fn estimate_sums_every_token_category_at_its_own_rate() {
             let price = ModelPriceUsdPerMillion {
-                input: 3.0,
-                output: 15.0,
-                cache_write: Some(3.75),
-                cache_read: Some(0.30),
+                input: 2.0,
+                output: 10.0,
+                cache_write: Some(2.50),
+                cache_write_1h: Some(4.0),
+                cache_read: Some(0.10),
             };
             // 1M input + 1M output + 1M cache-write + 1M cache-read tokens.
             let usd = estimate_usd(price, 1_000_000, 1_000_000, 1_000_000, 1_000_000);
             let usd = usd.expect("all token categories have known prices");
-            assert!((usd - (3.0 + 15.0 + 3.75 + 0.30)).abs() < 1e-9, "usd={usd}");
+            assert!((usd - (2.0 + 10.0 + 2.50 + 0.10)).abs() < 1e-9, "usd={usd}");
+
+            let split_usd = estimate_usd_with_cache_split(
+                price,
+                1_000_000,
+                1_000_000,
+                1_000_000,
+                Some(500_000),
+                Some(500_000),
+                1_000_000,
+            )
+            .expect("split cache writes have known prices");
+            assert!(
+                (split_usd - (2.0 + 10.0 + 0.5 * 2.50 + 0.5 * 4.0 + 0.10)).abs() < 1e-9,
+                "split_usd={split_usd}"
+            );
         }
 
         #[test]

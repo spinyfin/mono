@@ -209,15 +209,7 @@ fn fold_record(fold: &mut RunFold, record: &CostRunRecord, want_usd: bool, gaps:
     let usd = if !want_usd || !tokens.is_measured() {
         UsdOutcome::NotRequested
     } else {
-        match price_for_record(record).and_then(|price| {
-            cost_pricing::estimate_usd(
-                price,
-                record.input_tokens.unwrap_or(0),
-                record.output_tokens.unwrap_or(0),
-                record.cache_creation_tokens.unwrap_or(0),
-                record.cache_read_tokens.unwrap_or(0),
-            )
-        }) {
+        match estimate_record_usd(record) {
             Some(usd) => UsdOutcome::Estimate(usd),
             None => {
                 gaps.insert(record.model.as_deref().unwrap_or(NO_MODEL_GAP_LABEL).to_owned());
@@ -231,6 +223,19 @@ fn fold_record(fold: &mut RunFold, record: &CostRunRecord, want_usd: bool, gaps:
         usage_unavailable: record.usage_unavailable.as_deref(),
         usd,
     });
+}
+
+fn estimate_record_usd(record: &CostRunRecord) -> Option<f64> {
+    let price = price_for_record(record)?;
+    cost_pricing::estimate_usd_with_cache_split(
+        price,
+        record.input_tokens?,
+        record.output_tokens?,
+        record.cache_creation_tokens?,
+        record.cache_creation_5m_tokens,
+        record.cache_creation_1h_tokens,
+        record.cache_read_tokens?,
+    )
 }
 
 // Subscription-backed Grok/Antigravity model names are not verified API rates.
@@ -450,15 +455,7 @@ pub fn build_top_cost_report(
         }
         let total_tokens = run_tokens(record).known_total();
 
-        let estimated_usd = want_usd.then(|| price_for_record(record)).flatten().and_then(|price| {
-            cost_pricing::estimate_usd(
-                price,
-                record.input_tokens.unwrap_or(0),
-                record.output_tokens.unwrap_or(0),
-                record.cache_creation_tokens.unwrap_or(0),
-                record.cache_read_tokens.unwrap_or(0),
-            )
-        });
+        let estimated_usd = want_usd.then(|| estimate_record_usd(record)).flatten();
         if want_usd && estimated_usd.is_none() {
             gaps.insert(record.model.as_deref().unwrap_or(NO_MODEL_GAP_LABEL).to_owned());
         }
@@ -755,8 +752,19 @@ mod tests {
         assert!(report.overall.estimated_usd.is_some());
         // Only the priced run's cost is counted — the unpriced run's
         // tokens are excluded from the dollar figure, not assumed free.
-        assert!((report.overall.estimated_usd.unwrap() - 3.0).abs() < 1e-9);
+        assert!((report.overall.estimated_usd.unwrap() - 2.0).abs() < 1e-9);
         assert_eq!(report.pricing_gaps, vec!["gpt-5-codex".to_owned()]);
+    }
+
+    #[test]
+    fn usd_estimate_prices_5m_and_1h_cache_writes_separately_when_split_is_present() {
+        let mut split = measured(record("run_1", "exec_1"), 0, 0, 1_000_000, 0);
+        split.model = Some("claude-fable-5-2".to_owned());
+        split.cache_creation_5m_tokens = Some(400_000);
+        split.cache_creation_1h_tokens = Some(600_000);
+        let report = build_task_cost_report("task_1", None, "t", &[split], true, 0);
+        // 0.4M * $10 + 0.6M * $16 = $4.00 + $9.60 = $13.60
+        assert!((report.overall.estimated_usd.unwrap() - 13.60).abs() < 1e-9);
     }
 
     #[test]
