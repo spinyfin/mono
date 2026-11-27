@@ -121,6 +121,12 @@ pub struct InFlightPrompt {
     /// once observed in the journal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_seq: Option<u64>,
+    /// True when the intent log recorded a `Withdrawn` for this prompt after
+    /// it was `Sent`. The entry still binds its wire echo (the adapter may be
+    /// running it) but is never re-queued by
+    /// [`TurnQueue::recover_unsent_dispatches`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub withdrawn: bool,
 }
 
 /// Result of pressing Stop on the turn queue.
@@ -284,6 +290,7 @@ impl TurnQueue {
             request_id,
             sent_ts_ms,
             wire_seq: None,
+            withdrawn: false,
         };
         self.cancel_requested = false;
         self.in_flight = Some(entry.clone());
@@ -323,6 +330,7 @@ impl TurnQueue {
             request_id,
             sent_ts_ms,
             wire_seq: None,
+            withdrawn: false,
         };
         self.dispatched_awaiting_wire.push(entry.clone());
         Some(entry)
@@ -496,15 +504,23 @@ impl TurnQueue {
 
     /// Applies a `Withdrawn` intent-log record during live or replay processing.
     ///
-    /// Removes the prompt from `queued` only. A prompt that is `Sent` has
-    /// normally already been written to the host socket (the `Sent` record is
-    /// appended first), so whether it reached the wire is only known at the
-    /// live boundary; it has to be returned to `queued` through
-    /// [`Self::apply_requeued_intent`] before it can be withdrawn. Dropping a
-    /// dispatched entry here would report the queue idle while the adapter is
-    /// still running that prompt and leave its wire echo unbound.
+    /// Removes the prompt from `queued`. A prompt that is `Sent` has normally
+    /// already been written to the host socket (the `Sent` record is appended
+    /// first), so it cannot simply be dropped: that would report the queue idle
+    /// while the adapter is still running it and leave its wire echo unbound.
+    /// Instead the dispatched entry is marked withdrawn: its echo still binds,
+    /// but [`Self::recover_unsent_dispatches`] discards it rather than
+    /// re-queueing it, so a withdrawn prompt is never sent after all.
     pub(crate) fn apply_withdrawn_intent(&mut self, intent_id: u64) -> Option<QueuedPrompt> {
-        self.withdraw(intent_id)
+        if let Some(prompt) = self.withdraw(intent_id) {
+            return Some(prompt);
+        }
+        let entry = self
+            .dispatched_awaiting_wire
+            .iter_mut()
+            .find(|entry| entry.prompt.intent_id == intent_id)?;
+        entry.withdrawn = true;
+        Some(entry.prompt.clone())
     }
 
     /// Computes the [`StopOutcome`] without mutating the queue.
@@ -575,6 +591,7 @@ impl TurnQueue {
         let mut recovered: Vec<QueuedPrompt> = self
             .dispatched_awaiting_wire
             .drain(..)
+            .filter(|entry| !entry.withdrawn)
             .map(|entry| entry.prompt)
             .collect();
         recovered.sort_by_key(|prompt| prompt.intent_id);

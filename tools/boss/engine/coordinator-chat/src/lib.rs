@@ -13,7 +13,6 @@
 //! leaves the reducer.
 
 pub mod intent;
-mod jsonl;
 pub mod queue;
 pub mod redact;
 pub mod reducer;

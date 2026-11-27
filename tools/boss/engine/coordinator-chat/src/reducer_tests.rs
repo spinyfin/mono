@@ -2605,6 +2605,28 @@ mod restart_and_snapshot_tests {
         .unwrap();
         assert_eq!(mid.reducer.queue(), reducer.queue());
 
+        // Full replay of the persisted intent records plus the wire records
+        // agrees mid-cancel too: the operator prompt stays withdrawn.
+        let persisted = crate::intent::read_intent_file_if_exists(&intent_path).unwrap();
+        let replayed_mid = replay_with_intent_log(
+            &wire_records,
+            &persisted,
+            CredentialRedactor::none(),
+            DEFAULT_TOOL_TEXT_LIMIT,
+        );
+        assert_eq!(replayed_mid.queue(), reducer.queue());
+        assert_eq!(replayed_mid.items(), reducer.items());
+        assert!(replayed_mid.queue().cancel_requested());
+        assert!(
+            replayed_mid
+                .queue()
+                .queued()
+                .iter()
+                .all(|prompt| prompt.intent_id != q2.intent_id()),
+            "withdrawn operator prompt must not return on replay"
+        );
+        assert!(replayed_mid.queue().peek_next_dispatchable().is_none());
+
         // The cancelled turn's response arrives: only the engine prompt remains
         // and it is next to dispatch.
         wire_records.push(prompt_done_wire(3, 1, "cancelled"));
@@ -2629,6 +2651,61 @@ mod restart_and_snapshot_tests {
         let next = recovered.reducer.queue().peek_next_dispatchable().unwrap();
         assert_eq!(next.origin, PromptOrigin::Engine);
         assert_eq!(next.intent_id, q3.intent_id());
+
+        let replayed = replay_with_intent_log(
+            &wire_records,
+            &persisted,
+            CredentialRedactor::none(),
+            DEFAULT_TOOL_TEXT_LIMIT,
+        );
+        assert_eq!(replayed.queue(), reducer.queue());
+        assert_eq!(replayed.queue(), recovered.reducer.queue());
+        assert_eq!(replayed.items(), reducer.items());
+        assert!(!replayed.queue().cancel_requested());
+        assert_eq!(replayed.queue().queued().len(), 1);
+        let next = replayed.queue().peek_next_dispatchable().unwrap();
+        assert_eq!(next.origin, PromptOrigin::Engine);
+        assert_eq!(next.intent_id, q3.intent_id());
+    }
+
+    #[test]
+    fn version_one_snapshot_is_a_cache_miss_so_unbound_prompts_are_not_lost() {
+        // Written before unbound-prompt tracking existed: an in-flight unbound
+        // prompt lived only in the wire tracker, so the queue loaded as idle.
+        let old = br#"{"schema_version":1}"#;
+        assert_eq!(
+            load_snapshot_bytes(old),
+            SnapshotLoad::VersionMismatch {
+                found: 1,
+                expected: SNAPSHOT_SCHEMA_VERSION,
+            }
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let wire_path = dir.path().join("wire.jsonl");
+        let snap_path = dir.path().join("old.json");
+        std::fs::write(&snap_path, old).unwrap();
+        let wire_records = vec![prompt_wire(1, 5)];
+        write_wire_file(&wire_path, &wire_records);
+        let res = recover_from_files(
+            &wire_path,
+            None,
+            Some(&snap_path),
+            CredentialRedactor::none(),
+            DEFAULT_TOOL_TEXT_LIMIT,
+            UnsentDispatchPolicy::ReconcileNow,
+        )
+        .unwrap();
+        let full = replay_with_intent_log(&wire_records, &[], CredentialRedactor::none(), DEFAULT_TOOL_TEXT_LIMIT);
+        assert!(matches!(
+            res.snapshot_status,
+            SnapshotLoadStatus::VersionMismatch { .. }
+        ));
+        assert_eq!(res.reducer.queue(), full.queue());
+        assert!(res.reducer.queue().is_busy());
+        assert!(
+            !res.reducer.queue().can_send(),
+            "unbound prompt blocks dispatch until its response"
+        );
     }
 
     #[test]

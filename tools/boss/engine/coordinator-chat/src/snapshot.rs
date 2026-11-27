@@ -24,16 +24,19 @@ use boss_protocol::{CoordinatorChatConnectionState, CoordinatorChatItem};
 use serde::{Deserialize, Serialize};
 
 use crate::intent::{IntentRecord, REPLAY_READ_BUFFER_BYTES, read_intent_file_if_exists};
-use crate::jsonl::scan_jsonl;
 use crate::queue::{QueuedPrompt, TurnQueue};
 use crate::redact::CredentialRedactor;
 use crate::reducer::{ActiveStreamSnapshot, ConversationReducer, WireTracker};
+use boss_agent_host::journal::scan_jsonl;
 
 /// Current on-disk schema version of [`ReducerSnapshot`].
 ///
 /// Bump this whenever the serialized shape or semantics of [`ReducerSnapshot`]
 /// changes so older snapshots cleanly fall back to full replay.
-pub const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+// Version 2 adds `TurnQueue` unbound-prompt tracking and the withdrawn flag on
+// dispatched prompts. A version 1 snapshot taken while an unbound
+// `session/prompt` was in flight would load as idle, so it is a cache miss.
 
 /// Recommended wire-record interval between periodic reducer snapshots.
 ///

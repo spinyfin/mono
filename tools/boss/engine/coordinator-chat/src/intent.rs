@@ -21,8 +21,8 @@ use boss_acp_client::schema::RequestId;
 use boss_agent_host::journal::now_ms;
 use serde::{Deserialize, Serialize};
 
-use crate::jsonl::scan_jsonl;
 use crate::queue::{PromptImageRef, PromptOrigin};
+use boss_agent_host::journal::scan_jsonl;
 
 /// Read buffer capacity for replaying intent logs and wire journals.
 ///
