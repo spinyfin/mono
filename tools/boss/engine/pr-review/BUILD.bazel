@@ -19,6 +19,7 @@ rust_library(
         "//tools/boss/engine/work-db:__pkg__",
     ],
     deps = [
+        "//tools/boss/engine/feature-flags",
         "//tools/boss/engine/pr-template",
         "//tools/boss/engine/structured-output",
         "//tools/boss/protocol",
@@ -35,6 +36,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//tools/boss/engine/feature-flags",
         "//tools/boss/engine/pr-template",
         "//tools/boss/engine/structured-output",
         "//tools/boss/protocol",

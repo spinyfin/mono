@@ -5,6 +5,7 @@ edition.workspace = true
 workspace = "../../../.."
 
 [dependencies]
+boss-feature-flags = { path = "../feature-flags" }
 bon = { workspace = true }
 boss-engine-structured-output = { path = "../structured-output" }
 boss-pr-template = { path = "../pr-template" }

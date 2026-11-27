@@ -137,6 +137,8 @@ pub enum ReviewYieldArm {
     NotEnrolled,
     /// No arm set was recorded for the launched members.
     NotRecorded,
+    /// A recorded arm set failed the shared decoder.
+    Unreadable,
 }
 
 impl ReviewYieldArm {
@@ -148,6 +150,7 @@ impl ReviewYieldArm {
             Self::Mixed => "mixed",
             Self::NotEnrolled => "not_enrolled",
             Self::NotRecorded => "not_recorded",
+            Self::Unreadable => "unreadable",
         }
     }
 }
@@ -192,7 +195,9 @@ pub struct RemediationYield {
     pub changed_code_and_merged: u64,
 }
 
-/// One reviewer role's reports in one phase.
+/// One reviewer role's reports in one phase and its own execution arm.
+/// Remediation is credited once per role named in accepted sources, and to
+/// the deciding role; missing legacy sources leave leaf-role yield incomplete.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct ReviewYieldRoleRow {
@@ -225,6 +230,13 @@ pub struct ReviewYieldRoleRow {
     #[serde(default)]
     #[builder(default)]
     pub by_category: Vec<LabelCount>,
+    /// Remediation from accepted findings naming this role, once per batch.
+    #[serde(default)]
+    #[builder(default)]
+    pub revisions: RemediationYield,
+    #[serde(default)]
+    #[builder(default)]
+    pub followups: RemediationYield,
 }
 
 /// What the deciding review of each batch (the supervisor before merge, the
@@ -232,6 +244,10 @@ pub struct ReviewYieldRoleRow {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct ReviewYieldDecisions {
+    /// Minted remediations whose verdict has missing legacy source attribution.
+    #[serde(default)]
+    #[builder(default)]
+    pub remediations_without_source_attribution: u64,
     /// Batches with an applied verdict.
     #[serde(default)]
     #[builder(default)]
@@ -376,6 +392,9 @@ pub struct ReviewYieldEligibility {
     #[serde(default)]
     #[builder(default)]
     pub would_be_excluded: PostMergeYield,
+    #[serde(default)]
+    #[builder(default)]
+    pub unknown_size: PostMergeYield,
 }
 
 /// The report for one arm (or, with no experiment, for the whole window).
@@ -447,6 +466,7 @@ mod tests {
             ReviewYieldArm::Mixed,
             ReviewYieldArm::NotEnrolled,
             ReviewYieldArm::NotRecorded,
+            ReviewYieldArm::Unreadable,
         ] {
             assert_eq!(serde_json::to_value(arm).unwrap(), arm.as_str());
         }

@@ -1171,6 +1171,11 @@ fn print_review_yield_report(report: &boss_protocol::ReviewYieldReport, tz: &Dis
 }
 
 fn print_review_yield_arm(arm: &boss_protocol::ReviewYieldArmReport) {
+    if arm.arm.is_some() {
+        println!(
+            "Reviewer rows follow each execution’s arm; batch outcomes use consensus of recorded sets (mixed on disagreement)."
+        );
+    }
     println!();
     match arm.arm {
         Some(arm_name) => println!("=== Arm {arm_name}: {} review batch(es) ===", arm.batches),
@@ -1184,7 +1189,7 @@ fn print_review_yield_arm(arm: &boss_protocol::ReviewYieldArmReport) {
             phase.batches,
             phase.batches_without_verdict,
         );
-        if phase.batches == 0 {
+        if phase.batches == 0 && phase.roles.is_empty() {
             continue;
         }
         if !phase.roles.is_empty() {
@@ -1199,6 +1204,8 @@ fn print_review_yield_arm(arm: &boss_protocol::ReviewYieldArmReport) {
                 "PASS GATE",
                 "ON ALWAYS-ON ONLY",
                 "CATEGORIES",
+                "REVISIONS",
+                "FOLLOW-UPS",
             ]);
             for row in review_yield_role_rows(&phase.roles) {
                 table.add_row(row);
@@ -1225,7 +1232,7 @@ fn print_review_yield_arm(arm: &boss_protocol::ReviewYieldArmReport) {
     }
     if deep.unreadable_classifications > 0 {
         println!(
-            "  {} batch(es) have an unreadable classification and are in neither this table nor the next.",
+            "  {} batch(es) have an unreadable classification; post-merge batches appear under unknown size.",
             deep.unreadable_classifications
         );
     }
@@ -1317,6 +1324,8 @@ fn review_yield_role_rows(roles: &[boss_protocol::ReviewYieldRoleRow]) -> Vec<Ve
                 row.passing_gate.to_string(),
                 row.passing_on_always_on_category_only.to_string(),
                 review_yield_counts(&row.by_category),
+                review_yield_remediation_summary(&row.revisions),
+                review_yield_remediation_summary(&row.followups),
             ]
         })
         .collect()
@@ -1352,6 +1361,12 @@ fn review_yield_decision_lines(decisions: &boss_protocol::ReviewYieldDecisions) 
         ));
     }
     let mut lines = vec![verdicts];
+    if decisions.remediations_without_source_attribution > 0 {
+        lines.push(format!(
+            "Remediations with missing source attribution: {} (leaf-role yield is incomplete).",
+            decisions.remediations_without_source_attribution
+        ));
+    }
     if !decisions.gate_outcomes.is_empty() {
         lines.push(format!(
             "Gate outcomes: {}",
@@ -1412,6 +1427,7 @@ fn review_yield_eligibility_rows(eligibility: &boss_protocol::ReviewYieldEligibi
     [
         ("stays eligible", &eligibility.stays_eligible),
         ("would be excluded", &eligibility.would_be_excluded),
+        ("unknown size", &eligibility.unknown_size),
     ]
     .into_iter()
     .map(|(label, yielded)| {
@@ -2108,6 +2124,9 @@ mod tests {
         );
         assert_eq!(rows[1][1], "1", "no unreadable suffix when every report read");
         assert_eq!(rows[1][9], "—", "no categories prints a dash");
+        assert_eq!(rows[0].len(), 12);
+        assert_eq!(rows[0][10], "none minted");
+        assert_eq!(rows[0][11], "none minted");
     }
 
     #[test]
@@ -2191,6 +2210,7 @@ mod tests {
         assert_eq!(rows[0], ["stays eligible", "3", "3", "7", "2", "2", "2", "2", "1", "1"]);
         assert_eq!(rows[1][0], "would be excluded");
         assert_eq!(rows[1][1], "0");
+        assert_eq!(rows[2][0], "unknown size");
     }
 
     #[test]

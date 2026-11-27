@@ -14,6 +14,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::supervisor_types::SupervisorSourceRole;
+use boss_feature_flags::{ExperimentArm, ExperimentArmSet};
 use boss_protocol::{
     DeepCriterion, DeepCriterionRow, LabelCount, PostMergeYield, RemediationYield, ReviewBatchMemberRole,
     ReviewBatchMemberStatus, ReviewBatchPhase, ReviewClassification, ReviewProfile, ReviewYieldArm,
@@ -35,6 +37,8 @@ use crate::types::{ReviewFindingCategory, ReviewFindingSeverity};
 pub struct YieldFinding {
     pub severity: ReviewFindingSeverity,
     pub category: ReviewFindingCategory,
+    #[serde(default)]
+    pub sources: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -139,6 +143,14 @@ pub fn build_review_yield_report(
     for batch in batches {
         let arm = experiment.map(|key| batch_arm(key, &batch.members));
         arms.entry(arm).or_default().add_batch(batch);
+        for member in batch
+            .members
+            .iter()
+            .filter(|m| m.status == ReviewBatchMemberStatus::Reported)
+        {
+            let arm = experiment.map(|key| member_arm(key, member).unwrap_or(ReviewYieldArm::NotRecorded));
+            arms.entry(arm).or_default().add_member(batch, member);
+        }
     }
 
     let mut still_open = 0;
@@ -198,13 +210,14 @@ pub fn build_review_yield_report(
 /// it carries no arm set to read.
 fn member_arm(experiment: &str, member: &YieldMember) -> Option<ReviewYieldArm> {
     let text = member.experiment_arms.as_deref()?;
-    let arms: BTreeMap<String, String> = serde_json::from_str(text).ok()?;
-    Some(match arms.get(experiment).map(String::as_str) {
+    let Ok(arms) = ExperimentArmSet::decode(text) else {
+        return Some(ReviewYieldArm::Unreadable);
+    };
+    Some(match arms.get(experiment) {
         None => ReviewYieldArm::NotEnrolled,
-        Some("treatment") => ReviewYieldArm::Treatment,
-        Some("control") => ReviewYieldArm::Control,
-        Some("stopped") => ReviewYieldArm::Stopped,
-        Some(_) => return None,
+        Some(ExperimentArm::Treatment) => ReviewYieldArm::Treatment,
+        Some(ExperimentArm::Control) => ReviewYieldArm::Control,
+        Some(ExperimentArm::Stopped) => ReviewYieldArm::Stopped,
     })
 }
 
@@ -233,7 +246,13 @@ const ROLE_ORDER: [ReviewBatchMemberRole; 5] = [
 ];
 
 fn role_index(role: ReviewBatchMemberRole) -> usize {
-    ROLE_ORDER.iter().position(|candidate| *candidate == role).unwrap_or(0)
+    match role {
+        ReviewBatchMemberRole::ClaudeReviewer => 0,
+        ReviewBatchMemberRole::CodexReviewer => 1,
+        ReviewBatchMemberRole::GrokReviewer => 2,
+        ReviewBatchMemberRole::Supervisor => 3,
+        ReviewBatchMemberRole::PostMergeReviewer => 4,
+    }
 }
 
 /// The member whose output is the batch's decision: the supervisor before
@@ -429,6 +448,7 @@ struct DeepAcc {
 struct EligibilityAcc {
     stays_eligible: PostMergeYield,
     would_be_excluded: PostMergeYield,
+    unknown_size: PostMergeYield,
 }
 
 struct ArmAcc {
@@ -457,50 +477,31 @@ impl ArmAcc {
         self.batches += 1;
         let yielded = BatchYield::of(batch);
         let phase = ReviewYieldPhase::for_batch(batch.phase, batch.round);
-        let phase_index = ReviewYieldPhase::ALL
-            .iter()
-            .position(|candidate| *candidate == phase)
-            .unwrap_or(0);
+        let phase_index = phase_index(phase);
         let acc = &mut self.phases[phase_index];
         acc.batches += 1;
         match &batch.verdict {
             Some(verdict) => add_decision(&mut acc.decisions, &mut acc.gate_outcomes, verdict, &yielded),
             None => acc.batches_without_verdict += 1,
         }
-        for member in batch
-            .members
-            .iter()
-            .filter(|member| member.status == ReviewBatchMemberStatus::Reported)
-        {
-            let role = &mut acc.roles[role_index(member.role)];
-            role.row.reviews += 1;
-            let Some(findings) = &member.findings else {
-                role.row.unreadable_reports += 1;
-                self.unreadable_payloads += 1;
-                continue;
-            };
-            let basis = gate_basis(findings.iter().map(|f| (&f.severity, &f.category)));
-            role.row.passing_gate += u64::from(basis != GateBasis::NotPassed);
-            role.row.passing_on_always_on_category_only += u64::from(basis == GateBasis::AlwaysOnCategoryOnly);
-            for finding in findings {
-                role.row.findings += 1;
-                match finding.severity {
-                    ReviewFindingSeverity::Critical => role.row.by_severity.critical += 1,
-                    ReviewFindingSeverity::High => role.row.by_severity.high += 1,
-                    ReviewFindingSeverity::Medium => role.row.by_severity.medium += 1,
-                    ReviewFindingSeverity::Low => role.row.by_severity.low += 1,
-                }
-                *role.categories.entry(category_label(&finding.category)).or_default() += 1;
-            }
-        }
         // A verdict with no reported deciding member has no payload to read at
-        // all; one whose member reported unreadably was counted just above.
+        // all; one whose member reported unreadably is counted in add_member.
+        if yielded.remediation.is_some()
+            && deciding_member(batch)
+                .and_then(|m| m.findings.as_deref())
+                .is_none_or(|findings| findings.iter().any(|f| f.sources.is_empty()))
+        {
+            acc.decisions.remediations_without_source_attribution += 1;
+        }
         if yielded.has_verdict && deciding_member(batch).is_none() {
             self.unreadable_payloads += 1;
         }
 
         let Some(classification) = &batch.classification else {
             self.deep.unreadable_classifications += 1;
+            if batch.phase == ReviewBatchPhase::PostMerge {
+                add_post_merge(&mut self.eligibility.unknown_size, &yielded);
+            }
             return;
         };
         if classification.profile == ReviewProfile::Deep {
@@ -522,12 +523,65 @@ impl ArmAcc {
         }
         if batch.phase == ReviewBatchPhase::PostMerge {
             let eligible = post_merge_size_eligible(&DeepInputs::from_classification(classification));
-            let side = if eligible {
+            let side = if !classification.metadata_missing.is_empty() {
+                &mut self.eligibility.unknown_size
+            } else if eligible {
                 &mut self.eligibility.stays_eligible
             } else {
                 &mut self.eligibility.would_be_excluded
             };
             add_post_merge(side, &yielded);
+        }
+    }
+
+    fn add_member(&mut self, batch: &YieldBatch, member: &YieldMember) {
+        let acc = &mut self.phases[phase_index(ReviewYieldPhase::for_batch(batch.phase, batch.round))];
+        let role = &mut acc.roles[role_index(member.role)];
+        role.row.reviews += 1;
+        if let Some(remediation) = batch.verdict.as_ref().and_then(|v| v.remediation) {
+            let deciding = deciding_member(batch);
+            let accepted = deciding.and_then(|m| m.findings.as_deref());
+            let attributed = accepted.is_some_and(|findings| {
+                findings.iter().any(|finding| {
+                    finding.sources.iter().any(|source| {
+                        crate::types::leaf_finding_role(source)
+                            .or_else(|| SupervisorSourceRole::parse(source))
+                            .is_some_and(|source_role| source_role.member_role() == member.role)
+                    })
+                })
+            });
+            // The deciding role owns the verdict; leaf roles receive yield only
+            // when an accepted finding names them, once per role and batch.
+            let latest_for_role = batch
+                .members
+                .iter()
+                .rfind(|m| m.role == member.role && m.status == ReviewBatchMemberStatus::Reported)
+                .is_some_and(|m| std::ptr::eq(m, member));
+            if latest_for_role && (deciding.is_some_and(|m| std::ptr::eq(m, member)) || attributed) {
+                let total = match remediation.kind {
+                    RemediationKind::Revision => &mut role.row.revisions,
+                    RemediationKind::FollowUp => &mut role.row.followups,
+                };
+                add_remediation(total, &remediation);
+            }
+        }
+        let Some(findings) = &member.findings else {
+            role.row.unreadable_reports += 1;
+            self.unreadable_payloads += 1;
+            return;
+        };
+        let basis = gate_basis(findings.iter().map(|f| (&f.severity, &f.category)));
+        role.row.passing_gate += u64::from(basis != GateBasis::NotPassed);
+        role.row.passing_on_always_on_category_only += u64::from(basis == GateBasis::AlwaysOnCategoryOnly);
+        for finding in findings {
+            role.row.findings += 1;
+            match finding.severity {
+                ReviewFindingSeverity::Critical => role.row.by_severity.critical += 1,
+                ReviewFindingSeverity::High => role.row.by_severity.high += 1,
+                ReviewFindingSeverity::Medium => role.row.by_severity.medium += 1,
+                ReviewFindingSeverity::Low => role.row.by_severity.low += 1,
+            }
+            *role.categories.entry(category_label(&finding.category)).or_default() += 1;
         }
     }
 
@@ -595,6 +649,7 @@ impl ArmAcc {
             .rule(post_merge_size_eligibility_rule())
             .stays_eligible(self.eligibility.stays_eligible)
             .would_be_excluded(self.eligibility.would_be_excluded)
+            .unknown_size(self.eligibility.unknown_size)
             .build();
 
         ReviewYieldArmReport::builder()
@@ -608,10 +663,22 @@ impl ArmAcc {
 }
 
 fn criterion_index(criterion: DeepCriterion) -> usize {
-    DeepCriterion::ALL
-        .iter()
-        .position(|candidate| *candidate == criterion)
-        .unwrap_or(0)
+    match criterion {
+        DeepCriterion::ChangedLines => 0,
+        DeepCriterion::ChangedFiles => 1,
+        DeepCriterion::Subsystems => 2,
+        DeepCriterion::ProductionLanguages => 3,
+        DeepCriterion::ComplexityFlags => 4,
+    }
+}
+
+fn phase_index(phase: ReviewYieldPhase) -> usize {
+    match phase {
+        ReviewYieldPhase::PreMergeRound1 => 0,
+        ReviewYieldPhase::PreMergeRound2 => 1,
+        ReviewYieldPhase::PreMergeRound3Plus => 2,
+        ReviewYieldPhase::PostMerge => 3,
+    }
 }
 
 #[cfg(test)]
@@ -625,7 +692,11 @@ mod tests {
     const POST: ReviewBatchPhase = ReviewBatchPhase::PostMerge;
 
     fn finding(severity: ReviewFindingSeverity, category: ReviewFindingCategory) -> YieldFinding {
-        YieldFinding { severity, category }
+        YieldFinding {
+            severity,
+            category,
+            sources: vec![],
+        }
     }
 
     fn reported(role: ReviewBatchMemberRole, findings: Vec<YieldFinding>) -> YieldMember {
@@ -710,6 +781,148 @@ mod tests {
 
     use ReviewFindingCategory::{Architecture, Correctness, Readability, Regression};
     use ReviewFindingSeverity::{Critical, High, Low, Medium};
+
+    #[test]
+    fn member_rows_follow_their_own_arms_while_batch_outcomes_use_consensus() {
+        for leaf_arm in [None, Some(r#"{"k":"control"}"#)] {
+            let mut leaf = reported(ReviewBatchMemberRole::ClaudeReviewer, vec![finding(High, Correctness)]);
+            leaf.experiment_arms = leaf_arm.map(str::to_owned);
+            let supervisor = with_arms(
+                reported(ReviewBatchMemberRole::Supervisor, vec![]),
+                r#"{"k":"treatment"}"#,
+            );
+            let batch = YieldBatch::builder()
+                .phase(PRE)
+                .round(1)
+                .members(vec![leaf, supervisor])
+                .build();
+            let report = build(Some("k"), &[batch]);
+            let row_arm = leaf_arm.map_or(ReviewYieldArm::NotRecorded, |_| ReviewYieldArm::Control);
+            let leaf_report = report.arms.iter().find(|a| a.arm == Some(row_arm)).unwrap();
+            assert_eq!(leaf_report.phases[0].roles[0].findings, 1);
+            let supervisor_report = report
+                .arms
+                .iter()
+                .find(|a| a.arm == Some(ReviewYieldArm::Treatment))
+                .unwrap();
+            assert_eq!(supervisor_report.phases[0].roles.len(), 1);
+            assert_eq!(
+                supervisor_report.phases[0].roles[0].role,
+                ReviewBatchMemberRole::Supervisor
+            );
+            let batch_arm = if leaf_arm.is_some() {
+                ReviewYieldArm::Mixed
+            } else {
+                ReviewYieldArm::Treatment
+            };
+            assert_eq!(
+                report.arms.iter().find(|a| a.arm == Some(batch_arm)).unwrap().batches,
+                1
+            );
+            assert_eq!(report.arms.iter().map(|a| a.batches).sum::<u64>(), 1);
+        }
+    }
+
+    #[test]
+    fn accepted_sources_credit_remediation_once_per_role_and_rejected_findings_do_not() {
+        let mut accepted = finding(High, Correctness);
+        accepted.sources = vec!["codex-1".into(), "codex-2".into()];
+        let mut batch = pre_batch(
+            1,
+            vec![accepted],
+            Some(verdict(
+                "completed_with_findings",
+                true,
+                Some(remediation(RemediationKind::Revision, false, true, true)),
+            )),
+        );
+        batch.members.insert(
+            0,
+            reported(ReviewBatchMemberRole::ClaudeReviewer, vec![finding(Low, Readability)]),
+        );
+        batch.members.insert(
+            0,
+            reported(ReviewBatchMemberRole::CodexReviewer, vec![finding(High, Correctness)]),
+        );
+        batch.members.insert(
+            0,
+            reported(ReviewBatchMemberRole::CodexReviewer, vec![finding(High, Correctness)]),
+        );
+        let report = build(None, &[batch.clone()]);
+        let rows = &report.arms[0].phases[0].roles;
+        let claude = rows
+            .iter()
+            .find(|r| r.role == ReviewBatchMemberRole::ClaudeReviewer)
+            .unwrap();
+        let codex = rows
+            .iter()
+            .find(|r| r.role == ReviewBatchMemberRole::CodexReviewer)
+            .unwrap();
+        assert_eq!(claude.revisions.minted, 0);
+        assert_eq!(codex.revisions.minted, 1);
+        assert_eq!(codex.revisions.changed_code_and_merged, 1);
+        assert_eq!(report.arms[0].phases[0].decisions.revisions.minted, 1);
+        assert_eq!(
+            report.arms[0].phases[0]
+                .decisions
+                .remediations_without_source_attribution,
+            0
+        );
+        batch.members.last_mut().unwrap().findings.as_mut().unwrap()[0]
+            .sources
+            .clear();
+        let legacy = build(None, &[batch]);
+        assert_eq!(
+            legacy.arms[0].phases[0]
+                .decisions
+                .remediations_without_source_attribution,
+            1
+        );
+        assert_eq!(legacy.arms[0].phases[0].roles[1].revisions.minted, 0);
+        let mut followup_batch = pre_batch(
+            1,
+            vec![finding(High, Correctness)],
+            Some(verdict(
+                "completed_with_findings",
+                true,
+                Some(remediation(RemediationKind::FollowUp, true, false, false)),
+            )),
+        );
+        followup_batch.members[0].findings.as_mut().unwrap()[0].sources = vec!["codex-1".into()];
+        let mut leaf = reported(ReviewBatchMemberRole::CodexReviewer, vec![]);
+        leaf.findings = None;
+        followup_batch.members.insert(0, leaf);
+        let open = build(None, &[followup_batch]);
+        assert_eq!(open.arms[0].phases[0].roles[0].followups.minted, 1);
+        assert_eq!(open.arms[0].phases[0].roles[0].followups.still_open, 1);
+        let encoded = serde_json::to_value(report).unwrap();
+        assert_eq!(encoded["arms"][0]["phases"][0]["roles"][1]["revisions"]["merged"], 1);
+    }
+
+    #[test]
+    fn missing_size_metadata_is_unknown_instead_of_excluded() {
+        let classification = classify_pr_review_metadata(&PrReviewMetadata {
+            additions: None,
+            deletions: None,
+            changed_files: None,
+        });
+        let report = build(None, &[post_batch(classification, vec![], None)]);
+        let eligibility = &report.arms[0].post_merge_eligibility;
+        assert_eq!(eligibility.unknown_size.batches, 1);
+        assert_eq!(eligibility.would_be_excluded.batches, 0);
+        assert_eq!(eligibility.stays_eligible.batches, 0);
+    }
+
+    #[test]
+    fn malformed_arm_sets_are_unreadable_instead_of_missing() {
+        for arms in [r#"{"k":"surprise"}"#, r#"{"k":"control","k":"treatment"}"#, "broken"] {
+            let member = with_arms(reported(ReviewBatchMemberRole::Supervisor, vec![]), arms);
+            assert_eq!(member_arm("k", &member), Some(ReviewYieldArm::Unreadable));
+            let batch = YieldBatch::builder().phase(PRE).round(1).members(vec![member]).build();
+            let report = build(Some("k"), &[batch]);
+            assert_eq!(report.arms[0].arm, Some(ReviewYieldArm::Unreadable));
+        }
+    }
 
     #[test]
     fn an_empty_window_still_reports_every_phase_in_order() {
@@ -1174,7 +1387,8 @@ mod tests {
                 (ReviewYieldArm::Control, 1),
                 (ReviewYieldArm::Stopped, 1),
                 (ReviewYieldArm::NotEnrolled, 2),
-                (ReviewYieldArm::NotRecorded, 2),
+                (ReviewYieldArm::NotRecorded, 1),
+                (ReviewYieldArm::Unreadable, 1),
             ]
         );
         for arm in &report.arms {
@@ -1222,7 +1436,7 @@ mod tests {
         );
         assert_eq!(
             batch_arm("k", &[member(Some(r#"{"k":"surprise"}"#))]),
-            ReviewYieldArm::NotRecorded,
+            ReviewYieldArm::Unreadable,
             "an arm this build does not know is not read as any arm"
         );
     }

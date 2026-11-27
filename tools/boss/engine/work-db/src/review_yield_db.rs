@@ -64,12 +64,12 @@ fn batches_sql() -> String {
                              AND earlier.id < b.id))),
                 v.gate_outcome, v.revision_warranted, v.revision_task_id,
                 t.kind, t.status, t.pr_url,
-                EXISTS (SELECT 1 FROM pr_merge_evidence e
+                (SELECT json_group_array(e.canonical_pr_url) FROM pr_merge_evidence e
                          WHERE e.root_task_id = CASE WHEN t.kind = '{revision}' THEN b.cycle_root_id ELSE t.id END),
                 EXISTS (SELECT 1 FROM work_executions x
                          WHERE x.work_item_id = t.id
                            AND x.pr_head_before IS NOT NULL AND x.pr_head_after IS NOT NULL
-                           AND x.pr_head_before <> x.pr_head_after)
+                           AND x.pr_head_before <> x.pr_head_after), b.pr_url
            FROM pr_review_batches b
            LEFT JOIN pr_review_verdicts v ON v.batch_id = b.id
            LEFT JOIN tasks t ON t.id = v.revision_task_id
@@ -114,7 +114,17 @@ pub(crate) fn review_yield_batches_in(
         let task_kind: Option<String> = row.get(7)?;
         let task_status: Option<String> = row.get(8)?;
         let task_pr_url: Option<String> = row.get(9)?;
-        let merged: bool = row.get(10)?;
+        let evidence_urls: String = row.get(10)?;
+        let evidence_urls: Vec<String> = serde_json::from_str(&evidence_urls)?;
+        let reviewed_pr_url: String = row.get(12)?;
+        let remediation_pr = if task_kind.as_deref() == Some(TaskKind::Revision.as_str()) {
+            Some(reviewed_pr_url.as_str())
+        } else {
+            task_pr_url.as_deref()
+        };
+        let merged = remediation_pr
+            .and_then(boss_github::pr_url::canonical_pr_url)
+            .is_some_and(|url| evidence_urls.contains(&url));
         let heads_changed: bool = row.get(11)?;
 
         let remediation = remediation_task.as_ref().and(task_kind.as_deref()).map(|kind| {
@@ -224,7 +234,7 @@ mod tests {
     const REPORT: &str = r#"{"batch_id":"b","target_sha":"s","report":{"findings":[
         {"severity":"high","category":"correctness"},{"severity":"low","category":"readability"}]}}"#;
     const VERDICT: &str = r#"{"batch_id":"b","verdict":{"findings":[
-        {"severity":"low","category":"regression"}]}}"#;
+        {"severity":"low","category":"regression","sources":["claude-2"]}]}}"#;
 
     fn classification(additions: i64) -> String {
         serde_json::to_string(&classify_pr_review_metadata(&PrReviewMetadata {
@@ -440,7 +450,11 @@ mod tests {
             );
         }
         f.sql(
-            "INSERT INTO pr_merge_evidence (root_task_id, canonical_pr_url, observed_at) VALUES (?1, 'pr', '1')",
+            "INSERT INTO pr_merge_evidence (root_task_id, canonical_pr_url, observed_at) VALUES (?1, 'https://github.com/o/r/pull/7', '1')",
+            [&f.root],
+        );
+        f.sql(
+            "INSERT INTO pr_merge_evidence (root_task_id, canonical_pr_url, observed_at) VALUES (?1, 'https://github.com/o/r/pull/99', '1')",
             [&f.root],
         );
         for (batch, at, revision) in [
@@ -491,7 +505,7 @@ mod tests {
         );
         f.task("fu_nothing", "chore", "done", None);
         f.sql(
-            "INSERT INTO pr_merge_evidence (root_task_id, canonical_pr_url, observed_at) VALUES ('fu_merged', 'pr', '1')",
+            "INSERT INTO pr_merge_evidence (root_task_id, canonical_pr_url, observed_at) VALUES ('fu_merged', 'https://github.com/o/r/pull/20', '1')",
             [],
         );
         for (batch, at, followup) in [
@@ -525,6 +539,50 @@ mod tests {
     }
 
     #[test]
+    fn merge_evidence_must_match_the_remediations_canonical_pr() {
+        let f = Fixture::new();
+        f.execution("exec_sup", &f.root, None);
+        f.task("rev", "revision", "done", None);
+        f.task("followup", "followup", "done", Some("https://github.com/O/R/pull/21/"));
+        f.sql(
+            "INSERT INTO pr_merge_evidence (root_task_id, canonical_pr_url, observed_at)
+             VALUES (?1, 'https://github.com/o/r/pull/99', '1'),
+                    ('followup', 'https://github.com/o/r/pull/20', '1')",
+            [&f.root],
+        );
+        for (id, kind, task) in [
+            ("revision_batch", "pre_merge", "rev"),
+            ("followup_batch", "post_merge", "followup"),
+        ] {
+            f.batch(id, kind, 1000, &classification(10));
+            f.verdict(id, "exec_sup", id, "completed_with_findings", true, Some(task));
+        }
+        assert!(
+            f.batches(0, 2000)
+                .iter()
+                .all(|b| !b.verdict.as_ref().unwrap().remediation.unwrap().merged)
+        );
+        f.sql(
+            "INSERT INTO pr_merge_evidence (root_task_id, canonical_pr_url, observed_at)
+             VALUES ('followup', 'https://github.com/o/r/pull/21', '1')",
+            [],
+        );
+        let batches = f.batches(0, 2000);
+        assert!(
+            batches
+                .iter()
+                .find(|b| b.phase == ReviewBatchPhase::PostMerge)
+                .unwrap()
+                .verdict
+                .as_ref()
+                .unwrap()
+                .remediation
+                .unwrap()
+                .merged
+        );
+    }
+
+    #[test]
     fn an_unreadable_classification_is_kept_as_none_and_a_batch_with_no_verdict_has_none() {
         let f = Fixture::new();
         f.batch("b1", "pre_merge", 1_000, "{ not a classification");
@@ -549,7 +607,7 @@ mod tests {
             [],
         );
         f.sql(
-            "INSERT INTO pr_merge_evidence (root_task_id, canonical_pr_url, observed_at) VALUES (?1, 'pr', '1')",
+            "INSERT INTO pr_merge_evidence (root_task_id, canonical_pr_url, observed_at) VALUES (?1, 'https://github.com/o/r/pull/7', '1')",
             [&f.root],
         );
         f.batch("b1", "pre_merge", 1_000, &classification(10));
@@ -586,6 +644,8 @@ mod tests {
         assert_eq!(round1.decisions.passed_on_always_on_category_only, 1);
         assert_eq!(round1.decisions.revisions.changed_code_and_merged, 1);
         assert_eq!(round1.decisions.from_always_on_category_only.merged, 1);
+        assert_eq!(claude.revisions.changed_code_and_merged, 1);
+        assert_eq!(round1.decisions.remediations_without_source_attribution, 0);
         assert!(report.notes.is_empty(), "{:?}", report.notes);
     }
 
