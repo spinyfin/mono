@@ -74,6 +74,15 @@ impl OrderedCalls {
             }
         }
     }
+
+    /// Record that a call with `key` happened without erasing a known
+    /// observation already stored under the same key.
+    fn reserve(&mut self, key: &str) {
+        if !self.position.contains_key(key) {
+            self.position.insert(key.to_owned(), self.calls.len());
+            self.calls.push(CallContext::UNKNOWN);
+        }
+    }
 }
 
 /// A count of events that is unchanged when the same record is read again:
@@ -110,7 +119,13 @@ pub(super) struct ContextShape {
     claude_calls: OrderedCalls,
     /// `compact_boundary` records, by `uuid`.
     claude_compactions: DistinctEvents,
-    codex_calls: Vec<CallContext>,
+    /// Per-call `token_usage_record` entries from current Codex rollouts,
+    /// deduplicated and ordered by `response_id`.
+    codex_usage_records: OrderedCalls,
+    /// Per-call `event_msg/token_count` `last_token_usage` entries from older
+    /// Codex rollouts, deduplicated on replay. Used only when no
+    /// `token_usage_record` was observed so hybrid rollouts never double-count.
+    codex_legacy_calls: OrderedCalls,
     /// Codex records a compaction both as a rollout item and as an event. The
     /// two counts are alternative views of the same compactions, so the larger
     /// one is the count; summing them would double it. Both are keyed by the
@@ -127,12 +142,24 @@ impl ContextShape {
         self.claude_calls.observe(message_id, call);
     }
 
+    pub(super) fn reserve_claude_call(&mut self, message_id: &str) {
+        self.claude_calls.reserve(message_id);
+    }
+
     pub(super) fn observe_claude_compaction(&mut self, uuid: Option<&str>) {
         self.claude_compactions.observe(uuid);
     }
 
-    pub(super) fn observe_codex_call(&mut self, call: CallContext) {
-        self.codex_calls.push(call);
+    pub(super) fn observe_codex_usage_record(&mut self, key: &str, call: CallContext) {
+        self.codex_usage_records.observe(key, call);
+    }
+
+    pub(super) fn reserve_codex_usage_record(&mut self, key: &str) {
+        self.codex_usage_records.reserve(key);
+    }
+
+    pub(super) fn observe_codex_legacy_call(&mut self, key: &str, call: CallContext) {
+        self.codex_legacy_calls.observe(key, call);
     }
 
     pub(super) fn observe_codex_compacted_item(&mut self, timestamp: Option<&str>) {
@@ -165,12 +192,17 @@ impl ContextShape {
         if !self.claude_calls.calls.is_empty() || claude_compactions > 0 {
             return reduce(&self.claude_calls.calls, Some(claude_compactions));
         }
+        let codex_calls = if !self.codex_usage_records.calls.is_empty() {
+            &self.codex_usage_records.calls
+        } else {
+            &self.codex_legacy_calls.calls
+        };
         let codex_compactions = self
             .codex_compacted_items
             .count()
             .max(self.codex_compaction_events.count());
-        if !self.codex_calls.is_empty() || codex_compactions > 0 {
-            return reduce(&self.codex_calls, Some(codex_compactions));
+        if !codex_calls.is_empty() || codex_compactions > 0 {
+            return reduce(codex_calls, Some(codex_compactions));
         }
         ContextFigures::default()
     }

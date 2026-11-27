@@ -147,9 +147,14 @@ impl RunFacts<'_> {
     /// This run as the call-statistics accumulator sees it.
     pub(crate) fn calls(&self) -> RunCalls {
         let tokens = run_tokens(self.rec);
+        let known_tokens = match self.convention {
+            InputConvention::Net => tokens.is_measured().then(|| tokens.known_total()),
+            InputConvention::Gross => normalized_gross_tokens(&tokens),
+            InputConvention::Unknown => None,
+        };
         RunCalls {
             rounds: self.rec.rounds,
-            known_tokens: tokens.is_measured().then(|| tokens.known_total()),
+            known_tokens,
             first_call_context: self.rec.first_call_context_tokens,
             peak_context: self.rec.peak_context_tokens,
             compactions: self.rec.compactions,
@@ -235,6 +240,26 @@ fn run_tokens(rec: &UsageRunRecord) -> RunTokens {
         cache_creation: rec.cache_creation_tokens,
         cache_read: rec.cache_read_tokens,
     }
+}
+
+/// Normalise a `Gross`-input run (such as Codex) before summing for
+/// `tokens_per_round`: `input` already includes `cache_read`, so subtract
+/// `cache_read` from `input` when both are present to count cached reads once.
+fn normalized_gross_tokens(tokens: &RunTokens) -> Option<i64> {
+    if !tokens.is_measured() {
+        return None;
+    }
+    let fresh_input = match (tokens.input, tokens.cache_read) {
+        (Some(input), Some(cached)) => Some(input.saturating_sub(cached)),
+        (input, _) => input,
+    };
+    Some(
+        RunTokens {
+            input: fresh_input,
+            ..*tokens
+        }
+        .known_total(),
+    )
 }
 
 /// Measurement state, matching `CostMeasurement`'s own counting: a run is

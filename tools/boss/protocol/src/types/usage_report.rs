@@ -272,9 +272,13 @@ pub struct CallStats {
     pub rounds: i64,
     /// `rounds / runs_with_rounds`; `None` when no run recorded rounds.
     pub rounds_per_run: Option<f64>,
-    /// The token classes each run reported, summed, over those rounds, taken
-    /// over the runs that have both tokens and rounds. A floor when any of those
-    /// runs is `partial`. `None` when no such run exists or they made no rounds.
+    /// The normalised token classes each run reported, summed, over those
+    /// rounds, taken over the runs that have both tokens and rounds. For
+    /// `InputConvention::Gross` runs (such as Codex), `cache_read` is
+    /// subtracted from `input` before summing so cached reads are counted once;
+    /// runs with `InputConvention::Unknown` are excluded from both numerator
+    /// and denominator. A floor when any contributing run is `partial`. `None`
+    /// when no such run exists or they made no rounds.
     pub tokens_per_round: Option<f64>,
     /// Runs whose first call's prompt size is recorded.
     #[serde(default)]

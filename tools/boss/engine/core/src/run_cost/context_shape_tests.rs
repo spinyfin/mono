@@ -131,6 +131,46 @@ fn an_unreadable_first_call_is_unknown_and_never_replaced_by_the_second() {
 }
 
 #[test]
+fn a_claude_call_with_no_usage_object_makes_first_call_or_peak_unknown() {
+    let without_usage = |id: &str| {
+        format!(
+            "{}\n",
+            json!({"type":"assistant","message":{"id":id,"model":"claude-opus-5-5"}})
+        )
+    };
+
+    // Absent-usage first call is reserved in order, so the second call cannot
+    // take its place as the first call and the peak is unknown.
+    let first_missing = format!("{}{}", without_usage("a"), claude_message("b", full_usage(1, 500, 0)));
+    assert_eq!(figures(&snapshot_of(&first_missing)), (None, None, None, Some(0)));
+
+    // Absent-usage later call keeps the first call but invalidates the peak.
+    let later_missing = format!(
+        "{}{}{}",
+        claude_message("a", full_usage(1, 500, 0)),
+        without_usage("b"),
+        claude_message("c", full_usage(1, 5, 900)),
+    );
+    assert_eq!(
+        figures(&snapshot_of(&later_missing)),
+        (Some(501), Some(500), None, Some(0))
+    );
+
+    // Split records for the same message id: a usage-bearing record fills a
+    // reserved entry, and a later usage-less record does not erase a known one.
+    let filled_then_empty = format!(
+        "{}{}{}",
+        without_usage("a"),
+        claude_message("a", full_usage(2, 300, 100)),
+        without_usage("a"),
+    );
+    assert_eq!(
+        figures(&snapshot_of(&filled_then_empty)),
+        (Some(402), Some(300), Some(402), Some(0))
+    );
+}
+
+#[test]
 fn only_a_synthesized_record_is_not_a_call() {
     let text = "{\"type\":\"assistant\",\"message\":{\"id\":\"s\",\"model\":\"<synthetic>\",\"usage\":{\"input_tokens\":0}}}\n";
     assert_eq!(figures(&snapshot_of(text)), (None, None, None, None));
@@ -201,6 +241,9 @@ fn a_codex_rollout_reports_the_last_call_prompt_and_counts_each_compaction_once(
     // included: 13,999 on the first call, 14,656 on the last. Each compaction
     // is recorded as a rollout item and as an event, and counts once.
     assert_eq!(figures(&snapshot), (Some(13_999), Some(0), Some(14_656), Some(2)));
+    // Five model-call `token_count` events with `info`, even with no
+    // `task_complete` turn boundary, and deduplicated across replay.
+    assert_eq!(snapshot.rounds, Some(5));
     // The cumulative totals the run already reported are unchanged.
     assert_eq!(snapshot.input_tokens, Some(71_908));
 }
@@ -212,7 +255,52 @@ fn a_codex_event_with_no_info_is_not_a_call() {
         json!({"type":"event_msg","payload":{"type":"token_count","info":null}}),
         json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","duration_ms":5}}),
     );
-    assert_eq!(figures(&snapshot_of(&text)), (None, None, None, None));
+    let snapshot = snapshot_of(&text);
+    assert_eq!(figures(&snapshot), (None, None, None, None));
+    assert_eq!(snapshot.rounds, Some(0));
+}
+
+#[test]
+fn codex_0_160_1_token_usage_records_capture_context_shape_rounds_and_replay() {
+    // Shape from recorded codex-cli 0.160.1 rollouts: per-call usage lives in
+    // top-level `token_usage_record` keyed by `response_id`, while
+    // `event_msg/token_count` carries only cumulative `total_token_usage`.
+    let before_task_complete = concat!(
+        r#"{"timestamp":"2026-10-07T01:59:09.318Z","ordinal":13,"type":"token_usage_record","payload":{"thread_id":"thread-0160","turn_id":"turn-1","response_id":"resp-1","usage":{"input_tokens":13794,"cached_input_tokens":0,"cache_write_input_tokens":200,"output_tokens":40,"total_tokens":13834}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-07T01:59:09.659Z","ordinal":16,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":13794,"cached_input_tokens":0,"cache_write_input_tokens":200,"output_tokens":40,"total_tokens":13834}}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-07T01:59:11.000Z","ordinal":18,"type":"token_usage_record","payload":{"thread_id":"thread-0160","turn_id":"turn-1","response_id":"resp-2","usage":{"input_tokens":18420,"cached_input_tokens":12000,"cache_write_input_tokens":0,"output_tokens":55,"total_tokens":18475}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-07T01:59:11.200Z","ordinal":19,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":32214,"cached_input_tokens":12000,"cache_write_input_tokens":200,"output_tokens":95,"total_tokens":32309}}}}"#,
+        "\n",
+    );
+    let before = snapshot_of(before_task_complete);
+    assert_eq!(figures(&before), (Some(13_794), Some(200), Some(18_420), Some(0)));
+    assert_eq!(before.rounds, Some(2));
+    assert_eq!(before.input_tokens, Some(32_214));
+
+    let with_task_complete = format!(
+        "{before_task_complete}{}\n",
+        json!({"timestamp":"2026-10-07T01:59:13.087Z","ordinal":21,"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","duration_ms":8129}})
+    );
+    let after = snapshot_of(&with_task_complete);
+    assert_eq!(figures(&after), (Some(13_794), Some(200), Some(18_420), Some(0)));
+    // `task_complete` is a user turn boundary, not an extra model call.
+    assert_eq!(after.rounds, Some(2));
+    assert_eq!(after.agent_active_ms, Some(8_129));
+
+    // A hybrid rollout that carries both `token_usage_record` and legacy
+    // `last_token_usage` on `token_count` must not double-count calls.
+    let hybrid = concat!(
+        r#"{"timestamp":"2026-10-07T01:59:09.318Z","ordinal":13,"type":"token_usage_record","payload":{"response_id":"resp-1","usage":{"input_tokens":13794,"cached_input_tokens":0,"cache_write_input_tokens":200,"output_tokens":40}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-07T01:59:09.659Z","ordinal":16,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":13794,"cached_input_tokens":0,"cache_write_input_tokens":200,"output_tokens":40},"last_token_usage":{"input_tokens":13794,"cached_input_tokens":0,"cache_write_input_tokens":200,"output_tokens":40}}}}"#,
+        "\n",
+    );
+    let hybrid_snap = snapshot_of(hybrid);
+    assert_eq!(figures(&hybrid_snap), (Some(13_794), Some(200), Some(13_794), Some(0)));
+    assert_eq!(hybrid_snap.rounds, Some(1));
 }
 
 #[test]

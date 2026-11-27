@@ -1455,6 +1455,56 @@ fn every_node_and_group_carries_call_stats_over_its_own_runs() {
 }
 
 #[test]
+fn tokens_per_round_normalises_gross_input_and_excludes_unknown_convention() {
+    // Codex reports gross input (100,000 already includes 80,000 cache reads).
+    // Normalised total is (100,000 - 80,000) + 5,000 + 0 + 80,000 = 105,000,
+    // not 185,000.
+    let codex = with_calls(
+        with_driver(
+            tokens(run("r_codex", "e1", "t1", BASE_EPOCH_S), 100_000, 5_000, 0, 80_000),
+            Some("codex"),
+        ),
+        Some(10),
+        Some(14_000),
+        Some(15_000),
+        Some(0),
+    );
+    // Claude reports net input: 20,000 + 5,000 + 0 + 80,000 = 105,000.
+    let claude = with_calls(
+        tokens(run("r_claude", "e2", "t1", BASE_EPOCH_S + 1), 20_000, 5_000, 0, 80_000),
+        Some(10),
+        Some(20_000),
+        Some(30_000),
+        Some(0),
+    );
+    // Unknown driver has an unknown input convention, so it is excluded from
+    // `tokens_per_round` (both numerator and denominator) while still
+    // contributing to `rounds_per_run`.
+    let unknown = with_calls(
+        with_driver(
+            tokens(run("r_unknown", "e3", "t1", BASE_EPOCH_S + 2), 999_999, 1, 0, 500_000),
+            None,
+        ),
+        Some(5),
+        None,
+        None,
+        None,
+    );
+
+    let codex_only = build(&window(), &records(vec![codex.clone()], vec![task("t1", "t1", 1)]));
+    assert_eq!(codex_only.overall_calls.tokens_per_round, Some(105_000.0 / 10.0));
+
+    let mixed = build(
+        &window(),
+        &records(vec![codex, claude, unknown], vec![task("t1", "t1", 3)]),
+    );
+    assert_eq!(mixed.overall_calls.runs_with_rounds, 3);
+    assert_eq!(mixed.overall_calls.rounds, 25);
+    assert_eq!(mixed.overall_calls.rounds_per_run, Some(25.0 / 3.0));
+    assert_eq!(mixed.overall_calls.tokens_per_round, Some(210_000.0 / 20.0));
+}
+
+#[test]
 fn a_reply_from_an_engine_without_call_stats_still_decodes_with_empty_ones() {
     let report = build(&window(), &mixed_records());
     let mut json = serde_json::to_value(&report).unwrap();
