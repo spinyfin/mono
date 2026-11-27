@@ -15,6 +15,7 @@ use boss_protocol::{
     CoordinatorChatConnectionPhase, CoordinatorChatConnectionState, CoordinatorChatInProgressMessage,
     CoordinatorChatItem, CoordinatorChatItemKind, CoordinatorChatPermissionResolution,
 };
+use serde::{Deserialize, Serialize};
 
 /// Placeholder substituted wherever a configured credential appears.
 ///
@@ -310,4 +311,29 @@ impl StreamingRedactor {
         let flushed = self.emitted[flush_offset..].to_owned();
         (flush_offset, flushed, self.emitted)
     }
+
+    pub(crate) fn snapshot(&self) -> StreamingRedactorSnapshot {
+        StreamingRedactorSnapshot {
+            emitted: self.emitted.clone(),
+            pending: self.pending.clone(),
+        }
+    }
+
+    pub(crate) fn from_snapshot(redactor: CredentialRedactor, snapshot: StreamingRedactorSnapshot) -> Self {
+        Self {
+            redactor,
+            emitted: snapshot.emitted,
+            pending: snapshot.pending,
+        }
+    }
+}
+
+/// Serializable state of an in-progress [`StreamingRedactor`].
+///
+/// Secrets are never stored here; the caller re-attaches the generation's
+/// [`CredentialRedactor`] when restoring from a snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct StreamingRedactorSnapshot {
+    pub(crate) emitted: String,
+    pub(crate) pending: String,
 }

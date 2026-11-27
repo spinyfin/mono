@@ -2,10 +2,11 @@
 //! coordinator chat vocabulary.
 //!
 //! The reducer is a pure state machine: feeding the same sequence of
-//! [`WireRecord`]s (and optional intent-log [`PromptIntent`] entries) always
-//! yields the exact same [`CoordinatorChatConnectionState`], ordered
-//! [`CoordinatorChatItem`] list, and [`CoordinatorChatInProgressMessage`]
-//! snapshot. It runs identically on live traffic and on journal replay.
+//! [`WireRecord`]s joined with the engine's append-only [`IntentRecord`] log
+//! always yields the exact same [`CoordinatorChatConnectionState`], ordered
+//! [`CoordinatorChatItem`] list, [`CoordinatorChatInProgressMessage`]
+//! snapshot, and [`TurnQueue`] state. It runs identically on live traffic and
+//! on journal replay.
 
 use std::collections::HashMap;
 use std::io::{self, BufRead};
@@ -26,9 +27,12 @@ use boss_protocol::{
     CoordinatorChatToolKind, CoordinatorChatToolStatus, CoordinatorChatTurnBoundaryItem, CoordinatorChatTurnOrigin,
     CoordinatorChatUsage,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::redact::{CredentialRedactor, StreamingRedactor};
+use crate::intent::{IntentRecord, IntentRecordKind};
+use crate::queue::{PromptContent, QueuedPrompt, TurnQueue};
+use crate::redact::{CredentialRedactor, StreamingRedactor, StreamingRedactorSnapshot};
 
 /// Default character ceiling for bounded tool inputs and outputs.
 ///
@@ -37,28 +41,8 @@ use crate::redact::{CredentialRedactor, StreamingRedactor};
 /// point cannot leak in part.
 pub const DEFAULT_TOOL_TEXT_LIMIT: usize = 4_000;
 
-/// An operator- or engine-authored prompt supplied from the engine's intent log.
-///
-/// The ACP adapter does not echo prompts back as `user_message_chunk` updates
-/// on live turns, so operator and engine message items come from the intent log
-/// rather than from the wire journal.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PromptIntent {
-    /// Journal sequence number associated with this prompt (used for stable id
-    /// derivation and ordering).
-    pub seq: u64,
-    /// Wall-clock milliseconds when the prompt was recorded.
-    pub ts_ms: u64,
-    /// Who authored the prompt (`Operator` or `Engine`).
-    pub role: CoordinatorChatMessageRole,
-    /// Raw prompt text; redacted before becoming a chat item.
-    pub text: String,
-    /// Optional client-assigned id for correlating pending composer messages.
-    pub client_message_id: Option<String>,
-}
-
 /// Summary of what a single [`ConversationReducer::apply_record`] or
-/// [`ConversationReducer::apply_intent_message`] call changed.
+/// [`ConversationReducer::apply_intent_record`] call changed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReduceDelta {
     /// Item ids created or mutated by this step, in order.
@@ -73,19 +57,42 @@ pub struct ReduceDelta {
 #[derive(Debug, Clone)]
 pub struct ConversationReducer {
     redactor: CredentialRedactor,
-    tool_text_limit: usize,
     state: CoordinatorChatConnectionState,
     items: ItemStore,
     wire: WireTracker,
+    queue_state: QueueTracker,
 }
 
 #[derive(Debug, Clone, Default)]
+struct QueueTracker {
+    queue: TurnQueue,
+    last_intent_seq: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ItemIndices {
+    tool: HashMap<String, usize>,
+    compaction: HashMap<String, usize>,
+    permission: HashMap<String, usize>,
+}
+
+#[derive(Debug, Clone)]
 struct ItemStore {
     items: Vec<CoordinatorChatItem>,
-    tool_indices: HashMap<String, usize>,
-    compaction_indices: HashMap<String, usize>,
-    permission_indices: HashMap<String, usize>,
+    indices: ItemIndices,
     streaming: StreamingBuffers,
+    tool_text_limit: usize,
+}
+
+impl ItemStore {
+    fn new(tool_text_limit: usize) -> Self {
+        Self {
+            items: Vec::new(),
+            indices: ItemIndices::default(),
+            streaming: StreamingBuffers::default(),
+            tool_text_limit,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -94,13 +101,14 @@ struct StreamingBuffers {
     thought: Option<ActiveStream>,
 }
 
-#[derive(Debug, Clone)]
-struct StreamMeta {
-    item_id: String,
-    started_seq: u64,
-    updated_seq: u64,
-    ts_ms: u64,
-    message_id: Option<String>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct StreamMeta {
+    pub(crate) item_id: String,
+    pub(crate) started_seq: u64,
+    pub(crate) updated_seq: u64,
+    pub(crate) ts_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) message_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,19 +117,42 @@ struct ActiveStream {
     buffer: StreamingRedactor,
 }
 
-#[derive(Debug, Clone)]
-struct PendingClientRequest {
-    method: String,
-    detail: Option<String>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ActiveStreamSnapshot {
+    pub(crate) meta: StreamMeta,
+    pub(crate) buffer: StreamingRedactorSnapshot,
 }
 
-#[derive(Debug, Clone, Default)]
-struct WireTracker {
-    pending_client_requests: HashMap<String, PendingClientRequest>,
-    pending_agent_permissions: HashMap<String, String>,
-    open_agent_turns: Vec<String>,
-    current_turn_origin: Option<CoordinatorChatTurnOrigin>,
-    last_turn_boundary_idx: Option<usize>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PendingClientRequest {
+    pub(crate) request_id: RequestId,
+    pub(crate) method: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TurnOriginTracker {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) current_turn_origin: Option<CoordinatorChatTurnOrigin>,
+    #[serde(default)]
+    pub(crate) current_turn_origin_from_intent: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_turn_boundary_idx: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WireTracker {
+    #[serde(default)]
+    pub(crate) pending_client_requests: HashMap<String, PendingClientRequest>,
+    #[serde(default)]
+    pub(crate) pending_agent_permissions: HashMap<String, String>,
+    #[serde(default)]
+    pub(crate) open_agent_turns: Vec<String>,
+    #[serde(flatten)]
+    pub(crate) turns: TurnOriginTracker,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) highest_numeric_client_request_id: Option<i64>,
 }
 
 impl ConversationReducer {
@@ -134,10 +165,10 @@ impl ConversationReducer {
     pub fn with_tool_text_limit(redactor: CredentialRedactor, tool_text_limit: usize) -> Self {
         Self {
             redactor,
-            tool_text_limit,
             state: CoordinatorChatConnectionState::default(),
-            items: ItemStore::default(),
+            items: ItemStore::new(tool_text_limit),
             wire: WireTracker::default(),
+            queue_state: QueueTracker::default(),
         }
     }
 
@@ -149,6 +180,120 @@ impl ConversationReducer {
     /// Ordered completed (and in-place-updated) chat items.
     pub fn items(&self) -> &[CoordinatorChatItem] {
         &self.items.items
+    }
+
+    /// Current turn queue state recovered from intent and wire records.
+    pub fn queue(&self) -> &TurnQueue {
+        &self.queue_state.queue
+    }
+
+    /// Highest wire-journal sequence number applied so far (`0` if none).
+    pub fn last_wire_seq(&self) -> u64 {
+        self.state.last_seq
+    }
+
+    /// Highest intent-log sequence number applied so far (`0` if none).
+    pub fn last_intent_seq(&self) -> u64 {
+        self.queue_state.last_intent_seq
+    }
+
+    /// Client JSON-RPC request ids still awaiting a response from the agent.
+    ///
+    /// On engine restart, register each of these with
+    /// `boss_acp_client::connection::PreparedConnection::expect_response`
+    /// before reading live traffic from the agent host.
+    pub fn pending_client_request_ids(&self) -> Vec<RequestId> {
+        let mut pairs: Vec<(&String, &RequestId)> = self
+            .wire
+            .pending_client_requests
+            .iter()
+            .map(|(key, req)| (key, &req.request_id))
+            .collect();
+        pairs.sort_by_key(|(key, _)| *key);
+        pairs.into_iter().map(|(_, id)| id.clone()).collect()
+    }
+
+    /// Agent JSON-RPC permission request ids still awaiting a client response.
+    ///
+    /// Per ACP, Stop answers each of these with `cancelled` before sending
+    /// `session/cancel`.
+    pub fn pending_permission_request_ids(&self) -> Vec<RequestId> {
+        let mut keys: Vec<&String> = self.wire.pending_agent_permissions.keys().collect();
+        keys.sort();
+        keys.into_iter()
+            .filter_map(|key| serde_json::from_str::<RequestId>(key).ok())
+            .collect()
+    }
+
+    /// Highest numeric client `RequestId` observed on the wire or in an
+    /// `IntentRecord::Sent` record so far, useful for seeding a fresh
+    /// connection's id counter after a restart so no previously logged request
+    /// id (including an abandoned unsent attempt) is ever reused.
+    pub fn highest_numeric_client_request_id(&self) -> Option<i64> {
+        self.wire.highest_numeric_client_request_id
+    }
+
+    fn observe_client_request_id(&mut self, id: &RequestId) {
+        if let RequestId::Number(num) = id {
+            self.wire.highest_numeric_client_request_id = Some(
+                self.wire
+                    .highest_numeric_client_request_id
+                    .map_or(*num, |prev| prev.max(*num)),
+            );
+        }
+    }
+
+    /// Applies one append-only record from the generation's intent log.
+    ///
+    /// Records whose `seq` is already covered (`seq > 0 && seq <= last_intent_seq`)
+    /// are ignored so replaying overlapping tails is idempotent.
+    pub fn apply_intent_record(&mut self, record: &IntentRecord) -> ReduceDelta {
+        if record.seq > 0 && record.seq <= self.queue_state.last_intent_seq {
+            return ReduceDelta::default();
+        }
+        if record.seq > self.queue_state.last_intent_seq {
+            self.queue_state.last_intent_seq = record.seq;
+        }
+        match &record.kind {
+            IntentRecordKind::Queued {
+                intent_id,
+                origin,
+                text,
+                client_message_id,
+                images,
+            } => {
+                self.queue_state.queue.enqueue(QueuedPrompt {
+                    intent_id: *intent_id,
+                    origin: *origin,
+                    content: PromptContent {
+                        text: text.clone(),
+                        images: images.clone(),
+                    },
+                    client_message_id: client_message_id.clone(),
+                    queued_ts_ms: record.ts_ms,
+                });
+            }
+            IntentRecordKind::Sent { intent_id, request_id } => {
+                self.observe_client_request_id(request_id);
+                self.queue_state
+                    .queue
+                    .mark_intent_sent(*intent_id, request_id.clone(), record.ts_ms);
+            }
+            IntentRecordKind::Requeued { intent_id } => {
+                self.queue_state.queue.apply_requeued_intent(*intent_id);
+            }
+            IntentRecordKind::Withdrawn { intent_id, .. } => {
+                self.queue_state.queue.apply_withdrawn_intent(*intent_id);
+            }
+        }
+        ReduceDelta::default()
+    }
+
+    /// Re-queues any prompts marked `Sent` in the intent log that never
+    /// appeared on the wire journal (for example when the previous engine died
+    /// between writing the intent record and the host journalling the line).
+    pub fn reconcile_unsent_dispatches(&mut self) -> Vec<QueuedPrompt> {
+        self.queue_state.queue.recover_unsent_dispatches()
     }
 
     /// Snapshot of the currently streaming coordinator message, if any.
@@ -171,40 +316,6 @@ impl ConversationReducer {
         self.items.items.iter().find(|item| item.id == id)
     }
 
-    /// Records a prompt message from the engine's intent log as a chat item.
-    ///
-    /// The text is redacted before being stored. An intent never finalizes an
-    /// open streaming message or thought: stream boundaries come only from wire
-    /// records, so live application and [`replay_with_intents`] (which applies a
-    /// tied intent before its record) agree on message boundaries, ids and
-    /// redaction. Finalized streams are inserted at their started `seq`, so the
-    /// intent lands at its `seq` position ahead of wire-record items with the
-    /// same `seq`.
-    pub fn apply_intent_message(&mut self, intent: PromptIntent) -> ReduceDelta {
-        let mut delta = ReduceDelta::default();
-        let item_id = format!("prompt-{}", intent.seq);
-        let mut item = CoordinatorChatItem {
-            id: item_id.clone(),
-            seq: intent.seq,
-            updated_seq: intent.seq,
-            ts_ms: intent.ts_ms,
-            kind: CoordinatorChatItemKind::Message(CoordinatorChatMessageItem {
-                role: intent.role,
-                text: self.redactor.redact_str(&intent.text),
-                client_message_id: intent.client_message_id,
-                message_id: None,
-                sender: None,
-            }),
-        };
-        self.redactor.redact_item(&mut item);
-        let idx = self.items.items.partition_point(|existing| {
-            existing.seq < intent.seq || (existing.seq == intent.seq && existing.id.starts_with("prompt-"))
-        });
-        self.insert_item_at(item, idx);
-        delta.upserted_item_ids.push(item_id);
-        delta
-    }
-
     /// Inserts `item` into `self.items.items` in non-decreasing `seq` order,
     /// shifting any stored item indices at or after the insertion point.
     fn insert_item(&mut self, item: CoordinatorChatItem) -> usize {
@@ -219,22 +330,22 @@ impl ConversationReducer {
 
     fn insert_item_at(&mut self, item: CoordinatorChatItem, idx: usize) -> usize {
         self.items.items.insert(idx, item);
-        for slot in self.items.tool_indices.values_mut() {
+        for slot in self.items.indices.tool.values_mut() {
             if *slot >= idx {
                 *slot += 1;
             }
         }
-        for slot in self.items.compaction_indices.values_mut() {
+        for slot in self.items.indices.compaction.values_mut() {
             if *slot >= idx {
                 *slot += 1;
             }
         }
-        for slot in self.items.permission_indices.values_mut() {
+        for slot in self.items.indices.permission.values_mut() {
             if *slot >= idx {
                 *slot += 1;
             }
         }
-        if let Some(last_idx) = &mut self.wire.last_turn_boundary_idx
+        if let Some(last_idx) = &mut self.wire.turns.last_turn_boundary_idx
             && *last_idx >= idx
         {
             *last_idx += 1;
@@ -271,13 +382,25 @@ impl ConversationReducer {
         delta
     }
 
+    fn has_active_wire_turn(&self) -> bool {
+        !self.wire.open_agent_turns.is_empty()
+            || self
+                .wire
+                .pending_client_requests
+                .values()
+                .any(|req| req.method == "session/prompt")
+    }
+
     fn handle_to_agent(&mut self, record: &WireRecord, message: &Map<String, Value>, delta: &mut ReduceDelta) {
         let id = parse_request_id(message.get("id"));
         if let Some(method) = message.get("method").and_then(Value::as_str) {
             if let Some(id) = id {
                 self.handle_client_request(record, &id, method, message.get("params"), delta);
             } else if method == "session/cancel" {
-                self.state.cancel_requested = true;
+                if self.has_active_wire_turn() {
+                    self.state.cancel_requested = true;
+                }
+                self.queue_state.queue.note_wire_cancel_sent();
             }
         } else if let Some(id) = id
             && (message.contains_key("result") || message.contains_key("error"))
@@ -294,6 +417,7 @@ impl ConversationReducer {
         params: Option<&Value>,
         delta: &mut ReduceDelta,
     ) {
+        self.observe_client_request_id(id);
         let detail = match method {
             "session/set_mode" => params
                 .and_then(|value| value.get("modeId"))
@@ -304,6 +428,7 @@ impl ConversationReducer {
         self.wire.pending_client_requests.insert(
             request_id_key(id),
             PendingClientRequest {
+                request_id: id.clone(),
                 method: method.to_owned(),
                 detail,
             },
@@ -315,11 +440,38 @@ impl ConversationReducer {
                 }
             }
             "session/prompt" => {
-                // Prompts are not echoed by the adapter, so no message item is
-                // created here; operator/engine messages come from the intent log.
+                // Prompts are not echoed by the adapter, so operator/engine
+                // message items and turn origins come from joining this wire
+                // request id against the engine's intent log.
                 self.flush_streams(record.seq, delta);
-                self.wire.last_turn_boundary_idx = None;
-                self.wire.current_turn_origin = None;
+                self.wire.turns.last_turn_boundary_idx = None;
+                if let Some(in_flight) = self.queue_state.queue.on_wire_prompt_sent(id, record.seq) {
+                    let item_id = format!("prompt-{}", record.seq);
+                    let mut item = CoordinatorChatItem {
+                        id: item_id.clone(),
+                        seq: record.seq,
+                        updated_seq: record.seq,
+                        ts_ms: record.ts_ms,
+                        kind: CoordinatorChatItemKind::Message(CoordinatorChatMessageItem {
+                            role: in_flight.prompt.origin.message_role(),
+                            text: self.redactor.redact_str(in_flight.prompt.text()),
+                            client_message_id: in_flight.prompt.client_message_id.clone(),
+                            message_id: None,
+                            sender: None,
+                        }),
+                    };
+                    self.redactor.redact_item(&mut item);
+                    let idx = self.items.items.partition_point(|existing| {
+                        existing.seq < record.seq || (existing.seq == record.seq && existing.id.starts_with("prompt-"))
+                    });
+                    self.insert_item_at(item, idx);
+                    delta.upserted_item_ids.push(item_id);
+                    self.wire.turns.current_turn_origin = Some(in_flight.prompt.origin.turn_origin());
+                    self.wire.turns.current_turn_origin_from_intent = true;
+                } else {
+                    self.wire.turns.current_turn_origin = None;
+                    self.wire.turns.current_turn_origin_from_intent = false;
+                }
                 self.recompute_phase();
             }
             _ => {}
@@ -396,7 +548,8 @@ impl ConversationReducer {
             .is_some()
             || self
                 .items
-                .tool_indices
+                .indices
+                .tool
                 .get(&tool_call_id)
                 .and_then(|&idx| self.items.items.get(idx))
                 .is_some_and(|item| {
@@ -452,7 +605,7 @@ impl ConversationReducer {
             ),
         };
         let index = self.insert_item(item);
-        self.items.permission_indices.insert(display_id.clone(), index);
+        self.items.indices.permission.insert(display_id.clone(), index);
         self.wire
             .pending_agent_permissions
             .insert(request_id_key(id), display_id);
@@ -544,7 +697,7 @@ impl ConversationReducer {
                     self.state.model = Some(self.redactor.redact_str(&model));
                 }
             }
-            "session/prompt" => self.handle_prompt_response(record, message, delta),
+            "session/prompt" => self.handle_prompt_response(record, id, message, delta),
             _ => {}
         }
     }
@@ -618,10 +771,18 @@ impl ConversationReducer {
         }
     }
 
-    fn handle_prompt_response(&mut self, record: &WireRecord, message: &Map<String, Value>, delta: &mut ReduceDelta) {
+    fn handle_prompt_response(
+        &mut self,
+        record: &WireRecord,
+        id: &RequestId,
+        message: &Map<String, Value>,
+        delta: &mut ReduceDelta,
+    ) {
         self.flush_streams(record.seq, delta);
         self.state.cancel_requested = false;
-        let origin = self.wire.current_turn_origin.take();
+        self.queue_state.queue.on_wire_prompt_finished(id);
+        let origin = self.wire.turns.current_turn_origin.take();
+        self.wire.turns.current_turn_origin_from_intent = false;
 
         if let Some(result) = message.get("result") {
             let stop_reason = serde_json::from_value::<PromptResponse>(result.clone())
@@ -755,8 +916,10 @@ impl ConversationReducer {
                     if !self.wire.open_agent_turns.iter().any(|existing| existing == task_id) {
                         self.wire.open_agent_turns.push(task_id.to_owned());
                     }
-                    self.wire.last_turn_boundary_idx = None;
-                    self.wire.current_turn_origin = None;
+                    self.queue_state.queue.on_agent_turn_started(task_id);
+                    self.wire.turns.last_turn_boundary_idx = None;
+                    self.wire.turns.current_turn_origin = None;
+                    self.wire.turns.current_turn_origin_from_intent = false;
                     self.recompute_phase();
                 }
             }
@@ -772,9 +935,11 @@ impl ConversationReducer {
                         .position(|existing| existing == task_id)
                 {
                     self.wire.open_agent_turns.remove(pos);
+                    self.queue_state.queue.on_agent_turn_finished(task_id);
                     self.flush_streams(record.seq, delta);
                     self.state.cancel_requested = false;
-                    let origin = self.wire.current_turn_origin.take();
+                    let origin = self.wire.turns.current_turn_origin.take();
+                    self.wire.turns.current_turn_origin_from_intent = false;
                     self.push_turn_boundary(record, true, origin, Some(state.to_owned()), None, delta);
                     self.recompute_phase();
                 }
@@ -889,8 +1054,8 @@ impl ConversationReducer {
 
     fn handle_tool_call(&mut self, record: &WireRecord, call: &ToolCall, raw_update: &Value, delta: &mut ReduceDelta) {
         let tool_call_id = call.tool_call_id.to_string();
-        if self.items.tool_indices.contains_key(&tool_call_id)
-            || self.items.compaction_indices.contains_key(&tool_call_id)
+        if self.items.indices.tool.contains_key(&tool_call_id)
+            || self.items.indices.compaction.contains_key(&tool_call_id)
         {
             self.handle_tool_call_update(record, &ToolCallUpdate::from(call.clone()), raw_update, delta);
             return;
@@ -932,7 +1097,7 @@ impl ConversationReducer {
                 ts_ms: record.ts_ms,
                 kind: CoordinatorChatItemKind::Notice(notice),
             });
-            self.items.compaction_indices.insert(tool_call_id, idx);
+            self.items.indices.compaction.insert(tool_call_id, idx);
             delta.upserted_item_ids.push(item_id);
             return;
         }
@@ -971,7 +1136,7 @@ impl ConversationReducer {
                     .build(),
             ),
         });
-        self.items.tool_indices.insert(tool_call_id, idx);
+        self.items.indices.tool.insert(tool_call_id, idx);
         delta.upserted_item_ids.push(item_id);
     }
 
@@ -985,7 +1150,7 @@ impl ConversationReducer {
         let tool_call_id = update.tool_call_id.to_string();
         let meta = raw_update.get("_meta").unwrap_or(&Value::Null);
 
-        if let Some(&idx) = self.items.compaction_indices.get(&tool_call_id) {
+        if let Some(&idx) = self.items.indices.compaction.get(&tool_call_id) {
             if let Some(item) = self.items.items.get_mut(idx)
                 && let CoordinatorChatItemKind::Notice(notice) = &mut item.kind
             {
@@ -1010,7 +1175,7 @@ impl ConversationReducer {
             .or_else(|| meta.pointer("/claudeCode/toolName").and_then(Value::as_str))
             .map(|name| self.redactor.redact_str(name));
 
-        if let Some(&idx) = self.items.tool_indices.get(&tool_call_id) {
+        if let Some(&idx) = self.items.indices.tool.get(&tool_call_id) {
             let input = update
                 .fields
                 .raw_input
@@ -1107,7 +1272,7 @@ impl ConversationReducer {
                 ts_ms: record.ts_ms,
                 kind: CoordinatorChatItemKind::Notice(notice),
             });
-            self.items.compaction_indices.insert(tool_call_id, idx);
+            self.items.indices.compaction.insert(tool_call_id, idx);
             delta.upserted_item_ids.push(item_id);
             return;
         }
@@ -1162,7 +1327,7 @@ impl ConversationReducer {
                     .build(),
             ),
         });
-        self.items.tool_indices.insert(tool_call_id, idx);
+        self.items.indices.tool.insert(tool_call_id, idx);
         delta.upserted_item_ids.push(item_id);
     }
 
@@ -1194,10 +1359,13 @@ impl ConversationReducer {
         if let Some(origin_kind) = meta.pointer("/_claude~1origin/kind").and_then(Value::as_str) {
             let origin = map_turn_origin(origin_kind);
             if self.has_active_turn() {
-                self.wire.current_turn_origin = Some(origin);
-            } else if let Some(idx) = self.wire.last_turn_boundary_idx
+                if !self.wire.turns.current_turn_origin_from_intent {
+                    self.wire.turns.current_turn_origin = Some(origin);
+                }
+            } else if let Some(idx) = self.wire.turns.last_turn_boundary_idx
                 && let Some(item) = self.items.items.get_mut(idx)
                 && let CoordinatorChatItemKind::TurnBoundary(boundary) = &mut item.kind
+                && boundary.origin.is_none()
             {
                 boundary.origin = Some(origin);
                 item.updated_seq = record.seq;
@@ -1267,12 +1435,12 @@ impl ConversationReducer {
                 error: self.redactor.redact_opt_str(error),
             }),
         });
-        self.wire.last_turn_boundary_idx = Some(idx);
+        self.wire.turns.last_turn_boundary_idx = Some(idx);
         delta.upserted_item_ids.push(item_id);
     }
 
     fn lookup_permission_option_name(&self, display_id: &str, option_id: &str) -> Option<String> {
-        let &idx = self.items.permission_indices.get(display_id)?;
+        let &idx = self.items.indices.permission.get(display_id)?;
         let item = self.items.items.get(idx)?;
         let CoordinatorChatItemKind::PermissionRequest(permission) = &item.kind else {
             return None;
@@ -1291,7 +1459,7 @@ impl ConversationReducer {
         seq: u64,
         delta: &mut ReduceDelta,
     ) {
-        let Some(&idx) = self.items.permission_indices.get(display_id) else {
+        let Some(&idx) = self.items.indices.permission.get(display_id) else {
             return;
         };
         let Some(item) = self.items.items.get_mut(idx) else {
@@ -1336,7 +1504,140 @@ impl ConversationReducer {
     /// boundary cannot leave a partial secret prefix behind.
     fn redact_and_bound(&self, text: &str) -> String {
         let redacted = self.redactor.redact_str(text);
-        bound_text(&redacted, self.tool_text_limit)
+        bound_text(&redacted, self.items.tool_text_limit)
+    }
+
+    /// Captures a versioned snapshot of the reducer's full state at the
+    /// current `(last_wire_seq, last_intent_seq)` boundary.
+    pub fn snapshot(&self) -> crate::snapshot::ReducerSnapshot {
+        crate::snapshot::ReducerSnapshot {
+            schema_version: crate::snapshot::SNAPSHOT_SCHEMA_VERSION,
+            cursor: crate::snapshot::SnapshotCursor {
+                wire_seq: self.state.last_seq,
+                intent_seq: self.queue_state.last_intent_seq,
+                tool_text_limit: self.items.tool_text_limit,
+            },
+            projection: crate::snapshot::SnapshotProjection {
+                state: self.state.clone(),
+                items: self.items.items.clone(),
+                compaction_indices: self.items.indices.compaction.clone(),
+                streaming_message: self
+                    .items
+                    .streaming
+                    .message
+                    .as_ref()
+                    .map(|active| ActiveStreamSnapshot {
+                        meta: active.meta.clone(),
+                        buffer: active.buffer.snapshot(),
+                    }),
+                streaming_thought: self
+                    .items
+                    .streaming
+                    .thought
+                    .as_ref()
+                    .map(|active| ActiveStreamSnapshot {
+                        meta: active.meta.clone(),
+                        buffer: active.buffer.snapshot(),
+                    }),
+            },
+            wire: self.wire.clone(),
+            queue: self.queue_state.queue.clone(),
+        }
+    }
+
+    /// Restores a reducer from a validated [`crate::snapshot::ReducerSnapshot`]
+    /// and re-attaches `redactor`.
+    ///
+    /// Returns an error if the snapshot version mismatches or any internal
+    /// item index is out of bounds or points to the wrong item variant.
+    pub fn from_snapshot(
+        snapshot: crate::snapshot::ReducerSnapshot,
+        redactor: CredentialRedactor,
+    ) -> Result<Self, String> {
+        if snapshot.schema_version != crate::snapshot::SNAPSHOT_SCHEMA_VERSION {
+            return Err(format!(
+                "snapshot schema version {} does not match expected {}",
+                snapshot.schema_version,
+                crate::snapshot::SNAPSHOT_SCHEMA_VERSION
+            ));
+        }
+        if snapshot.cursor.wire_seq != snapshot.projection.state.last_seq {
+            return Err(format!(
+                "snapshot wire_seq {} disagrees with state.last_seq {}",
+                snapshot.cursor.wire_seq, snapshot.projection.state.last_seq
+            ));
+        }
+        if snapshot.wire.open_agent_turns != snapshot.queue.open_agent_turns() {
+            return Err("snapshot wire open_agent_turns disagrees with queue open_agent_turns".to_owned());
+        }
+        if let Some(last_idx) = snapshot.wire.turns.last_turn_boundary_idx {
+            match snapshot.projection.items.get(last_idx) {
+                Some(item) if matches!(item.kind, CoordinatorChatItemKind::TurnBoundary(_)) => {}
+                _ => {
+                    return Err(format!(
+                        "snapshot last_turn_boundary_idx {last_idx} does not point to a TurnBoundary item"
+                    ));
+                }
+            }
+        }
+        for (tool_call_id, &idx) in &snapshot.projection.compaction_indices {
+            match snapshot.projection.items.get(idx) {
+                Some(item)
+                    if matches!(
+                        &item.kind,
+                        CoordinatorChatItemKind::Notice(notice)
+                            if notice.notice_kind == CoordinatorChatNoticeKind::Compaction
+                    ) => {}
+                _ => {
+                    return Err(format!(
+                        "snapshot compaction index {idx} for {tool_call_id} does not point to a Compaction notice"
+                    ));
+                }
+            }
+        }
+
+        let mut tool = HashMap::new();
+        let mut permission = HashMap::new();
+        for (idx, item) in snapshot.projection.items.iter().enumerate() {
+            match &item.kind {
+                CoordinatorChatItemKind::ToolCall(t) => {
+                    tool.insert(t.tool_call_id.clone(), idx);
+                }
+                CoordinatorChatItemKind::PermissionRequest(perm) => {
+                    permission.insert(perm.request_id.clone(), idx);
+                }
+                _ => {}
+            }
+        }
+
+        let message = snapshot.projection.streaming_message.map(|active| ActiveStream {
+            meta: active.meta,
+            buffer: StreamingRedactor::from_snapshot(redactor.clone(), active.buffer),
+        });
+        let thought = snapshot.projection.streaming_thought.map(|active| ActiveStream {
+            meta: active.meta,
+            buffer: StreamingRedactor::from_snapshot(redactor.clone(), active.buffer),
+        });
+
+        Ok(Self {
+            redactor,
+            state: snapshot.projection.state,
+            items: ItemStore {
+                items: snapshot.projection.items,
+                indices: ItemIndices {
+                    tool,
+                    compaction: snapshot.projection.compaction_indices,
+                    permission,
+                },
+                streaming: StreamingBuffers { message, thought },
+                tool_text_limit: snapshot.cursor.tool_text_limit,
+            },
+            wire: snapshot.wire,
+            queue_state: QueueTracker {
+                queue: snapshot.queue,
+                last_intent_seq: snapshot.cursor.intent_seq,
+            },
+        })
     }
 
     fn format_rpc_error(&self, prefix: &str, error: &Value) -> String {
@@ -1362,25 +1663,30 @@ pub fn replay_records<'a>(
     reducer
 }
 
-/// Replays wire records and intent-log prompts merged by `seq` through a fresh
-/// reducer. Both inputs must already be ordered by `seq`; on a tie the intent is
-/// applied first.
-pub fn replay_with_intents<'a>(
+/// Replays a wire journal joined with an append-only intent log through a
+/// fresh reducer, recovering both conversation items (with prompt origins and
+/// redacted prompt text) and the turn queue state.
+///
+/// Intent records are indexed before wire records so each `ToAgent`
+/// `session/prompt` joins with its matching `IntentRecord::Sent` by
+/// `request_id` (FIFO per id). After all wire records have been applied, any
+/// `Sent` intent that never appeared on the wire journal is returned to the
+/// queue via [`ConversationReducer::reconcile_unsent_dispatches`]; only use
+/// this helper on complete/offline logs that already reach the host's live
+/// boundary.
+pub fn replay_with_intent_log<'a>(
     records: impl IntoIterator<Item = &'a WireRecord>,
-    intents: impl IntoIterator<Item = PromptIntent>,
+    intent_records: impl IntoIterator<Item = &'a IntentRecord>,
     redactor: CredentialRedactor,
 ) -> ConversationReducer {
     let mut reducer = ConversationReducer::new(redactor);
-    let mut intents = intents.into_iter().peekable();
+    for intent in intent_records {
+        reducer.apply_intent_record(intent);
+    }
     for record in records {
-        while let Some(intent) = intents.next_if(|intent| intent.seq <= record.seq) {
-            reducer.apply_intent_message(intent);
-        }
         reducer.apply_record(record);
     }
-    for intent in intents {
-        reducer.apply_intent_message(intent);
-    }
+    reducer.reconcile_unsent_dispatches();
     reducer
 }
 

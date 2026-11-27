@@ -908,9 +908,11 @@ version = "0.1.0"
 dependencies = [
  "boss-acp-client",
  "boss-agent-host",
+ "boss-engine-utils",
  "boss-protocol",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

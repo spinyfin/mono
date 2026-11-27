@@ -7,6 +7,10 @@ workspace = "../../../.."
 [dependencies]
 boss-acp-client = { path = "../../acp_client" }
 boss-agent-host = { path = "../../agent-host" }
+boss-engine-utils = { path = "../utils" }
 boss-protocol = { path = "../../protocol" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
