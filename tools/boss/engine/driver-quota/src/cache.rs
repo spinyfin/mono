@@ -2,9 +2,10 @@
 //!
 //! # Refresh policy
 //!
-//! - **Lazy.** Nothing probes until something asks for a snapshot. Engine
-//!   startup never triggers a cycle, and opening Preferences on a warm cache
-//!   does not either.
+//! - **Lazy for app reads.** Opening Preferences on a warm cache does not
+//!   probe. Engine startup does not wait on a cycle. A separate 15-minute
+//!   background sampler (kill-switched, token-free drivers only) keeps the
+//!   retained series populated when nobody has the pane open.
 //! - **TTL [`DEFAULT_TTL`] (15 minutes).** An ordinary read older than this
 //!   runs one cycle; anything fresher is served straight from memory. Three
 //!   provider calls per quarter-hour of active looking is not hammering.
@@ -31,7 +32,7 @@
 //! rows, and this code cannot create one (it does not depend on the crate
 //! that can). [`QuotaCache`] holds nothing but probes and a snapshot.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use boss_protocol::{
@@ -66,12 +67,22 @@ pub struct QuotaCache {
     locks: QuotaLocks,
 }
 
-/// Snapshot and cycle mutexes, grouped so [`QuotaCache`] stays at five
-/// named fields (the giant-structs check) without collapsing the two
-/// locks into one — cached reads must not wait on a running cycle.
+/// Snapshot, cycle mutex, and persist sink, grouped so [`QuotaCache`]
+/// stays at five named fields (the giant-structs check) without
+/// collapsing the two locks into one — cached reads must not wait on a
+/// running cycle.
 struct QuotaLocks {
     state: tokio::sync::Mutex<CacheState>,
     cycle: tokio::sync::Mutex<()>,
+    /// Set once by the composition root after `WorkDb` exists. Probe
+    /// outcomes still land in memory when this is empty (tests, early boot).
+    sink: OnceLock<Arc<dyn QuotaSnapshotSink>>,
+}
+
+/// Persists one probe outcome. The cache never depends on the work DB;
+/// the engine supplies an adapter after construction.
+pub trait QuotaSnapshotSink: Send + Sync {
+    fn persist(&self, entry: &DriverQuotaEntry);
 }
 
 #[derive(Default)]
@@ -94,6 +105,7 @@ impl QuotaCache {
             locks: QuotaLocks {
                 state: tokio::sync::Mutex::new(CacheState::default()),
                 cycle: tokio::sync::Mutex::new(()),
+                sink: OnceLock::new(),
             },
         }
     }
@@ -105,6 +117,11 @@ impl QuotaCache {
         self.min_refresh_interval = min_refresh_interval;
         self.probe_timeout = probe_timeout;
         self
+    }
+
+    /// Install the persist sink. Later calls are ignored.
+    pub fn set_sink(&self, sink: Arc<dyn QuotaSnapshotSink>) {
+        let _ = self.locks.sink.set(sink);
     }
 
     fn decide(&self, generated_at_epoch_s: Option<i64>, refresh: bool, now: i64) -> (bool, bool) {
@@ -192,27 +209,60 @@ impl QuotaCache {
         state.snapshot.clone()
     }
 
+    /// Probe every driver whose [`DriverQuotaProbe::spends_model_tokens`] is
+    /// false. Used by the background sampler. Does not replace the cached
+    /// snapshot as a whole — unsampled drivers keep their last reading.
+    /// `generated_at_epoch_s` moves only when every probe in the set was
+    /// eligible, so a skipped driver cannot look fresh until its own TTL.
+    pub async fn sample_token_free(&self) -> usize {
+        let probes: Vec<Arc<dyn DriverQuotaProbe>> = self
+            .probes
+            .iter()
+            .filter(|probe| !probe.spends_model_tokens())
+            .cloned()
+            .collect();
+        if probes.is_empty() {
+            return 0;
+        }
+        let _cycle = self.locks.cycle.lock().await;
+        {
+            let mut state = self.locks.state.lock().await;
+            let (should_probe, _) = self.decide(state.snapshot.generated_at_epoch_s, false, now_epoch_s());
+            if !should_probe {
+                return 0;
+            }
+            state.pending = probes.iter().map(|probe| probe.driver().to_owned()).collect();
+        }
+        let mut join_set = tokio::task::JoinSet::new();
+        for probe in &probes {
+            spawn_probe_task(&mut join_set, Arc::clone(probe), self.probe_timeout);
+        }
+        let mut landed = 0usize;
+        while let Some(joined) = join_set.join_next().await {
+            match joined {
+                Ok(entry) => {
+                    landed += 1;
+                    let _ = self.record_landed(&entry).await;
+                }
+                Err(err) => tracing::error!(?err, "driver_quota: background probe task failed"),
+            }
+        }
+        let sampled_all = probes.len() == self.probes.len();
+        let mut state = self.locks.state.lock().await;
+        state.pending.clear();
+        if sampled_all {
+            state.snapshot.generated_at_epoch_s = Some(now_epoch_s());
+            state.snapshot.refresh_throttled = false;
+            state.snapshot.pending_drivers.clear();
+        }
+        landed
+    }
+
     /// Run every probe concurrently under its own deadline.
     async fn run_cycle(&self, progress: &impl Fn(DriverQuotaSnapshot)) -> DriverQuotaSnapshot {
         let mut join_set = tokio::task::JoinSet::new();
         for probe in &self.probes {
-            let probe = Arc::clone(probe);
-            let timeout = self.probe_timeout;
-            boss_task_scope::spawn_into(&mut join_set, async move {
-                let driver = probe.driver().to_owned();
-                let outcome = match tokio::time::timeout(timeout, probe.probe()).await {
-                    Ok(outcome) => outcome,
-                    Err(_) => DriverQuotaOutcome::Unavailable {
-                        kind: DriverQuotaFailureKind::Timeout,
-                        reason: format!("no answer within {}s", timeout.as_secs()),
-                    },
-                };
-                DriverQuotaEntry {
-                    driver,
-                    observed_at_epoch_s: now_epoch_s(),
-                    outcome,
-                }
-            });
+            spawn_probe_task(&mut join_set, Arc::clone(probe), self.probe_timeout);
         }
         let mut entries: Vec<DriverQuotaEntry> = Vec::new();
         while let Some(joined) = join_set.join_next().await {
@@ -253,6 +303,7 @@ impl QuotaCache {
             generated_at_epoch_s: Some(now_epoch_s()),
             refresh_throttled: false,
             pending_drivers: Vec::new(),
+            history: None,
         }
     }
 
@@ -270,8 +321,42 @@ impl QuotaCache {
         let mut partial = state.snapshot.clone();
         partial.refresh_throttled = false;
         partial.pending_drivers = state.pending.clone();
+        drop(state);
+        self.persist_entry(entry).await;
         partial
     }
+
+    async fn persist_entry(&self, entry: &DriverQuotaEntry) {
+        let Some(sink) = self.locks.sink.get().cloned() else {
+            return;
+        };
+        let entry = entry.clone();
+        if let Err(err) = tokio::task::spawn_blocking(move || sink.persist(&entry)).await {
+            tracing::warn!(?err, "driver_quota: persist task failed");
+        }
+    }
+}
+
+fn spawn_probe_task(
+    join_set: &mut tokio::task::JoinSet<DriverQuotaEntry>,
+    probe: Arc<dyn DriverQuotaProbe>,
+    timeout: Duration,
+) {
+    boss_task_scope::spawn_into(join_set, async move {
+        let driver = probe.driver().to_owned();
+        let outcome = match tokio::time::timeout(timeout, probe.probe()).await {
+            Ok(outcome) => outcome,
+            Err(_) => DriverQuotaOutcome::Unavailable {
+                kind: DriverQuotaFailureKind::Timeout,
+                reason: format!("no answer within {}s", timeout.as_secs()),
+            },
+        };
+        DriverQuotaEntry {
+            driver,
+            observed_at_epoch_s: now_epoch_s(),
+            outcome,
+        }
+    });
 }
 
 /// Stable presentation order regardless of which probe answered first.
@@ -295,6 +380,7 @@ mod tests {
         driver: &'static str,
         calls: AtomicUsize,
         percent: f64,
+        spends_model_tokens: bool,
     }
 
     impl CountingProbe {
@@ -303,6 +389,16 @@ mod tests {
                 driver,
                 calls: AtomicUsize::new(0),
                 percent,
+                spends_model_tokens: true,
+            })
+        }
+
+        fn token_free(driver: &'static str, percent: f64) -> Arc<Self> {
+            Arc::new(Self {
+                driver,
+                calls: AtomicUsize::new(0),
+                percent,
+                spends_model_tokens: false,
             })
         }
     }
@@ -311,6 +407,9 @@ mod tests {
     impl DriverQuotaProbe for CountingProbe {
         fn driver(&self) -> &'static str {
             self.driver
+        }
+        fn spends_model_tokens(&self) -> bool {
+            self.spends_model_tokens
         }
         async fn probe(&self) -> DriverQuotaOutcome {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -574,5 +673,75 @@ mod tests {
             "a stale decline must not describe the accepted request"
         );
         assert_eq!(accepted.snapshot.pending_drivers, vec!["claude".to_owned()]);
+    }
+
+    struct RecordingSink {
+        entries: std::sync::Mutex<Vec<DriverQuotaEntry>>,
+    }
+
+    impl QuotaSnapshotSink for RecordingSink {
+        fn persist(&self, entry: &DriverQuotaEntry) {
+            self.entries.lock().expect("sink mutex").push(entry.clone());
+        }
+    }
+
+    #[tokio::test]
+    async fn every_landed_probe_is_persisted() {
+        let probe = CountingProbe::new("claude", 7.0);
+        let cache = QuotaCache::new(vec![probe]);
+        let sink = Arc::new(RecordingSink {
+            entries: std::sync::Mutex::new(Vec::new()),
+        });
+        cache.set_sink(sink.clone());
+        cache.snapshot(false).await;
+        let stored = sink.entries.lock().expect("sink mutex");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].driver, "claude");
+        match &stored[0].outcome {
+            DriverQuotaOutcome::Reading(reading) => assert_eq!(reading.used_percent, 7.0),
+            other => panic!("expected a reading, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sample_token_free_skips_token_spending_drivers_and_keeps_their_entries() {
+        let spending = CountingProbe::new("claude", 1.0);
+        let free = CountingProbe::token_free("codex", 2.0);
+        let cache = QuotaCache::new(vec![spending.clone(), free.clone()]).with_policy(
+            Duration::from_secs(0),
+            Duration::from_secs(0),
+            DEFAULT_PROBE_TIMEOUT,
+        );
+        cache.snapshot(false).await;
+        assert_eq!(spending.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(free.calls.load(Ordering::SeqCst), 1);
+
+        let landed = cache.sample_token_free().await;
+        assert_eq!(landed, 1);
+        assert_eq!(
+            spending.calls.load(Ordering::SeqCst),
+            1,
+            "token-spending probe must not run"
+        );
+        assert_eq!(free.calls.load(Ordering::SeqCst), 2);
+        let snapshot = cache.lookup(false).await.snapshot;
+        assert_eq!(snapshot.entries.len(), 2);
+        assert!(snapshot.entries.iter().any(|e| e.driver == "claude"));
+        assert!(snapshot.entries.iter().any(|e| e.driver == "codex"));
+    }
+
+    #[tokio::test]
+    async fn sample_token_free_does_not_mark_the_snapshot_fresh_when_a_driver_was_skipped() {
+        let spending = CountingProbe::new("claude", 1.0);
+        let free = CountingProbe::token_free("codex", 2.0);
+        let cache = QuotaCache::new(vec![spending, free]);
+        let landed = cache.sample_token_free().await;
+        assert_eq!(landed, 1);
+        let lookup = cache.lookup(false).await;
+        assert!(
+            lookup.snapshot.generated_at_epoch_s.is_none(),
+            "a partial background sample must not look like a finished cycle"
+        );
+        assert!(lookup.should_probe, "the skipped driver must still be due");
     }
 }

@@ -733,11 +733,13 @@ struct ServerState {
     /// `app::server::serve`). See [`boss_engine_runtime::spawn_health`].
     spawn_health: Arc<boss_engine_runtime::spawn_health::SpawnHealthTracker>,
     /// Per-driver provider quota readings and the policy governing when to
-    /// re-probe. Lazy by construction: no probe runs until a client asks for
-    /// a snapshot, so this costs engine startup nothing. A probe is a
-    /// short-lived child process (or one HTTPS request) owned by the cache —
-    /// it allocates no worker slot, creates no execution row, and opens no
-    /// pane, so it can never be mistaken for, or occupy, a dispatch slot.
+    /// re-probe. App reads are lazy: opening Preferences on a warm cache
+    /// does not probe. A kill-switched 15-minute background sampler probes
+    /// token-free drivers so the retained series is not limited to pane
+    /// visits. A probe is a short-lived child process (or one HTTPS request)
+    /// owned by the cache — it allocates no worker slot, creates no execution
+    /// row, and opens no pane, so it can never be mistaken for, or occupy, a
+    /// dispatch slot.
     #[builder(default = Arc::new(boss_engine_driver_quota::QuotaCache::new(
         boss_engine_runtime::grok_quota_refresh::production_probes(),
     )))]

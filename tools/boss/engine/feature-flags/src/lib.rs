@@ -556,6 +556,18 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         default_enabled: true,
         capability_id: None,
     },
+    FeatureFlagSpec {
+        name: DRIVER_QUOTA_BACKGROUND_SAMPLE_FLAG,
+        description: "Sample provider quota on a 15-minute background cycle and persist every probe \
+             outcome into driver_quota_snapshots. Enabled only for drivers whose probes spend no \
+             model tokens (claude local /usage, Codex account/rateLimits/read, Grok billing HTTPS, \
+             agy --print /usage). App-driven Preferences probes still persist when this is off. \
+             DEFAULT ON: observation-only, changes no run. Kill switch: set false to stop the \
+             background cycle; retained rows stay until the 30-day prune.",
+        category: "quota",
+        default_enabled: true,
+        capability_id: None,
+    },
 ];
 
 /// Master switch for just-in-time merge-conflict resolution. See the
@@ -565,6 +577,10 @@ pub const CONFLICT_RESOLUTION_DEFERRAL_FLAG: &str = "conflict_resolution_deferra
 /// Restricts [`CONFLICT_RESOLUTION_DEFERRAL_FLAG`] to the treatment arm of
 /// the PR-number-parity experiment. See the registry entry.
 pub const CONFLICT_RESOLUTION_DEFERRAL_AB_SPLIT_FLAG: &str = "conflict_resolution_deferral_ab_split";
+
+/// Kill switch for the provider-quota background sampler. See the registry
+/// entry. App-driven probes persist regardless of this flag.
+pub const DRIVER_QUOTA_BACKGROUND_SAMPLE_FLAG: &str = "driver_quota_background_sample";
 
 /// Which arm of the just-in-time conflict-resolution rollout a PR is in.
 ///

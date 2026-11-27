@@ -26,11 +26,12 @@ metrics registry (`bossctl metrics list --prefix <sweep>`; values flush to
 | `terminal_work_sweep` | the candidate-gathering phase of one 60 s terminal-work pass                     | live worker slots inspected                                                        |
 | `dead_pane_terminal`  | the terminal execution scan plus the process probes of one pane-death sweep pass | recent terminal execution rows probed                                              |
 | `agent_jsonl_stream`  | one 50 ms tail poll iteration of any live JSONL stream                           | sessions-root revalidations (`lstat` + `canonicalize`) performed in that iteration |
+| `driver_quota_sample` | one 15-minute token-free provider-quota sample plus retention prune              | drivers probed in that pass (zero when the kill-switch is off)                     |
 
-Only the singleton envelope and terminal-work sweeps publish tick intervals.
-`dead_pane_terminal` has no `tick_interval_ms`. Concurrent tails and bookmark
-operations have no shared cadence. Root revalidation counts are isolated per
-tail, excluding discovery and other tails.
+Only the singleton envelope, terminal-work, and provider-quota sample sweeps
+publish tick intervals. `dead_pane_terminal` has no `tick_interval_ms`.
+Concurrent tails and bookmark operations have no shared cadence. Root
+revalidation counts are isolated per tail, excluding discovery and other tails.
 
 One extra counter:
 

@@ -624,36 +624,115 @@ pub(super) async fn handle_set_dispatch_concurrency(ctx: Dispatch, req: Frontend
 pub(super) async fn handle_get_driver_quota_usage(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
+        work_db,
         sink,
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::GetDriverQuotaUsage { refresh } = req else {
+    let FrontendRequest::GetDriverQuotaUsage {
+        refresh,
+        since_epoch_s,
+        until_epoch_s,
+    } = req
+    else {
         unreachable!()
     };
     let lookup = server_state.driver_quota.lookup(refresh).await;
-    send_response(
-        &sink,
-        &request_id,
-        FrontendEvent::DriverQuotaUsageResult {
-            snapshot: lookup.snapshot,
-        },
-    );
+    let mut snapshot = lookup.snapshot;
+    attach_quota_history(&work_db, &mut snapshot, since_epoch_s, until_epoch_s);
+    send_response(&sink, &request_id, FrontendEvent::DriverQuotaUsageResult { snapshot });
     if lookup.should_probe {
         let quota = Arc::clone(&server_state.driver_quota);
         let sink = Arc::clone(&sink);
+        let work_db = Arc::clone(&work_db);
         boss_task_scope::spawn(async move {
             // Each driver's result is pushed as its probe lands; the final
-            // snapshot (no pending drivers) closes the request.
+            // snapshot (no pending drivers) closes the request. Progress
+            // pushes omit history so a landing probe is not a DB scan.
             let progress_sink = Arc::clone(&sink);
             let snapshot = quota
                 .snapshot_with_progress(refresh, move |snapshot| {
                     send_push(&progress_sink, FrontendEvent::DriverQuotaUsageResult { snapshot });
                 })
                 .await;
+            let mut snapshot = snapshot;
+            attach_quota_history(&work_db, &mut snapshot, since_epoch_s, until_epoch_s);
             send_push(&sink, FrontendEvent::DriverQuotaUsageResult { snapshot });
         });
     }
+}
+
+fn attach_quota_history(
+    work_db: &WorkDb,
+    snapshot: &mut boss_protocol::DriverQuotaSnapshot,
+    since_epoch_s: Option<i64>,
+    until_epoch_s: Option<i64>,
+) {
+    let Some(since_epoch_s) = since_epoch_s else {
+        return;
+    };
+    let until_epoch_s = until_epoch_s.unwrap_or_else(boss_engine_utils::epoch_time::now_epoch_secs);
+    let samples = match work_db.driver_quota_samples_in_range(since_epoch_s, until_epoch_s) {
+        Ok(samples) => samples,
+        Err(err) => {
+            tracing::warn!(?err, "driver_quota: loading snapshot history failed");
+            return;
+        }
+    };
+    let records = match work_db.cost_records_for_window(since_epoch_s, until_epoch_s) {
+        Ok(records) => records,
+        Err(err) => {
+            tracing::warn!(?err, "driver_quota: loading cost records for quota history failed");
+            return;
+        }
+    };
+    snapshot.history = Some(boss_engine_runtime::cost_report::build_quota_history(
+        &samples, &records,
+    ));
+}
+
+/// Persist adapter: the quota cache never depends on the work DB.
+pub(super) struct WorkDbQuotaSink {
+    pub db: Arc<WorkDb>,
+}
+
+impl boss_engine_driver_quota::QuotaSnapshotSink for WorkDbQuotaSink {
+    fn persist(&self, entry: &boss_protocol::DriverQuotaEntry) {
+        if let Err(err) = self.db.driver_quota_insert(entry) {
+            tracing::warn!(?err, driver = %entry.driver, "driver_quota: persist snapshot failed");
+        }
+    }
+}
+
+/// 15-minute token-free quota sample plus retention prune. The flag is a
+/// kill switch for the sample; prune still runs so app-driven rows cannot
+/// grow without bound.
+pub(super) fn spawn_driver_quota_sampler(server_state: Arc<ServerState>) -> tokio::task::JoinHandle<()> {
+    boss_task_scope::spawn(async move {
+        let mut interval = tokio::time::interval(boss_engine_driver_quota::DEFAULT_TTL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut previous = None;
+        loop {
+            interval.tick().await;
+            let registry = server_state.metrics.as_ref();
+            boss_engine_runtime::sweep_metrics::DRIVER_QUOTA_SAMPLE.record_tick(registry, &mut previous);
+            let pass = boss_engine_runtime::sweep_metrics::DRIVER_QUOTA_SAMPLE.begin();
+            let now = boss_engine_utils::epoch_time::now_epoch_secs();
+            let cutoff = now.saturating_sub(boss_work_db::DRIVER_QUOTA_RETENTION_DAYS.saturating_mul(86_400));
+            if let Err(err) = server_state.work_db.driver_quota_prune(cutoff) {
+                tracing::warn!(?err, "driver_quota: prune failed");
+            }
+            let items = if server_state
+                .feature_flags
+                .is_enabled(boss_feature_flags::DRIVER_QUOTA_BACKGROUND_SAMPLE_FLAG)
+            {
+                server_state.driver_quota.sample_token_free().await
+            } else {
+                0
+            };
+            pass.finish(registry, items);
+        }
+    })
 }
 
 pub(super) async fn handle_get_driver_traffic_split(ctx: Dispatch, req: FrontendRequest) {

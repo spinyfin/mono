@@ -15,7 +15,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use boss_protocol::{
-    CostBucket, CostTopRow, DRIVER_SLUG_AGY, DRIVER_SLUG_GROK, ExecutionCostRow, TaskCostReport, TopCostReport,
+    CostBucket, CostTopRow, DRIVER_SLUG_AGY, DRIVER_SLUG_GROK, DriverQuotaEntry, DriverQuotaHistory,
+    DriverQuotaHistoryInterval, DriverQuotaOutcome, DriverQuotaWindow, ExecutionCostRow, TaskCostReport, TopCostReport,
     WindowCostReport,
 };
 
@@ -272,6 +273,62 @@ fn run_tokens(record: &CostRunRecord) -> RunTokens {
 
 fn label_or_none(value: Option<&str>) -> String {
     value.map(str::to_owned).unwrap_or_else(|| NO_VALUE_LABEL.to_owned())
+}
+
+/// Pair consecutive successful quota readings per driver and window, and
+/// fold Boss-side cost records into each `[start, end)` interval.
+///
+/// Failures stay in `samples` and are not interval endpoints; a later
+/// reading of the same window pairs across a failure. Token totals are
+/// filtered to the interval's driver.
+pub fn build_quota_history(samples: &[DriverQuotaEntry], records: &[CostRunRecord]) -> DriverQuotaHistory {
+    let mut intervals = Vec::new();
+    let mut last_reading: HashMap<(String, DriverQuotaWindow), (i64, f64)> = HashMap::new();
+    for sample in samples {
+        let DriverQuotaOutcome::Reading(reading) = &sample.outcome else {
+            continue;
+        };
+        let key = (sample.driver.clone(), reading.window);
+        if let Some((start_epoch_s, start_used_percent)) = last_reading.get(&key).copied()
+            && sample.observed_at_epoch_s > start_epoch_s
+        {
+            let mut fold = RunFold::default();
+            let mut by_model: BTreeMap<String, RunFold> = BTreeMap::new();
+            let mut gaps = BTreeSet::new();
+            for record in records {
+                if record.created_at_epoch_s < start_epoch_s
+                    || record.created_at_epoch_s >= sample.observed_at_epoch_s
+                    || record.driver.as_deref() != Some(sample.driver.as_str())
+                {
+                    continue;
+                }
+                fold_record(&mut fold, record, false, &mut gaps);
+                fold_record(
+                    by_model.entry(label_or_none(record.model.as_deref())).or_default(),
+                    record,
+                    false,
+                    &mut gaps,
+                );
+            }
+            intervals.push(
+                DriverQuotaHistoryInterval::builder()
+                    .driver(&sample.driver)
+                    .by_model(finish_buckets(by_model))
+                    .end_epoch_s(sample.observed_at_epoch_s)
+                    .end_used_percent(reading.used_percent)
+                    .start_epoch_s(start_epoch_s)
+                    .start_used_percent(start_used_percent)
+                    .tokens(fold.finish())
+                    .window(reading.window)
+                    .build(),
+            );
+        }
+        last_reading.insert(key, (sample.observed_at_epoch_s, reading.used_percent));
+    }
+    DriverQuotaHistory {
+        intervals,
+        samples: samples.to_vec(),
+    }
 }
 
 fn finish_buckets(map: BTreeMap<String, RunFold>) -> Vec<CostBucket> {
@@ -863,5 +920,94 @@ mod tests {
             assert!(report.overall.estimated_usd.is_none());
             assert!(report.overall.estimated_usd_partial);
         }
+    }
+
+    fn quota_reading(driver: &str, at: i64, percent: f64, window: DriverQuotaWindow) -> DriverQuotaEntry {
+        DriverQuotaEntry {
+            driver: driver.to_owned(),
+            observed_at_epoch_s: at,
+            outcome: DriverQuotaOutcome::Reading(boss_protocol::DriverQuotaReading {
+                used_percent: percent,
+                window,
+                resets_at_epoch_s: None,
+                resets_at_text: None,
+                source: "test".to_owned(),
+            }),
+        }
+    }
+
+    fn quota_failure(driver: &str, at: i64) -> DriverQuotaEntry {
+        DriverQuotaEntry {
+            driver: driver.to_owned(),
+            observed_at_epoch_s: at,
+            outcome: DriverQuotaOutcome::Unavailable {
+                kind: boss_protocol::DriverQuotaFailureKind::Timeout,
+                reason: "timeout".to_owned(),
+            },
+        }
+    }
+
+    #[test]
+    fn quota_history_pairs_consecutive_readings_and_filters_tokens_by_driver() {
+        let samples = vec![
+            quota_reading("claude", 100, 3.0, DriverQuotaWindow::Weekly),
+            quota_reading("codex", 100, 10.0, DriverQuotaWindow::Weekly),
+            quota_reading("claude", 200, 4.5, DriverQuotaWindow::Weekly),
+            quota_reading("codex", 200, 11.0, DriverQuotaWindow::Weekly),
+        ];
+        let mut claude_run = measured(record("run_c", "exec_c"), 100, 50, 0, 0);
+        claude_run.driver = Some("claude".to_owned());
+        claude_run.created_at_epoch_s = 150;
+        claude_run.model = Some("opus".to_owned());
+        let mut codex_run = measured(record("run_x", "exec_x"), 20, 10, 0, 0);
+        codex_run.driver = Some("codex".to_owned());
+        codex_run.created_at_epoch_s = 150;
+        let history = build_quota_history(&samples, &[claude_run, codex_run]);
+        assert_eq!(history.samples.len(), 4);
+        assert_eq!(history.intervals.len(), 2);
+        let claude = history
+            .intervals
+            .iter()
+            .find(|i| i.driver == "claude")
+            .expect("claude interval");
+        assert_eq!(claude.start_used_percent, 3.0);
+        assert_eq!(claude.end_used_percent, 4.5);
+        assert_eq!(claude.tokens.total_tokens, 150);
+        assert_eq!(claude.by_model[0].label, "opus");
+        let codex = history
+            .intervals
+            .iter()
+            .find(|i| i.driver == "codex")
+            .expect("codex interval");
+        assert_eq!(codex.tokens.total_tokens, 30);
+    }
+
+    #[test]
+    fn quota_history_pairs_across_a_failure_of_the_same_window() {
+        let samples = vec![
+            quota_reading("claude", 100, 3.0, DriverQuotaWindow::Weekly),
+            quota_failure("claude", 150),
+            quota_reading("claude", 200, 5.0, DriverQuotaWindow::Weekly),
+        ];
+        let history = build_quota_history(&samples, &[]);
+        assert_eq!(history.samples.len(), 3);
+        assert_eq!(history.intervals.len(), 1);
+        assert_eq!(history.intervals[0].start_epoch_s, 100);
+        assert_eq!(history.intervals[0].end_epoch_s, 200);
+        assert_eq!(history.intervals[0].end_used_percent, 5.0);
+    }
+
+    #[test]
+    fn quota_history_does_not_pair_across_a_window_change() {
+        let samples = vec![
+            quota_reading("claude", 100, 3.0, DriverQuotaWindow::Weekly),
+            quota_reading("claude", 200, 40.0, DriverQuotaWindow::Other { minutes: 300 }),
+            quota_reading("claude", 300, 41.0, DriverQuotaWindow::Other { minutes: 300 }),
+        ];
+        let history = build_quota_history(&samples, &[]);
+        assert_eq!(history.intervals.len(), 1);
+        assert_eq!(history.intervals[0].window, DriverQuotaWindow::Other { minutes: 300 });
+        assert_eq!(history.intervals[0].start_epoch_s, 200);
+        assert_eq!(history.intervals[0].end_epoch_s, 300);
     }
 }

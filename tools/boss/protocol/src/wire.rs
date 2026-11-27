@@ -779,9 +779,12 @@ pub enum FrontendRequest {
     /// provider reports the maintainer has consumed of the current
     /// subscription window. Served from the engine's cache; a probe cycle
     /// runs only when the cache is older than the service's TTL, or when
-    /// `refresh` is set and the anti-hammer floor has elapsed. Never
-    /// triggered by engine startup. Replies with
-    /// [`FrontendEvent::DriverQuotaUsageResult`].
+    /// `refresh` is set and the anti-hammer floor has elapsed. A 15-minute
+    /// background sampler also probes token-free drivers. Never triggered
+    /// by engine startup. Replies with
+    /// [`FrontendEvent::DriverQuotaUsageResult`]. When `since_epoch_s` is
+    /// set, the snapshot includes retained history and engine-computed
+    /// token totals for each interval.
     ///
     /// `refresh` marks an explicit refresh from the Preferences pane; it
     /// bypasses the TTL but not the floor, and a refusal comes back as
@@ -792,6 +795,14 @@ pub enum FrontendRequest {
     GetDriverQuotaUsage {
         #[serde(default)]
         refresh: bool,
+        /// Inclusive start of the retained-history window, epoch seconds.
+        /// When set, the reply's snapshot carries [`crate::DriverQuotaHistory`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since_epoch_s: Option<i64>,
+        /// Inclusive end of the retained-history window, epoch seconds.
+        /// Defaults to now when `since_epoch_s` is set and this is omitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until_epoch_s: Option<i64>,
     },
 
     /// Query the current driver traffic split (the four-way `grok` /

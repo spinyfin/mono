@@ -16,6 +16,10 @@ pub(crate) enum CostCommand {
     /// kind, model, reasoning mode, and effort level — the groupings
     /// that answer "where did the budget go."
     Window(CostWindowArgs),
+    /// Provider quota change over a window, per driver and quota window,
+    /// beside engine-computed token totals by class and model for the
+    /// same intervals.
+    Quota(CostQuotaArgs),
     /// The highest-token-cost runs recorded in a time window, ranked
     /// descending.
     Top(CostTopArgs),
@@ -106,6 +110,24 @@ pub(crate) struct CostWindowArgs {
     /// `boss cost task --usd`'s help for the pricing-table caveat.
     #[arg(long)]
     pub(crate) usd: bool,
+
+    /// Print report timestamps in UTC instead of this host's local time.
+    #[arg(long)]
+    pub(crate) utc: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct CostQuotaArgs {
+    /// Start of the window: an RFC3339 timestamp (e.g.
+    /// `2026-07-01T00:00:00Z`) or a relative duration ago (`24h`, `7d`,
+    /// `2w`).
+    #[arg(long)]
+    pub(crate) since: String,
+
+    /// End of the window, same accepted formats as `--since`. Defaults
+    /// to now.
+    #[arg(long)]
+    pub(crate) until: Option<String>,
 
     /// Print report timestamps in UTC instead of this host's local time.
     #[arg(long)]
@@ -313,6 +335,28 @@ pub(crate) async fn run_cost_command(command: CostCommand, ctx: &RunContext) -> 
             let tz = resolve_display_tz(args.utc);
             print_entity(ctx, &serde_json::json!({ "report": report }), || {
                 print_window_cost_report(&report, &tz)
+            })
+        }
+        CostCommand::Quota(args) => {
+            let (since_epoch_s, until_epoch_s) = resolve_window(&args.since, args.until.as_deref())?;
+            let response = client
+                .send_request(&FrontendRequest::GetDriverQuotaUsage {
+                    refresh: false,
+                    since_epoch_s: Some(since_epoch_s),
+                    until_epoch_s: Some(until_epoch_s),
+                })
+                .await
+                .map_err(CliError::internal)?;
+            let snapshot = match response {
+                FrontendEvent::DriverQuotaUsageResult { snapshot } => snapshot,
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    return Err(CliError::application(message));
+                }
+                other => return Err(unexpected_event("cost quota", &other)),
+            };
+            let tz = resolve_display_tz(args.utc);
+            print_entity(ctx, &serde_json::json!({ "snapshot": snapshot }), || {
+                print_quota_history(&snapshot, since_epoch_s, until_epoch_s, &tz)
             })
         }
         CostCommand::Rows(args) => {
@@ -581,6 +625,69 @@ fn print_cost_buckets(title: &str, buckets: &[CostBucket], caveat: Option<&str>)
         ]);
     }
     print_table(table);
+}
+
+fn quota_window_label(window: DriverQuotaWindow) -> String {
+    match window {
+        DriverQuotaWindow::Weekly => "weekly".to_owned(),
+        DriverQuotaWindow::Other { minutes } => format!("{minutes}m"),
+    }
+}
+
+fn print_quota_history(snapshot: &DriverQuotaSnapshot, since_epoch_s: i64, until_epoch_s: i64, tz: &DisplayTz) {
+    println!(
+        "Provider quota from {} to {} ({})",
+        format_epoch(since_epoch_s, tz),
+        format_epoch(until_epoch_s, tz),
+        tz.label
+    );
+    let Some(history) = &snapshot.history else {
+        println!();
+        println!("  No retained quota history in this window.");
+        return;
+    };
+    if history.intervals.is_empty() {
+        println!();
+        println!("  No consecutive quota readings in this window yet.");
+    }
+    for interval in &history.intervals {
+        let delta = interval.end_used_percent - interval.start_used_percent;
+        println!();
+        println!(
+            "{} {}  {} → {}  {:.1}% → {:.1}%  ({delta:+.1}%)",
+            interval.driver,
+            quota_window_label(interval.window),
+            format_epoch(interval.start_epoch_s, tz),
+            format_epoch(interval.end_epoch_s, tz),
+            interval.start_used_percent,
+            interval.end_used_percent,
+        );
+        print_measurement_summary(&interval.tokens);
+        if !interval.by_model.is_empty() {
+            print_cost_buckets("  By model", &interval.by_model, None);
+        }
+    }
+    let failures: Vec<_> = history
+        .samples
+        .iter()
+        .filter_map(|sample| match &sample.outcome {
+            DriverQuotaOutcome::Unavailable { kind, reason } => Some((sample, kind, reason)),
+            DriverQuotaOutcome::Reading(_) => None,
+        })
+        .collect();
+    if !failures.is_empty() {
+        println!();
+        println!("Failures (not used as interval endpoints):");
+        for (sample, kind, reason) in failures {
+            println!(
+                "  {} at {}: {} — {}",
+                sample.driver,
+                format_epoch(sample.observed_at_epoch_s, tz),
+                kind.as_str(),
+                reason
+            );
+        }
+    }
 }
 
 fn print_window_cost_report(report: &WindowCostReport, tz: &DisplayTz) {

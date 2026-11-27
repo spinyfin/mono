@@ -31,9 +31,11 @@
 //! A probe is a short-lived child process (or one HTTPS request) owned by
 //! this crate. It never allocates a worker slot, never creates an execution
 //! row, never touches the pane/tmux layer, and never asks the dispatcher for
-//! anything — see [`cache::QuotaCache`] and the crate's tests. The cache is
-//! lazy: no probe runs until something asks for a snapshot, so engine startup
-//! is untouched.
+//! anything — see [`cache::QuotaCache`] and the crate's tests. App reads are
+//! lazy: opening Preferences on a warm cache does not probe. A kill-switched
+//! 15-minute background sampler additionally probes drivers whose
+//! [`DriverQuotaProbe::spends_model_tokens`] is false, so the retained series
+//! is not limited to Preferences visits.
 
 pub mod agy;
 pub mod cache;
@@ -701,7 +703,7 @@ pub mod probes;
 #[cfg(test)]
 mod grok_tests;
 
-pub use cache::{DEFAULT_MIN_REFRESH_INTERVAL, DEFAULT_TTL, QuotaCache, QuotaLookup, QuotaProbeSet};
+pub use cache::{DEFAULT_MIN_REFRESH_INTERVAL, DEFAULT_TTL, QuotaCache, QuotaLookup, QuotaProbeSet, QuotaSnapshotSink};
 pub use probes::grok::{GrokCredentialRefresher, GrokRefreshOutcome};
 
 // ---------------------------------------------------------------------------
@@ -732,6 +734,14 @@ pub trait DriverQuotaProbe: Send + Sync {
     /// Run the probe. Must not log, return, or otherwise expose any
     /// credential, token, API key, or session identifier it encounters.
     async fn probe(&self) -> DriverQuotaOutcome;
+
+    /// `true` when this probe spends model tokens (a prompt-shaped
+    /// `/usage`, a chat turn, anything billed). The background sampler
+    /// skips those drivers. Default is `true` so a new probe is never
+    /// sampled until its author confirms it is free.
+    fn spends_model_tokens(&self) -> bool {
+        true
+    }
 }
 
 /// Current wall-clock time in epoch seconds. Saturates rather than panics on
@@ -779,6 +789,9 @@ mod tests {
         fn driver(&self) -> &'static str {
             "agy"
         }
+        fn spends_model_tokens(&self) -> bool {
+            false
+        }
         async fn probe(&self) -> DriverQuotaOutcome {
             parse::unavailable(
                 boss_protocol::DriverQuotaFailureKind::NotReported,
@@ -805,5 +818,9 @@ mod tests {
         );
         let slugs: Vec<&str> = probes.iter().map(|p| p.driver()).collect();
         assert_eq!(slugs, DRIVER_QUOTA_ORDER.to_vec());
+        assert!(
+            probes.iter().all(|p| !p.spends_model_tokens()),
+            "every production probe must be confirmed token-free before the background sampler may run it"
+        );
     }
 }

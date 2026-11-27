@@ -2727,6 +2727,16 @@ async fn serve_scoped(
         &server_state.settings,
     );
 
+    // Provider quota history: persist every probe outcome, and sample
+    // token-free drivers on a 15-minute cycle so the series is not
+    // limited to Preferences visits. The cycle is a kill-switch.
+    server_state
+        .driver_quota
+        .set_sink(Arc::new(super::engine_meta::WorkDbQuotaSink {
+            db: server_state.work_db.clone(),
+        }));
+    let _driver_quota_sample_handle = super::engine_meta::spawn_driver_quota_sampler(Arc::clone(&server_state));
+
     // Periodic stalled-spawn + stale-activity honesty timers. Two complementary
     // Spawning-lie fixes share one 10s tick so agents-list activity stays
     // trustworthy after events.sock degrades:
