@@ -90,18 +90,35 @@ independently of this fix.
 ## Bazel configuration under isolated homes
 
 Grok and Antigravity set `HOME` to a per-run `process-home`. Their shared
-`HostToolPaths::provision_into` setup links the host user's `.bazelrc` into
-that home when it exists, alongside the existing host-tool and cache delegates.
-Bazel therefore discovers the same machine configuration through its normal
-user-rc lookup in mono and other repositories. The link follows later edits or
-atomic replacements of the host file; setup never writes to that file or
-changes its permissions. Like the other host-tool delegates, this is not a
-read-only filesystem boundary. A host without `.bazelrc` needs no setup and
-keeps each repository's default execution settings.
+`HostToolPaths::provision_into` setup writes a generated `.bazelrc` into that
+home, alongside the existing host-tool and cache delegates. It has two parts:
+
+- `startup --output_user_root=<host Bazel output root>/_bazel_<user>`, the
+  same root Bazel used when it was pointed there through `TEST_TMPDIR`, so
+  existing output bases, install bases and caches stay valid.
+- `try-import <host ~/.bazelrc>`, after the startup line, so the host's
+  machine configuration (remote endpoint, `dev-remote` configs, ...) applies
+  in mono and other repositories through Bazel's normal user-rc lookup. The
+  import follows later edits or atomic replacements of the host file; setup
+  never writes to that file or changes its permissions. A host rc that sets
+  its own `output_user_root` still wins over the pin.
+
+Setup does not export `TEST_TMPDIR`. The Bazel client treats any set value as
+"running inside a test": in the pinned 9.3.3 client, `startup_options.cc:115`
+drops the default `max_idle_secs` from 3 h to 15 s and
+`startup_options.cc:669-676` roots the default `output_user_root` under it
+(`blaze.cc:1659` only logs). Exporting it made every worker's Bazel server
+shut down 15 s after each command and re-run loading and analysis on the next.
+The generated file is rewritten on every provisioning and is only ever
+replaced over a link left by earlier provisioning or a file carrying its own
+header, never a hand-written rc. Like the other host-tool delegates, this is
+not a read-only filesystem boundary. If `USER` and `LOGNAME` are both unset the
+pin is omitted and Bazel picks its own default root.
 
 Codex isolates `CODEX_HOME` only, and Claude leaves `HOME` unchanged. Both
 already inherit the user's Bazel configuration. Existing Grok and Antigravity
-homes gain the link when provisioned again; new runs receive it at setup.
+homes get the generated file when provisioned again; new runs receive it at
+setup.
 
 ## The progression agent: no workspace
 
