@@ -108,6 +108,15 @@ pub struct WorkerSpawnOpts {
     /// Use explicit empty PR templates and manifest hints instead of probing local disk.
     #[builder(default)]
     pub remote_workspace: bool,
+    /// The experiment arms this launch runs under, resolved by the caller
+    /// before composing (see `experiment_arms::resolve_launch_experiment_arms`).
+    /// Composition turns them into plain prompt options and carries the set on
+    /// [`SpawnConfig::experiment_arms`], so the dispatch site records exactly
+    /// what was composed. The empty default is "nothing was running": a caller
+    /// that does not run experiments, such as the remote spawn path, records
+    /// `{}` and is never treated.
+    #[builder(default)]
+    pub experiment_arms: crate::feature_flags::ExperimentArmSet,
 }
 
 /// Fetch authoritative PR metadata for a reviewer worker's initial prompt.
@@ -643,7 +652,10 @@ pub async fn compose_worker_spawn(
         bazel_workspace,
         repo_guidance,
         remote_workspace,
+        experiment_arms,
     } = editorial_opts;
+    // Experiments reach the composer as plain options, never as keys.
+    let batched_search = experiment_arms.is_treated(crate::feature_flags::BATCHED_SEARCH_EXPERIMENT);
     // For any project-scoped task (the synthetic `kind = 'design'`
     // task and ordinary `project_task` rows alike), the richer
     // brief — what the project is for, what its goal is — lives
@@ -1190,6 +1202,7 @@ pub async fn compose_worker_spawn(
                 .merge_order_preservation(&merge_order_preservation)
                 .maybe_bazel_workspace(bazel_workspace)
                 .remote_workspace(remote_workspace)
+                .batched_search(batched_search)
                 .build(),
         )
     };
@@ -1286,7 +1299,7 @@ pub async fn compose_worker_spawn(
             boss_engine_effort::is_design_or_investigation_tier(model_inputs.kind, model_inputs.reasoning),
         )
     };
-    let spawn_config = if execution.kind == ExecutionKind::PrReviewGuide {
+    let mut spawn_config = if execution.kind == ExecutionKind::PrReviewGuide {
         let config = resolve_review_guide_spawn_config(&registry)?;
         if let Ok(Some(attempt)) = work_db.pr_review_guide_attempt_for_execution(&execution.id)
             && let Err(error) = work_db.record_pr_review_guide_attempt_spawn_config(
@@ -1339,12 +1352,17 @@ pub async fn compose_worker_spawn(
         }
     };
 
+    // Carried to the dispatch site that stamps the launch record and the
+    // `pane_spawned` event, so what is recorded is what was just composed.
+    spawn_config.experiment_arms = Some(experiment_arms.encode());
+
     tracing::info!(
         execution_id = %execution.id,
         driver = %spawn_config.driver,
         model = %spawn_config.model,
         driver_source = spawn_config.driver_source.as_str(),
         model_source = spawn_config.model_source.as_str(),
+        experiment_arms = spawn_config.experiment_arms.as_deref().unwrap_or(""),
         "resolved worker model/driver pair",
     );
 

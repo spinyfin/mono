@@ -1616,6 +1616,7 @@ async fn pane_spawned_event_carries_spawn_config_details() {
             driver: crate::effort::ENGINE_DEFAULT_DRIVER.to_owned(),
             driver_source: crate::effort::DriverResolutionSource::EngineDefault,
             prompt_addendum: None,
+            experiment_arms: Some(r#"{"batched_search":"treatment","ranged_reads":"control"}"#.to_owned()),
         }),
         ..FakeExecutionRunner::default()
     });
@@ -1645,6 +1646,17 @@ async fn pane_spawned_event_carries_spawn_config_details() {
     assert_eq!(spawn["driver"], crate::effort::ENGINE_DEFAULT_DRIVER);
     assert_eq!(spawn["driver_source"], "engine_default");
     assert_eq!(spawn["prompt_addendum_applied"], false);
+    // The arm set rides the event as an object, so a diagnose verb can show
+    // which arm of each experiment this launch ran under.
+    assert_eq!(spawn["experiment_arms"]["batched_search"], "treatment");
+    assert_eq!(spawn["experiment_arms"]["ranged_reads"], "control");
+    // The same arm set is what the dispatch site stamped on the launch record.
+    assert_eq!(
+        db.stored_experiment_arms(&execution_id).unwrap(),
+        crate::work::StoredExperimentArms::Recorded(
+            r#"{"batched_search":"treatment","ranged_reads":"control"}"#.to_owned()
+        ),
+    );
 }
 
 /// Cube lease failures also need the loud-failure contract: a

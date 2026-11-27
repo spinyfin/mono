@@ -2294,3 +2294,97 @@ mod progression_model_policy_tests {
         );
     }
 }
+
+mod experiment_arm_tests {
+    //! The experiment arms a caller hands `compose_worker_spawn` reach both the
+    //! prompt (as a plain option) and `SpawnConfig` (as the set the dispatch
+    //! site records), and the default is "nothing was running".
+
+    use super::*;
+    use crate::feature_flags::{BATCHED_SEARCH_EXPERIMENT, ExperimentArm, ExperimentArmSet};
+
+    const RULE: &str = "**Batch independent tool calls.**";
+
+    async fn compose_with(arms: Option<ExperimentArmSet>, workspace: &Path) -> ComposedWorkerSpawn {
+        let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
+        let execution = WorkExecution::builder()
+            .id("exec_arms_01")
+            .work_item_id("task-arms")
+            .kind(ExecutionKind::ChoreImplementation)
+            .status(ExecutionStatus::Running)
+            .repo_remote_url("git@github.com:org/repo.git")
+            .workspace_path(workspace.to_string_lossy())
+            .created_at("2026-05-15T00:00:00Z")
+            .build();
+        let task = Task::builder()
+            .id("task-arms")
+            .product_id("prod-arms")
+            .kind(TaskKind::Chore)
+            .name("Widget import")
+            .description("Implement widget import.")
+            .status(TaskStatus::Todo)
+            .created_at("2026-05-15T00:00:00Z")
+            .updated_at("2026-05-15T00:00:00Z")
+            .build();
+        let opts = WorkerSpawnOpts::builder().review_signal_checks(|_| &[]);
+        let opts = match arms {
+            Some(arms) => opts.experiment_arms(arms).build(),
+            None => opts.build(),
+        };
+        compose_worker_spawn(
+            &db,
+            "worker-arms",
+            &execution,
+            &WorkItem::Chore(task),
+            workspace,
+            None,
+            opts,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn set(arm: ExperimentArm) -> ExperimentArmSet {
+        let mut arms = ExperimentArmSet::new();
+        arms.insert(BATCHED_SEARCH_EXPERIMENT, arm);
+        arms
+    }
+
+    #[tokio::test]
+    async fn a_caller_that_resolves_no_arms_records_an_empty_set_and_is_never_treated() {
+        // The remote spawn path builds its options without arms.
+        let workspace = tempfile::tempdir().unwrap();
+        let composed = compose_with(None, workspace.path()).await;
+        assert_eq!(composed.spawn_config.experiment_arms.as_deref(), Some("{}"));
+        assert!(!composed.prompt_text.contains(RULE));
+    }
+
+    #[tokio::test]
+    async fn treatment_changes_the_brief_and_is_recorded() {
+        let workspace = tempfile::tempdir().unwrap();
+        let composed = compose_with(Some(set(ExperimentArm::Treatment)), workspace.path()).await;
+        assert_eq!(composed.prompt_text.matches(RULE).count(), 1);
+        assert_eq!(
+            composed.spawn_config.experiment_arms.as_deref(),
+            Some(r#"{"batched_search":"treatment"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn control_and_stopped_keep_todays_brief_and_are_recorded() {
+        let workspace = tempfile::tempdir().unwrap();
+        let untreated = compose_with(None, workspace.path()).await;
+        for (arm, recorded) in [
+            (ExperimentArm::Control, r#"{"batched_search":"control"}"#),
+            (ExperimentArm::Stopped, r#"{"batched_search":"stopped"}"#),
+        ] {
+            let composed = compose_with(Some(set(arm)), workspace.path()).await;
+            assert_eq!(composed.prompt_text, untreated.prompt_text, "{arm:?}");
+            assert_eq!(
+                composed.spawn_config.experiment_arms.as_deref(),
+                Some(recorded),
+                "{arm:?}"
+            );
+        }
+    }
+}

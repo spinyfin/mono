@@ -199,12 +199,15 @@ impl ExecutionCoordinator {
                     None => run,
                 };
                 if let Some(spawn) = outcome.spawn_config.as_ref()
-                    && let Err(err) = self.work_db.record_execution_launch_config(
-                        &execution.id,
-                        &spawn.driver,
-                        &spawn.model,
-                        spawn.effort_level,
-                    )
+                    && let Err(err) = self
+                        .work_db
+                        .record_execution_launch(&crate::work::ExecutionLaunchRecord {
+                            execution_id: &execution.id,
+                            driver: &spawn.driver,
+                            model: &spawn.model,
+                            effort_level: spawn.effort_level,
+                            experiment_arms: spawn.experiment_arms.as_deref(),
+                        })
                 {
                     tracing::error!(?err, execution_id = %execution.id, "failed to persist progression launch configuration");
                 }
