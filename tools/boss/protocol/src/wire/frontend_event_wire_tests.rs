@@ -400,7 +400,15 @@ fn window_cost_report() -> crate::WindowCostReport {
 fn top_cost_report() -> crate::TopCostReport {
     crate::TopCostReport::builder()
         .rows(vec![])
-        .excluded_unmeasured_count(0)
+        .excluded_unmeasured_count(1)
+        .unmeasured_coordinator(vec![
+            crate::CostUnmeasuredCoordinatorRow::builder()
+                .execution_id("coord_sess_abcd1234")
+                .label("Coordinator session abcd1234")
+                .status("active")
+                .reason("Coordinator transcript not found")
+                .build(),
+        ])
         .generated_at_epoch_s(1_747_000_000)
         .limit(10)
         .pricing_gaps(vec![])

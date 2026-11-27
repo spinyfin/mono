@@ -6,8 +6,8 @@
 //! to re-derive one.
 
 use boss_protocol::{
-    DRIVER_SLUG_AGY, DRIVER_SLUG_CLAUDE, DRIVER_SLUG_CODEX, DRIVER_SLUG_GROK, DriverSource, ExecutionKind,
-    InputConvention, RunCoverage, SpendClass, TokenClasses, UsageCaveat, UsageDimension,
+    COORDINATOR_USAGE_KIND, DRIVER_SLUG_AGY, DRIVER_SLUG_CLAUDE, DRIVER_SLUG_CODEX, DRIVER_SLUG_GROK, DriverSource,
+    ExecutionKind, InputConvention, RunCoverage, SpendClass, TokenClasses, UsageCaveat, UsageDimension,
 };
 
 pub(crate) use crate::fold::UsdOutcome;
@@ -202,6 +202,9 @@ pub(crate) fn price_if_requested(facts: &mut RunFacts<'_>, ctx: &ClassifyContext
 /// [`ExecutionKind`], so a new kind fails to compile here until someone
 /// decides which class it belongs to.
 pub fn spend_class(kind: &str) -> SpendClass {
+    if kind == COORDINATOR_USAGE_KIND {
+        return SpendClass::Overhead;
+    }
     let Ok(kind) = kind.parse::<ExecutionKind>() else {
         return SpendClass::Unclassified;
     };
@@ -363,7 +366,7 @@ fn visit_caveats(
     if measured && facts.convention == InputConvention::Gross {
         visit(caveat::GROSS_INPUT, &|| None);
     }
-    if measured && facts.driver == Some(DRIVER_SLUG_CLAUDE) {
+    if measured && facts.driver == Some(DRIVER_SLUG_CLAUDE) && rec.execution_kind != COORDINATOR_USAGE_KIND {
         visit(caveat::SUBAGENTS_EXCLUDED, &|| None);
     }
     if rec.run_model.as_deref() == Some(SYNTHETIC_MODEL) {
@@ -485,10 +488,11 @@ pub(crate) fn dimension_value_of<'a>(src: &DimensionSource<'a>, dimension: Usage
         UsageDimension::TaskKind => src
             .task
             .map_or_else(|| none("(no task)"), |task| same(task.kind.as_str())),
-        UsageDimension::ExecutionKind => src
-            .execution_kind
-            .filter(|kind| !kind.is_empty())
-            .map_or_else(|| none("(none)"), same),
+        UsageDimension::ExecutionKind => match src.execution_kind.filter(|kind| !kind.is_empty()) {
+            Some(kind) if kind == COORDINATOR_USAGE_KIND => (COORDINATOR_USAGE_KIND, "Coordinator"),
+            Some(kind) => same(kind),
+            None => none("(none)"),
+        },
         UsageDimension::SpendClass => src
             .spend_class
             .map_or_else(|| none("(none)"), |class| same(class.as_str())),

@@ -51,8 +51,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use boss_protocol::{
-    CostMeasurement, DriverSource, RunCoverage, SpendClass, TokenUsageSeriesReport, UsageBucket, UsageBucketWidth,
-    UsageCaveatCount, UsageCell, UsageDimension, UsageFilter, UsageRatios, UsageSeriesCoverage, UsageSeriesNote,
+    COORDINATOR_USAGE_KIND, CostMeasurement, DriverSource, RunCoverage, SpendClass, TokenUsageSeriesReport,
+    UsageBucket, UsageBucketWidth, UsageCaveatCount, UsageCell, UsageDimension, UsageFilter, UsageRatios,
+    UsageSeriesCoverage, UsageSeriesNote,
 };
 
 use crate::classify::{
@@ -345,8 +346,13 @@ pub fn build_usage_series_report(
                 .map(|(group, measurement, derived)| {
                     let share_of_bucket_total_tokens = (measurement.runs_measured > 0 && bucket_measured_tokens > 0)
                         .then(|| measurement.total_tokens as f64 / bucket_measured_tokens as f64);
-                    let tokens_per_run = (measurement.runs_measured > 0)
-                        .then(|| measurement.total_tokens as f64 / measurement.runs_measured as f64);
+                    let worker_runs_measured = measurement
+                        .runs_measured
+                        .saturating_sub(derived.coordinator_slices_measured);
+                    let tokens_per_run = (worker_runs_measured > 0).then(|| {
+                        (measurement.total_tokens - derived.coordinator_slice_tokens) as f64
+                            / worker_runs_measured as f64
+                    });
                     let tokens_per_completed_execution = (measurement.runs_measured > 0
                         && derived.executions_completed > 0)
                         .then(|| measurement.total_tokens as f64 / derived.executions_completed as f64);
@@ -568,6 +574,11 @@ struct CellAcc<'a> {
     active_tokens: i64,
     active_ms: i64,
     active_measured_runs: u32,
+    /// Measured coordinator hour slices and their tokens. A slice is an hour
+    /// of coordinator activity, not a unit of work, so it stays out of the
+    /// `tokens_per_run` numerator and denominator.
+    coordinator_slices_measured: u32,
+    coordinator_slice_tokens: i64,
     executions_completed: u32,
     distinct_prs: BTreeSet<&'a str>,
     tasks_completed: u32,
@@ -577,6 +588,10 @@ struct CellAcc<'a> {
 impl<'a> CellAcc<'a> {
     fn add_run(&mut self, facts: &'a RunFacts<'a>) {
         self.measurement.add(&facts.sample());
+        if facts.rec.execution_kind == COORDINATOR_USAGE_KIND && facts.coverage != RunCoverage::Unmeasured {
+            self.coordinator_slices_measured += 1;
+            self.coordinator_slice_tokens += known_total(facts.rec, facts.coverage).unwrap_or(0);
+        }
         // Restrict BOTH numerator and denominator of `tokens_per_active_hour`
         // to measured runs that actually have `agent_active_ms` recorded.
         if facts.coverage != RunCoverage::Unmeasured
@@ -611,6 +626,8 @@ impl<'a> CellAcc<'a> {
                 active_tokens: self.active_tokens,
                 active_ms: self.active_ms,
                 active_measured_runs: self.active_measured_runs,
+                coordinator_slices_measured: self.coordinator_slices_measured,
+                coordinator_slice_tokens: self.coordinator_slice_tokens,
                 executions_completed: self.executions_completed,
                 distinct_prs: self.distinct_prs.len() as u32,
                 tasks_completed: self.tasks_completed,
@@ -625,6 +642,8 @@ struct CellDerived {
     active_tokens: i64,
     active_ms: i64,
     active_measured_runs: u32,
+    coordinator_slices_measured: u32,
+    coordinator_slice_tokens: i64,
     executions_completed: u32,
     distinct_prs: u32,
     tasks_completed: u32,
@@ -833,6 +852,15 @@ fn build_coverage(
     }
 
     let mut notes = Vec::new();
+    if window_runs
+        .iter()
+        .any(|facts| facts.rec.execution_kind == COORDINATOR_USAGE_KIND)
+    {
+        notes.push(UsageSeriesNote {
+            code: "coordinator_hour_slices".into(), epoch_s: None,
+            detail: "Coordinator usage is recorded in UTC hourly/model slices whose hour starts fall within the window (whole slices at partial-hour edges), included in work volume as slices and excluded from both tokens and run counts for tokens per run; that ratio describes worker runs only.".into(),
+        });
+    }
     if query.since_epoch_s < query.capture_start_epoch_s {
         notes.push(UsageSeriesNote {
             code: note::CAPTURE_STARTED.to_owned(),

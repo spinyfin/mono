@@ -294,6 +294,21 @@ pub(super) fn all() -> Vec<Migration> {
             apply: conflict_stop::migrate,
         },
         Migration {
+            id: "20261127_2305_coordinator_usage_capture_state".into(),
+            legacy_version: None,
+            apply: coordinator_usage::migrate_capture_state,
+        },
+        Migration {
+            id: "20261127_2215_coordinator_usage_facts".into(),
+            legacy_version: None,
+            apply: coordinator_usage::migrate_facts,
+        },
+        Migration {
+            id: coordinator_usage::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: coordinator_usage::migrate,
+        },
+        Migration {
             id: "20261029_1430_critical_requests".into(),
             legacy_version: None,
             apply: critical_requests::migrate,

@@ -1534,3 +1534,108 @@ fn the_report_round_trips_through_json_with_unmeasured_tokens_as_null() {
         .expect("the fixture has an unmeasured revision run");
     assert!(unmeasured_run["tokens"].is_null());
 }
+
+#[test]
+fn coordinator_runs_are_included_in_totals_grouped_as_coordinator_and_omit_subagents_excluded_caveat() {
+    let worker = with_model(
+        tokens(run("r_worker", "e_worker", "t1", BASE_EPOCH_S), 100, 20, 10, 200),
+        "claude-opus",
+    );
+    let mut coord_measured = with_model(
+        tokens(
+            run("coord_run_1", "coord_sess_a", "coordinator:a", BASE_EPOCH_S + 10),
+            500,
+            100,
+            50,
+            1_000,
+        ),
+        "claude-opus",
+    );
+    coord_measured.execution_kind = boss_protocol::COORDINATOR_USAGE_KIND.into();
+    let mut coord_unknown = run("coord_run_2", "coord_sess_b", "coordinator:b", BASE_EPOCH_S + 20);
+    coord_unknown.execution_kind = boss_protocol::COORDINATOR_USAGE_KIND.into();
+    coord_unknown.usage_unavailable = Some("Coordinator transcript unreadable".into());
+
+    let report = build(
+        &window(),
+        &records(vec![worker, coord_measured, coord_unknown], vec![task("t1", "t1", 1)]),
+    );
+    assert_eq!(report.overall.runs_total, 3);
+    assert_eq!(report.overall.runs_measured, 2);
+    assert_eq!(report.overall.runs_unmeasured, 1);
+    assert_eq!(report.overall.total_tokens, 330 + 1_650);
+
+    let coord_m = report
+        .coordinator_measurement
+        .as_ref()
+        .expect("coordinator_measurement must be populated");
+    assert_eq!(coord_m.runs_total, 2);
+    assert_eq!(coord_m.runs_measured, 1);
+    assert_eq!(coord_m.runs_unmeasured, 1);
+    assert_eq!(coord_m.total_tokens, 1_650);
+
+    let coord_exec_a = report
+        .taskless
+        .iter()
+        .find(|e| e.execution_id == "coord_sess_a")
+        .expect("measured coordinator session in taskless");
+    assert_eq!(coord_exec_a.spend_class, SpendClass::Overhead);
+    assert!(
+        coord_exec_a.runs[0]
+            .caveats
+            .iter()
+            .all(|c| c.code != caveat::SUBAGENTS_EXCLUDED),
+        "coordinator capture includes subagents: {:?}",
+        coord_exec_a.runs[0].caveats
+    );
+
+    let coord_exec_b = report
+        .taskless
+        .iter()
+        .find(|e| e.execution_id == "coord_sess_b")
+        .expect("unmeasured coordinator session in taskless");
+    assert_eq!(coord_exec_b.runs[0].coverage, RunCoverage::Unmeasured);
+    assert_eq!(coord_exec_b.runs[0].total_tokens, None);
+    assert!(
+        coord_exec_b.runs[0]
+            .caveats
+            .iter()
+            .any(|c| c.code == caveat::USAGE_UNAVAILABLE)
+    );
+
+    // Filtering by execution_kind=coordinator isolates coordinator runs.
+    let mut filtered_q = window();
+    filtered_q.filters = vec![UsageFilter {
+        dimension: UsageDimension::ExecutionKind,
+        values: vec![boss_protocol::COORDINATOR_USAGE_KIND.into()],
+    }];
+    let filtered = build(
+        &filtered_q,
+        &records(
+            vec![
+                with_model(
+                    tokens(run("r_worker", "e_worker", "t1", BASE_EPOCH_S), 100, 20, 10, 200),
+                    "claude-opus",
+                ),
+                {
+                    let mut r = with_model(
+                        tokens(
+                            run("coord_run_1", "coord_sess_a", "coordinator:a", BASE_EPOCH_S + 10),
+                            500,
+                            100,
+                            50,
+                            1_000,
+                        ),
+                        "claude-opus",
+                    );
+                    r.execution_kind = boss_protocol::COORDINATOR_USAGE_KIND.into();
+                    r
+                },
+            ],
+            vec![task("t1", "t1", 1)],
+        ),
+    );
+    assert_eq!(filtered.overall.total_tokens, 1_650);
+    assert!(filtered.tasks.is_empty());
+    assert_eq!(filtered.taskless.len(), 1);
+}

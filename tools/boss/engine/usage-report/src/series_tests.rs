@@ -1036,3 +1036,130 @@ fn orphan_revision_completed_in_window_is_not_counted_as_a_chain_root() {
     );
     assert_eq!(cell.tasks_completed_cost.runs_total, 0);
 }
+
+#[test]
+fn coordinator_runs_appear_as_their_own_series_and_unknown_when_unmeasured() {
+    let q = UsageSeriesQuery {
+        bucket: Some(UsageBucketWidth::Day),
+        group_by: Some(UsageDimension::ExecutionKind),
+        ..series_query(DAY0, DAY0 + 2 * DAY)
+    };
+    let worker = with_tokens(
+        run("r_worker", "e_worker", "t1", DAY0 + 100),
+        Some(100),
+        Some(50),
+        Some(0),
+        Some(0),
+        Some(1_000),
+    );
+    let mut coord = with_tokens(
+        run("coord_run_1", "coord_sess_1", "coordinator:1", DAY0 + 200),
+        Some(400),
+        Some(100),
+        Some(50),
+        Some(450),
+        Some(2_000),
+    );
+    coord.execution_kind = boss_protocol::COORDINATOR_USAGE_KIND.into();
+    let mut coord_unmeasured = run("coord_run_2", "coord_sess_2", "coordinator:2", DAY0 + DAY + 200);
+    coord_unmeasured.execution_kind = boss_protocol::COORDINATOR_USAGE_KIND.into();
+    coord_unmeasured.usage_unavailable = Some("Coordinator transcript unreadable".into());
+
+    let report = build_usage_series_report(
+        &q,
+        &UsageSeriesRecords {
+            runs: vec![worker, coord, coord_unmeasured],
+            finished_executions: Vec::new(),
+            tasks: vec![task("t1", "t1", None)],
+        },
+        None,
+    );
+    assert_eq!(
+        report
+            .group_labels
+            .get(boss_protocol::COORDINATOR_USAGE_KIND)
+            .map(String::as_str),
+        Some("Coordinator")
+    );
+    assert!(report.groups.iter().any(|g| g == boss_protocol::COORDINATOR_USAGE_KIND));
+    assert_eq!(report.buckets.len(), 2);
+
+    let day0_coord = report.buckets[0]
+        .cells
+        .iter()
+        .find(|c| c.group == boss_protocol::COORDINATOR_USAGE_KIND)
+        .expect("day 0 coordinator cell");
+    assert_eq!(day0_coord.measurement.total_tokens, 1_000);
+    assert_eq!(day0_coord.measurement.runs_measured, 1);
+    assert_eq!(
+        day0_coord.ratios.tokens_per_run, None,
+        "a coordinator hour slice is not a run"
+    );
+
+    let day1_coord = report.buckets[1]
+        .cells
+        .iter()
+        .find(|c| c.group == boss_protocol::COORDINATOR_USAGE_KIND)
+        .expect("day 1 unmeasured coordinator cell");
+    assert_eq!(day1_coord.measurement.runs_measured, 0);
+    assert_eq!(day1_coord.measurement.runs_unmeasured, 1);
+    assert_eq!(day1_coord.measurement.input_tokens, None);
+    assert_eq!(day1_coord.ratios.tokens_per_run, None);
+}
+
+#[test]
+fn coordinator_hour_slices_stay_out_of_the_tokens_per_run_normalizer() {
+    let q = UsageSeriesQuery {
+        bucket: Some(UsageBucketWidth::Day),
+        group_by: None,
+        ..series_query(DAY0, DAY0 + DAY)
+    };
+    let worker = with_tokens(
+        run("r_worker", "e_worker", "t1", DAY0 + 100),
+        Some(100),
+        Some(50),
+        Some(0),
+        Some(0),
+        Some(1_000),
+    );
+    let mut coords = Vec::new();
+    for hour in 0..3 {
+        let mut coord = with_tokens(
+            run(
+                &format!("coord_run_{hour}"),
+                "coord_sess_1",
+                "coordinator:1",
+                DAY0 + 200 + hour * 3_600,
+            ),
+            Some(400),
+            Some(100),
+            Some(50),
+            Some(450),
+            Some(2_000),
+        );
+        coord.execution_kind = boss_protocol::COORDINATOR_USAGE_KIND.into();
+        coords.push(coord);
+    }
+    let mut runs = vec![worker];
+    runs.extend(coords);
+    let report = build_usage_series_report(
+        &q,
+        &UsageSeriesRecords {
+            runs,
+            finished_executions: Vec::new(),
+            tasks: vec![task("t1", "t1", None)],
+        },
+        None,
+    );
+    let cell = &report.buckets[0].cells[0];
+    assert_eq!(
+        cell.measurement.runs_measured, 4,
+        "the totals still include the coordinator"
+    );
+    assert_eq!(cell.measurement.total_tokens, 150 + 3 * 1_000);
+    assert_eq!(
+        cell.ratios.tokens_per_run,
+        Some(150.0),
+        "per-run is over worker runs only"
+    );
+}

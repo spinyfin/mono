@@ -198,6 +198,17 @@ pub mod raw {
 
 const CHECKPOINT_BYTES: u64 = 4096;
 
+/// Result of [`TranscriptTail::poll_lenient`].
+#[derive(Debug, Default)]
+pub struct LenientPoll {
+    /// Newly read, valid JSON lines.
+    pub values: Vec<serde_json::Value>,
+    /// Complete lines skipped because they were not valid UTF-8 or JSON.
+    pub skipped_lines: usize,
+    /// Description of the first skipped line in this poll, if any.
+    pub first_skip_error: Option<String>,
+}
+
 #[derive(Debug, Error)]
 pub enum TailError {
     #[error("transcript io: {0}")]
@@ -310,11 +321,12 @@ impl TranscriptTail {
         self.poll_through(u64::MAX).await
     }
 
-    /// Read only the prefix committed by the source ledger.
-    pub async fn poll_through(&mut self, committed: u64) -> Result<Vec<serde_json::Value>, TailError> {
+    /// Open the file, verify containment and reset the cursor when the file was
+    /// truncated or replaced. Returns `None` when the file does not exist.
+    async fn open_synced(&mut self, committed: u64) -> Result<Option<(fs::File, u64)>, TailError> {
         let mut file = match open_no_follow(&self.path).await {
             Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
         };
 
@@ -348,6 +360,60 @@ impl TranscriptTail {
             self.generation = self.generation.saturating_add(1);
         }
         self.file_identity = Some(opened_identity);
+        Ok(Some((file, size)))
+    }
+
+    /// Like [`Self::poll`], but a complete line that is not valid UTF-8 or JSON
+    /// is skipped and counted instead of failing the poll, so one corrupt line
+    /// never hides the good lines around it or stalls the cursor. A trailing
+    /// line without a newline is left for the next poll. I/O and containment
+    /// failures still return an error.
+    pub async fn poll_lenient(&mut self) -> Result<LenientPoll, TailError> {
+        let mut poll = LenientPoll::default();
+        let Some((mut file, size)) = self.open_synced(u64::MAX).await? else {
+            return Ok(poll);
+        };
+        if size == self.offset {
+            self.checkpoint = read_checkpoint(&mut file, size).await?;
+            return Ok(poll);
+        }
+        file.seek(SeekFrom::Start(self.offset)).await?;
+        let mut buf = Vec::with_capacity((size - self.offset) as usize);
+        (&mut file).take(size - self.offset).read_to_end(&mut buf).await?;
+        let Some(last_newline) = buf.iter().rposition(|byte| *byte == b'\n') else {
+            return Ok(poll);
+        };
+        for raw in buf[..last_newline].split(|byte| *byte == b'\n') {
+            let Ok(line) = std::str::from_utf8(raw) else {
+                poll.skipped_lines += 1;
+                poll.first_skip_error
+                    .get_or_insert_with(|| "line is not valid UTF-8".to_owned());
+                continue;
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<serde_json::Value>(trimmed) {
+                Ok(value) => poll.values.push(value),
+                Err(error) => {
+                    poll.skipped_lines += 1;
+                    poll.first_skip_error
+                        .get_or_insert_with(|| format!("invalid JSON: {error}"));
+                }
+            }
+        }
+        self.offset += last_newline as u64 + 1;
+        self.partial.clear();
+        self.checkpoint = read_checkpoint(&mut file, self.offset).await?;
+        Ok(poll)
+    }
+
+    /// Read only the prefix committed by the source ledger.
+    pub async fn poll_through(&mut self, committed: u64) -> Result<Vec<serde_json::Value>, TailError> {
+        let Some((mut file, size)) = self.open_synced(committed).await? else {
+            return Ok(Vec::new());
+        };
 
         if size == self.offset {
             self.checkpoint = read_checkpoint(&mut file, size).await?;
@@ -889,5 +955,35 @@ mod tests {
             matches!(tail.poll().await, Err(TailError::Containment(_))),
             "the opened descriptor must be rejected when a parent redirects outside the root"
         );
+    }
+
+    #[tokio::test]
+    async fn lenient_poll_skips_corrupt_lines_and_keeps_good_ones_around_them() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let mut bytes = b"{\"n\":1}\nnot json\n".to_vec();
+        bytes.extend_from_slice(&[0xff, 0xfe, b'\n']);
+        bytes.extend_from_slice(b"{\"n\":2}\n{\"n\":3");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut tail = TranscriptTail::new(&path);
+        let poll = tail.poll_lenient().await.unwrap();
+        let ns: Vec<i64> = poll.values.iter().map(|v| v["n"].as_i64().unwrap()).collect();
+        assert_eq!(ns, vec![1, 2], "good lines on both sides of a corrupt line survive");
+        assert_eq!(poll.skipped_lines, 2);
+        assert!(poll.first_skip_error.is_some());
+
+        // The mid-write trailing line is picked up once it completes, and the
+        // corrupt lines are not re-counted.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"}\n")
+            .unwrap();
+        let next = tail.poll_lenient().await.unwrap();
+        assert_eq!(next.values.len(), 1);
+        assert_eq!(next.values[0]["n"], 3);
+        assert_eq!(next.skipped_lines, 0);
     }
 }

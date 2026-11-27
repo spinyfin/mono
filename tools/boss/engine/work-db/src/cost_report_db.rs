@@ -192,7 +192,9 @@ fn fill_resolved_drivers_with_cache<'a>(
 ) {
     let pending: Vec<(&'a str, &'a mut RecordedDriver)> = items
         .into_iter()
-        .filter(|(_, driver)| driver.slug().is_none())
+        .filter(|(execution_id, driver)| {
+            driver.slug().is_none() && !execution_id.starts_with(coordinator_usage::COORDINATOR_EXECUTION_ID_PREFIX)
+        })
         .collect();
     if pending.is_empty() {
         return;
@@ -445,8 +447,17 @@ impl WorkDb {
                 .prepare(&sql)?
                 .query_map(params![since_epoch_s, until_epoch_s], map_usage_run_record)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+            runs.extend(coordinator_usage::query_coordinator_usage_records(
+                &tx,
+                since_epoch_s,
+                until_epoch_s,
+            )?);
 
-            let mut work_item_ids: Vec<&str> = runs.iter().map(|run| run.work_item_id.as_str()).collect();
+            let mut work_item_ids: Vec<&str> = runs
+                .iter()
+                .filter(|run| run.execution_kind != boss_protocol::COORDINATOR_USAGE_KIND)
+                .map(|run| run.work_item_id.as_str())
+                .collect();
             work_item_ids.sort_unstable();
             work_item_ids.dedup();
             let roots = chain_helpers::chain_roots(&tx, &work_item_ids)?;
@@ -516,6 +527,11 @@ impl WorkDb {
                 .prepare(&run_sql)?
                 .query_map(params![since_epoch_s, until_epoch_s], map_usage_run_record)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+            runs.extend(coordinator_usage::query_coordinator_usage_records(
+                &tx,
+                since_epoch_s,
+                until_epoch_s,
+            )?);
 
             let exec_sql = format!(
                 "SELECT {USAGE_EXECUTION_COLUMNS}
@@ -720,11 +736,13 @@ impl WorkDb {
         })
     }
 
-    /// Every `work_runs` row created in `[since_epoch_s, until_epoch_s)`,
-    /// oldest first. Backs both `boss cost window` (aggregated further by
-    /// the caller) and `boss cost top` (ranked further by the caller).
+    /// Every `work_runs` row and coordinator usage slice created in
+    /// `[since_epoch_s, until_epoch_s)`, oldest first. Backs both
+    /// `boss cost window` (aggregated further by the caller) and
+    /// `boss cost top` (ranked further by the caller).
     pub fn cost_records_for_window(&self, since_epoch_s: i64, until_epoch_s: i64) -> Result<Vec<CostRunRecord>> {
-        let conn = self.connect()?;
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
         let sql = format!(
             "SELECT {COST_RECORD_COLUMNS}
              FROM work_runs wr
@@ -733,12 +751,21 @@ impl WorkDb {
              WHERE CAST(wr.created_at AS INTEGER) >= ?1 AND CAST(wr.created_at AS INTEGER) < ?2
              ORDER BY wr.created_at ASC, wr.id ASC"
         );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![since_epoch_s, until_epoch_s], map_cost_run_record)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
+        let mut out = tx
+            .prepare(&sql)?
+            .query_map(params![since_epoch_s, until_epoch_s], map_cost_run_record)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        out.extend(coordinator_usage::query_coordinator_cost_records(
+            &tx,
+            since_epoch_s,
+            until_epoch_s,
+        )?);
+        tx.commit()?;
+        out.sort_by(|a, b| {
+            a.created_at_epoch_s
+                .cmp(&b.created_at_epoch_s)
+                .then_with(|| a.run_id.cmp(&b.run_id))
+        });
         Ok(out)
     }
 }
@@ -1396,7 +1423,7 @@ mod tests {
             .expect("the seed fixture applies to a freshly migrated database");
         let now = boss_engine_utils::epoch_time::now_epoch_secs();
         let records = db.usage_records_for_window(0, now + 86_400).unwrap();
-        assert_eq!(records.runs.len(), 20);
+        assert_eq!(records.runs.len(), 24);
 
         let query = |since: i64| {
             UsageRowsQuery::builder()
@@ -1419,13 +1446,20 @@ mod tests {
                 coverage.runs_zero,
                 coverage.runs_unmeasured
             ),
-            (20, 14, 2, 1, 3)
+            (24, 17, 2, 1, 4)
         );
         assert_eq!(
             report.taskless.len(),
-            4,
-            "answer agent, review guide, automation triage and an unresolvable progression"
+            7,
+            "answer agent, review guide, automation triage, unresolvable progression, and 3 coordinator sessions"
         );
+        let coord = report
+            .coordinator_measurement
+            .as_ref()
+            .expect("seed fixture must include coordinator usage");
+        assert_eq!(coord.runs_total, 4);
+        assert_eq!(coord.runs_measured, 3);
+        assert_eq!(coord.runs_unmeasured, 1);
         let drivers = report
             .dimension_values
             .iter()
@@ -1438,6 +1472,19 @@ mod tests {
                 "{expected} missing from {driver_values:?}"
             );
         }
+        let kinds = report
+            .dimension_values
+            .iter()
+            .find(|d| d.dimension == UsageDimension::ExecutionKind)
+            .unwrap();
+        assert!(
+            kinds
+                .values
+                .iter()
+                .any(|v| v.value == boss_protocol::COORDINATOR_USAGE_KIND && v.label == "Coordinator" && v.runs == 4),
+            "execution_kind dimension must expose Coordinator: {:?}",
+            kinds.values
+        );
         let count = |code: &str| coverage.by_caveat.iter().find(|c| c.code == code).map_or(0, |c| c.runs);
         for code in [
             caveat::PRE_CAPTURE,
@@ -1452,7 +1499,7 @@ mod tests {
             assert!(count(code) > 0, "the seed has no run with caveat {code}");
         }
         assert!(report.spans_capture_boundary);
-        assert!(report.overall.runs_unmeasured == 3 && report.overall.runs_zero == 1);
+        assert!(report.overall.runs_unmeasured == 4 && report.overall.runs_zero == 1);
 
         // Grok and Antigravity: measured but partial, and never priced even
         // though the Antigravity model name is one an API table could match.
@@ -1477,7 +1524,17 @@ mod tests {
         // and Antigravity only the first and peak prompt, and the runs that
         // made no model call or were never captured record none.
         let calls = &report.overall_calls;
-        assert_eq!((calls.runs_with_rounds, calls.rounds), (17, 261));
+        assert_eq!((calls.runs_with_rounds, calls.rounds), (20, 360));
+        // Coordinator hourly/model slices contribute their recorded rounds,
+        // but do not invent worker-run first-call or compaction observations.
+        let coordinator_rounds: i64 = report
+            .taskless
+            .iter()
+            .filter(|execution| execution.kind == "coordinator")
+            .map(|execution| execution.calls.rounds)
+            .sum();
+        assert_eq!(coordinator_rounds, 99);
+        assert_eq!(calls.rounds - coordinator_rounds, 261);
         assert_eq!(calls.runs_with_first_call_context, 15);
         assert_eq!(calls.runs_with_peak_context, 15);
         assert_eq!(calls.max_peak_context, Some(205_000));
@@ -1650,9 +1707,10 @@ mod tests {
             .flat_map(|b| b.cells.iter())
             .map(|c| c.measurement.runs_total)
             .sum();
-        // Window has 18 runs (all 20 minus pre-capture h1 and 40d-old c0).
+        // Window has 22 runs (18 worker runs minus pre-capture h1 and 40d-old
+        // c0, plus 4 coordinator slices in the last 48h).
         // Completed tasks in 7d include ghost_root (which pulls in c0!).
-        assert_eq!(total_window_runs, 18);
+        assert_eq!(total_window_runs, 22);
         assert!(
             total_completed_task_runs > 0,
             "completed tasks in 7d must carry attributed chain runs"

@@ -201,6 +201,20 @@ pub struct CostTopRow {
     pub started_at_epoch_s: Option<i64>,
 }
 
+/// A coordinator session in a `boss cost top` window whose usage could not be
+/// read. It is never ranked and never scored as zero: it is listed so the
+/// missing coordinator is visible as unknown.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct CostUnmeasuredCoordinatorRow {
+    pub execution_id: String,
+    /// Display name of the coordinator session.
+    pub label: String,
+    pub status: String,
+    /// Why the usage is unknown, verbatim from capture.
+    pub reason: Option<String>,
+}
+
 /// Output shape for `boss cost top` — the highest-token-cost runs
 /// recorded in `[since_epoch_s, until_epoch_s)`, ranked descending by
 /// `total_tokens`.
@@ -213,6 +227,12 @@ pub struct TopCostReport {
     /// rather than sorted as if they cost zero. Counted here so the
     /// omission is visible instead of silent.
     pub excluded_unmeasured_count: u32,
+    /// Coordinator sessions in the window whose usage is unknown (also
+    /// counted in `excluded_unmeasured_count`), so an unreadable coordinator
+    /// is shown as unknown rather than silently missing.
+    #[serde(default)]
+    #[builder(default)]
+    pub unmeasured_coordinator: Vec<CostUnmeasuredCoordinatorRow>,
     pub generated_at_epoch_s: i64,
     pub limit: u32,
     pub pricing_gaps: Vec<String>,
