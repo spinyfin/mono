@@ -194,7 +194,6 @@ pub fn build_usage_rows_report(
         .pricing_gaps(gaps.into_iter().collect())
         .taskless(taskless)
         .tasks(task_nodes)
-        .maybe_coordinator_measurement(coordinator_measurement)
         .build()
 }
 
@@ -436,7 +435,6 @@ fn build_groups(
                     .measurement(measurement)
                     .calls(calls)
                     .subgroups(build_groups(ctx, &members, &dims[1..], &key))
-                    .maybe_coordinator_measurement(coordinator_measurement)
                     .build()
             } else {
                 let (tasks, taskless) = build_tree(ctx, &members);
@@ -446,7 +444,6 @@ fn build_groups(
                     .calls(calls)
                     .tasks(tasks)
                     .taskless(taskless)
-                    .maybe_coordinator_measurement(coordinator_measurement)
                     .build()
             }
         })

@@ -6,7 +6,6 @@ import Foundation
 struct TokenUsageTableNode: Identifiable, Hashable {
     enum Kind: String, Hashable, Sendable {
         case group
-        case coordinator
         case task
         case revision
         case execution
@@ -87,9 +86,6 @@ struct TokenUsageTableNode: Identifiable, Hashable {
 }
 
 enum TokenUsageTree {
-    static let coordinatorKind = "coordinator"
-    static let coordinatorID = "coordinator"
-    static let coordinatorName = "Coordinator"
     static let tasklessHeaderID = "taskless"
     static let tasklessHeaderName = "Engine overhead (no task)"
 
@@ -97,9 +93,7 @@ enum TokenUsageTree {
         if !report.groups.isEmpty {
             return report.groups.map { groupNode($0, path: []) }
         }
-        return coordinatorNodes(report.taskless, measurement: report.coordinatorMeasurement, path: "root")
-            + taskNodes(report.tasks, path: "root")
-            + tasklessNodes(report.taskless.filter { $0.kind != Self.coordinatorKind }, path: "root")
+        return taskNodes(report.tasks, path: "root") + tasklessNodes(report.taskless, path: "root")
     }
 
     static func sort(_ nodes: [TokenUsageTableNode], by comparators: [KeyPathComparator<TokenUsageTableNode>]) -> [TokenUsageTableNode] {
@@ -159,9 +153,7 @@ enum TokenUsageTree {
         if !group.subgroups.isEmpty {
             children = group.subgroups.map { groupNode($0, path: path + [leaf?.value ?? ""]) }
         } else {
-            children = coordinatorNodes(group.taskless, measurement: group.coordinatorMeasurement, path: id)
-                + taskNodes(group.tasks, path: id)
-                + tasklessNodes(group.taskless.filter { $0.kind != Self.coordinatorKind }, path: id)
+            children = taskNodes(group.tasks, path: id) + tasklessNodes(group.taskless, path: id)
         }
         return aggregateNode(
             id: id,
@@ -261,11 +253,13 @@ enum TokenUsageTree {
             id: id,
             kind: .execution,
             children: children.isEmpty ? nil : children,
-            name: displayName,
+            name: execution.kind,
             kindLabel: execution.kind,
             driver: TokenUsageFormatter.driverLabel(execution.driver, source: execution.driverSource),
             driverSource: execution.driverSource,
-            model: executionModel,
+            model: execution.runs.compactMap(\.modelObserved).first
+                ?? execution.modelLaunched
+                ?? "",
             modelIsSynthetic: execution.runs.contains { $0.modelObserved == "<synthetic>" },
             launchedModel: execution.modelLaunched,
             launchedEffort: execution.effortLaunched,
@@ -314,14 +308,11 @@ enum TokenUsageTree {
 
     private static func runNode(_ run: RunUsageRow, execution: ExecutionUsageNode, path: String) -> TokenUsageTableNode {
         let id = "\(path)/run:\(run.runId)"
-        let displayName = execution.kind == Self.coordinatorKind
-            ? TokenUsageFormatter.utcTimestampString(epochS: run.startedAtEpochS ?? run.createdAtEpochS)
-            : shortRunId(run.runId)
         return TokenUsageTableNode(
             id: id,
             kind: .run,
             children: nil,
-            name: displayName,
+            name: shortRunId(run.runId),
             kindLabel: "run",
             driver: TokenUsageFormatter.driverLabel(execution.driver, source: execution.driverSource),
             driverSource: execution.driverSource,
