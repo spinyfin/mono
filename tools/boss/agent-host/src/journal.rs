@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// Which way a line travelled.
@@ -175,33 +176,115 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Reads a journal back. A final line that was cut off mid-write is ignored;
-/// any other unreadable line is an error.
+/// Reads a journal back. A final line that was cut off mid-write (including
+/// mid-UTF-8 sequence) is ignored; any other unreadable line is an error.
 pub fn read_records(reader: impl BufRead) -> io::Result<Vec<WireRecord>> {
+    Ok(scan_jsonl::<WireRecord>(reader, "journal")?.records)
+}
+
+// Byte-delimited, torn-tail-tolerant JSONL scanning. A crash or power loss can
+// cut the final record off anywhere, including in the middle of a multi-byte
+// UTF-8 character, so lines are read as raw bytes and validated afterwards. A
+// damaged *final* record is dropped; damage anywhere else is a hard error.
+/// Records parsed from a JSONL stream plus where the valid prefix ends.
+#[derive(Debug)]
+pub struct JsonlScan<T> {
+    /// Successfully parsed records, in file order.
+    pub records: Vec<T>,
+    /// Byte offset immediately after the last valid record (including its
+    /// newline when it has one). Anything past this is a torn tail.
+    pub valid_end: u64,
+    /// True when the final valid record parsed but lacks its trailing newline,
+    /// so a writer must append `\n` at `valid_end` before the next record.
+    pub missing_final_newline: bool,
+}
+
+/// Scans `reader` as JSONL of `T`, tolerating a torn final record.
+///
+/// `label` names the stream in error messages (for example `"intent log"`).
+pub fn scan_jsonl<T: DeserializeOwned>(mut reader: impl BufRead, label: &str) -> io::Result<JsonlScan<T>> {
     let mut records = Vec::new();
-    let mut lines = reader.lines().peekable();
-    while let Some(line) = lines.next() {
-        let line = line?;
-        if line.trim().is_empty() {
+    let mut buf = Vec::new();
+    let mut offset: u64 = 0;
+    let mut valid_end: u64 = 0;
+
+    loop {
+        buf.clear();
+        let read = reader.read_until(b'\n', &mut buf)?;
+        if read == 0 {
+            break;
+        }
+        let line_start = offset;
+        offset += read as u64;
+        let has_newline = buf.ends_with(b"\n");
+
+        let Ok(line) = std::str::from_utf8(&buf) else {
+            if !has_newline || reader_at_eof(&mut reader)? {
+                // Torn final record (cut off mid-UTF-8 sequence).
+                break;
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{label} contains invalid UTF-8 at byte offset {line_start}"),
+            ));
+        };
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if has_newline {
+                valid_end = offset;
+            }
             continue;
         }
-        match serde_json::from_str::<WireRecord>(&line) {
-            Ok(record) => records.push(record),
-            Err(_) if lines.peek().is_none() => break,
+
+        match serde_json::from_str::<T>(trimmed) {
+            Ok(record) => {
+                records.push(record);
+                valid_end = offset;
+                if !has_newline {
+                    return Ok(JsonlScan {
+                        records,
+                        valid_end,
+                        missing_final_newline: true,
+                    });
+                }
+            }
+            Err(_) if !has_newline || reader_at_eof(&mut reader)? => break,
             Err(err) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("journal record after seq {}: {err}", records.len()),
+                    format!("{label} record after seq {}: {err}", records.len()),
                 ));
             }
         }
     }
-    Ok(records)
+
+    Ok(JsonlScan {
+        records,
+        valid_end,
+        missing_final_newline: false,
+    })
+}
+
+fn reader_at_eof(reader: &mut impl BufRead) -> io::Result<bool> {
+    Ok(reader.fill_buf()?.is_empty())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_final_line_cut_off_mid_utf8_is_dropped_but_an_earlier_one_is_an_error() {
+        let good = b"{\"seq\":1,\"ts_ms\":1,\"dir\":\"to_agent\",\"line\":\"a\"}\n";
+        let mut torn = good.to_vec();
+        torn.extend_from_slice(b"{\"seq\":2,\"ts_ms\":1,\"dir\":\"to_agent\",\"line\":\"\xe2\x82");
+        assert_eq!(read_records(torn.as_slice()).unwrap().len(), 1);
+
+        let mut damaged = b"{\"seq\":1,\"line\":\"\xe2\x82\n".to_vec();
+        damaged.extend_from_slice(good);
+        assert!(read_records(damaged.as_slice()).is_err());
+    }
 
     fn journal() -> (tempfile::TempDir, Journal) {
         let dir = tempfile::tempdir().unwrap();

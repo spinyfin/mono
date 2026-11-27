@@ -11,7 +11,8 @@
 //! - No prompt is dispatched while an agent-started turn (`async_task_spawned`
 //!   with `taskType: "turn"`) is open, or while a `session/prompt` is in flight
 //!   or dispatched awaiting wire confirmation.
-//! - Stop (`request_stop`) cancels only the active turn: every still-queued
+//! - Stop (`plan_stop`, then a `Withdrawn` intent record per returned prompt)
+//!   cancels only the active turn: every still-queued
 //!   operator prompt is drained in FIFO order to be returned to the composer as
 //!   a draft, while queued engine prompts stay in the queue and proceed once
 //!   the cancelled turn completes.
@@ -120,6 +121,12 @@ pub struct InFlightPrompt {
     /// once observed in the journal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_seq: Option<u64>,
+    /// True when the intent log recorded a `Withdrawn` for this prompt after
+    /// it was `Sent`. The entry still binds its wire echo (the adapter may be
+    /// running it) but is never re-queued by
+    /// [`TurnQueue::recover_unsent_dispatches`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub withdrawn: bool,
 }
 
 /// Result of pressing Stop on the turn queue.
@@ -134,6 +141,20 @@ pub struct StopOutcome {
     /// Queued operator prompts removed from the queue in FIFO order so the app
     /// can return them to the composer as a draft.
     pub returned_operator_prompts: Vec<QueuedPrompt>,
+}
+
+/// Turns the adapter is running that were not dispatched from the queue.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct UnqueuedTurns {
+    /// Currently open agent-started turns (`async_task_spawned` with
+    /// `taskType: "turn"`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    open_agent_turns: Vec<String>,
+    /// Request ids of wire `session/prompt` records that bound to no intent
+    /// (the adapter is running them, but the intent log never recorded them).
+    /// They keep the queue busy until their response arrives.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    unbound_prompts: Vec<RequestId>,
 }
 
 /// Single-flight coordinator turn queue state machine.
@@ -154,10 +175,9 @@ pub struct TurnQueue {
     /// wire records in order during replay.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     dispatched_awaiting_wire: Vec<InFlightPrompt>,
-    /// Currently open agent-started turns (`async_task_spawned` with
-    /// `taskType: "turn"`).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    open_agent_turns: Vec<String>,
+    /// Turns the adapter is running that no queued prompt accounts for.
+    #[serde(flatten)]
+    unqueued_turns: UnqueuedTurns,
     /// True after Stop / `session/cancel` until the active turn closes.
     #[serde(default)]
     cancel_requested: bool,
@@ -192,13 +212,15 @@ impl TurnQueue {
 
     /// Currently open agent-started turn task ids.
     pub fn open_agent_turns(&self) -> &[String] {
-        &self.open_agent_turns
+        &self.unqueued_turns.open_agent_turns
     }
 
     /// True when either a `session/prompt` is in flight on the wire or an
     /// agent-started turn is open.
     pub fn has_active_turn(&self) -> bool {
-        self.in_flight.is_some() || !self.open_agent_turns.is_empty()
+        self.in_flight.is_some()
+            || !self.unqueued_turns.unbound_prompts.is_empty()
+            || !self.unqueued_turns.open_agent_turns.is_empty()
     }
 
     /// True when the queue cannot dispatch another prompt (active turn on the
@@ -257,7 +279,8 @@ impl TurnQueue {
     ///
     /// Returns `None` if a turn is already active, a dispatch is awaiting wire
     /// confirmation, or the queue is empty.
-    pub fn begin_send(&mut self, request_id: RequestId, sent_ts_ms: u64) -> Option<InFlightPrompt> {
+    #[cfg(test)]
+    pub(crate) fn begin_send(&mut self, request_id: RequestId, sent_ts_ms: u64) -> Option<InFlightPrompt> {
         if !self.can_send() {
             return None;
         }
@@ -267,6 +290,7 @@ impl TurnQueue {
             request_id,
             sent_ts_ms,
             wire_seq: None,
+            withdrawn: false,
         };
         self.cancel_requested = false;
         self.in_flight = Some(entry.clone());
@@ -306,6 +330,7 @@ impl TurnQueue {
             request_id,
             sent_ts_ms,
             wire_seq: None,
+            withdrawn: false,
         };
         self.dispatched_awaiting_wire.push(entry.clone());
         Some(entry)
@@ -316,7 +341,7 @@ impl TurnQueue {
     /// Matches the earliest `dispatched_awaiting_wire` entry carrying
     /// `request_id` (FIFO), moves it to `in_flight` with `wire_seq`, and
     /// returns it. If `in_flight` already carries `request_id` without a
-    /// `wire_seq` (for callers that drove [`Self::begin_send`] directly), its
+    /// `wire_seq` (for callers that drove `begin_send` directly), its
     /// `wire_seq` is filled in and returned.
     pub fn on_wire_prompt_sent(&mut self, request_id: &RequestId, wire_seq: u64) -> Option<InFlightPrompt> {
         if let Some(pos) = self
@@ -344,9 +369,39 @@ impl TurnQueue {
         None
     }
 
+    /// Records a wire `session/prompt` that bound to no intent. The adapter is
+    /// running it, so the queue stays busy until [`Self::on_wire_prompt_finished`]
+    /// sees its response.
+    pub fn on_wire_prompt_unbound(&mut self, request_id: &RequestId) {
+        if self
+            .unqueued_turns
+            .unbound_prompts
+            .iter()
+            .any(|existing| request_ids_equal(existing, request_id))
+        {
+            return;
+        }
+        if !self.has_active_turn() {
+            self.cancel_requested = false;
+        }
+        self.unqueued_turns.unbound_prompts.push(request_id.clone());
+    }
+
     /// Completes the in-flight prompt when its `FromAgent` JSON-RPC response
     /// arrives on the wire.
     pub fn on_wire_prompt_finished(&mut self, request_id: &RequestId) -> Option<InFlightPrompt> {
+        if let Some(pos) = self
+            .unqueued_turns
+            .unbound_prompts
+            .iter()
+            .position(|existing| request_ids_equal(existing, request_id))
+        {
+            self.unqueued_turns.unbound_prompts.remove(pos);
+            if !self.has_active_turn() {
+                self.cancel_requested = false;
+            }
+            return None;
+        }
         let matches = self
             .in_flight
             .as_ref()
@@ -366,21 +421,31 @@ impl TurnQueue {
     /// turn remains open.
     pub fn on_agent_turn_started(&mut self, task_id: impl Into<String>) {
         let task_id = task_id.into();
-        if !self.open_agent_turns.iter().any(|existing| existing == &task_id) {
+        if !self
+            .unqueued_turns
+            .open_agent_turns
+            .iter()
+            .any(|existing| existing == &task_id)
+        {
             if !self.has_active_turn() {
                 self.cancel_requested = false;
             }
-            self.open_agent_turns.push(task_id);
+            self.unqueued_turns.open_agent_turns.push(task_id);
         }
     }
 
     /// Closes an agent-started turn (`async_task_state_update` with
     /// `completed`, `failed`, or `stopped`).
     pub fn on_agent_turn_finished(&mut self, task_id: &str) -> bool {
-        let Some(pos) = self.open_agent_turns.iter().position(|existing| existing == task_id) else {
+        let Some(pos) = self
+            .unqueued_turns
+            .open_agent_turns
+            .iter()
+            .position(|existing| existing == task_id)
+        else {
             return false;
         };
-        self.open_agent_turns.remove(pos);
+        self.unqueued_turns.open_agent_turns.remove(pos);
         if !self.has_active_turn() {
             self.cancel_requested = false;
         }
@@ -439,18 +504,23 @@ impl TurnQueue {
 
     /// Applies a `Withdrawn` intent-log record during live or replay processing.
     ///
-    /// Removes the prompt from `queued`, or from `dispatched_awaiting_wire` if
-    /// it was withdrawn after a crash before ever reaching the wire. Never
-    /// removes a prompt that is already `in_flight` on the wire.
+    /// Removes the prompt from `queued`. A prompt that is `Sent` has normally
+    /// already been written to the host socket (the `Sent` record is appended
+    /// first), so it cannot simply be dropped: that would report the queue idle
+    /// while the adapter is still running it and leave its wire echo unbound.
+    /// Instead the dispatched entry is marked withdrawn: its echo still binds,
+    /// but [`Self::recover_unsent_dispatches`] discards it rather than
+    /// re-queueing it, so a withdrawn prompt is never sent after all.
     pub(crate) fn apply_withdrawn_intent(&mut self, intent_id: u64) -> Option<QueuedPrompt> {
         if let Some(prompt) = self.withdraw(intent_id) {
             return Some(prompt);
         }
-        let pos = self
+        let entry = self
             .dispatched_awaiting_wire
-            .iter()
-            .position(|entry| entry.prompt.intent_id == intent_id)?;
-        Some(self.dispatched_awaiting_wire.remove(pos).prompt)
+            .iter_mut()
+            .find(|entry| entry.prompt.intent_id == intent_id)?;
+        entry.withdrawn = true;
+        Some(entry.prompt.clone())
     }
 
     /// Computes the [`StopOutcome`] without mutating the queue.
@@ -481,7 +551,8 @@ impl TurnQueue {
     ///   them so they can be restored to the composer as a draft.
     /// - Keeps every queued `Engine` prompt in the queue to run once the
     ///   cancelled turn finishes.
-    pub fn request_stop(&mut self) -> StopOutcome {
+    #[cfg(test)]
+    pub(crate) fn request_stop(&mut self) -> StopOutcome {
         let active_turn = self.is_busy();
         let send_cancel = active_turn && !self.cancel_requested;
         if active_turn {
@@ -520,6 +591,7 @@ impl TurnQueue {
         let mut recovered: Vec<QueuedPrompt> = self
             .dispatched_awaiting_wire
             .drain(..)
+            .filter(|entry| !entry.withdrawn)
             .map(|entry| entry.prompt)
             .collect();
         recovered.sort_by_key(|prompt| prompt.intent_id);

@@ -18,7 +18,7 @@ use std::fs::File;
 use std::io::{self, BufReader};
 use std::path::Path;
 
-use boss_agent_host::journal::{WireRecord, read_records};
+use boss_agent_host::journal::WireRecord;
 use boss_engine_utils::atomic_blob::write_blob_atomic_with_mode;
 use boss_protocol::{CoordinatorChatConnectionState, CoordinatorChatItem};
 use serde::{Deserialize, Serialize};
@@ -27,12 +27,16 @@ use crate::intent::{IntentRecord, REPLAY_READ_BUFFER_BYTES, read_intent_file_if_
 use crate::queue::{QueuedPrompt, TurnQueue};
 use crate::redact::CredentialRedactor;
 use crate::reducer::{ActiveStreamSnapshot, ConversationReducer, WireTracker};
+use boss_agent_host::journal::scan_jsonl;
 
 /// Current on-disk schema version of [`ReducerSnapshot`].
 ///
 /// Bump this whenever the serialized shape or semantics of [`ReducerSnapshot`]
 /// changes so older snapshots cleanly fall back to full replay.
-pub const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+// Version 2 adds `TurnQueue` unbound-prompt tracking and the withdrawn flag on
+// dispatched prompts. A version 1 snapshot taken while an unbound
+// `session/prompt` was in flight would load as idle, so it is a cache miss.
 
 /// Recommended wire-record interval between periodic reducer snapshots.
 ///
@@ -120,6 +124,9 @@ pub enum SnapshotLoadStatus {
     Corrupt { reason: String },
     /// Snapshot schema version did not match; replayed from the start.
     VersionMismatch { found: u32, expected: u32 },
+    /// Snapshot was written with a different tool text limit than the one
+    /// requested, so its projected tool items would differ; replayed from the start.
+    ToolTextLimitMismatch { found: usize, expected: usize },
     /// Snapshot claimed a sequence number beyond the journal/intent log tips; replayed from the start.
     StaleAheadOfJournal {
         snapshot_wire_seq: u64,
@@ -216,10 +223,15 @@ pub fn load_snapshot_bytes(bytes: &[u8]) -> SnapshotLoad {
 }
 
 /// Reads a wire journal file using [`REPLAY_READ_BUFFER_BYTES`], returning an
-/// empty vector if the file does not exist yet.
+/// empty vector if the file does not exist yet. A final record cut off
+/// mid-write (including mid-UTF-8 codepoint) is dropped.
 pub fn read_wire_file_if_exists(path: &Path) -> io::Result<Vec<WireRecord>> {
     match File::open(path) {
-        Ok(file) => read_records(BufReader::with_capacity(REPLAY_READ_BUFFER_BYTES, file)),
+        Ok(file) => Ok(scan_jsonl::<WireRecord>(
+            BufReader::with_capacity(REPLAY_READ_BUFFER_BYTES, file),
+            "wire journal",
+        )?
+        .records),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(err) => Err(err),
     }
@@ -242,6 +254,7 @@ pub fn recover_from_files(
     intent_path: Option<&Path>,
     snapshot_path: Option<&Path>,
     redactor: CredentialRedactor,
+    tool_text_limit: usize,
     unsent_policy: UnsentDispatchPolicy,
 ) -> io::Result<RecoveryResult> {
     let wire_records = read_wire_file_if_exists(wire_path)?;
@@ -255,6 +268,7 @@ pub fn recover_from_files(
         &intent_records,
         loaded,
         redactor,
+        tool_text_limit,
         unsent_policy,
     ))
 }
@@ -269,6 +283,7 @@ pub fn recover_from_snapshot_and_tail(
     wire_tail: &[WireRecord],
     intent_tail: &[IntentRecord],
     redactor: CredentialRedactor,
+    tool_text_limit: usize,
     unsent_policy: UnsentDispatchPolicy,
 ) -> Result<RecoveryResult, SnapshotLoadStatus> {
     let snapshot = match load_snapshot_bytes(snapshot_bytes) {
@@ -279,6 +294,12 @@ pub fn recover_from_snapshot_and_tail(
             return Err(SnapshotLoadStatus::VersionMismatch { found, expected });
         }
     };
+    if snapshot.cursor.tool_text_limit != tool_text_limit {
+        return Err(SnapshotLoadStatus::ToolTextLimitMismatch {
+            found: snapshot.cursor.tool_text_limit,
+            expected: tool_text_limit,
+        });
+    }
     let snap_wire_seq = snapshot.cursor.wire_seq;
     let snap_intent_seq = snapshot.cursor.intent_seq;
     let mut reducer = ConversationReducer::from_snapshot(*snapshot, redactor)
@@ -323,10 +344,18 @@ pub fn recover_from_slices(
     intent_records: &[IntentRecord],
     snapshot_bytes: Option<&[u8]>,
     redactor: CredentialRedactor,
+    tool_text_limit: usize,
     unsent_policy: UnsentDispatchPolicy,
 ) -> RecoveryResult {
     let loaded = snapshot_bytes.map(load_snapshot_bytes);
-    recover_from_loaded(wire_records, intent_records, loaded, redactor, unsent_policy)
+    recover_from_loaded(
+        wire_records,
+        intent_records,
+        loaded,
+        redactor,
+        tool_text_limit,
+        unsent_policy,
+    )
 }
 
 fn recover_from_loaded(
@@ -334,6 +363,7 @@ fn recover_from_loaded(
     intent_records: &[IntentRecord],
     loaded: Option<SnapshotLoad>,
     redactor: CredentialRedactor,
+    tool_text_limit: usize,
     unsent_policy: UnsentDispatchPolicy,
 ) -> RecoveryResult {
     let journal_wire_seq = wire_records.iter().map(|rec| rec.seq).max().unwrap_or(0);
@@ -341,33 +371,54 @@ fn recover_from_loaded(
 
     let (mut reducer, snapshot_status, start_wire_seq, start_intent_seq) = match loaded {
         None => (
-            ConversationReducer::new(redactor),
+            ConversationReducer::with_tool_text_limit(redactor, tool_text_limit),
             SnapshotLoadStatus::NotConfigured,
             0,
             0,
         ),
-        Some(SnapshotLoad::Missing) => (ConversationReducer::new(redactor), SnapshotLoadStatus::Missing, 0, 0),
+        Some(SnapshotLoad::Missing) => (
+            ConversationReducer::with_tool_text_limit(redactor, tool_text_limit),
+            SnapshotLoadStatus::Missing,
+            0,
+            0,
+        ),
         Some(SnapshotLoad::Corrupt { reason }) => (
-            ConversationReducer::new(redactor),
+            ConversationReducer::with_tool_text_limit(redactor, tool_text_limit),
             SnapshotLoadStatus::Corrupt { reason },
             0,
             0,
         ),
         Some(SnapshotLoad::VersionMismatch { found, expected }) => (
-            ConversationReducer::new(redactor),
+            ConversationReducer::with_tool_text_limit(redactor, tool_text_limit),
             SnapshotLoadStatus::VersionMismatch { found, expected },
             0,
             0,
         ),
         Some(SnapshotLoad::Loaded(snapshot)) => {
-            if snapshot.cursor.wire_seq > journal_wire_seq || snapshot.cursor.intent_seq > journal_intent_seq {
+            if snapshot.cursor.tool_text_limit != tool_text_limit {
+                let status = SnapshotLoadStatus::ToolTextLimitMismatch {
+                    found: snapshot.cursor.tool_text_limit,
+                    expected: tool_text_limit,
+                };
+                (
+                    ConversationReducer::with_tool_text_limit(redactor, tool_text_limit),
+                    status,
+                    0,
+                    0,
+                )
+            } else if snapshot.cursor.wire_seq > journal_wire_seq || snapshot.cursor.intent_seq > journal_intent_seq {
                 let status = SnapshotLoadStatus::StaleAheadOfJournal {
                     snapshot_wire_seq: snapshot.cursor.wire_seq,
                     journal_wire_seq,
                     snapshot_intent_seq: snapshot.cursor.intent_seq,
                     journal_intent_seq,
                 };
-                (ConversationReducer::new(redactor), status, 0, 0)
+                (
+                    ConversationReducer::with_tool_text_limit(redactor, tool_text_limit),
+                    status,
+                    0,
+                    0,
+                )
             } else {
                 let snap_wire_seq = snapshot.cursor.wire_seq;
                 let snap_intent_seq = snapshot.cursor.intent_seq;
@@ -382,7 +433,7 @@ fn recover_from_loaded(
                         snap_intent_seq,
                     ),
                     Err(reason) => (
-                        ConversationReducer::new(redactor),
+                        ConversationReducer::with_tool_text_limit(redactor, tool_text_limit),
                         SnapshotLoadStatus::Corrupt { reason },
                         0,
                         0,

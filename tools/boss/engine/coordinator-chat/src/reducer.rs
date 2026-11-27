@@ -147,8 +147,6 @@ pub(crate) struct WireTracker {
     pub(crate) pending_client_requests: HashMap<String, PendingClientRequest>,
     #[serde(default)]
     pub(crate) pending_agent_permissions: HashMap<String, String>,
-    #[serde(default)]
-    pub(crate) open_agent_turns: Vec<String>,
     #[serde(flatten)]
     pub(crate) turns: TurnOriginTracker,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -382,22 +380,13 @@ impl ConversationReducer {
         delta
     }
 
-    fn has_active_wire_turn(&self) -> bool {
-        !self.wire.open_agent_turns.is_empty()
-            || self
-                .wire
-                .pending_client_requests
-                .values()
-                .any(|req| req.method == "session/prompt")
-    }
-
     fn handle_to_agent(&mut self, record: &WireRecord, message: &Map<String, Value>, delta: &mut ReduceDelta) {
         let id = parse_request_id(message.get("id"));
         if let Some(method) = message.get("method").and_then(Value::as_str) {
             if let Some(id) = id {
                 self.handle_client_request(record, &id, method, message.get("params"), delta);
             } else if method == "session/cancel" {
-                if self.has_active_wire_turn() {
+                if self.has_active_turn() {
                     self.state.cancel_requested = true;
                 }
                 self.queue_state.queue.note_wire_cancel_sent();
@@ -469,6 +458,10 @@ impl ConversationReducer {
                     self.wire.turns.current_turn_origin = Some(in_flight.prompt.origin.turn_origin());
                     self.wire.turns.current_turn_origin_from_intent = true;
                 } else {
+                    // Not joined to any intent (for example a prompt sent
+                    // outside the intent log): the adapter is still running
+                    // it, so the queue must stay busy until its response.
+                    self.queue_state.queue.on_wire_prompt_unbound(id);
                     self.wire.turns.current_turn_origin = None;
                     self.wire.turns.current_turn_origin_from_intent = false;
                 }
@@ -913,9 +906,6 @@ impl ConversationReducer {
                     && let Some(task_id) = task_id
                 {
                     self.flush_streams(record.seq, delta);
-                    if !self.wire.open_agent_turns.iter().any(|existing| existing == task_id) {
-                        self.wire.open_agent_turns.push(task_id.to_owned());
-                    }
                     self.queue_state.queue.on_agent_turn_started(task_id);
                     self.wire.turns.last_turn_boundary_idx = None;
                     self.wire.turns.current_turn_origin = None;
@@ -928,14 +918,8 @@ impl ConversationReducer {
                 let state = raw_update.get("state").and_then(Value::as_str);
                 if let (Some(task_id), Some(state)) = (task_id, state)
                     && matches!(state, "completed" | "failed" | "stopped")
-                    && let Some(pos) = self
-                        .wire
-                        .open_agent_turns
-                        .iter()
-                        .position(|existing| existing == task_id)
+                    && self.queue_state.queue.on_agent_turn_finished(task_id)
                 {
-                    self.wire.open_agent_turns.remove(pos);
-                    self.queue_state.queue.on_agent_turn_finished(task_id);
                     self.flush_streams(record.seq, delta);
                     self.state.cancel_requested = false;
                     let origin = self.wire.turns.current_turn_origin.take();
@@ -1475,7 +1459,7 @@ impl ConversationReducer {
     }
 
     fn has_active_turn(&self) -> bool {
-        self.has_prompt_in_flight() || !self.wire.open_agent_turns.is_empty()
+        self.has_prompt_in_flight() || !self.queue_state.queue.open_agent_turns().is_empty()
     }
 
     fn has_prompt_in_flight(&self) -> bool {
@@ -1566,9 +1550,6 @@ impl ConversationReducer {
                 "snapshot wire_seq {} disagrees with state.last_seq {}",
                 snapshot.cursor.wire_seq, snapshot.projection.state.last_seq
             ));
-        }
-        if snapshot.wire.open_agent_turns != snapshot.queue.open_agent_turns() {
-            return Err("snapshot wire open_agent_turns disagrees with queue open_agent_turns".to_owned());
         }
         if let Some(last_idx) = snapshot.wire.turns.last_turn_boundary_idx {
             match snapshot.projection.items.get(last_idx) {
@@ -1678,8 +1659,9 @@ pub fn replay_with_intent_log<'a>(
     records: impl IntoIterator<Item = &'a WireRecord>,
     intent_records: impl IntoIterator<Item = &'a IntentRecord>,
     redactor: CredentialRedactor,
+    tool_text_limit: usize,
 ) -> ConversationReducer {
-    let mut reducer = ConversationReducer::new(redactor);
+    let mut reducer = ConversationReducer::with_tool_text_limit(redactor, tool_text_limit);
     for intent in intent_records {
         reducer.apply_intent_record(intent);
     }

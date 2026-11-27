@@ -334,3 +334,29 @@ fn stray_or_late_wire_cancel_does_not_suppress_next_turn_stop() {
     queue.on_agent_turn_started("autonomous-turn-1");
     assert!(queue.request_stop().send_cancel);
 }
+
+#[test]
+fn withdrawn_sent_prompt_is_not_requeued_by_reconcile_when_echo_never_arrives() {
+    let mut queue = TurnQueue::new();
+    queue.enqueue(prompt(1, PromptOrigin::Operator, "stale"));
+    queue.mark_intent_sent(1, RequestId::Number(7), 100).unwrap();
+    assert!(queue.apply_withdrawn_intent(1).is_some());
+    assert!(queue.is_busy(), "adapter may still be running the dispatched prompt");
+
+    let recovered = queue.recover_unsent_dispatches();
+    assert!(recovered.is_empty());
+    assert!(queue.queued().is_empty());
+    assert!(!queue.is_busy());
+}
+
+#[test]
+fn withdrawn_sent_prompt_still_binds_its_echo() {
+    let mut queue = TurnQueue::new();
+    queue.enqueue(prompt(1, PromptOrigin::Operator, "stale"));
+    queue.mark_intent_sent(1, RequestId::Number(7), 100).unwrap();
+    queue.apply_withdrawn_intent(1);
+    let bound = queue.on_wire_prompt_sent(&RequestId::Number(7), 3).unwrap();
+    assert_eq!(bound.prompt.intent_id, 1);
+    assert!(queue.recover_unsent_dispatches().is_empty());
+    assert!(queue.queued().is_empty());
+}
