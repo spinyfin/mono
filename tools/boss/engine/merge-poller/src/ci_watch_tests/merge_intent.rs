@@ -81,7 +81,8 @@ async fn rebounce_decline_gates_end_the_owed_merge_request() {
         if gate == "episode_insert" {
             on_queue_side_failure_detected(
                 &db,
-                crate::queue_ci_contract::test_context(&publisher),
+                &publisher,
+                crate::queue_ci_contract::test_context(&publisher).fetcher,
                 &candidate(&product, &chore, pr),
                 None,
                 QueueSideFailureEpisode {

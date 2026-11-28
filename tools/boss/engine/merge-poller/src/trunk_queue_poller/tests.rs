@@ -490,7 +490,6 @@ async fn no_active_intents_means_no_trunk_traffic() {
                 work_db: &db,
                 publisher: &publisher,
                 api: &api,
-                ci_fix: None,
             },
             Instant::now(),
         )
@@ -525,7 +524,6 @@ async fn intents_sharing_a_repo_and_branch_cost_one_get_queue_call() {
                 work_db: &db,
                 publisher: &publisher,
                 api: &api,
-                ci_fix: None,
             },
             Instant::now(),
         )
@@ -553,7 +551,6 @@ async fn a_queue_is_not_re_probed_before_its_tier_interval_elapses() {
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
     let t0 = Instant::now();
 
@@ -583,7 +580,6 @@ async fn a_testing_entry_pulls_the_queue_onto_the_fifteen_second_tier() {
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
     let t0 = Instant::now();
 
@@ -619,7 +615,6 @@ async fn writes_queued_state_with_a_one_based_position_and_section_order() {
                 work_db: &db,
                 publisher: &publisher,
                 api: &api,
-                ci_fix: None,
             },
             Instant::now(),
         )
@@ -687,7 +682,6 @@ async fn an_unchanged_queue_state_is_not_republished_every_cycle() {
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
     let t0 = Instant::now();
 
@@ -721,7 +715,6 @@ async fn a_cancelled_entry_retires_the_intent_and_snaps_the_card_back_to_review(
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
     let t0 = Instant::now();
 
@@ -769,7 +762,6 @@ async fn a_merged_entry_retires_the_intent_but_leaves_the_columns_to_the_github_
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
     let t0 = Instant::now();
 
@@ -807,7 +799,6 @@ async fn an_evicted_entry_keeps_its_intent_active_for_the_remediation_path() {
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
     let t0 = Instant::now();
 
@@ -866,7 +857,6 @@ async fn an_evicted_entry_with_state_changed_at_triggers_ci_watch() {
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
     let t0 = Instant::now();
 
@@ -1026,7 +1016,6 @@ async fn an_eviction_boss_did_not_initiate_is_adopted_and_remediated() {
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
 
     let outcome = probe.run_pass(&ctx, Instant::now()).await;
@@ -1118,7 +1107,6 @@ async fn run_eviction(
         work_db: db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
     let t0 = Instant::now();
     probe.run_pass(&ctx, t0).await;
@@ -1483,7 +1471,6 @@ async fn a_conflict_handover_sentinel_survives_the_reconciliation_backstop() {
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
     let t0 = Instant::now();
 
@@ -1696,7 +1683,6 @@ async fn a_resubmitted_entry_returns_to_the_merging_lane() {
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
     let t0 = Instant::now();
 
@@ -1737,7 +1723,6 @@ async fn an_intent_awaiting_resubmit_is_resubmitted_and_returns_to_the_merging_l
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
 
     let outcome = probe.run_pass(&ctx, Instant::now()).await;
@@ -1795,7 +1780,6 @@ async fn run_pass_over_a_parked_intent(db: &WorkDb, task_id: &str, seconds_ago: 
         work_db: db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
     probe.run_pass(&ctx, Instant::now()).await
 }
@@ -1889,7 +1873,6 @@ async fn the_stalled_backstop_files_one_item_not_one_per_sweep() {
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
     let t0 = Instant::now();
     probe.run_pass(&ctx, t0).await;
@@ -1920,7 +1903,6 @@ async fn a_failed_resubmit_leaves_the_sentinel_for_the_next_cycle() {
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
 
     let outcome = probe.run_pass(&ctx, Instant::now()).await;
@@ -1964,7 +1946,6 @@ async fn a_live_intent_superseded_by_conflict_is_cancelled_before_its_sentinel_c
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
 
     let outcome = probe.run_pass(&ctx, Instant::now()).await;
@@ -2005,7 +1986,6 @@ async fn an_intent_superseded_by_conflict_is_cancelled_and_the_sentinel_persists
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
 
     let outcome = probe.run_pass(&ctx, Instant::now()).await;
@@ -2045,7 +2025,6 @@ async fn a_cancel_that_finds_no_live_entry_is_not_a_probe_failure() {
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
 
     let outcome = probe.run_pass(&ctx, Instant::now()).await;
@@ -2077,7 +2056,6 @@ async fn a_withdrawn_intent_is_cancelled_then_retired() {
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
 
     let outcome = probe.run_pass(&ctx, Instant::now()).await;
@@ -2110,7 +2088,6 @@ async fn a_withdraw_cancel_that_finds_no_live_entry_still_retires_the_intent() {
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
 
     let outcome = probe.run_pass(&ctx, Instant::now()).await;
@@ -2137,7 +2114,6 @@ async fn an_entry_unknown_to_trunk_leaves_the_intent_untouched() {
                 work_db: &db,
                 publisher: &publisher,
                 api: &api,
-                ci_fix: None,
             },
             Instant::now(),
         )
@@ -2171,7 +2147,6 @@ async fn an_intent_whose_task_already_finished_is_retired_without_any_trunk_call
                 work_db: &db,
                 publisher: &publisher,
                 api: &api,
-                ci_fix: None,
             },
             Instant::now(),
         )
@@ -2197,7 +2172,6 @@ async fn repeated_failures_back_the_queue_off_before_the_next_probe() {
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
     let t0 = Instant::now();
 
@@ -2230,7 +2204,6 @@ async fn a_queue_unreachable_for_fifteen_minutes_files_exactly_one_attention_ite
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
     let t0 = Instant::now();
 
@@ -2265,7 +2238,6 @@ async fn a_rejected_token_is_reported_immediately_and_once() {
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
     let t0 = Instant::now();
 
@@ -2303,7 +2275,6 @@ async fn recovery_re_arms_the_unreachable_attention_for_the_next_outage() {
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
     let t0 = Instant::now();
 
@@ -2350,7 +2321,6 @@ async fn a_paused_queue_files_one_attention_item_per_episode() {
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
     let t0 = Instant::now();
 
@@ -2392,7 +2362,6 @@ async fn an_unparseable_repo_slug_parks_the_queue_instead_of_calling_trunk() {
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
     let t0 = Instant::now();
 
@@ -2452,7 +2421,6 @@ async fn section_order_is_a_contiguous_rank_across_only_the_boss_tracked_members
                 work_db: &db,
                 publisher: &publisher,
                 api: &api,
-                ci_fix: None,
             },
             Instant::now(),
         )
@@ -2490,7 +2458,6 @@ async fn a_stable_queue_does_not_re_renumber_every_pass() {
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
     let t0 = Instant::now();
 
@@ -2529,7 +2496,6 @@ async fn the_reconciliation_backstop_catches_a_transition_the_point_probes_misse
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
     let t0 = Instant::now();
 
@@ -2569,7 +2535,6 @@ async fn the_reconciliation_backstop_does_not_fire_before_its_own_cadence() {
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
     let t0 = Instant::now();
 
@@ -2606,7 +2571,6 @@ async fn a_failed_reconciliation_call_does_not_advance_the_since_cursor() {
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
     let t0 = Instant::now();
 
@@ -2650,7 +2614,6 @@ async fn the_reconciliation_backstop_follows_next_cursor_into_a_second_page() {
         work_db: &db,
         publisher: &publisher,
         api: &api,
-        ci_fix: None,
     };
     let t0 = Instant::now();
 

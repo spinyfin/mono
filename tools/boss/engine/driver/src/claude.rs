@@ -13,10 +13,12 @@ use boss_engine_structured_output::StructuredOutputKind;
 use boss_engine_structured_output::fallback::FallbackCandidate;
 use boss_engine_transient_error::ErrorClass;
 use boss_protocol::{
-    EffortLevel, NormalizeError, PaneMonitorSpec, ReasoningMode, ReviewModelTier, WorkerEvent, normalize_hook_event,
+    DRIVER_SLUG_CLAUDE, EffortLevel, NormalizeError, PaneMonitorSpec, ReasoningMode, ReviewModelTier, WorkerEvent,
+    normalize_hook_event,
 };
 use boss_ssh_transport::shell_quote;
 
+pub use super::InvestigationRouting;
 use super::{
     AgentDriver, Capability, CapabilitySet, DriverDescriptor, EnvDirective, HookWiringDestination, InterruptDelivery,
     InterruptGesture, InterruptPlan, LaunchOptions, MidTurnPaneInput, ModelMenu, PermissionArtifacts, PermissionInput,
@@ -65,24 +67,8 @@ fn claude_model_for_reasoning(reasoning: ReasoningMode) -> &'static str {
     }
 }
 
-/// One step down for a design or investigation run on Claude, for the
-/// `investigation_routing` experiment.
-///
-/// The design/investigation tier launches on Fable, and its `large` effort
-/// resolves to Claude's `xhigh`. Anthropic's guidance for Fable is to start at
-/// `high` and use `xhigh` only where a gain is measured, and a `small` or
-/// `medium` run rarely needs the most expensive model. A field that is `None`
-/// leaves what the ordinary tier resolution chose.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InvestigationRouting {
-    /// The model to launch on instead of the design/investigation tier's.
-    pub model: Option<&'static str>,
-    /// The `--effort` value to launch with instead of the level's own.
-    pub effort_value: Option<&'static str>,
-}
-
-/// The routing the `investigation_routing` treatment applies at `level`:
-/// `large` effort at the `medium` level's value (`high`), and `small` or
+/// The routing the `investigation_routing` treatment applies at `level` on
+/// Claude: `large` effort at the `medium` level's value (`high`), and `small` or
 /// `medium` effort on the investigation reasoning model (Opus). `trivial`,
 /// `max` and a row with no level are not routed: the first two are the
 /// extremes the experiment does not test, and a row with no level launches
@@ -180,11 +166,8 @@ fn claude_model_belongs_to_driver(model: &str) -> bool {
     lower.contains("claude") || matches!(lower.as_str(), "opus" | "sonnet" | "haiku" | "fable")
 }
 
-/// The Claude driver's slug: `tasks.driver`, `--driver`, and the registry key.
-pub const DRIVER_SLUG: &str = "claude";
-
 static CLAUDE_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
-    name: DRIVER_SLUG,
+    name: DRIVER_SLUG_CLAUDE,
     label: "Claude Code",
     binary: "claude",
     config_dir: ".claude",
@@ -205,6 +188,7 @@ static CLAUDE_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
         model_for_reasoning: claude_model_for_reasoning,
         review_model_for_tier: claude_review_model_for_tier,
         design_investigation_model: Some(|| "fable"),
+        investigation_routing: Some(investigation_routing_for_level),
         prompt_addendum_for_level: claude_prompt_addendum_for_level,
         model_requires_auto_permissions: claude_model_requires_auto_permissions,
         model_belongs_to_driver: claude_model_belongs_to_driver,

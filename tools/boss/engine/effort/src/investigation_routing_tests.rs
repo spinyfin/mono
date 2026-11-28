@@ -186,3 +186,28 @@ fn other_drivers_are_never_routed() {
         }
     }
 }
+
+#[test]
+fn ci_fix_revisions_are_excluded_from_investigation_routing() {
+    let created_via = format!("{}attempt-1", boss_protocol::CREATED_VIA_CI_FIX_PREFIX);
+    for level in [EffortLevel::Small, EffortLevel::Medium, EffortLevel::Large] {
+        let resolve_ci_fix = |treated| {
+            resolve_spawn_config(
+                &SpawnResolutionInput::builder()
+                    .execution_kind(&ExecutionKind::RevisionImplementation)
+                    .created_via(created_via.as_str())
+                    .kind(&TaskKind::Revision)
+                    .reasoning(ReasoningMode::Investigation)
+                    .effort_level(level)
+                    .investigation_routing(treated)
+                    .build(),
+            )
+            .unwrap()
+        };
+        let treated = resolve_ci_fix(true);
+        let control = resolve_ci_fix(false);
+        assert_eq!(treated, control, "{level:?}");
+        assert_eq!(treated.model, "fable", "{level:?}");
+        assert_eq!(treated.model_source, ModelResolutionSource::DesignInvestigationTier);
+    }
+}

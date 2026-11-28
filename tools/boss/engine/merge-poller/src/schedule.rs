@@ -858,7 +858,6 @@ pub fn spawn_loop<C: CompletionRequests + 'static>(
                                     work_db: work_db.as_ref(),
                                     publisher: publisher.as_ref(),
                                     api: trunk_queue_api.as_ref(),
-                                    ci_fix: Some(host.as_ref() as &dyn crate::host::CiFixPolicy),
                                 },
                                 Instant::now(),
                             ),

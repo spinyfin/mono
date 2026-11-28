@@ -374,9 +374,6 @@ pub struct TrunkSweepContext<'a> {
     pub work_db: &'a WorkDb,
     pub publisher: &'a dyn ExecutionPublisher,
     pub api: &'a dyn TrunkQueueApi,
-    /// Tiers the revision minted for an eviction with no failing build. `None`
-    /// mints it as it always was.
-    pub ci_fix: Option<&'a dyn crate::host::CiFixPolicy>,
 }
 
 /// Outcome of one pass, for logging, metrics, and tests.
@@ -2071,7 +2068,6 @@ async fn handle_trunk_queue_eviction(
                 crate::queue_ci_contract::DetectionContext {
                     publisher: ctx.publisher,
                     fetcher: ctx.contract_fetcher,
-                    ci_fix: ctx.ci_fix,
                 },
                 &candidate,
                 None, // head branch not tracked on the intent; mirrors the GH rebounce production callsite

@@ -590,11 +590,13 @@ pub struct SpawnResolutionInput<'a> {
     #[builder(default)]
     pub design_reasoning_effort_xhigh: bool,
     /// The `investigation_routing` treatment: a design or investigation run on
-    /// the Claude driver goes one step down (see
-    /// [`boss_engine_driver::claude::investigation_routing_for_level`]). Applies
-    /// only where the design/investigation tier itself chose the model, so a
-    /// model pin, a pool tier and every other driver resolve as they always did.
-    /// The explicit design `xhigh` setting still wins over the effort step.
+    /// a driver whose [`boss_engine_driver::ModelMenu::investigation_routing`]
+    /// supplies a step-down goes one step down. Applies only where the
+    /// design/investigation tier itself chose the model, and never to CI-fix
+    /// revisions (which belong to `ci_fix_standard_tier`), so a model pin, a
+    /// pool tier, a CI-fix revision and every other driver resolve as they
+    /// always did. The explicit design `xhigh` setting still wins over the
+    /// effort step.
     #[builder(default)]
     pub investigation_routing: bool,
 }
@@ -693,12 +695,18 @@ pub fn resolve_spawn_config_in(
     };
 
     // The `investigation_routing` treatment. Gated on the model having come
-    // from the design/investigation tier, so every pin and pool tier that
-    // outranks it is untouched, and on the driver the routing is written for.
-    let routing = (input.investigation_routing
-        && model_source == ModelResolutionSource::DesignInvestigationTier
-        && driver == boss_engine_driver::claude::DRIVER_SLUG)
-        .then(|| boss_engine_driver::claude::investigation_routing_for_level(effort_level));
+    // from the design/investigation tier (so every pin and pool tier that
+    // outranks it is untouched), on not being a CI-fix revision (so no-evidence
+    // CI-fix revisions stay exclusively in `ci_fix_standard_tier`'s population),
+    // and on the driver's `ModelMenu` supplying a routing function.
+    let is_ci_fix = input
+        .created_via
+        .is_some_and(|cv| cv.starts_with(boss_protocol::CREATED_VIA_CI_FIX_PREFIX));
+    let routing =
+        (input.investigation_routing && !is_ci_fix && model_source == ModelResolutionSource::DesignInvestigationTier)
+            .then_some(menu.investigation_routing)
+            .flatten()
+            .map(|route| route(effort_level));
     if let Some(routed_model) = routing.and_then(|routing| routing.model) {
         model = routed_model.to_owned();
         model_source = ModelResolutionSource::InvestigationRouting;
@@ -1151,6 +1159,7 @@ mod tests {
                 model_for_reasoning: stub_model_for_reasoning,
                 review_model_for_tier: |_| "stub-model",
                 design_investigation_model: Some(|| "stub-tier"),
+                investigation_routing: None,
                 prompt_addendum_for_level: stub_prompt_addendum_for_level,
                 model_requires_auto_permissions: stub_model_requires_auto_permissions,
                 model_belongs_to_driver: stub_model_belongs_to_driver,

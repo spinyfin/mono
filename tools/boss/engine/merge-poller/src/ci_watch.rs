@@ -37,13 +37,12 @@
 #[cfg(test)]
 use boss_protocol::TaskKind;
 use boss_protocol::{
-    CREATED_VIA_CI_FIX_PREFIX, CreateAttentionItemInput, CreateRevisionInput, EffortLevel, ExecutionKind,
-    ExecutionStatus, FrontendEvent, ReasoningMode,
+    CREATED_VIA_CI_FIX_PREFIX, CreateAttentionItemInput, CreateRevisionInput, ExecutionKind, ExecutionStatus,
+    FrontendEvent, ReasoningMode,
 };
 use serde::Serialize;
 
 use crate::blocking_signal::{self, SignalKind};
-use crate::host::{CiFixPolicy, NoEvidenceCiFixTier};
 use crate::work::{
     ARCHIVE_MECHANISM_CI_WATCH_SUPERSESSION, ArchiveProvenance, CiRemediation, CiRemediationInsertInput,
     ClearResolvedSignal, CreateExecutionInput, InFlightCiFixRevision, MergeIntentCiFixDecline, PendingMergeCheck,
@@ -884,9 +883,7 @@ pub async fn on_ci_failure_detected(
         && a.attempt_kind == "fix"
         && a.status == "pending"
         && a.revision_task_id.is_none()
-        // `failures` is never empty here (checked on entry), so there is no
-        // no-evidence tier to ask the host about.
-        && maybe_spawn_ci_revision(work_db, publisher, pr_checker, candidate, failures, a, None).await
+        && maybe_spawn_ci_revision(work_db, publisher, pr_checker, candidate, failures, a).await
     {
         task_unblocked_for_revision =
             blocking_signal::unblock_for_revision(work_db, SignalKind::CiFailure, candidate, &a.id);
@@ -1007,9 +1004,6 @@ fn ci_revision_description(failures: &[RequiredCheckFailure], failure_kind: Opti
 /// as a `pending` attempt with no fix vehicle. The parent stays
 /// `blocked: ci_failure`; the poller's merged/closed handling reconciles it
 /// on a later sweep.
-///
-/// `ci_fix` is the engine host's answer to how a revision with no evidence is
-/// tiered (see [`CiFixPolicy`]); `None` is today's pin.
 async fn maybe_spawn_ci_revision(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
@@ -1017,12 +1011,11 @@ async fn maybe_spawn_ci_revision(
     candidate: &PendingMergeCheck,
     failures: &[RequiredCheckFailure],
     attempt: &CiRemediation,
-    ci_fix: Option<&dyn CiFixPolicy>,
 ) -> bool {
     let description = ci_revision_description(failures, attempt.failure_kind.as_deref());
     let created_via = format!("{CREATED_VIA_CI_FIX_PREFIX}{}", attempt.id);
 
-    let (reasoning, effort_level) = if failures.is_empty() {
+    let reasoning = if failures.is_empty() {
         // No failed check or log excerpt is attached — this is a
         // queue-side eviction the poller could not pin to a specific
         // failing build (or ambiguously resolved), so working out whether
@@ -1031,23 +1024,12 @@ async fn maybe_spawn_ci_revision(
         // than `standard`: `failures.is_empty()` is exactly the branch that
         // is reached *by construction* only when there is no evidence,
         // which is the one case that is itself a diagnosis.
-        //
-        // The one exception is the `ci_fix_standard_tier` experiment, which
-        // tests whether that pin is worth its cost. For a treated family the
-        // revision is standard reasoning at `medium` effort; the empty
-        // evidence list is what is left after the watcher already tried, so
-        // fetching the failing log first is not an alternative on offer. The
-        // family is asked at the moment of minting, so the experiment's kill
-        // switch acts on the very next revision.
-        match ci_fix.map(|policy| policy.no_evidence_ci_fix_tier(work_db, candidate)) {
-            Some(NoEvidenceCiFixTier::StandardMedium) => (ReasoningMode::Standard, Some(EffortLevel::Medium)),
-            Some(NoEvidenceCiFixTier::Investigation) | None => (ReasoningMode::Investigation, None),
-        }
+        ReasoningMode::Investigation
     } else {
         // The failed check and its log excerpt are attached; there is
         // nothing to diagnose. Pin `standard` rather than inheriting the
         // chain root's mode.
-        (ReasoningMode::Standard, None)
+        ReasoningMode::Standard
     };
     let revision = match work_db.create_revision(
         CreateRevisionInput::builder()
@@ -1055,7 +1037,6 @@ async fn maybe_spawn_ci_revision(
             .description(description)
             .created_via(created_via)
             .reasoning(reasoning)
-            .maybe_effort_level(effort_level)
             .build(),
         pr_checker,
     ) {
@@ -1248,6 +1229,7 @@ pub async fn on_merge_queue_rebounce_detected(
     queue_base_sha: Option<&str>,
     failures: &[RequiredCheckFailure],
 ) -> bool {
+    let publisher = context.publisher;
     match work_db.ci_remediation_exists_for_merge_queue_episode(&candidate.work_item_id, pr_head_sha, before_commit_sha)
     {
         Ok(true) => {
@@ -1263,7 +1245,8 @@ pub async fn on_merge_queue_rebounce_detected(
     let discriminator = merge_queue_rebounce_discriminator(pr_head_sha);
     on_queue_side_failure_detected(
         work_db,
-        context,
+        publisher,
+        context.fetcher,
         candidate,
         None,
         QueueSideFailureEpisode {
@@ -1340,7 +1323,8 @@ struct QueueSideFailureEpisode<'a> {
 /// evictions have none) differ between callers — see [`QueueSideFailureEpisode`].
 async fn on_queue_side_failure_detected(
     work_db: &WorkDb,
-    context: crate::queue_ci_contract::DetectionContext<'_>,
+    publisher: &dyn ExecutionPublisher,
+    fetcher: &dyn crate::queue_ci_contract::ContractFetcher,
     candidate: &PendingMergeCheck,
     head_ref_name: Option<&str>,
     episode: QueueSideFailureEpisode<'_>,
@@ -1354,11 +1338,6 @@ async fn on_queue_side_failure_detected(
         failure_kind,
         labels,
     } = episode;
-    let crate::queue_ci_contract::DetectionContext {
-        publisher,
-        fetcher,
-        ci_fix,
-    } = context;
     if failures.is_empty() {
         // Confirmed queue rejection with no construction-build / check-run
         // names attached. GitHub-native rebounce hits this when evidence
@@ -1685,7 +1664,6 @@ async fn on_queue_side_failure_detected(
             candidate,
             failures,
             &attempt,
-            ci_fix,
         )
         .await
     {
@@ -1859,10 +1837,12 @@ pub async fn on_trunk_queue_eviction_detected(
     trunk_state_changed_at: &str,
     failures: &[RequiredCheckFailure],
 ) -> bool {
+    let publisher = context.publisher;
     let discriminator = trunk_eviction_discriminator(trunk_entry_id, trunk_state_changed_at);
     on_queue_side_failure_detected(
         work_db,
-        context,
+        publisher,
+        context.fetcher,
         candidate,
         head_branch,
         QueueSideFailureEpisode {

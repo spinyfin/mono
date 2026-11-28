@@ -121,6 +121,7 @@ static GROK_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
         model_for_reasoning: model_menu::model_for_reasoning,
         review_model_for_tier: model_menu::review_model_for_tier,
         design_investigation_model: None,
+        investigation_routing: None,
         prompt_addendum_for_level: model_menu::prompt_addendum_for_level,
         model_requires_auto_permissions: model_menu::model_requires_auto_permissions,
         model_belongs_to_driver: model_menu::model_belongs_to_driver,

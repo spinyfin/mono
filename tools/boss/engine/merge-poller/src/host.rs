@@ -196,38 +196,9 @@ impl ActiveProducts for EveryProductActive {
     }
 }
 
-/// The reasoning a CI-fix revision is minted with when the poller has no
-/// failure evidence to hand it: a queue rejection with no failing check attached.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum NoEvidenceCiFixTier {
-    /// Pinned to investigation reasoning: with nothing attached, working out
-    /// whether anything is broken on the PR is the job. What every revision
-    /// of this kind has always been.
-    #[default]
-    Investigation,
-    /// Standard reasoning at `medium` effort: the `ci_fix_standard_tier`
-    /// treatment.
-    StandardMedium,
-}
-
-/// How the engine tiers the CI-fix revision it mints with no failure evidence.
-///
-/// The poller decides *when* a queue rejection calls for a revision; whether a
-/// given PR family is in the experiment that tiers it down is the engine's to
-/// answer, from flags the poller cannot see. The default is today's behaviour,
-/// so a host without flags, and every test double, mints as it always did.
-pub trait CiFixPolicy: Send + Sync {
-    /// The tier for the revision about to be minted for `candidate`, read from the
-    /// live experiment flags and the candidate's PR family at the moment of minting.
-    fn no_evidence_ci_fix_tier(&self, _work_db: &WorkDb, _candidate: &PendingMergeCheck) -> NoEvidenceCiFixTier {
-        NoEvidenceCiFixTier::Investigation
-    }
-}
-
 /// Everything the sweep needs from the engine host: conflict handling, design-doc
 /// pointer maintenance (the same [`DesignDetection`] contract the completion
-/// service consumes), project population, the tier of a CI-fix revision with no
-/// evidence, and the loop's optional passes.
-pub trait SweepHost: ConflictHandling + DesignDetection + PopulationRequests + LoopPasses + CiFixPolicy {}
+/// service consumes), project population and the loop's optional passes.
+pub trait SweepHost: ConflictHandling + DesignDetection + PopulationRequests + LoopPasses {}
 
-impl<T: ConflictHandling + DesignDetection + PopulationRequests + LoopPasses + CiFixPolicy + ?Sized> SweepHost for T {}
+impl<T: ConflictHandling + DesignDetection + PopulationRequests + LoopPasses + ?Sized> SweepHost for T {}

@@ -127,8 +127,6 @@ impl DesignDetection for RecordingHost {
     }
 }
 
-impl crate::host::CiFixPolicy for RecordingHost {}
-
 impl PopulationRequests for RecordingHost {
     fn enqueue_from_merge(&self, _: &WorkDb, request: PopulationRequest) {
         self.record(HostCall::Populate(request));

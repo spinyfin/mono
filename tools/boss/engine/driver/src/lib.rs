@@ -508,6 +508,20 @@ impl CapabilitySet {
 /// Resolve a selected model and effort into their concrete spawn values.
 pub type ModelEffortResolver = fn(&str, Option<&str>) -> (String, Option<&'static str>);
 
+/// One step down for a design or investigation run under the
+/// `investigation_routing` experiment.
+///
+/// Returned by [`ModelMenu::investigation_routing`] so each driver owns its own
+/// model and effort vocabulary. A field that is `None` leaves what the ordinary
+/// tier resolution chose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvestigationRouting {
+    /// The model to launch on instead of the design/investigation tier's.
+    pub model: Option<&'static str>,
+    /// The `--effort` value to launch with instead of the level's own.
+    pub effort_value: Option<&'static str>,
+}
+
 /// Per-driver model and effort menu (capability: [`Capability::ModelAndEffortMenu`]).
 ///
 /// Static data and function pointers let the menu live in a `static`
@@ -566,6 +580,9 @@ pub struct ModelMenu {
     /// driver is eligible for that tier. Kept in the driver menu so model
     /// vocabulary remains owned by the driver that accepts it.
     pub design_investigation_model: Option<fn() -> &'static str>,
+    /// Optional per-effort step-down for the `investigation_routing` experiment.
+    /// `None` for drivers that do not participate in the treatment.
+    pub investigation_routing: Option<fn(Option<EffortLevel>) -> InvestigationRouting>,
     /// Optional per-level worker-prompt addendum to prepend to the initial-prompt body.
     /// `None` for levels where no addendum is appropriate.
     pub prompt_addendum_for_level: fn(EffortLevel) -> Option<&'static str>,

@@ -182,7 +182,6 @@ pub(crate) fn parse_dequeue_event_nodes(nodes: &[serde_json::Value]) -> Vec<Merg
 pub(crate) async fn run_merge_queue_rebounce_pass(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
-    host: Option<&dyn crate::host::SweepHost>,
     in_review: &[PendingMergeCheck],
     blocked_ci: &[PendingMergeCheck],
     parked_ids: Option<&std::collections::HashSet<String>>,
@@ -221,7 +220,6 @@ pub(crate) async fn run_merge_queue_rebounce_pass(
             crate::queue_ci_contract::DetectionContext {
                 publisher,
                 fetcher: &crate::queue_ci_contract::ProviderFetcher,
-                ci_fix: host.map(|host| host as &dyn crate::host::CiFixPolicy),
             },
             candidate,
             &dequeue_events,
