@@ -58,6 +58,10 @@ pub mod note {
     /// One or more measured runs lacked `agent_active_ms` (e.g. Grok) and were
     /// excluded from both numerator and denominator of `tokens_per_active_hour`.
     pub const ACTIVE_TIME_MISSING: &str = "active_time_missing";
+    /// An experiment-arm comparison was read from a capped run set, so its
+    /// token comparison covers only the retained runs while the observed
+    /// experiment counts cover the whole window.
+    pub const EXPERIMENT_COMPARISON_CAPPED: &str = "experiment_comparison_capped";
 }
 
 /// What a rows request asks for, plus the engine constants the report
@@ -178,7 +182,7 @@ pub fn build_usage_rows_report(
                 .any(|f| f.dimension == UsageDimension::ExperimentArm))
     {
         coverage.notes.push(UsageNote {
-            code: "experiment_comparison_capped".into(),
+            code: note::EXPERIMENT_COMPARISON_CAPPED.to_owned(),
             detail: "Arm comparisons cover only the most recent matching runs retained by the reply cap; observed experiment counts cover the whole window before filters. Narrow the window or filter to the pipeline stage being compared.".into(),
         });
     }

@@ -774,6 +774,7 @@ fn print_usage_rows_report(report: &boss_protocol::TokenUsageRowsReport, depth: 
     print_measurement_summary(&report.overall);
     println!("  Calls: {}", format_call_stats(&report.overall_calls));
     print_usage_coverage(&report.coverage);
+    print_observed_experiments(&report.observed_experiments);
     print_pricing_gaps(&report.pricing_gaps);
 
     if report.group_by.is_empty() {
@@ -788,6 +789,27 @@ fn print_usage_rows_report(report: &boss_protocol::TokenUsageRowsReport, depth: 
     if usd {
         println!();
         println!("  USD figures: (ESTIMATE, not billing truth)");
+    }
+}
+
+/// Lists each recorded experiment arm with its run and distinct-family counts.
+/// Counts cover the whole window before filters and the row cap.
+fn print_observed_experiments(observed: &[boss_protocol::UsageObservedExperiment]) {
+    if observed.is_empty() {
+        return;
+    }
+    println!("  Observed experiments (whole window, before filters and the row cap):");
+    for experiment in observed {
+        for arm in &experiment.arms {
+            println!(
+                "    {} / {}: {} run(s), {} famil{}",
+                experiment.experiment,
+                arm.arm,
+                arm.runs,
+                arm.families,
+                if arm.families == 1 { "y" } else { "ies" },
+            );
+        }
     }
 }
 
@@ -1255,6 +1277,7 @@ fn print_usage_series_report(report: &boss_protocol::TokenUsageSeriesReport, usd
             println!("  NOTE ({}): {}", note.code, note.detail);
         }
     }
+    print_observed_experiments(&report.observed_experiments);
     print_pricing_gaps(&report.pricing_gaps);
 
     let rows = series_table_rows(report, usd, tz);

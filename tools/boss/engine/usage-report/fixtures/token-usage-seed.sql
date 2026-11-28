@@ -31,7 +31,7 @@
 -- task is done, so the engine has nothing to dispatch or recover.
 --
 -- Expected result over the whole history (also pinned by a test in the work
--- database): 24 runs = 17 measured, 2 partial (Grok, Antigravity: no cache
+-- database): 28 runs = 21 measured, 2 partial (Grok, Antigravity: no cache
 -- creation), 1 zero, 4 unmeasured (one pre-capture, one with a recorded
 -- `usage_unavailable` reason, one with no resolvable driver, one unreadable
 -- coordinator session); 7 taskless executions (4 worker overhead + 3
@@ -86,6 +86,12 @@ INSERT INTO work_executions (id, work_item_id, kind, status, repo_remote_url, cr
   ('exec_seed_i1', 'task_seed_i_zero_synth', 'chore_implementation',        'failed',    'https://github.com/example/boss',  (SELECT now - 5 * 3600 FROM seed_clock),   (SELECT now - 5 * 3600 FROM seed_clock),   (SELECT now - 5 * 3600 FROM seed_clock),   'claude', 'opus',          'medium', 'local', NULL),
   ('exec_seed_i2', 'task_seed_i_zero_synth', 'chore_implementation',        'completed', 'https://github.com/example/boss',  (SELECT now - 4 * 3600 FROM seed_clock),   (SELECT now - 4 * 3600 FROM seed_clock),   (SELECT now - 3 * 3600 FROM seed_clock),   'claude', 'opus',          'medium', 'local', NULL),
   ('exec_seed_j1', 'task_seed_j_design',     'product_design',              'completed', 'https://github.com/example/boss',  (SELECT now - 36 * 3600 FROM seed_clock),  (SELECT now - 36 * 3600 FROM seed_clock),  (SELECT now - 35 * 3600 FROM seed_clock),  'claude', 'opus',          'xhigh',  'local', NULL),
+  -- Pipeline-stage coverage: a reviewer-role pre-merge review, a post-merge
+  -- review, a project design, and a kind the classifier does not know.
+  ('exec_seed_p1', 'task_seed_a_claude',     'pr_review',                   'completed', 'https://github.com/example/boss',  (SELECT now - 24 * 3600 FROM seed_clock),  (SELECT now - 24 * 3600 FROM seed_clock),  (SELECT now - 23 * 3600 FROM seed_clock),  'claude', 'sonnet',        'medium', 'local', NULL),
+  ('exec_seed_p2', 'task_seed_a_claude',     'pr_review',                   'completed', 'https://github.com/example/boss',  (SELECT now - 22 * 3600 FROM seed_clock),  (SELECT now - 22 * 3600 FROM seed_clock),  (SELECT now - 21 * 3600 FROM seed_clock),  'claude', 'sonnet',        'medium', 'local', NULL),
+  ('exec_seed_p3', 'task_seed_j_design',    'project_design',              'completed', 'https://github.com/example/boss',  (SELECT now - 18 * 3600 FROM seed_clock),  (SELECT now - 18 * 3600 FROM seed_clock),  (SELECT now - 17 * 3600 FROM seed_clock),  'claude', 'opus',          'high',   'local', NULL),
+  ('exec_seed_p4', 'task_seed_a_claude',     'future_kind',                 'completed', 'https://github.com/example/boss',  (SELECT now - 16 * 3600 FROM seed_clock),  (SELECT now - 16 * 3600 FROM seed_clock),  (SELECT now - 15 * 3600 FROM seed_clock),  'claude', 'sonnet',        'medium', 'local', NULL),
   ('exec_seed_t1', 'comment_seed_1',         'answer_agent',                'completed', 'https://github.com/example/boss',  (SELECT now - 3 * 3600 FROM seed_clock),   (SELECT now - 3 * 3600 FROM seed_clock),   (SELECT now - 3 * 3600 FROM seed_clock),   'claude', 'sonnet',        'medium', 'local', NULL),
   ('exec_seed_t2', 'comparison_seed_1',      'pr_review_guide',             'completed', 'https://github.com/example/boss',  (SELECT now - 2 * 3600 FROM seed_clock),   (SELECT now - 2 * 3600 FROM seed_clock),   (SELECT now - 2 * 3600 FROM seed_clock),   'codex',  'gpt-6-astra',   'high',   'local', NULL),
   ('exec_seed_t3', 'automation_seed_1',      'automation_triage',           'completed', 'https://github.com/example/boss',  (SELECT now - 1 * 3600 FROM seed_clock),   (SELECT now - 1 * 3600 FROM seed_clock),   (SELECT now - 1 * 3600 FROM seed_clock),   'claude', 'haiku',         'low',    'local', NULL),
@@ -124,6 +130,10 @@ INSERT INTO work_runs (id, execution_id, agent_id, status, created_at, started_a
   ('run_seed_i1_1', 'exec_seed_i1', 'worker-1', 'failed',    (SELECT now - 5 * 3600 FROM seed_clock),   (SELECT now - 5 * 3600 FROM seed_clock),   (SELECT now - 5 * 3600 FROM seed_clock),   'local', NULL,                0,      0,     0,     NULL,  NULL,  0,       0,  0,       NULL, NULL, NULL, NULL, NULL),
   ('run_seed_i2_1', 'exec_seed_i2', 'worker-1', 'completed', (SELECT now - 4 * 3600 FROM seed_clock),   (SELECT now - 4 * 3600 FROM seed_clock),   (SELECT now - 3 * 3600 FROM seed_clock),   'local', '<synthetic>',       50,     200,   0,     0,     0,     1000,   1,  15000,    NULL, NULL, NULL, NULL, NULL),
   ('run_seed_j1_1', 'exec_seed_j1', 'worker-2', 'completed', (SELECT now - 36 * 3600 FROM seed_clock),  (SELECT now - 36 * 3600 FROM seed_clock),  (SELECT now - 35 * 3600 FROM seed_clock),  'local', 'claude-opus-5-5',   900,    6500,  30000, 30000, 0,     480000, 20, 540000,  NULL, 20500, 20000, 120000, 0),
+  ('run_seed_p1_1', 'exec_seed_p1', 'review-2', 'completed', (SELECT now - 24 * 3600 FROM seed_clock),  (SELECT now - 24 * 3600 FROM seed_clock),  (SELECT now - 23 * 3600 FROM seed_clock),  'local', 'claude-sonnet-5-5', 600,    2500,  8000,  8000,  0,     120000, 8,  250000,  NULL, 21000, 20000, 38000, 0),
+  ('run_seed_p2_1', 'exec_seed_p2', 'review-3', 'completed', (SELECT now - 22 * 3600 FROM seed_clock),  (SELECT now - 22 * 3600 FROM seed_clock),  (SELECT now - 21 * 3600 FROM seed_clock),  'local', 'claude-sonnet-5-5', 500,    2200,  7000,  7000,  0,     100000, 7,  220000,  NULL, 20500, 19500, 36000, 0),
+  ('run_seed_p3_1', 'exec_seed_p3', 'design-1', 'completed', (SELECT now - 18 * 3600 FROM seed_clock),  (SELECT now - 18 * 3600 FROM seed_clock),  (SELECT now - 17 * 3600 FROM seed_clock),  'local', 'claude-opus-5-5',   800,    5000,  25000, 25000, 0,     400000, 15, 500000,  NULL, 19800, 19000, 90000, 0),
+  ('run_seed_p4_1', 'exec_seed_p4', 'other-1',  'completed', (SELECT now - 16 * 3600 FROM seed_clock),  (SELECT now - 16 * 3600 FROM seed_clock),  (SELECT now - 15 * 3600 FROM seed_clock),  'local', 'claude-sonnet-5-5', 300,    1200,  4000,  4000,  0,     60000,  5,  120000,  NULL, 18000, 17500, 30000, 0),
   ('run_seed_t1_1', 'exec_seed_t1', 'answer-1', 'completed', (SELECT now - 3 * 3600 FROM seed_clock),   (SELECT now - 3 * 3600 FROM seed_clock),   (SELECT now - 3 * 3600 FROM seed_clock),   'local', 'claude-sonnet-5-5', 400,    900,   3000,  3000,  0,     60000,  4,  60000,    NULL, 12000, 11500, 20000, 0),
   ('run_seed_t2_1', 'exec_seed_t2', 'guide-1',  'completed', (SELECT now - 2 * 3600 FROM seed_clock),   (SELECT now - 2 * 3600 FROM seed_clock),   (SELECT now - 2 * 3600 FROM seed_clock),   'local', 'gpt-6-astra',       40000,  1800,  0,     NULL,  NULL,  30000,  6,  90000,    NULL, 14000, 0, 32000, 0),
   ('run_seed_t3_1', 'exec_seed_t3', 'triage-1', 'completed', (SELECT now - 1 * 3600 FROM seed_clock),   (SELECT now - 1 * 3600 FROM seed_clock),   (SELECT now - 1 * 3600 FROM seed_clock),   'local', 'claude-haiku-5-5',  200,    300,   1000,  1000,  0,     20000,  2,  20000,    NULL, 6000, 5500, 8000, 0),
@@ -195,7 +205,14 @@ UPDATE tasks SET created_via = 'pr_review:post_merge:seed_proposal' WHERE id = '
 INSERT INTO pr_review_batches (id, cycle_root_id, base_sha, classification_json, created_at, phase, pr_number, pr_url, status, target_sha, updated_at)
  VALUES ('batch_seed', 'task_seed_a_claude', 'seed_base', '{}', '1784000000', 'pre_merge', 101, 'https://github.com/example/boss/pull/101', 'completed', 'seed_head', '1784000000');
 INSERT INTO pr_review_batch_members (id, batch_id, attempt, created_at, provider_effort, requested_driver, resolved_model, role, status, updated_at, execution_id)
- VALUES ('member_seed', 'batch_seed', 1, '1784000000', 'medium', 'claude', 'sonnet', 'supervisor', 'reported', '1784000000', 'exec_seed_a2');
+ VALUES ('member_seed', 'batch_seed', 1, '1784000000', 'medium', 'claude', 'sonnet', 'supervisor', 'reported', '1784000000', 'exec_seed_a2'),
+        ('member_seed_reviewer', 'batch_seed', 1, '1784000000', 'medium', 'claude', 'sonnet', 'claude_reviewer', 'reported', '1784000000', 'exec_seed_p1');
+
+-- A post-merge batch whose member is the post-merge reviewer.
+INSERT INTO pr_review_batches (id, cycle_root_id, base_sha, classification_json, created_at, phase, pr_number, pr_url, status, target_sha, updated_at)
+ VALUES ('batch_seed_post', 'task_seed_a_claude', 'seed_base', '{}', '1784000000', 'post_merge', 101, 'https://github.com/example/boss/pull/101', 'completed', 'seed_head', '1784000000');
+INSERT INTO pr_review_batch_members (id, batch_id, attempt, created_at, provider_effort, requested_driver, resolved_model, role, status, updated_at, execution_id)
+ VALUES ('member_seed_post', 'batch_seed_post', 1, '1784000000', 'medium', 'claude', 'sonnet', 'post_merge_reviewer', 'reported', '1784000000', 'exec_seed_p2');
 
 -- A guide's work item is its comparison, but its experiment family is the PR root.
 INSERT INTO pr_review_guide_source_series (id, root_task_id, canonical_pr_url, created_at, updated_at)

@@ -79,7 +79,7 @@ fn filters_and_cap_do_not_change_observed_experiments_and_capped_comparisons_say
             .coverage
             .notes
             .iter()
-            .any(|n| n.code == "experiment_comparison_capped")
+            .any(|n| n.code == crate::note::EXPERIMENT_COMPARISON_CAPPED)
     );
     assert_eq!(report.groups[0].key[0].value, "treatment");
     assert_eq!(report.groups[0].subgroups[0].key[1].value, "filed_work");
@@ -90,7 +90,7 @@ fn filters_and_cap_do_not_change_observed_experiments_and_capped_comparisons_say
             .coverage
             .notes
             .iter()
-            .any(|n| n.code == "experiment_comparison_capped")
+            .any(|n| n.code == crate::note::EXPERIMENT_COMPARISON_CAPPED)
     );
     q.since_epoch_s = BASE_EPOCH_S + 1;
     let report = build_usage_rows_report(&q, &records, None);
@@ -225,4 +225,139 @@ fn series_experiment_filter_applies_to_runs_and_runless_completed_executions() {
     );
     assert!(report.groups.iter().any(|g| g == "review_supervisor"));
     assert_eq!(report.observed_experiments.len(), 2);
+}
+
+/// Eight runs with distinct power-of-two token counts, so any leaf sum that
+/// matches the overall total proves each run landed in exactly one leaf.
+fn mixed_stage_records() -> UsageWindowRecords {
+    // (kind, review role, arms, task created_via)
+    let specs: [(&str, Option<&str>, Option<&str>, &str); 8] = [
+        (
+            "task_implementation",
+            None,
+            Some(r#"{"alpha":"treatment","beta":"control"}"#),
+            "cli",
+        ),
+        (
+            "revision_implementation",
+            None,
+            Some(r#"{"alpha":"treatment"}"#),
+            "pr_review:review",
+        ),
+        (
+            "revision_implementation",
+            None,
+            Some(r#"{"alpha":"control"}"#),
+            "ci-fix:attempt",
+        ),
+        (
+            "pr_review",
+            Some("claude_reviewer"),
+            Some(r#"{"alpha":"stopped"}"#),
+            "cli",
+        ),
+        ("pr_review", Some("supervisor"), Some("{}"), "cli"),
+        ("pr_review", Some("post_merge_reviewer"), None, "cli"),
+        ("project_design", None, Some(r#"{"beta":"treatment"}"#), "cli"),
+        (
+            "future_kind",
+            None,
+            Some(r#"{"alpha":"treatment","beta":"control"}"#),
+            "cli",
+        ),
+    ];
+    let mut runs = Vec::new();
+    let mut tasks = Vec::new();
+    for (i, (kind, role, arms, via)) in specs.into_iter().enumerate() {
+        let id = format!("t{i}");
+        let mut r = tokens(
+            run(&format!("r{i}"), &format!("e{i}"), &id, BASE_EPOCH_S + i as i64),
+            1 << i,
+            0,
+            0,
+            0,
+        );
+        r.execution_kind = kind.into();
+        r.review_member_role = role.map(str::to_owned);
+        r.experiment_arms = arms.map(str::to_owned);
+        runs.push(r);
+        let mut t = task(&id, &id, 1);
+        t.created_via = Some(via.into());
+        tasks.push(t);
+    }
+    records(runs, tasks)
+}
+
+fn leaves(groups: &[boss_protocol::UsageGroup]) -> Vec<&boss_protocol::UsageGroup> {
+    groups
+        .iter()
+        .flat_map(|g| {
+            if g.subgroups.is_empty() {
+                vec![g]
+            } else {
+                leaves(&g.subgroups)
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn new_dimensions_conserve_runs_and_tokens_at_every_level() {
+    let records = mixed_stage_records();
+    let cases: [(Option<&str>, Vec<UsageDimension>); 5] = [
+        (None, vec![UsageDimension::PipelineStage]),
+        (None, vec![UsageDimension::ExperimentArm]),
+        (Some("alpha"), vec![UsageDimension::ExperimentArm]),
+        (None, vec![UsageDimension::ExperimentArm, UsageDimension::PipelineStage]),
+        (
+            Some("alpha"),
+            vec![UsageDimension::ExperimentArm, UsageDimension::PipelineStage],
+        ),
+    ];
+    for (experiment, group_by) in cases {
+        let mut q = window();
+        q.experiment = experiment.map(str::to_owned);
+        q.group_by = group_by.clone();
+        let report = build(&q, &records);
+        let label = format!("{experiment:?} {group_by:?}");
+        assert_eq!(report.overall.runs_total, 8, "{label}");
+        assert_eq!(report.overall.total_tokens, 255, "{label}");
+        // Each level's groups sum to its parent.
+        fn check(groups: &[boss_protocol::UsageGroup], runs: u32, tokens: i64, label: &str) {
+            assert_eq!(
+                groups.iter().map(|g| g.measurement.runs_total).sum::<u32>(),
+                runs,
+                "{label}"
+            );
+            assert_eq!(
+                groups.iter().map(|g| g.measurement.total_tokens).sum::<i64>(),
+                tokens,
+                "{label}"
+            );
+            for g in groups.iter().filter(|g| !g.subgroups.is_empty()) {
+                check(
+                    &g.subgroups,
+                    g.measurement.runs_total,
+                    g.measurement.total_tokens,
+                    label,
+                );
+            }
+        }
+        check(&report.groups, 8, 255, &label);
+        // Distinct power-of-two tokens: leaves sum to the total only if every
+        // run sits in exactly one leaf.
+        let leaf_groups = leaves(&report.groups);
+        assert_eq!(
+            leaf_groups.iter().map(|g| g.measurement.total_tokens).sum::<i64>(),
+            255,
+            "{label}"
+        );
+        assert_eq!(
+            leaf_groups.iter().map(|g| g.measurement.runs_total).sum::<u32>(),
+            8,
+            "{label}"
+        );
+        let keys: std::collections::BTreeSet<_> = leaf_groups.iter().map(|g| format!("{:?}", g.key)).collect();
+        assert_eq!(keys.len(), leaf_groups.len(), "leaf keys are unique: {label}");
+    }
 }

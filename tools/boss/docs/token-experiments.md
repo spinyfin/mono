@@ -8,8 +8,7 @@ Every experiment ships **inert**: its flag is off, and a build that contains it 
 
 The mechanism and its first experiment are in the engine. The things that make an experiment readable are not:
 
-- **Landed:** the experiment registry and flags, the arm assigned to every launch, the `experiment_arms` column in the launch record, and the `pane_spawned` dispatch event carrying the arm set.
-- **Landed:** usage rows and series accept `--experiment <key>` and the `experiment_arm` and `pipeline_stage` dimensions. Replies list observed experiments with run and family counts per arm.
+- **Landed:** the experiment registry and flags, the arm assigned to every launch, the `experiment_arms` column in the launch record, the `pane_spawned` dispatch event carrying the arm set, and usage rows and series that accept `--experiment <key>` with the `experiment_arm` and `pipeline_stage` dimensions (replies list observed experiments with run and family counts per arm).
 - **Not landed:** the per-family outcomes report and the Token Usage window picker.
 
 **Do not switch an experiment on until the family outcomes report has landed.** The CLI can now compare recorded token usage by arm, but evaluating savings also needs the family outcomes and guardrails. The Token Usage window picker is still pending. Recorded arms are durable, so work launched in the meantime is readable afterwards; the experiment's treatment is live for its treated half the whole time.
@@ -134,7 +133,7 @@ To run it: switch `worker_autocompact` on (a half-and-half split starts), switch
 3. Read the arm where the behaviour is decided. A prompt or launch change reads it from the arm set the runner resolved before composing, and turns it into a plain option, so the composer and the drivers never see an experiment key. A policy decision (skip a review, admit a post-merge review) resolves the family's arm with the same function and the same family id.
 4. Add a section to this page: what it changes, how its effect is read, its guardrail, and when to stop it early. Say in the pull request that it ships inert and which flag makes it live.
 
-### Reading experiment arms and pipeline stages
+## Reading experiment arms and pipeline stages
 
 `boss cost rows --since 14d --experiment batched_search --group-by experiment_arm,pipeline_stage` compares recorded assignments. Filter to the stage or driver the experiment changes, for example `--filter pipeline_stage=filed_work --filter driver=claude`. `boss cost series --since 14d --experiment batched_search --group-by experiment_arm` uses the same selector and filters.
 

@@ -1490,6 +1490,10 @@ mod tests {
             "post_merge_follow_up",
             "review_supervisor",
             "review_guide",
+            "pre_merge_review",
+            "post_merge_review",
+            "project_design",
+            "unclassified",
         ] {
             assert!(stages.values.iter().any(|v| v.value == stage), "missing {stage}");
         }
@@ -1514,7 +1518,7 @@ mod tests {
                 coverage.runs_zero,
                 coverage.runs_unmeasured
             ),
-            (24, 17, 2, 1, 4)
+            (28, 21, 2, 1, 4)
         );
         assert_eq!(
             report.taskless.len(),
@@ -1592,7 +1596,7 @@ mod tests {
         // and Antigravity only the first and peak prompt, and the runs that
         // made no model call or were never captured record none.
         let calls = &report.overall_calls;
-        assert_eq!((calls.runs_with_rounds, calls.rounds), (20, 360));
+        assert_eq!((calls.runs_with_rounds, calls.rounds), (24, 395));
         // Coordinator hourly/model slices contribute their recorded rounds,
         // but do not invent worker-run first-call or compaction observations.
         let coordinator_rounds: i64 = report
@@ -1602,14 +1606,14 @@ mod tests {
             .map(|execution| execution.calls.rounds)
             .sum();
         assert_eq!(coordinator_rounds, 99);
-        assert_eq!(calls.rounds - coordinator_rounds, 261);
-        assert_eq!(calls.runs_with_first_call_context, 15);
-        assert_eq!(calls.runs_with_peak_context, 15);
+        assert_eq!(calls.rounds - coordinator_rounds, 296);
+        assert_eq!(calls.runs_with_first_call_context, 19);
+        assert_eq!(calls.runs_with_peak_context, 19);
         assert_eq!(calls.max_peak_context, Some(205_000));
         assert_eq!(
             (calls.runs_with_compactions_recorded, calls.runs_compacted),
-            (13, 3),
-            "Grok and Antigravity record no compactions; they are not 13 + 2 runs that did not compact"
+            (17, 3),
+            "Grok and Antigravity record no compactions; they are not 17 + 2 runs that did not compact"
         );
         for driver in ["grok", "agy"] {
             let (_, run) = all_runs
@@ -1775,10 +1779,10 @@ mod tests {
             .flat_map(|b| b.cells.iter())
             .map(|c| c.measurement.runs_total)
             .sum();
-        // Window has 22 runs (18 worker runs minus pre-capture h1 and 40d-old
+        // Window has 26 runs (22 worker runs minus pre-capture h1 and 40d-old
         // c0, plus 4 coordinator slices in the last 48h).
         // Completed tasks in 7d include ghost_root (which pulls in c0!).
-        assert_eq!(total_window_runs, 22);
+        assert_eq!(total_window_runs, 26);
         assert!(
             total_completed_task_runs > 0,
             "completed tasks in 7d must carry attributed chain runs"
