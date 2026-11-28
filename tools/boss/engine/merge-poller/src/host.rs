@@ -201,7 +201,7 @@ impl ActiveProducts for EveryProductActive {
 /// service consumes), project population and the loop's optional passes.
 pub trait SweepHost: ConflictHandling + DesignDetection + PopulationRequests + LoopPasses {
     /// Resolve the family's current treatment for post-merge admission.
-    fn slim_post_merge_review(&self, _work_db: &WorkDb, _cycle_root_id: &str) -> bool {
+    fn slim_post_merge_review(&self, _cycle_root_id: &str) -> bool {
         false
     }
 }

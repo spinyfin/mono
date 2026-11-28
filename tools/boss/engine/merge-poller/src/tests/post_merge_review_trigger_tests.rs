@@ -86,7 +86,7 @@ async fn no_post_merge_review_without_a_pre_merge_batch_on_record() {
     let candidate = candidate(product_id, work_item_id.clone(), pr);
     let probe = merged_probe(pr, Some("merge-sha-1"), Some("head-sha-1"));
 
-    maybe_trigger_post_merge_review(&db, &publisher, &candidate, &probe, false).await;
+    maybe_trigger_post_merge_review(&db, &publisher, &candidate, &probe, |_| false).await;
 
     assert_eq!(
         db.review_batches_for_cycle_root(&work_item_id).unwrap().len(),
@@ -108,7 +108,7 @@ async fn no_post_merge_review_when_pre_merge_profile_is_not_deep() {
     let candidate = candidate(product_id, work_item_id.clone(), pr);
     let probe = merged_probe(pr, Some("merge-sha-1"), Some("head-sha-1"));
 
-    maybe_trigger_post_merge_review(&db, &publisher, &candidate, &probe, false).await;
+    maybe_trigger_post_merge_review(&db, &publisher, &candidate, &probe, |_| false).await;
 
     assert!(
         db.review_batch_for_target(&work_item_id, ReviewBatchPhase::PostMerge, "merge-sha-1")
@@ -132,7 +132,7 @@ async fn deep_pr_gets_a_post_merge_batch_keyed_on_the_merge_commit_and_is_idempo
     let candidate = candidate(product_id, work_item_id.clone(), pr);
     let probe = merged_probe(pr, Some("merge-sha-1"), Some("head-sha-1"));
 
-    maybe_trigger_post_merge_review(&db, &publisher, &candidate, &probe, false).await;
+    maybe_trigger_post_merge_review(&db, &publisher, &candidate, &probe, |_| false).await;
 
     let batch = db
         .review_batch_for_target(&work_item_id, ReviewBatchPhase::PostMerge, "merge-sha-1")
@@ -148,7 +148,7 @@ async fn deep_pr_gets_a_post_merge_batch_keyed_on_the_merge_commit_and_is_idempo
 
     // Idempotent: a redundant trigger call for the same merge must not mint
     // a second batch.
-    maybe_trigger_post_merge_review(&db, &publisher, &candidate, &probe, false).await;
+    maybe_trigger_post_merge_review(&db, &publisher, &candidate, &probe, |_| false).await;
     assert_eq!(
         db.review_batches_for_cycle_root(&work_item_id)
             .unwrap()
@@ -176,7 +176,7 @@ async fn skips_when_only_head_ref_oid_is_available() {
     let candidate = candidate(product_id, work_item_id.clone(), pr);
     let probe = merged_probe(pr, None, Some("head-sha-1"));
 
-    maybe_trigger_post_merge_review(&db, &publisher, &candidate, &probe, false).await;
+    maybe_trigger_post_merge_review(&db, &publisher, &candidate, &probe, |_| false).await;
 
     assert_eq!(
         db.review_batches_for_cycle_root(&work_item_id)
@@ -202,7 +202,7 @@ async fn skips_when_neither_merge_commit_nor_head_sha_is_available() {
     let candidate = candidate(product_id, work_item_id.clone(), pr);
     let probe = merged_probe(pr, None, None);
 
-    maybe_trigger_post_merge_review(&db, &publisher, &candidate, &probe, false).await;
+    maybe_trigger_post_merge_review(&db, &publisher, &candidate, &probe, |_| false).await;
 
     assert_eq!(
         db.review_batches_for_cycle_root(&work_item_id)
@@ -253,7 +253,10 @@ async fn review_minted_families_are_skipped_only_in_treatment() {
                     &publisher,
                     &candidate(product_id, item, pr),
                     &merged_probe(pr, Some("merged"), Some("head")),
-                    treated,
+                    |cycle_root_id| {
+                        assert_eq!(cycle_root_id, root);
+                        treated
+                    },
                 )
                 .await;
                 assert_eq!(
@@ -316,7 +319,10 @@ async fn legacy_review_provenance_is_resolved_through_the_verdict_batch() {
             &RecordingPublisher::default(),
             &candidate(product, followup.clone(), pr),
             &merged_probe(pr, Some("followup-merge"), Some("followup-head")),
-            treated,
+            |cycle_root_id| {
+                assert_eq!(cycle_root_id, followup);
+                treated
+            },
         )
         .await;
         assert_eq!(

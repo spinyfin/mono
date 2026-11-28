@@ -237,21 +237,40 @@ async fn fetch_pr_review_context(pr_url: &str) -> Option<crate::pr_review::PrRev
     })
 }
 
-/// Fetch a PR diff, or the immutable merged commit diff for a treated post-merge review.
+/// Pure selection of how [`compose_worker_spawn`] fetches and embeds a review diff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewDiffFetchPlan {
+    gh_args: Vec<String>,
+    exclude_lockfiles: bool,
+    embed_in_post_merge_prompt: bool,
+}
+
+fn review_diff_fetch_plan(
+    pr_url: &str,
+    member_role: Option<ReviewBatchMemberRole>,
+    slim_post_merge: bool,
+) -> ReviewDiffFetchPlan {
+    let treated_post_merge = slim_post_merge && member_role == Some(ReviewBatchMemberRole::PostMergeReviewer);
+    ReviewDiffFetchPlan {
+        // Always fetch the PR diff rather than a single commit via
+        // `repos/{repo}/commits/{sha}`. After merge, `gh pr diff` is stable and
+        // spans every commit in the PR across squash, merge-commit, and
+        // multi-commit rebase merges (whereas `commits/{merge_commit_oid}`
+        // returns only the final rebased commit for a rebase merge).
+        gh_args: vec!["pr".to_owned(), "diff".to_owned(), pr_url.to_owned()],
+        exclude_lockfiles: treated_post_merge,
+        embed_in_post_merge_prompt: treated_post_merge,
+    }
+}
+
+/// Fetch a PR diff using the selected `gh` arguments.
 ///
 /// Returns the full diff text on success. Returns `None` on any error —
 /// callers fall back gracefully (reviewer fetches the diff itself). The
 /// caller is responsible for deciding whether the diff is small enough to
 /// embed.
-async fn fetch_pr_diff(pr_url: &str, merged_commit: Option<(&str, &str)>) -> Option<String> {
-    let endpoint;
-    let args = if let Some((repo, sha)) = merged_commit {
-        endpoint = format!("repos/{repo}/commits/{sha}");
-        vec!["api", &endpoint, "-H", "Accept: application/vnd.github.diff"]
-    } else {
-        vec!["pr", "diff", pr_url]
-    };
-    let output = gh_scope(callers::WORKER_SPAWN, gh_output(&args)).await.ok()?;
+async fn fetch_pr_diff(pr_url: &str, args: &[&str]) -> Option<String> {
+    let output = gh_scope(callers::WORKER_SPAWN, gh_output(args)).await.ok()?;
 
     if !output.status.success() {
         tracing::warn!(
@@ -675,21 +694,6 @@ pub async fn compose_worker_spawn(
         None
     };
     let slim_post_merge = experiment_arms.is_treated(crate::feature_flags::POST_MERGE_REVIEW_SLIM_EXPERIMENT);
-    let landed_batch = if slim_post_merge
-        && batch_member
-            .as_ref()
-            .is_some_and(|member| member.role == ReviewBatchMemberRole::PostMergeReviewer)
-    {
-        let member = batch_member.as_ref().expect("post-merge member checked");
-        Some(
-            work_db
-                .review_batch(&member.batch_id)?
-                .context("post-merge review batch is missing")?,
-        )
-    } else {
-        None
-    };
-    let landed_repo = git_utils::repo_slug::parse_github_slug(&execution.repo_remote_url);
     let batched_search = experiment_arms.is_treated(crate::feature_flags::BATCHED_SEARCH_EXPERIMENT);
     // For any project-scoped task (the synthetic `kind = 'design'`
     // task and ordinary `project_task` rows alike), the richer
@@ -1014,15 +1018,11 @@ pub async fn compose_worker_spawn(
             // BOSS_MAX_EMBED_DIFF_LINES=0. Embedding the fetched diff into
             // the reviewer's initial prompt is still gated on
             // max_embed_diff_lines so operators can disable that separately.
+            let diff_plan =
+                review_diff_fetch_plan(pr_url, batch_member.as_ref().map(|member| member.role), slim_post_merge);
+            let diff_args: Vec<&str> = diff_plan.gh_args.iter().map(String::as_str).collect();
             if let Some(ref mut ctx) = pr_review_context
-                && (landed_batch.is_none() || landed_repo.is_some())
-                && let Some(diff) = fetch_pr_diff(
-                    pr_url,
-                    landed_batch
-                        .as_ref()
-                        .and_then(|batch| landed_repo.as_deref().map(|repo| (repo, batch.target_sha.as_str()))),
-                )
-                .await
+                && let Some(diff) = fetch_pr_diff(pr_url, &diff_args).await
             {
                 // Mechanical assist for the agent-isms "Boss-construct
                 // references" sub-rule: sweep the diff's added lines for bare
@@ -1035,7 +1035,7 @@ pub async fn compose_worker_spawn(
 
                 let line_count = diff.lines().count() as u64;
                 if let Some(embedded) =
-                    crate::pr_review::bounded_review_diff(&diff, max_embed_diff_lines, landed_batch.is_some())
+                    crate::pr_review::bounded_review_diff(&diff, max_embed_diff_lines, diff_plan.exclude_lockfiles)
                 {
                     tracing::info!(
                         execution_id = %execution.id,
@@ -1186,9 +1186,10 @@ pub async fn compose_worker_spawn(
                         destination,
                         scope,
                         &reviewer_repo_slug,
-                        landed_batch
-                            .as_ref()
-                            .and_then(|_| pr_review_context.as_ref()?.diff_content.as_deref()),
+                        diff_plan
+                            .embed_in_post_merge_prompt
+                            .then(|| pr_review_context.as_ref()?.diff_content.as_deref())
+                            .flatten(),
                     )
                 }
                 Some((_, destination)) => crate::pr_review::render_batch_reviewer_initial_prompt(

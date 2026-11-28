@@ -33,11 +33,11 @@ pub(crate) async fn maybe_trigger_post_merge_review(
     publisher: &dyn ExecutionPublisher,
     candidate: &PendingMergeCheck,
     probe: &PrLifecycleProbe,
-    slim_post_merge: bool,
+    slim_post_merge: impl FnOnce(&str) -> bool,
 ) {
     let cycle_root_id = work_db.review_cycle_root_id(&candidate.work_item_id);
 
-    if slim_post_merge {
+    if slim_post_merge(&cycle_root_id) {
         match work_db.family_minted_by_post_merge_review(&cycle_root_id) {
             Ok(true) => return,
             Ok(false) => {}

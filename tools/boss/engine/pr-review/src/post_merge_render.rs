@@ -91,9 +91,13 @@ pub fn render_post_merge_reviewer_initial_prompt(
     repo_slug: &str,
     embedded_diff: Option<&str>,
 ) -> String {
-    let embedded_diff_section = embedded_diff.map(|diff| format!(
-        "## Embedded diff\n\nDiff of the merge commit below against its first parent, with lockfiles excluded.\n\n```diff\n{diff}\n```\n\n"
-    )).unwrap_or_default();
+    let embedded_diff_section = embedded_diff
+        .map(|diff| {
+            format!(
+                "## Embedded diff\n\nDiff of the merged PR below, with lockfiles excluded.\n\n```diff\n{diff}\n```\n\n"
+            )
+        })
+        .unwrap_or_default();
     let rubric = render_rubric_section(&scope);
     let brief_block = crate::brief::render_brief_packet_block(brief);
     let brief_conformance = crate::brief::render_brief_conformance_rubric();

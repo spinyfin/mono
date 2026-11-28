@@ -247,7 +247,7 @@ impl PopulationRequests for CoreSweepHost {
 }
 
 impl boss_engine_merge_poller::SweepHost for CoreSweepHost {
-    fn slim_post_merge_review(&self, _work_db: &WorkDb, cycle_root_id: &str) -> bool {
+    fn slim_post_merge_review(&self, cycle_root_id: &str) -> bool {
         self.feature_flags.as_ref().is_some_and(|flags| {
             flags
                 .resolve_experiment_arms(|key| boss_work_db::experiment_bucket(cycle_root_id, key))
@@ -319,24 +319,23 @@ mod slim_review_tests {
         let dir = tempfile::tempdir().unwrap();
         let flags = Arc::new(FeatureFlagsStore::new(dir.path().join("flags.toml")));
         flags.load().unwrap();
-        let db = WorkDb::open(dir.path().join("work.db")).unwrap();
         let host = CoreSweepHost::with_remediation(None).with_feature_flags(flags.clone());
         let key = POST_MERGE_REVIEW_SLIM_EXPERIMENT;
-        assert!(!host.slim_post_merge_review(&db, "family"));
+        assert!(!host.slim_post_merge_review("family"));
         flags.set(key, true).unwrap();
-        assert!(!host.slim_post_merge_review(&db, "family"));
+        assert!(!host.slim_post_merge_review("family"));
         flags.set("review_batch_fanout", true).unwrap();
         let mut seen = [false; 2];
         for n in 0..32 {
             let family = format!("family-{n}");
             let treated = boss_work_db::experiment_bucket(&family, key) < 50;
             seen[usize::from(treated)] = true;
-            assert_eq!(host.slim_post_merge_review(&db, &family), treated);
+            assert_eq!(host.slim_post_merge_review(&family), treated);
         }
         assert_eq!(seen, [true, true]);
         flags.set(POST_MERGE_REVIEW_SLIM_AB_SPLIT_FLAG, false).unwrap();
-        assert!(host.slim_post_merge_review(&db, "family"));
+        assert!(host.slim_post_merge_review("family"));
         flags.set(TOKEN_EXPERIMENTS_FLAG, false).unwrap();
-        assert!(!host.slim_post_merge_review(&db, "family"));
+        assert!(!host.slim_post_merge_review("family"));
     }
 }
