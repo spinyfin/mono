@@ -5,12 +5,13 @@
 //! can read [`AnthropicSseLoopback::captured`]; [`Drop`] posts `/__shutdown`
 //! so the listener thread does not leak.
 //!
-//! Each accepted connection is read/written with a timeout and then shut
-//! down. A client that never closes its write half cannot pin the listener
-//! (and therefore [`Drop`]) for the rest of the test process.
+//! Each accepted connection is served on its own thread, read/written with
+//! a timeout, and then shut down. A client that never sends a request cannot
+//! delay other requests or pin [`Drop`] for the rest of the test process.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -100,55 +101,77 @@ fn configure_stream(stream: &TcpStream) {
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
 }
 
+/// Accept loop: each connection is handled on its own thread so an idle or
+/// preconnected socket cannot stall later requests (parallel `count_tokens` /
+/// `messages` calls are served concurrently). The `/__shutdown` request sets a
+/// flag and pokes the listener so this loop observes it and exits.
 fn serve(listener: TcpListener, captured: Arc<Mutex<Vec<(String, String)>>>) {
+    let addr = listener.local_addr().ok();
+    let stop = Arc::new(AtomicBool::new(false));
     while let Ok((stream, _)) = listener.accept() {
-        configure_stream(&stream);
-        let mut reader = BufReader::new(stream);
-        let mut req_line = String::new();
-        if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
-            continue;
-        }
-        let mut content_length = 0usize;
-        let mut header = String::new();
-        loop {
-            header.clear();
-            if reader.read_line(&mut header).unwrap_or(0) == 0 || header == "\r\n" {
-                break;
-            }
-            if let Some(val) = header.to_ascii_lowercase().strip_prefix("content-length:") {
-                content_length = val.trim().parse::<usize>().unwrap_or(0);
-            }
-        }
-        let mut body = vec![0u8; content_length];
-        if content_length > 0 {
-            let _ = reader.read_exact(&mut body);
-        }
-        let is_shutdown = req_line.contains("/__shutdown");
-        if !is_shutdown {
-            captured
-                .lock()
-                .expect("captured lock")
-                .push((req_line.clone(), String::from_utf8_lossy(&body).into_owned()));
-        }
-        let (content_type, resp_body) = if req_line.contains("count_tokens") {
-            ("application/json", r#"{"input_tokens":1}"#.to_owned())
-        } else if is_shutdown {
-            ("text/plain", "bye".to_owned())
-        } else {
-            ("text/event-stream", SSE_OK.to_owned())
-        };
-        let mut stream = reader.into_inner();
-        let _ = write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
-            resp_body.len()
-        );
-        let _ = stream.flush();
-        let _ = stream.shutdown(Shutdown::Both);
-        if is_shutdown {
+        if stop.load(Ordering::SeqCst) {
             break;
         }
+        let captured = Arc::clone(&captured);
+        let stop = Arc::clone(&stop);
+        // Detached: an idle client's handler ends on its own read timeout.
+        thread::spawn(move || {
+            if handle_connection(stream, &captured) {
+                stop.store(true, Ordering::SeqCst);
+                if let Some(addr) = addr {
+                    let _ = TcpStream::connect(addr);
+                }
+            }
+        });
     }
+}
+
+/// Serve one connection; returns whether it was the `/__shutdown` request.
+fn handle_connection(stream: TcpStream, captured: &Mutex<Vec<(String, String)>>) -> bool {
+    configure_stream(&stream);
+    let mut reader = BufReader::new(stream);
+    let mut req_line = String::new();
+    if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
+        return false;
+    }
+    let mut content_length = 0usize;
+    let mut header = String::new();
+    loop {
+        header.clear();
+        if reader.read_line(&mut header).unwrap_or(0) == 0 || header == "\r\n" {
+            break;
+        }
+        if let Some(val) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+            content_length = val.trim().parse::<usize>().unwrap_or(0);
+        }
+    }
+    let mut body = vec![0u8; content_length];
+    if content_length > 0 {
+        let _ = reader.read_exact(&mut body);
+    }
+    let is_shutdown = req_line.contains("/__shutdown");
+    if !is_shutdown {
+        captured
+            .lock()
+            .expect("captured lock")
+            .push((req_line.clone(), String::from_utf8_lossy(&body).into_owned()));
+    }
+    let (content_type, resp_body) = if req_line.contains("count_tokens") {
+        ("application/json", r#"{"input_tokens":1}"#.to_owned())
+    } else if is_shutdown {
+        ("text/plain", "bye".to_owned())
+    } else {
+        ("text/event-stream", SSE_OK.to_owned())
+    };
+    let mut stream = reader.into_inner();
+    let _ = write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+        resp_body.len()
+    );
+    let _ = stream.flush();
+    let _ = stream.shutdown(Shutdown::Both);
+    is_shutdown
 }
 
 #[cfg(test)]
@@ -195,5 +218,16 @@ mod tests {
         assert_eq!(bodies.len(), 2, "{bodies:?}");
         assert!(bodies[0].0.contains("count_tokens"));
         assert!(fixture.first_messages_body().unwrap().contains("model"));
+    }
+
+    #[test]
+    fn idle_connection_does_not_block_later_requests() {
+        let fixture = AnthropicSseLoopback::spawn().expect("bind");
+        let addr = fixture.addr();
+        let _idle = TcpStream::connect(addr).expect("idle connect");
+        let started = std::time::Instant::now();
+        let resp = post(addr, "/v1/messages/count_tokens", "{}");
+        assert!(resp.contains("input_tokens"), "{resp}");
+        assert!(started.elapsed() < IO_TIMEOUT / 2, "request waited on idle socket");
     }
 }

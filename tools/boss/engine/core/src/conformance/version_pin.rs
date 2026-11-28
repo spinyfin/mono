@@ -1177,12 +1177,22 @@ fn spawn_print_claude(
         .expect("spawn claude loopback probe")
 }
 
+/// Poll until `marker` exists or `timeout` elapses; hooks and MCP servers
+/// write their markers from child processes that can outlive `claude -p`.
+fn wait_for_marker(marker: &std::path::Path, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline && !marker.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    marker.exists()
+}
+
 #[test]
 fn installed_claude_lean_flags_exclude_user_env_and_keep_hooks_when_present() {
     use crate::conformance::anthropic_loopback::AnthropicSseLoopback;
     use crate::driver::claude::{CLAUDE_BASE_DISALLOWED_TOOLS, CLAUDE_LEAN_EXTRA_DISALLOWED_TOOLS, claude_spawn_args};
     use crate::driver::{LaunchOptions, SpawnRequest};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     let Some(claude_bin) = require_or_skip_claude() else {
         return;
@@ -1216,23 +1226,28 @@ fn installed_claude_lean_flags_exclude_user_env_and_keep_hooks_when_present() {
     std::fs::write(ws.join(".claude/CLAUDE.md"), format!("{worker_rules_sentinel}\n"))
         .expect("write worker rules CLAUDE.md");
 
-    let hook_marker = tmp.path().join("session-start-fired.txt");
+    let control_hook_marker = tmp.path().join("session-start-control.txt");
+    let treated_hook_marker = tmp.path().join("session-start-treated.txt");
     let settings_path = tmp.path().join("worker-settings.json");
-    let mut settings = serde_json::json!({
-        "hooks": {
-            "SessionStart": [{
-                "matcher": "*",
-                "hooks": [{
-                    "type": "command",
-                    "command": format!("printf fired > '{}'", hook_marker.display()),
+    // Each launch gets its own hook marker so the treated assertion cannot be
+    // satisfied by the control launch's hook.
+    let write_settings = |hook_marker: &std::path::Path| {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{
+                    "matcher": "*",
+                    "hooks": [{
+                        "type": "command",
+                        "command": format!("printf fired > '{}'", hook_marker.display()),
+                    }]
                 }]
-            }]
+            }
+        });
+        for (key, enabled) in crate::driver::claude::CLAUDE_LEAN_PERMISSION_ACKNOWLEDGEMENTS {
+            settings[*key] = serde_json::Value::Bool(*enabled);
         }
-    });
-    for (key, enabled) in crate::driver::claude::CLAUDE_LEAN_PERMISSION_ACKNOWLEDGEMENTS {
-        settings[*key] = serde_json::Value::Bool(*enabled);
-    }
-    std::fs::write(&settings_path, settings.to_string()).expect("write settings.json");
+        std::fs::write(&settings_path, settings.to_string()).expect("write settings.json");
+    };
 
     let write_mcp = |marker: &std::path::Path| {
         std::fs::write(
@@ -1259,6 +1274,7 @@ fn installed_claude_lean_flags_exclude_user_env_and_keep_hooks_when_present() {
         run_id: None,
     };
 
+    write_settings(&control_hook_marker);
     write_mcp(&control_mcp_marker);
     let control_args = claude_spawn_args(spawn_req, &LaunchOptions::default());
     let control_out = spawn_print_claude(&claude_bin, &ws, &fake_home, tmp.path(), addr, &control_args);
@@ -1269,15 +1285,17 @@ fn installed_claude_lean_flags_exclude_user_env_and_keep_hooks_when_present() {
         String::from_utf8_lossy(&control_out.stdout),
         String::from_utf8_lossy(&control_out.stderr),
     );
-    let deadline = Instant::now() + Duration::from_secs(8);
-    while Instant::now() < deadline && !control_mcp_marker.exists() {
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let marker_grace = Duration::from_secs(8);
     assert!(
-        control_mcp_marker.exists(),
+        wait_for_marker(&control_mcp_marker, marker_grace),
         "control launch (no --strict-mcp-config) must start the inherited MCP fixture"
     );
+    assert!(
+        wait_for_marker(&control_hook_marker, marker_grace),
+        "control launch must fire the SessionStart hook so the treated hook assertion is meaningful"
+    );
 
+    write_settings(&treated_hook_marker);
     write_mcp(&treated_mcp_marker);
     let treated_args = claude_spawn_args(
         spawn_req,
@@ -1296,11 +1314,13 @@ fn installed_claude_lean_flags_exclude_user_env_and_keep_hooks_when_present() {
         String::from_utf8_lossy(&out.stderr),
     );
     assert!(
-        hook_marker.exists(),
+        wait_for_marker(&treated_hook_marker, marker_grace),
         "SessionStart hook from --settings must still fire under lean flags"
     );
+    // The control launch needed the grace period for its MCP marker, so a
+    // treated server that started late must not slip past an immediate check.
     assert!(
-        !treated_mcp_marker.exists(),
+        !wait_for_marker(&treated_mcp_marker, marker_grace),
         "--strict-mcp-config must not start the inherited MCP fixture; marker was written"
     );
 
@@ -1435,9 +1455,7 @@ fn installed_claude_lean_interactive_tui_skips_permission_dialog_when_present() 
 
     let api = AnthropicSseLoopback::spawn().expect("bind loopback mock API");
     let tmp = tempfile::TempDir::new().expect("tempdir");
-    let fake_home = tmp.path().join("home");
     let ws = tmp.path().join("ws");
-    std::fs::create_dir_all(fake_home.join(".claude")).expect("home .claude");
     std::fs::create_dir_all(&ws).expect("ws");
     let ws = ws.canonicalize().expect("canonicalize ws");
     std::fs::write(ws.join("CLAUDE.md"), "repo rules\n").expect("repo CLAUDE.md");
@@ -1451,17 +1469,26 @@ fn installed_claude_lean_interactive_tui_skips_permission_dialog_when_present() 
     if let Some(stripped) = ws.to_str().and_then(|p| p.strip_prefix("/private")) {
         projects.insert(stripped.to_owned(), serde_json::json!({"hasTrustDialogAccepted": true}));
     }
-    std::fs::write(
-        fake_home.join(".claude.json"),
-        serde_json::json!({
-            "hasCompletedOnboarding": true,
-            "lastOnboardingVersion": MIN_QUALIFIED_CLAUDE_LEAN_VERSION,
-            "customApiKeyResponses": {"approved": [&api_key[api_key.len() - 20..]], "rejected": []},
-            "projects": projects,
-        })
-        .to_string(),
-    )
-    .expect("write .claude.json");
+    // Every run gets its own HOME: Claude persists dialog acceptance there, so
+    // a shared one would let an earlier run suppress a later run's dialog.
+    let mut home_count = 0usize;
+    let mut fresh_home = || {
+        home_count += 1;
+        let home = tmp.path().join(format!("home-{home_count}"));
+        std::fs::create_dir_all(home.join(".claude")).expect("home .claude");
+        std::fs::write(
+            home.join(".claude.json"),
+            serde_json::json!({
+                "hasCompletedOnboarding": true,
+                "lastOnboardingVersion": MIN_QUALIFIED_CLAUDE_LEAN_VERSION,
+                "customApiKeyResponses": {"approved": [&api_key[api_key.len() - 20..]], "rejected": []},
+                "projects": projects.clone(),
+            })
+            .to_string(),
+        )
+        .expect("write .claude.json");
+        home
+    };
 
     let settings_with_acks = tmp.path().join("settings-acks.json");
     let settings_without_acks = tmp.path().join("settings-empty.json");
@@ -1511,13 +1538,14 @@ sys.stdout.buffer.write(buf)
     )
     .expect("write pty script");
 
-    let run_tui = |settings: &std::path::Path| -> String {
+    let mut run_tui = |model: &str, non_opus_auto_mode: bool, settings: &std::path::Path| -> String {
+        let home = fresh_home();
         let args = claude_spawn_args(
             SpawnRequest {
-                model: "sonnet",
+                model,
                 effort: None,
                 settings_path: Some(settings),
-                non_opus_auto_mode: false,
+                non_opus_auto_mode,
                 permission_mode_override: None,
                 run_id: None,
             },
@@ -1532,7 +1560,7 @@ sys.stdout.buffer.write(buf)
             .arg("12")
             .args(&args)
             .current_dir(&ws)
-            .env("HOME", &fake_home)
+            .env("HOME", &home)
             .env("TERM", "xterm-256color")
             .env("CLAUDE_CODE_TMPDIR", tmp.path())
             .env("ANTHROPIC_BASE_URL", format!("http://{}", api.addr()))
@@ -1544,16 +1572,16 @@ sys.stdout.buffer.write(buf)
             .env_remove("BOSS_EVENTS_SOCKET")
             .stdin(Stdio::null());
         let out = cmd.output().expect("python3 pty launch");
-        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr)
+        collapsed_visible(&(String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr)))
     };
 
-    let without = collapsed_visible(&run_tui(&settings_without_acks));
+    // `--dangerously-skip-permissions` path (sonnet, no auto mode).
+    let without = run_tui("sonnet", false, &settings_without_acks);
     assert!(
         without.contains("yes,iaccept"),
         "treated interactive launch without acknowledgement keys must show the bypass dialog; got {without}"
     );
-
-    let with_acks = collapsed_visible(&run_tui(&settings_with_acks));
+    let with_acks = run_tui("sonnet", false, &settings_with_acks);
     assert!(
         !with_acks.contains("yes,iaccept"),
         "2.1.332 must honour skipDangerousModePermissionPrompt from --settings; got {with_acks}"
@@ -1561,5 +1589,22 @@ sys.stdout.buffer.write(buf)
     assert!(
         with_acks.contains("bypasspermissionson"),
         "treated interactive launch with acknowledgements must reach the bypass-permissions prompt; got {with_acks}"
+    );
+
+    // `--permission-mode auto` path used by opus/fable workers.
+    let auto_notice = "letsclaudehandlepermissionprompts";
+    let auto_without = run_tui("opus", false, &settings_without_acks);
+    assert!(
+        auto_without.contains("automodeon") && auto_without.contains(auto_notice),
+        "treated auto-mode launch without acknowledgement keys must show the auto-mode notice; got {auto_without}"
+    );
+    let auto_with = run_tui("opus", false, &settings_with_acks);
+    assert!(
+        auto_with.contains("automodeon"),
+        "treated auto-mode launch with acknowledgements must reach the auto-mode ready marker; got {auto_with}"
+    );
+    assert!(
+        !auto_with.contains(auto_notice),
+        "2.1.332 must honour skipAutoPermissionPrompt from --settings; got {auto_with}"
     );
 }

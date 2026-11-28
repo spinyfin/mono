@@ -738,10 +738,14 @@ pub const CLAUDE_LEAN_SETTING_SOURCES: &str = "project,local";
 ///
 /// Claude persists `skipDangerousModePermissionPrompt` and
 /// `skipAutoPermissionPrompt` in the user-level `~/.claude/settings.json`.
-/// `--setting-sources project,local` drops that file, and Boss's rendered
-/// `--settings` did not previously supply the keys, so a treated interactive
-/// launch could stop on "Yes, I accept". Confirmed on 2.1.332: the CLI
-/// honours these keys from the flag-supplied `--settings` file.
+/// `--setting-sources project,local` drops that file, so a treated launch
+/// supplies these keys in the Boss `--settings` file; without them an
+/// interactive launch stops on "Yes, I accept" (bypass mode) or shows the
+/// auto-mode notice (auto mode). The live conformance test
+/// `installed_claude_lean_interactive_tui_skips_permission_dialog_when_present`
+/// confirms on 2.1.332 that the flag-supplied `--settings` file suppresses the
+/// bypass dialog for `--dangerously-skip-permissions` launches and the auto-mode
+/// notice for `--permission-mode auto` launches, each from a fresh `HOME`.
 pub const CLAUDE_LEAN_PERMISSION_ACKNOWLEDGEMENTS: &[(&str, bool)] = &[
     ("skipDangerousModePermissionPrompt", true),
     ("skipAutoPermissionPrompt", true),
