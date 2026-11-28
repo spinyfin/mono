@@ -1329,10 +1329,39 @@ pub(crate) fn run_done_directive(
     )
 }
 
-/// `[deferred-scope]` marker protocol directive (PR #765). When `seam_enabled`
-/// (`deferred_scope_proposals_seam`) is `false`, reproduces the pre-migration
-/// marker directive verbatim; when `true`, instructs `propose deferred-scope`
-/// while the engine still accepts a stray legacy marker as a counted fallback.
+/// `[deferred-scope]` marker protocol directive (root-caused to PR #765).
+/// A worker that deliberately narrows its own scope — delivers part of the
+/// brief and consciously defers a piece of it, rather than merely running
+/// out of turns — had no sanctioned way to record that decision: task
+/// completion is binary (PR merged => done) and nothing reconciles
+/// delivered scope against the brief. The PR #765 worker wired part
+/// of a feature, deferred the rest because it needed new data plumbing, and
+/// wrote "I've filed it as a followup" in the PR body — workers cannot file
+/// anything, so the remainder silently died until an operator noticed weeks
+/// later. This directive gives deferred scope a parseable channel mirroring
+/// `[effort-escalation]`'s grammar; see [`crate::deferred_scope`] for the
+/// parser and
+/// `completion::WorkerCompletionHandler::detect_and_record_deferred_scope`
+/// for what the engine does with it: appends a durable audit line to the
+/// work item's description and files a coordinator-visible attention item.
+///
+/// `seam_enabled` mirrors the `deferred_scope_proposals_seam` feature flag —
+/// the same flag
+/// `completion::WorkerCompletionHandler::detect_and_record_deferred_scope`
+/// reads for the engine's read path, threaded here so the two halves of the
+/// migration move together (following the
+/// recipe [`worker_escalation_protocol_directive`] established): a worker
+/// must never be taught the `"$BOSS_BIN" propose deferred-scope` verb when the
+/// engine won't yet read proposals-first for it, and flipping the flag off
+/// must restore today's marker-only directive exactly.
+///
+/// `seam_enabled = false` reproduces the pre-migration directive verbatim.
+/// `seam_enabled = true` instructs `"$BOSS_BIN" propose deferred-scope` instead —
+/// unlike `[blocked]`, the `[deferred-scope]` marker has no bootstrap-
+/// fallback carve-out (design §"Failure semantics": only `[blocked]` is
+/// retained indefinitely), so the seam-enabled directive teaches the verb
+/// only; the engine still accepts a stray legacy marker as a counted
+/// fallback (see [`crate::deferred_scope`]).
 pub(crate) fn deferred_scope_directive(seam_enabled: bool) -> String {
     if !seam_enabled {
         return "\n## If you deliver less than the task asks: declare the gap\n\n\

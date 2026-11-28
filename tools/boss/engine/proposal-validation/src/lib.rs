@@ -928,7 +928,7 @@ impl<'a> PayloadReader<'a> {
                     );
                     return None;
                 }
-                if let Err(message) = boss_protocol::OperatorAnswerType::validate_options(&canonical_options) {
+                if let Err(message) = boss_protocol::OperatorAnswerType::validate_worker_options(&canonical_options) {
                     self.error("question.answer_type.options", message);
                     return None;
                 }

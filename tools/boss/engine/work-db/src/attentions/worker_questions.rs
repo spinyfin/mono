@@ -224,32 +224,28 @@ pub(super) fn apply_owner_disposition_in_tx(
                 .context("answer timestamp is outside the supported range")?;
             let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
             let block = super::super::proposals::choice_block(&record.question, choice, &timestamp);
-            let description = format!("{}{block}", task.description);
-            if super::super::description_guard::validate_description_update(&task.description, &description, false)
-                .is_ok()
-            {
-                tx.execute(
-                    "UPDATE tasks SET description = ?2, updated_at = ?3 WHERE id = ?1",
-                    params![task.id, description, now],
-                )?;
-            }
-            let root = get_chain_root_task(tx, &task.id)?.unwrap_or_else(|| task.clone());
-            crate::parking::set_task_parked(
+            // Audited update path: a rejected description guard surfaces as an
+            // error instead of silently dropping the recorded answer.
+            db.update_task_in_tx(
                 tx,
                 pending,
-                &root.id,
-                true,
-                Some("the owner chose to park this item in an operator question"),
-                actor,
-                &now,
+                &task.id,
+                WorkItemPatch::builder()
+                    .description(format!("{}{block}", task.description))
+                    .build(),
+                crate::task_status_audit::WriteAttribution {
+                    actor,
+                    provenance: Some(provenance.unwrap_or("operator_question_park")),
+                },
             )?;
-            let mut touched = vec![root.id];
-            if !touched.contains(&task.id) {
-                touched.push(task.id);
-            }
+            let touched = crate::operator_disposition::park_chain_root_in_tx(tx, pending, &task, actor, &now)?;
             Ok(Some(("parked".to_owned(), reference, touched)))
         }
-        boss_protocol::ChoiceDisposition::Resume => Ok(None),
+        // Engine-reserved dispositions only appear on engine-built cards
+        // answered through their own handler, never on a worker question.
+        boss_protocol::ChoiceDisposition::Resume
+        | boss_protocol::ChoiceDisposition::ForceMerge
+        | boss_protocol::ChoiceDisposition::RewriteOntoBase => Ok(None),
     }
 }
 

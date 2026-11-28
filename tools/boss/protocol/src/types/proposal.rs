@@ -1188,9 +1188,19 @@ pub enum ChoiceDisposition {
     /// Park the item (or its chain root for a revision) as the repo owner in
     /// the answer transaction. Non-owner answerers fall back to [`Self::Resume`].
     Park,
+    /// Engine-reserved: re-dispatch the parked merge-conflict revision with an
+    /// instruction to resolve the conflicts in place against the refactored
+    /// code. Only the engine's architectural-mismatch card carries it; workers
+    /// cannot request it.
+    ForceMerge,
+    /// Engine-reserved: archive the parked merge-conflict revision and mint a
+    /// port-sized revision on the same PR. Only the engine's
+    /// architectural-mismatch card carries it; workers cannot request it.
+    RewriteOntoBase,
 }
 
 impl ChoiceDisposition {
+    /// Every disposition a worker may request on a card it files.
     pub const ALL: [Self; 3] = [Self::Resume, Self::Archive, Self::Park];
 
     pub const fn as_str(self) -> &'static str {
@@ -1198,7 +1208,15 @@ impl ChoiceDisposition {
             Self::Resume => "resume",
             Self::Archive => "archive",
             Self::Park => "park",
+            Self::ForceMerge => "force_merge",
+            Self::RewriteOntoBase => "rewrite_onto_base",
         }
+    }
+
+    /// Whether a worker may request this disposition on a card it files.
+    /// Engine-reserved dispositions belong to cards the engine builds itself.
+    pub const fn is_worker_assignable(self) -> bool {
+        matches!(self, Self::Resume | Self::Archive | Self::Park)
     }
 }
 
@@ -1324,6 +1342,19 @@ impl OperatorAnswerType {
                     ));
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// [`Self::validate_options`] for a card a worker files: additionally
+    /// refuses the engine-reserved dispositions.
+    pub fn validate_worker_options(options: &[OperatorChoiceOption]) -> Result<(), String> {
+        Self::validate_options(options)?;
+        if let Some(option) = options.iter().find(|option| !option.disposition.is_worker_assignable()) {
+            return Err(format!(
+                "choice `{}` has disposition `{}`, which is reserved for engine-built cards; expected one of: resume, archive, park",
+                option.label, option.disposition
+            ));
         }
         Ok(())
     }

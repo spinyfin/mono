@@ -949,8 +949,8 @@ pub(crate) struct LadderAnswerEffect {
 
 /// Apply the owner's answer to the engine's question, in the answer's
 /// transaction, dispatching on structured [`boss_protocol::ChoiceDisposition`]
-/// (falling back to the legacy constants only for rows stored before `options`
-/// existed). See the module documentation for each choice.
+/// only (stored cards without `options` are repaired by a migration). See the
+/// module documentation for each choice.
 pub(crate) fn answer_in_tx(
     pending: &mut PendingEvents,
     tx: &Connection,
@@ -970,18 +970,22 @@ pub(crate) fn answer_in_tx(
         .flatten()
         .map(|json| serde_json::from_str(&json))
         .transpose()?;
-    let disposition = match question.answer_type.choice_disposition(choice) {
-        Some(disposition) => disposition,
-        None => match choice {
-            KEEP_TRYING => boss_protocol::ChoiceDisposition::Resume,
-            PARK_IT => boss_protocol::ChoiceDisposition::Park,
-            ARCHIVE_IT => boss_protocol::ChoiceDisposition::Archive,
-            other => bail!("`{other}` is not an answer to the progression ladder's question"),
-        },
+    // Dispatch on the card's structured disposition, never on label text.
+    let Some(stored) = question.answer_type.choice_disposition(choice) else {
+        bail!("`{choice}` is not an answer to the progression ladder's question");
+    };
+    // Only the owner's choice acts on the item by archiving or parking it; any
+    // other answerer re-arms the ladder like "keep trying".
+    let disposition = if attribution.actor == LAST_STATUS_ACTOR_HUMAN {
+        stored
+    } else {
+        boss_protocol::ChoiceDisposition::Resume
     };
     let mut effect = LadderAnswerEffect::default();
     match disposition {
-        boss_protocol::ChoiceDisposition::Resume => {
+        boss_protocol::ChoiceDisposition::Resume
+        | boss_protocol::ChoiceDisposition::ForceMerge
+        | boss_protocol::ChoiceDisposition::RewriteOntoBase => {
             tx.execute(
                 "UPDATE progression_ladder
                  SET reset_at = CAST(?2 AS INTEGER),

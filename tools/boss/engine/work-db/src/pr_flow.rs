@@ -2743,7 +2743,7 @@ impl WorkDb {
         match (answer, &question.question.answer_type) {
             // The engine's own question when progression ran out of attempts.
             (OperatorAnswer::MultipleChoice { value }, OperatorAnswerType::MultipleChoice { .. })
-                if ladder_question && actor == LAST_STATUS_ACTOR_HUMAN =>
+                if ladder_question =>
             {
                 let effect = crate::progression_ladder::answer_in_tx(
                     &mut pending,
