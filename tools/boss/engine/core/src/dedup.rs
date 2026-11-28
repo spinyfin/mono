@@ -43,6 +43,9 @@ use boss_protocol::{
 use crate::claude_client::{CallConfig, RetryPolicy};
 use crate::structured_call::{StructuredCall, StructuredCallOutcome, structured_call};
 
+pub mod taxonomy;
+pub use taxonomy::{TAXONOMY_PER_KIND_CAP, TAXONOMY_WORK_ITEM_CAP, load_existing_work_items};
+
 /// The model the dedup decision runs on. Haiku by default (design R1): the
 /// creation-time call is frequent and the judgment is bounded (one candidate
 /// vs. a short prefiltered set), so a cheap tier is the right starting point.
@@ -273,8 +276,8 @@ fn reason_is_entity_specific(reason: &str) -> bool {
 }
 
 /// Does the text cite a concrete, checkable entity? Recognises: an issue/PR
-/// reference (`#123`), a short work-item id (an uppercase letter immediately
-/// followed by a digit, e.g. `T42`), or a source file path/extension.
+/// reference (`#123`), a short work-item id (task-table prefix `T{n}` or
+/// project prefix `P{n}`), or a source file path/extension.
 fn has_concrete_reference(text: &str) -> bool {
     let bytes = text.as_bytes();
     for pair in bytes.windows(2) {
@@ -282,7 +285,7 @@ fn has_concrete_reference(text: &str) -> bool {
         if pair[0] == b'#' && pair[1].is_ascii_digit() {
             return true;
         }
-        // "T42" / "C7" / "R3" / "P12" — a short work-item id.
+        // Task-table rows use T{n}; projects use P{n}.
         if pair[0].is_ascii_uppercase() && pair[1].is_ascii_digit() {
             return true;
         }

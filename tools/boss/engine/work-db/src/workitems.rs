@@ -1769,8 +1769,45 @@ impl WorkDb {
         include_deleted: bool,
         selector: Option<&str>,
     ) -> Result<Vec<Task>> {
+        self.list_tasks_filtered(product_id, project_id, dep_filter, include_deleted, selector, false)
+    }
+
+    /// Live (not soft-deleted) tasks whose status is not terminal, most
+    /// recently updated first. Terminal rows are excluded in SQL so a
+    /// mature product's done/archived history is never loaded; callers on
+    /// latency-sensitive paths (dedup comparison sets) use this instead of
+    /// [`Self::list_tasks`] plus a Rust-side status filter.
+    pub fn list_open_tasks_mru(&self, product_id: &str) -> Result<Vec<Task>> {
+        self.list_tasks_filtered(product_id, None, None, false, None, true)
+    }
+
+    fn list_tasks_filtered(
+        &self,
+        product_id: &str,
+        project_id: Option<&str>,
+        dep_filter: Option<&DependencyFilter>,
+        include_deleted: bool,
+        selector: Option<&str>,
+        open_only: bool,
+    ) -> Result<Vec<Task>> {
         let conn = self.connect()?;
         ensure_product_exists(&conn, product_id)?;
+        let (status_clause, order_clause) = if open_only {
+            (
+                format!(
+                    " AND status NOT IN ({})",
+                    TaskStatus::ALL
+                        .iter()
+                        .filter(|status| status.is_terminal())
+                        .map(|status| format!("'{}'", status.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                "CAST(updated_at AS INTEGER) DESC, id ASC",
+            )
+        } else {
+            (String::new(), "COALESCE(ordinal, 0) ASC, created_at ASC")
+        };
 
         // The soft-delete predicate is dropped entirely (rather than
         // negated) when the caller asks to include deleted rows, so the
@@ -1790,8 +1827,8 @@ impl WorkDb {
             let mut stmt = conn.prepare(&format!(
                 "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, parent_task_id, tags, parked_at, parked_by, parked_reason, parked_via, (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
                  FROM tasks
-                 WHERE product_id = ?1 AND project_id = ?2 AND kind IN ({kind_clause}){deleted_clause} AND (?3 IS NULL OR id = ?3 OR short_id = ?4)
-                 ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
+                 WHERE product_id = ?1 AND project_id = ?2 AND kind IN ({kind_clause}){deleted_clause}{status_clause} AND (?3 IS NULL OR id = ?3 OR short_id = ?4)
+                 ORDER BY {order_clause}",
             ))?;
             let rows = stmt.query_map(
                 params![
@@ -1807,8 +1844,8 @@ impl WorkDb {
             let mut stmt = conn.prepare(&format!(
                 "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, parent_task_id, tags, parked_at, parked_by, parked_reason, parked_via, (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
                  FROM tasks
-                 WHERE product_id = ?1 AND kind IN ({kind_clause}){deleted_clause} AND (?3 IS NULL OR id = ?3 OR short_id = ?4)
-                 ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
+                 WHERE product_id = ?1 AND kind IN ({kind_clause}){deleted_clause}{status_clause} AND (?3 IS NULL OR id = ?3 OR short_id = ?4)
+                 ORDER BY {order_clause}",
             ))?;
             let rows = stmt.query_map(
                 params![

@@ -201,7 +201,7 @@ CREATE TABLE IF NOT EXISTS attention_merges (
   id                      TEXT PRIMARY KEY,        -- merge_<...>
   -- Exactly one of canonical_attention_id / canonical_work_item_id is set per row.
   canonical_attention_id  TEXT REFERENCES attentions(id),  -- set for AttentionDup
-  canonical_work_item_id  TEXT,                    -- set for WorkItemDup / sensibility (T<n>, C<n>, etc.)
+  canonical_work_item_id  TEXT,                    -- set for WorkItemDup / sensibility (T<n> or P<n>)
   product_id              TEXT NOT NULL,
   trigger                 TEXT NOT NULL,           -- 'creation' | 'sweep' | 'sensibility'
   -- Creation-time: the candidate is never persisted, so we capture its identity inline.
@@ -245,7 +245,7 @@ pub struct DedupInput {
 }
 
 pub struct WorkItemBrief {
-    pub work_item_id: String,             // "T<n>" | "C<n>" | "R<n>" | "P<n>"
+    pub work_item_id: String,             // "T<n>" for every tasks-table row (task, chore, revision) | "P<n>" for projects
     pub kind: String,                     // "task" | "chore" | "revision" | "project"
     pub title: String,
     pub status: String,                   // non-terminal state string for context
@@ -325,9 +325,9 @@ Removing `association` and `group_id` from the bucket key means product-level bu
 When `notification_dedup_taxonomy` is enabled, `DedupInput.existing_work_items` is populated alongside the attention set:
 
 - **Work-item kinds:** tasks, chores, revisions, projects — all four.
-- **Non-terminal states:** any state that is not a terminal/closed state. Concretely: tasks and chores in `open | in_progress | review | paused`; revisions in `in_progress | in_review`; projects in `planned | active`. The query is `WHERE state NOT IN ('done','cancelled','archived','merged','closed')` scoped to the same product.
+- **Non-terminal states:** any state that is not a terminal/closed state. Concretely: task-table rows (tasks, chores, revisions) in `todo | active | blocked | in_review`; projects in `planned | active | blocked`. The query is `WHERE status NOT IN ('done','archived')` and not soft-deleted, scoped to the same product and ordered most-recently-updated first.
 - **Scope: same product, no recency window.** Unlike attentions (where a recency window prevents the comparison set growing unboundedly), work items in non-terminal states are by definition still active — a task open for three months is still work the human is tracking. Include all non-terminal items in the product. If the combined set (attentions + work items) exceeds K, attentions rank above work items as the primary dup target; work items beyond the cap are `log()`-ed, not silently dropped.
-- **K (combined cap):** raise the per-call cap to accommodate both sets (e.g. K ≤ 24 attentions + 24 work items = 48 total). Open question R15 covers the concrete value.
+- **K (combined cap):** K = 48 (24 attentions + 24 work items). Attentions ranked first. The work-item side applies a most-recently-updated prefilter before the cap (R15, provisional pending measurement): each of the four kinds keeps up to 6 newest rows, then unused combined-cap slots fill from remaining most-recently-updated items. Overflow is logged, never silently dropped.
 - **The LLM prompt** receives the two lists under distinct headings ("Existing open notifications:" and "Existing scheduled work items:") so it can make the distinction clear in its rationale.
 
 #### Work-item dup verdict handling
@@ -490,7 +490,7 @@ Three flags are registered. All default `false` (off-safe). The sub-flags are on
 
 **R14 — Startup sweep + sensibility filter scope.** The sweep is designed for attention-vs-attention folding. _Open:_ should the sweep also apply the sensibility filter to existing open attentions (evaluate whether already-persisted attentions are now stale)? The primary use case for sensibility is at creation time (catching bad attentions before they appear), and sweep-based sensibility would retire items the human may have already seen. Proposed: sensibility filter is creation-path-only in v1; the sweep applies attention-vs-attention folding + work-item dup detection only.
 
-**R15 — Combined comparison-set cap K for taxonomy-aware dedup.** Proposed: K ≤ 48 total (24 attentions + 24 work items), attentions ranked first. _Open:_ the right split depends on typical product sizes (how many open tasks vs. open attentions). If products regularly have 50+ open tasks, the work-item side needs its own prefilter (e.g. most-recently-updated N work items) before the combined cap. Settle by measuring real product sizes before implementing task 4a (taxonomy prefilter).
+**R15 — Combined comparison-set cap K for taxonomy-aware dedup.** Provisional: K = 48 (24 attentions + 24 work items), attentions ranked first. Work-item side: per-kind cap of 6 (task / chore / revision / project) with unused combined-cap slots filled from the remaining most-recently-updated items, so a product with many tasks and few chores still contributes the chores. Overflow is logged. A most-recently-updated prefilter is always applied (a no-op under the cap). The MRU-always policy is provisional: per-product open-item counts have not been measured (no authorized production snapshot was available), so whether busy products exceed the 50-open-task threshold that would require the prefilter is unconfirmed. Always applying it is safe because it is a no-op under the cap. **Measurement explicitly deferred:** an authorized operator must supply a sanitized aggregate snapshot of non-terminal row counts per product and kind (no titles, descriptions, or production database access for workers), then record how often products exceed 50 open tasks and confirm or revise the caps here. This measurement is registered as deferred scope; R15 remains provisional until that evidence is available.
 
 ---
 
