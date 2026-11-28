@@ -64,6 +64,8 @@ pub struct NavigatorRoot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NavigatorSection {
+    /// Display order is this variant order: Ready is first, above Working.
+    Ready,
     Working,
     NeedsAttention,
     Backlog,
@@ -416,5 +418,17 @@ mod tests {
         assert_eq!(root.section, NavigatorSection::Unknown);
         assert_eq!(root.default_detail, NavigatorDetail::Unknown);
         assert_eq!(root.reason, NavigatorReason::Unknown);
+    }
+
+    #[test]
+    fn ready_section_is_an_additive_wire_variant() {
+        assert_eq!(
+            serde_json::to_value(NavigatorSection::Ready).unwrap(),
+            serde_json::json!("ready")
+        );
+        assert_eq!(
+            serde_json::from_value::<NavigatorSection>(serde_json::json!("ready")).unwrap(),
+            NavigatorSection::Ready
+        );
     }
 }

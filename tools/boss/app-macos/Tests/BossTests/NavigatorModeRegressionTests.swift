@@ -88,7 +88,7 @@ final class NavigatorModeRegressionTests: XCTestCase {
             default: model.workSearchText = "revision"
             }
             XCTAssertFalse(model.isTaskVisible(chore), filter)
-            XCTAssertEqual(model.navigatorSections[0].rows.map(\.id), ["root"], filter)
+            XCTAssertEqual(model.navigatorSections[1].rows.map(\.id), ["root"], filter)
             model.setWorkViewMode(.kanban)
             XCTAssertFalse(model.showBlockedOnly, filter)
             XCTAssertTrue(model.includeChores, filter)
@@ -129,16 +129,16 @@ final class NavigatorModeRegressionTests: XCTestCase {
 
     func testNavigatorCacheInvalidatesForSearchAndSnapshot() {
         let model = NavigatorTestFixture.model([NavigatorTestFixture.task()])
-        XCTAssertEqual(model.navigatorSections[0].rows.count, 1)
+        XCTAssertEqual(model.navigatorSections[1].rows.count, 1)
         XCTAssertNotNil(model.cachedNavigatorSections)
         XCTAssertNil(model.navigatorCompatibilityMessage)
         XCTAssertNotNil(model.cachedNavigatorCompatibility)
         model.workSearchText = "no match"
         XCTAssertNil(model.cachedNavigatorSections)
-        XCTAssertTrue(model.navigatorSections[0].rows.isEmpty)
+        XCTAssertTrue(model.navigatorSections[1].rows.isEmpty)
         model.workSearchText = ""
         NavigatorTestFixture.snapshot(model, [NavigatorTestFixture.task(section: "landed")])
-        XCTAssertEqual(model.navigatorSections[3].rows.count, 1)
+        XCTAssertEqual(model.navigatorSections[4].rows.count, 1)
     }
 
     func testArchivedProjectFiltersUseTheSharedVisibleScope() {

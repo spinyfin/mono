@@ -11,8 +11,8 @@ use boss_engine_board_gesture::BoardRow;
 use boss_protocol::{BoardColumn, ReviewSection, Task, TaskKind, TaskStatus};
 
 use super::{
-    AI_REVIEW_STATE_REVIEW_QUEUED, AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS, AI_REVIEW_STATE_REVIEWING, Connection,
-    Result,
+    AI_REVIEW_STATE_NOT_REVIEWED, AI_REVIEW_STATE_REVIEW_QUEUED, AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS,
+    AI_REVIEW_STATE_REVIEWING, Connection, Result,
 };
 
 /// Resolve the Review-column section of `task`, or `None` when the row is not
@@ -33,11 +33,17 @@ use super::{
 ///    revision is itself blocked (nothing is running).
 /// 2. **In Revision** — a revision is running or queued on the PR
 ///    (`has_in_progress_revision`, the orange "in revision" badge).
-/// 3. **AI Review** — an AI review is queued or running, or it reported
-///    findings that no revision has started on yet (a started revision would
-///    have matched rule 2).
+/// 3. **AI Review** — an AI review is queued or running, a review is still
+///    due for the current head (`not_reviewed`), or it reported findings that
+///    no revision has started on yet (a started revision would have matched
+///    rule 2). `review_not_required` (no-op skip, cycle cap, exhausted
+///    `gave_up`, no review scheduled, or a findings revision that delivered
+///    without moving the head) is not AI Review: nothing automatic will
+///    review that head.
 /// 4. **Ready** — `ready_for_review`, the engine-computed flag, once the
-///    higher-priority states are excluded.
+///    higher-priority states are excluded. `review_not_required` and clean
+///    verdicts can be Ready; `not_reviewed` cannot, because a review is
+///    still due.
 /// 5. **Pending** — everything else: an open PR whose required CI is still
 ///    running or not yet polled, whose mergeability is unknown, or that has
 ///    no PR bound yet. Nothing is wrong and nobody needs to act; the card is
@@ -50,9 +56,10 @@ use super::{
 /// facts clear, the PR cannot merge, and the failure is the more
 /// important thing to see. In Revision outranks AI Review because a card with
 /// a revision running is not waiting on the reviewer, and AI Review outranks
-/// Ready because a clean-CI PR with a review still in flight is not yet safe
-/// to merge — `ready_for_review` deliberately knows nothing about the AI
-/// review, so the ordering here is what keeps such a card out of Ready.
+/// Ready because a clean-CI PR with a review still in flight, or with a
+/// review still due for the current head, is not yet safe to merge —
+/// `ready_for_review` deliberately knows nothing about the AI review, so the
+/// ordering here is what keeps such a card out of Ready.
 ///
 /// Reads `ready_for_review`, `has_in_progress_revision`,
 /// `in_revision_blocked_only` and `ai_review_state`, so it must run after
@@ -85,7 +92,12 @@ pub fn classify_review_section(task: &Task) -> Option<ReviewSection> {
     }
     if matches!(
         task.ai_review_state.as_deref(),
-        Some(AI_REVIEW_STATE_REVIEWING | AI_REVIEW_STATE_REVIEW_QUEUED | AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS)
+        Some(
+            AI_REVIEW_STATE_REVIEWING
+                | AI_REVIEW_STATE_REVIEW_QUEUED
+                | AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS
+                | AI_REVIEW_STATE_NOT_REVIEWED
+        )
     ) {
         return Some(ReviewSection::AiReview);
     }
@@ -187,13 +199,21 @@ mod tests {
 
     #[test]
     fn ready_card_with_clean_ai_review_stays_ready() {
-        for state in ["reviewed_all_clear", "review_not_required", "not_reviewed"] {
+        for state in ["reviewed_all_clear", "review_not_required"] {
             assert_eq!(
                 classify_review_section(&with_ai_state(ready_card(), state)),
                 Some(ReviewSection::Ready),
                 "ai_review_state={state}"
             );
         }
+    }
+
+    #[test]
+    fn not_reviewed_head_is_ai_review_not_ready() {
+        assert_eq!(
+            classify_review_section(&with_ai_state(ready_card(), "not_reviewed")),
+            Some(ReviewSection::AiReview)
+        );
     }
 
     #[test]
@@ -205,8 +225,8 @@ mod tests {
     }
 
     #[test]
-    fn ai_review_queued_running_or_findings_is_ai_review() {
-        for state in ["reviewing", "review_queued", "reviewed_with_findings"] {
+    fn ai_review_queued_running_findings_or_unreviewed_head_is_ai_review() {
+        for state in ["reviewing", "review_queued", "reviewed_with_findings", "not_reviewed"] {
             assert_eq!(
                 classify_review_section(&with_ai_state(ready_card(), state)),
                 Some(ReviewSection::AiReview),
@@ -325,6 +345,14 @@ mod tests {
         // review, so a review still in flight must pull the card out of Ready.
         let t = with_ai_state(ready_card(), "reviewing");
         assert!(t.ready_for_review);
+        assert_eq!(classify_review_section(&t), Some(ReviewSection::AiReview));
+    }
+
+    #[test]
+    fn not_reviewed_outranks_pending_ci() {
+        let mut t = with_ai_state(ready_card(), "not_reviewed");
+        t.ci_required_state = Some("in_progress".to_owned());
+        t.ready_for_review = false;
         assert_eq!(classify_review_section(&t), Some(ReviewSection::AiReview));
     }
 

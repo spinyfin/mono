@@ -49,7 +49,8 @@ use boss_engine_storage_values::dispatch_wait::{
 };
 use boss_protocol::{
     CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_MERGE_CONFLICT_PREFIX, ExecutionKind, ExecutionStatus,
-    NAVIGATOR_PROJECTION_VERSION, NavigatorProjection, NavigatorRoot, Task, TaskKind, TaskRuntime, TaskStatus,
+    NAVIGATOR_PROJECTION_VERSION, NavigatorProjection, NavigatorRoot, ReviewSection, Task, TaskKind, TaskRuntime,
+    TaskStatus,
 };
 use boss_work_navigator as nav;
 use std::cmp::Reverse;
@@ -651,12 +652,13 @@ fn intervention_reason(reason: Option<&str>) -> Option<&'static str> {
 }
 
 /// A human review or merge decision on the root's PR, offered only when the
-/// engine's own readiness fact holds: an open PR with every required check
-/// green, no conflict, no block and no revision that can still change it.
-/// Unknown or pending CI and mergeability are never readiness. The classifier
-/// further withholds it while automatic review, repair or a merge is in flight.
+/// Review column would put the card in Ready (`classify_review_section`).
+/// That fact already requires an open PR, green required checks, no conflict,
+/// no block and no revision that can still change it. The classifier further
+/// withholds it while automatic review, repair or a merge is in flight, except
+/// on a Ready card where the owner can act now.
 fn review_attention(root: &Task) -> Option<nav::Attention> {
-    if !(root.ready_for_review && root.status == TaskStatus::InReview && has_pr(root)) {
+    if root.review_section != Some(ReviewSection::Ready) {
         return None;
     }
     let (kind, label) = if root.review_required_state.as_deref() == Some("approved") {
@@ -857,6 +859,8 @@ fn pull_request(
             (Some("queued"), _) => nav::MergeFlow::Queued,
             _ => nav::MergeFlow::None,
         },
+        // Share the Review column's Ready fact; do not re-derive it here.
+        review_ready: root.review_section == Some(ReviewSection::Ready),
     })
 }
 
@@ -943,6 +947,7 @@ fn epoch(raw: &str) -> i64 {
 
 fn wire_section(section: nav::Section) -> boss_protocol::NavigatorSection {
     match section {
+        nav::Section::Ready => boss_protocol::NavigatorSection::Ready,
         nav::Section::Working => boss_protocol::NavigatorSection::Working,
         nav::Section::NeedsAttention => boss_protocol::NavigatorSection::NeedsAttention,
         nav::Section::Backlog => boss_protocol::NavigatorSection::Backlog,
@@ -1104,21 +1109,24 @@ fn reversed(value: i64) -> String {
 fn encode_sort_key(key: &nav::SortKey) -> String {
     let reverse = |Reverse(value): &Reverse<i32>| reversed(i64::from(*value));
     match key {
+        nav::SortKey::Ready(rank, priority, since, id) => {
+            format!("0|{rank:03}|{}|{}|{id}", reverse(priority), ordered(*since))
+        }
         nav::SortKey::Working(priority, started, id) => {
-            format!("0|{}|{}|{id}", reverse(priority), ordered(*started))
+            format!("1|{}|{}|{id}", reverse(priority), ordered(*started))
         }
         nav::SortKey::NeedsAttention(rank, priority, since, id) => {
-            format!("1|{rank:03}|{}|{}|{id}", reverse(priority), ordered(*since))
+            format!("2|{rank:03}|{}|{}|{id}", reverse(priority), ordered(*since))
         }
         nav::SortKey::Backlog(group, priority, ordinal, created, id) => {
             let ordinal = ordinal.map_or_else(|| "0".to_owned(), |ordinal| format!("1{}", ordered(ordinal)));
             format!(
-                "2|{group:03}|{}|{ordinal}|{}|{id}",
+                "3|{group:03}|{}|{ordinal}|{}|{id}",
                 reverse(priority),
                 ordered(*created)
             )
         }
-        nav::SortKey::Landed(Reverse(merged), id) => format!("3|{}|{id}", reversed(*merged)),
+        nav::SortKey::Landed(Reverse(merged), id) => format!("4|{}|{id}", reversed(*merged)),
     }
 }
 
@@ -1150,6 +1158,9 @@ mod tests {
     #[test]
     fn sort_key_encoding_preserves_classifier_order() {
         let keys = [
+            nav::SortKey::Ready(2, Reverse(1), 10, "a".into()),
+            nav::SortKey::Ready(2, Reverse(1), 9, "b".into()),
+            nav::SortKey::Ready(3, Reverse(3), 1, "a".into()),
             nav::SortKey::Working(Reverse(2), 5, "b".into()),
             nav::SortKey::Working(Reverse(2), 5, "c".into()),
             nav::SortKey::Working(Reverse(2), -3, "z".into()),

@@ -13,11 +13,38 @@ fn make_ready(db: &WorkDb, id: &str) {
         .unwrap()
         .execute(
             "UPDATE tasks SET status = 'in_review', blocked_reason = NULL,
-         pr_url = 'https://github.com/org/repo/pull/1', ci_required_state = 'success',
-         pr_mergeable_state = 'mergeable' WHERE id = ?1",
+         pr_url = 'https://github.com/org/repo/pull/1', pr_head_sha = 'head-1',
+         ci_required_state = 'success', pr_mergeable_state = 'mergeable' WHERE id = ?1",
             [id],
         )
         .unwrap();
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(id)
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+        [&execution.id],
+    )
+    .unwrap();
+    WorkDb::insert_review_verdict_in_tx(
+        &conn,
+        &execution.id,
+        id,
+        &crate::ReviewVerdictInput {
+            head_sha: Some("head-1".to_owned()),
+            findings_count: 0,
+            revision_warranted: false,
+            gate_outcome: "completed_clean",
+        },
+    )
+    .unwrap();
 }
 
 fn assert_ready(task: &Task) {

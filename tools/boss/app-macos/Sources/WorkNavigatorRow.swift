@@ -30,9 +30,11 @@ struct NavigatorRowPresentation {
             return NavigatorRowHealth(label: "CI pending", symbol: "clock")
         }
         if row.task.reviewRequiredState == "approved" {
+            if row.projection.knownSection == .ready { return nil }
             return NavigatorRowHealth(label: "Review approved", symbol: "checkmark.circle")
         }
         if row.task.ciRequiredState == "success" {
+            if row.projection.knownSection == .ready { return nil }
             return NavigatorRowHealth(label: "CI passed", symbol: "checkmark.circle")
         }
         return nil

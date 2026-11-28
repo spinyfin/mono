@@ -111,7 +111,13 @@ fn pr() -> PullRequest {
             conflict: Conflict::None,
         },
         merge_flow: MergeFlow::None,
+        review_ready: false,
     }
+}
+fn ready_pr() -> PullRequest {
+    let mut p = pr();
+    p.review_ready = true;
+    p
 }
 fn merged() -> PullRequest {
     let mut p = pr();
@@ -538,7 +544,68 @@ fn sorting_uses_semantic_groups_and_stable_ties() {
     let landed = key(&f);
     f.pr.as_mut().unwrap().evidence.as_mut().unwrap().merged_at = Some(301);
     assert!(key(&f) < landed);
-    assert!(active < question && question < failed && completed < landed);
+    f.pr = Some(ready_pr());
+    f.root.attentions[0].kind = HumanAction::Review;
+    let ready = key(&f);
+    assert!(ready < active && active < question && question < failed && completed < landed);
+}
+
+#[test]
+fn review_ready_is_the_ready_section_unless_a_person_must_still_act() {
+    let mut f = family();
+    f.pr = Some(ready_pr());
+    f.root.attentions = vec![attention(HumanAction::Review)];
+    assert_eq!(section(&f), Section::Ready);
+    assert_eq!(reason(&f), Reason::Human(HumanAction::Review));
+    assert_eq!(projection(&f).placement.detail, Detail::Review);
+    f.root.attentions[0].kind = HumanAction::Merge;
+    assert_eq!(section(&f), Section::Ready);
+    assert_eq!(reason(&f), Reason::Human(HumanAction::Merge));
+    f.root.attentions.push(attention(HumanAction::Question));
+    assert_eq!(section(&f), Section::NeedsAttention);
+    assert_eq!(reason(&f), Reason::Human(HumanAction::Question));
+    f.root.attentions = vec![attention(HumanAction::Review)];
+    f.root.activities.push(activity("root", ActivityKind::Reviewing));
+    assert_eq!(section(&f), Section::Working);
+    f.root.activities.clear();
+    f.pr = Some(merged());
+    assert_eq!(section(&f), Section::Landed);
+}
+
+#[test]
+fn review_ready_without_an_attention_is_still_ready() {
+    let mut f = family();
+    f.pr = Some(ready_pr());
+    assert_eq!(section(&f), Section::Ready);
+    assert_eq!(reason(&f), Reason::Human(HumanAction::Review));
+    assert!(projection(&f).actions.is_empty());
+}
+
+#[test]
+fn review_ready_does_not_override_input_or_intervention() {
+    for kind in [HumanAction::Input, HumanAction::Intervention] {
+        let mut f = family();
+        f.pr = Some(ready_pr());
+        f.root.attentions = vec![attention(kind)];
+        assert_eq!(section(&f), Section::NeedsAttention, "{kind:?}");
+        assert_eq!(reason(&f), Reason::Human(kind));
+    }
+    let mut f = family();
+    f.pr = Some(ready_pr());
+    let mut waiting = activity("root", ActivityKind::Implementing);
+    waiting.runtime.run = RunState::WaitingInput;
+    f.root.activities.push(waiting);
+    assert_eq!(section(&f), Section::NeedsAttention);
+    assert_eq!(reason(&f), Reason::Human(HumanAction::Input));
+}
+
+#[test]
+fn not_review_ready_review_actions_stay_needs_attention() {
+    let mut f = family();
+    f.pr = Some(pr());
+    f.root.attentions = vec![attention(HumanAction::Review)];
+    assert!(!f.pr.as_ref().unwrap().review_ready);
+    assert_eq!(section(&f), Section::NeedsAttention);
 }
 
 #[test]

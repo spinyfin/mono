@@ -7,10 +7,11 @@ enum WorkViewMode: String, CaseIterable, Identifiable {
 }
 
 enum NavigatorSection: String, CaseIterable, Identifiable, Decodable {
-    case working, needsAttention = "needs_attention", backlog, landed
+    case ready, working, needsAttention = "needs_attention", backlog, landed
     var id: String { rawValue }
     var title: String {
         switch self {
+        case .ready: "Ready"
         case .working: "Working"
         case .needsAttention: "Needs attention"
         case .backlog: "Backlog"

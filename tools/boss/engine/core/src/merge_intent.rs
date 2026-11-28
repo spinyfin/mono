@@ -120,7 +120,8 @@ fn decide(intent: &MergeIntent, current_head: Option<&str>, remediation: MergeIn
 /// in flight. Called on a definitive clean probe of an item that is not
 /// parked. Ready is the engine's own definition of "could be merged right
 /// now" (`classify_review_section`): in review, not blocked, no revision
-/// queued or running, no AI review pending, required CI green, mergeable.
+/// queued or running, no AI review pending, with unaddressed findings, or
+/// still due for the current head, required CI green, mergeable.
 pub async fn settle_after_clean_probe(db: &WorkDb, publisher: &dyn ExecutionPublisher, candidate: &PendingMergeCheck) {
     match settle(db, candidate) {
         Ok(Some(end)) => {
@@ -187,9 +188,13 @@ fn settle(db: &WorkDb, candidate: &PendingMergeCheck) -> anyhow::Result<Option<M
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::work::{CiRemediationInsertInput, GithubMergeIntentInsertInput, PrPollStateInput, WorkItemPatch};
+    use crate::work::{
+        CiRemediationInsertInput, ConflictResolutionInsertInput, CreateExecutionInput, ExecutionStatus,
+        GithubMergeIntentInsertInput, PrPollStateInput, REVIEW_GATE_OUTCOME_COMPLETED_CLEAN,
+        REVIEW_GATE_OUTCOME_SKIPPED_NOOP, ReviewVerdictInput, WorkItemPatch,
+    };
     use boss_execution_contracts::NoopExecutionPublisher;
-    use boss_protocol::{MERGE_INTENT_ACTIVE, MERGE_INTENT_REASON_REMOVED_FROM_MERGE_QUEUE};
+    use boss_protocol::{ExecutionKind, MERGE_INTENT_ACTIVE, MERGE_INTENT_REASON_REMOVED_FROM_MERGE_QUEUE};
 
     const PR: &str = "https://github.com/example/repo/pull/42";
     const APPROVED: &str = "aaaaaaa1111111111111111111111111111111aa";
@@ -342,6 +347,16 @@ mod tests {
 
     impl Fixture {
         fn probe(&self, head: &str, ci: &'static str) {
+            self.observe(head, ci);
+            // Ready requires a current-head AI state that is not still due.
+            // A green probe with a review due lands in AI Review, and settle is
+            // a no-op. A no-op skip records a skip verdict instead.
+            if ci == "success" {
+                self.mark_head_reviewed_clean(head);
+            }
+        }
+
+        fn observe(&self, head: &str, ci: &'static str) {
             self.db
                 .update_task_pr_poll_state(
                     &self.candidate.work_item_id,
@@ -355,6 +370,37 @@ mod tests {
                     },
                 )
                 .unwrap();
+        }
+
+        fn mark_head_reviewed_clean(&self, head_sha: &str) {
+            let execution = self
+                .db
+                .create_execution(
+                    CreateExecutionInput::builder()
+                        .work_item_id(&self.candidate.work_item_id)
+                        .kind(ExecutionKind::PrReview)
+                        .status(ExecutionStatus::Ready)
+                        .build(),
+                )
+                .unwrap();
+            let conn = self.db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+                [&execution.id],
+            )
+            .unwrap();
+            WorkDb::insert_review_verdict_in_tx(
+                &conn,
+                &execution.id,
+                &self.candidate.work_item_id,
+                &ReviewVerdictInput {
+                    head_sha: Some(head_sha.to_owned()),
+                    findings_count: 0,
+                    revision_warranted: false,
+                    gate_outcome: REVIEW_GATE_OUTCOME_COMPLETED_CLEAN,
+                },
+            )
+            .unwrap();
         }
 
         async fn settle(&self) {
@@ -635,5 +681,68 @@ mod tests {
         f.settle().await;
         assert!(f.standing().is_none());
         assert_eq!(f.on_card().unwrap().status, MERGE_INTENT_NEEDS_REVIEW);
+    }
+
+    #[tokio::test]
+    async fn a_standing_request_settles_after_a_pure_rebase_conflict_fix() {
+        let f = fixture(APPROVED);
+        let id = &f.candidate.work_item_id;
+        let requested = f.db.record_merge_intent(id, PR, Some(APPROVED)).unwrap();
+        f.db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE merge_intents SET created_at = CAST(created_at AS INTEGER) - 2",
+                [],
+            )
+            .unwrap();
+        let attempt =
+            f.db.insert_conflict_resolution(
+                ConflictResolutionInsertInput::builder()
+                    .product_id(&f.candidate.product_id)
+                    .work_item_id(id)
+                    .pr_url(PR)
+                    .pr_number(42)
+                    .head_branch("feature")
+                    .base_branch("main")
+                    .base_sha_at_trigger("base")
+                    .head_sha_before(APPROVED)
+                    .build(),
+            )
+            .unwrap()
+            .unwrap();
+        f.db.mark_conflict_resolution_succeeded(&attempt.id, Some(FIXED))
+            .unwrap();
+        f.observe(FIXED, "success");
+        let producer =
+            f.db.create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(id)
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        f.db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+                [&producer.id],
+            )
+            .unwrap();
+        f.db.record_skip_review_verdict(&producer.id, id, Some(FIXED), REVIEW_GATE_OUTCOME_SKIPPED_NOOP)
+            .unwrap();
+        f.settle().await;
+        assert!(f.standing().is_none());
+        let shown = f.on_card().unwrap();
+        assert_eq!(shown.id, requested.id);
+        assert_eq!(shown.status, MERGE_INTENT_NEEDS_REVIEW);
+        assert_eq!(shown.reason.as_deref(), Some(MERGE_INTENT_REASON_NO_DECISION));
+        assert_eq!(shown.decided_head_sha.as_deref(), Some(FIXED));
+        assert!(
+            shown
+                .detail
+                .unwrap()
+                .contains("an automatic conflict fix changed the PR")
+        );
     }
 }

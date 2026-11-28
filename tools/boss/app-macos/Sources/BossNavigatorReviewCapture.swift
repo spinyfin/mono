@@ -27,8 +27,16 @@ enum BossNavigatorReviewCapture {
         root.reviewGuideSelectedComparisonId = "comparison-current"
         root.ciRequiredState = "success"
         if kind == "merging" { root.mergeQueueState = "queued" }
-        let section = kind == "merging" ? "backlog" : kind == "landed" ? "landed" : kind == "working" ? "working" : "needs_attention"
-        let label = kind == "merging" ? "Merging" : kind == "landed" ? "Merged" : kind == "working" ? "Fixing CI" : "Ready for review"
+        let section = kind == "merging" ? "backlog"
+            : kind == "landed" ? "landed"
+            : kind == "working" ? "working"
+            : kind == "ready" ? "ready"
+            : "needs_attention"
+        let label = kind == "merging" ? "Merging"
+            : kind == "landed" ? "Merged"
+            : kind == "working" ? "Fixing CI"
+            : kind == "ready" ? "Review"
+            : "Ready for review"
         var projection: [String: Any] = [
             "section": section, "sort_key": "0", "default_detail": "review",
             "reason": ["type": "wait", "wait": ["kind": "merging"]], "reason_label": label,

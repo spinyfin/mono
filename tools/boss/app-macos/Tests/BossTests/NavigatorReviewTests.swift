@@ -119,7 +119,7 @@ final class NavigatorReviewTests: XCTestCase {
         model.isConnected = true
         model.beginNavigatorBriefEdit(root())
         model.setNavigatorBriefText("root", text: "Unsaved original")
-        for section in ["working", "needs_attention", "backlog", "landed"] {
+        for section in ["ready", "working", "needs_attention", "backlog", "landed"] {
             let task = NavigatorTestFixture.task(section: section)
             NavigatorTestFixture.snapshot(model, [task])
             XCTAssertEqual(model.navigator.selectedRootID, "root")

@@ -11,8 +11,12 @@ mod tests;
 /// Timestamps share an adapter-chosen epoch and unit; IDs are stable opaque keys.
 pub type Timestamp = i64;
 
+/// Display order is this variant order. Assignment still prefers Landed, then
+/// Working, then Ready: a confirmed merge or a live writer outranks a PR that
+/// could otherwise be reviewed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum Section {
+    Ready,
     Working,
     NeedsAttention,
     Backlog,
@@ -262,6 +266,10 @@ pub struct PullRequest {
     pub evidence: Option<MergeEvidence>,
     pub health: PrHealth,
     pub merge_flow: MergeFlow,
+    /// Copied from the Review column's Ready section (`classify_review_section`
+    /// → `ReviewSection::Ready`). The adapter shares that fact; this crate does
+    /// not re-derive CI, mergeability, AI-review or in-flight revision.
+    pub review_ready: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -336,6 +344,7 @@ pub enum Action {
 /// final tie-breaker. Variants also establish the fixed section order.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum SortKey {
+    Ready(u8, Reverse<i32>, Timestamp, String),
     Working(Reverse<i32>, Timestamp, String),
     NeedsAttention(u8, Reverse<i32>, Timestamp, String),
     Backlog(u8, Reverse<i32>, Option<i64>, Timestamp, String),
@@ -393,8 +402,12 @@ pub fn classify(family: &Family) -> Option<Projection> {
         for attention in &member.attentions {
             if matches!(attention.state, AttentionState::Open | AttentionState::PartlyAnswered) {
                 // Review controls cannot override ongoing automatic work or a merge.
+                // A Review-column Ready card is already past those holds: keep
+                // the review/merge action so the owner can act from Ready.
                 if matches!(attention.kind, HumanAction::Review | HumanAction::Merge)
-                    && (progressing.is_some() || evidence.is_some() || review_pending(family))
+                    && (progressing.is_some()
+                        || evidence.is_some()
+                        || (!review_ready(family) && review_pending(family)))
                 {
                     continue;
                 }
@@ -443,6 +456,17 @@ pub fn classify(family: &Family) -> Option<Projection> {
                     .unwrap_or(activity.started_at),
                 id,
             ),
+        }
+    } else if ready_for_owner(family, &human) {
+        let (kind, since) = human
+            .first()
+            .map(|(kind, since, _)| (*kind, *since))
+            .unwrap_or((HumanAction::Review, family.ordering.created_at));
+        Placement {
+            section: Section::Ready,
+            reason: Reason::Human(kind),
+            detail: Detail::Review,
+            sort_key: SortKey::Ready(human_rank(kind), priority, since, id),
         }
     } else if let Some((kind, since, _)) = human.first() {
         Placement {
@@ -493,6 +517,24 @@ fn action_identity(action: &Action) -> (&str, &str) {
         } => (task_id, attention_id),
         Action::OpenInput(reference) => (&reference.task_id, &reference.execution_id),
     }
+}
+
+fn review_ready(family: &Family) -> bool {
+    family.pr.as_ref().is_some_and(|pr| pr.review_ready)
+}
+
+/// The Review column's Ready fact, minus open questions, input waits and
+/// interventions: those stay in Needs attention even when the PR itself is
+/// mergeable. CI, conflicts, in-flight revisions and AI review are already
+/// inside `review_ready`.
+fn ready_for_owner(family: &Family, human: &[(HumanAction, Timestamp, Action)]) -> bool {
+    review_ready(family)
+        && !human.iter().any(|(kind, _, _)| {
+            matches!(
+                kind,
+                HumanAction::Question | HumanAction::Input | HumanAction::Intervention
+            )
+        })
 }
 
 fn review_pending(family: &Family) -> bool {
