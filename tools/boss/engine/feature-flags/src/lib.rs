@@ -56,7 +56,7 @@ pub use experiments::{
     BATCHED_SEARCH_AB_SPLIT_FLAG, BATCHED_SEARCH_EXPERIMENT, EXPERIMENT_FLAG_CATEGORY, EXPERIMENTS, ExperimentArm,
     ExperimentArmSet, ExperimentLane, ExperimentSpec, ExperimentState, TOKEN_EXPERIMENTS_FLAG, TREATMENT_BUCKET_LIMIT,
     WORKER_AUTOCOMPACT_AB_SPLIT_FLAG, WORKER_AUTOCOMPACT_EXPERIMENT, ab_split_flag_name, assign_arm, experiment_state,
-    resolve_arms,
+    is_valid_key, resolve_arms,
 };
 
 /// One feature flag entry in the registry. The registry is the source

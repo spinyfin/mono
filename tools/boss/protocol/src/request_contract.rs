@@ -445,6 +445,7 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
         // Ideas are human/coordinator drafts, deliberately not work items;
         // a worker's task does not depend on reading or editing those drafts.
         | R::GetIdea { .. }
+        | R::GetReviewYieldReport(_)
         | R::GetSolComparisonReport
         | R::GetStuckReport { .. }
         | R::GetTokenUsageRows(_)

@@ -1696,6 +1696,7 @@ version = "0.1.0"
 dependencies = [
  "bon",
  "boss-engine-structured-output",
+ "boss-feature-flags",
  "boss-pr-template",
  "boss-protocol",
  "serde",

@@ -258,6 +258,38 @@ pub(super) async fn handle_get_token_usage_series(ctx: Dispatch, req: FrontendRe
     send_response(&sink, &request_id, FrontendEvent::TokenUsageSeries { report });
 }
 
+/// What automated reviews in the window found and what became of it. A
+/// fetch-then-build shim over one `WorkDb` read; the builder is pure and lives
+/// with the classifier it shares its definitions with.
+pub(super) async fn handle_get_review_yield_report(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        work_db,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::GetReviewYieldReport(request) = req else {
+        unreachable!()
+    };
+    if request.until_epoch_s <= request.since_epoch_s {
+        return send_work_error(&sink, &request_id, "the window is empty: `until` must be after `since`");
+    }
+    if let Some(key) = &request.experiment
+        && !boss_feature_flags::is_valid_key(key)
+    {
+        return send_work_error(
+            &sink,
+            &request_id,
+            format!("`{key}` is not an experiment key: use lowercase letters, digits and underscores"),
+        );
+    }
+    let generated_at_epoch_s = boss_engine_utils::epoch_time::now_epoch_secs();
+    match work_db.review_yield_report(&request, generated_at_epoch_s) {
+        Ok(report) => send_response(&sink, &request_id, FrontendEvent::ReviewYieldReport { report }),
+        Err(err) => send_work_error(&sink, &request_id, &err),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests::{make_session_sink, test_server_state};
@@ -269,6 +301,19 @@ mod tests {
         request: FrontendRequest,
         request_id: &str,
     ) -> (Option<String>, FrontendEvent) {
+        ask_handler(state, request, request_id, handle_get_token_usage_rows).await
+    }
+
+    async fn ask_handler<Handler, Done>(
+        state: &Arc<ServerState>,
+        request: FrontendRequest,
+        request_id: &str,
+        handler: Handler,
+    ) -> (Option<String>, FrontendEvent)
+    where
+        Handler: FnOnce(Dispatch, FrontendRequest) -> Done,
+        Done: std::future::Future<Output = ()>,
+    {
         let sink = make_session_sink();
         let dispatch = Dispatch::builder()
             .server_state(state.clone())
@@ -279,7 +324,7 @@ mod tests {
             .recv_instant(std::time::Instant::now())
             .decode_ms(0.0)
             .build();
-        handle_get_token_usage_rows(dispatch, request).await;
+        handler(dispatch, request).await;
         sink.close();
         let envelope = sink.next().await.expect("the handler sends a reply");
         assert!(sink.next().await.is_none(), "the handler sends exactly one reply");
@@ -504,5 +549,91 @@ mod tests {
             panic!("expected WorkError, got {payload:?}");
         };
         assert!(message.contains("until_epoch_s"), "{message}");
+    }
+
+    fn review_yield_request(since_epoch_s: i64, until_epoch_s: i64, experiment: Option<&str>) -> FrontendRequest {
+        FrontendRequest::GetReviewYieldReport(boss_protocol::ReviewYieldRequest {
+            since_epoch_s,
+            until_epoch_s,
+            experiment: experiment.map(str::to_owned),
+        })
+    }
+
+    #[tokio::test]
+    async fn review_yield_replies_with_the_windows_batches_split_by_the_recorded_arm() {
+        let (state, _dir) = test_server_state();
+        let conn = state.work_db.connect().unwrap();
+        let classification = serde_json::json!({
+            "changed_files": ["src/lib.rs"], "complexity_flags": [], "has_production_code": true,
+            "metadata_missing": [], "production_languages": ["rust"], "profile": "light",
+            "subsystem_buckets": ["src"], "additions": 5, "deletions": 0,
+        })
+        .to_string();
+        conn.execute_batch(&format!(
+            "INSERT INTO products (id, name, slug, status, created_at, updated_at) VALUES ('p', 'P', 'p', 'active', '1', '1');
+             INSERT INTO tasks (id, product_id, kind, name, status, created_at, updated_at) VALUES ('t', 'p', 'chore', 'T', 'in_review', '1', '1');
+             INSERT INTO work_executions (id, work_item_id, kind, status, repo_remote_url, created_at, experiment_arms)
+               VALUES ('e1', 't', 'pr_review', 'completed', 'u', '1', '{{\"exp\":\"treatment\"}}');
+             INSERT INTO pr_review_batches (id, cycle_root_id, base_sha, classification_json, created_at, phase,
+                                            pr_number, pr_url, status, target_sha, updated_at)
+               VALUES ('b1', 't', 'base', '{classification}', '2000', 'pre_merge', 7, 'https://github.com/o/r/pull/7',
+                       'completed', 'head', '2000');
+             INSERT INTO pr_review_batch_members (id, batch_id, attempt, created_at, provider_effort, requested_driver,
+                                                  resolved_model, role, status, updated_at, execution_id)
+               VALUES ('m1', 'b1', 1, '1', 'high', 'claude', 'm', 'supervisor', 'failed', '1', 'e1');"
+        ))
+        .unwrap();
+        drop(conn);
+
+        let (request_id, payload) = ask_handler(
+            &state,
+            review_yield_request(1_000, 9_000, Some("exp")),
+            "req-yield-1",
+            handle_get_review_yield_report,
+        )
+        .await;
+        assert_eq!(request_id.as_deref(), Some("req-yield-1"));
+        let FrontendEvent::ReviewYieldReport { report } = payload else {
+            panic!("expected ReviewYieldReport, got {payload:?}");
+        };
+        assert_eq!(report.experiment.as_deref(), Some("exp"));
+        assert_eq!(report.arms.len(), 1);
+        assert_eq!(report.arms[0].arm, Some(boss_protocol::ReviewYieldArm::Treatment));
+        assert_eq!(report.arms[0].batches, 1);
+        assert_eq!(report.arms[0].phases[0].batches_without_verdict, 1);
+
+        // Outside the window the batch is not reported.
+        let (_, payload) = ask_handler(
+            &state,
+            review_yield_request(3_000, 9_000, None),
+            "req-yield-2",
+            handle_get_review_yield_report,
+        )
+        .await;
+        let FrontendEvent::ReviewYieldReport { report } = payload else {
+            panic!("expected ReviewYieldReport, got {payload:?}");
+        };
+        assert_eq!(report.arms[0].arm, None);
+        assert_eq!(report.arms[0].batches, 0);
+    }
+
+    #[tokio::test]
+    async fn review_yield_rejects_an_empty_window_and_a_malformed_experiment_key() {
+        let (state, _dir) = test_server_state();
+        for (request, expected) in [
+            (review_yield_request(5, 5, None), "window is empty"),
+            (review_yield_request(9, 5, None), "window is empty"),
+            (
+                review_yield_request(1, 5, Some("Not-A-Key")),
+                "is not an experiment key",
+            ),
+            (review_yield_request(1, 5, Some("")), "is not an experiment key"),
+        ] {
+            let (_, payload) = ask_handler(&state, request, "req-yield", handle_get_review_yield_report).await;
+            let FrontendEvent::WorkError { message } = payload else {
+                panic!("expected WorkError, got {payload:?}");
+            };
+            assert!(message.contains(expected), "{message}");
+        }
     }
 }

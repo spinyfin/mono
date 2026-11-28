@@ -15,6 +15,7 @@ rust_library(
         "//tools/boss/engine/completion:__pkg__",
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/execution-runner:__pkg__",
+        "//tools/boss/engine/pr-review:__pkg__",
     ],
     deps = all_crate_deps(normal = True),
 )
