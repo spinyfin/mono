@@ -2,6 +2,7 @@
 //! drain, chain-serialization holds, and automation preemption. Part of the
 //! `coordinator` module split; see [`super`] for the struct and shared types.
 use super::predecessor_hold::PredecessorHold;
+use super::spoke_in_doubt::format_duration_ms;
 use super::*;
 
 /// A queued answer agent older than this is unusual enough to require an
@@ -2827,6 +2828,11 @@ impl ExecutionCoordinator {
                         )
                         .await;
                     coordinator.recover_failed_dispatch(&execution, &worker_id, &err).await;
+                    // The freed slot can serve other rows now; a deferred row is
+                    // held by `dispatch_not_before`, so this cannot re-claim it.
+                    if err.downcast_ref::<super::spoke_in_doubt::DispatchDeferred>().is_some() {
+                        coordinator.kick();
+                    }
                 }
             }
         });
@@ -2863,6 +2869,9 @@ impl ExecutionCoordinator {
         // Parked attempts were already returned to ready without spending the
         // retry budget; do not record a pre-start failure or unclaim them again.
         if err.is::<super::spoke_in_doubt::SpokeAttemptParked>() {
+            return;
+        }
+        if super::spoke_in_doubt::release_budget_deferred_claim(&self.work_db, err, &current) {
             return;
         }
         if current.status != ExecutionStatus::Claimed {
@@ -2978,18 +2987,5 @@ impl Drop for DrainDispatchClaim {
                 "failed to release dispatch claim on drain defer"
             );
         }
-    }
-}
-
-fn format_duration_ms(milliseconds: u64) -> String {
-    let seconds = milliseconds / 1_000;
-    if seconds < 60 {
-        format!("{seconds}s")
-    } else if seconds < 60 * 60 {
-        format!("{}m", seconds / 60)
-    } else if seconds < 24 * 60 * 60 {
-        format!("{}h", seconds / (60 * 60))
-    } else {
-        format!("{}d", seconds / (24 * 60 * 60))
     }
 }
