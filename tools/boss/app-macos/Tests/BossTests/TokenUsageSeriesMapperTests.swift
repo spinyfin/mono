@@ -107,6 +107,28 @@ final class TokenUsageSeriesMapperTests: XCTestCase {
         )
     }
 
+    func testCoordinatorSlicesAreDisclosedAndExcludedFromPerRunChart() {
+        let worker = cell("task", ratios: UsageRatios(tokensPerRun: 500))
+        let coordinator = cell("coordinator", measurement: measurement(measured: 3, total: 4))
+        let mapper = makeMapper(report(
+            buckets: [(day0, [worker, coordinator])],
+            groups: ["task", "coordinator"],
+            groupBy: .executionKind,
+            labels: ["task": "Task", "coordinator": "Coordinator"]
+        ))
+        XCTAssertEqual(mapper.normalizedSegments(.perRun).map(\.series), ["Task"])
+        XCTAssertEqual(mapper.workBars(metric: .runs).map(\.value), [2, 4])
+        XCTAssertEqual(UsageWorkMetric.runs.title, "Runs + slices")
+        XCTAssertEqual(
+            mapper.normalizerCaption(.perRun),
+            "Measured worker tokens divided by measured worker runs in the bucket. Coordinator hourly/model slices are excluded."
+        )
+        for metric: UsageWorkMetric? in [nil, .runs] {
+            XCTAssertTrue(mapper.workCaption(metric: metric).contains("worker runs and coordinator hourly/model slices"))
+        }
+        XCTAssertFalse(mapper.workCaption(metric: .tasksCompleted).contains("slices"))
+    }
+
     // MARK: - Decoding
 
     func testParseKeepsGroupLabelKeysVerbatimAndNullRatiosNil() throws {

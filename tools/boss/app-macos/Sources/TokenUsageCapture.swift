@@ -4,9 +4,9 @@ import SwiftUI
 /// Capture the Token Usage window after the isolated app's cold connection.
 /// Requires `--capture-to`, `--capture-token-usage`, and an isolated socket.
 /// Optional `--capture-token-usage-scene=tree|grouped|capture-boundary|inspector|
-/// over-time|over-time-grouped|over-time-all|over-time-hover` selects which
-/// screenshot to take; default is `tree`. The Over time scenes use a taller
-/// window so all five cards fit without scrolling.
+/// over-time|over-time-grouped|over-time-by-kind|over-time-all|over-time-hover`
+/// selects which screenshot to take; default is `tree`. The Over time scenes use
+/// a taller window so all five cards fit without scrolling.
 @MainActor
 enum TokenUsageCapture {
     private static var window: NSWindow?

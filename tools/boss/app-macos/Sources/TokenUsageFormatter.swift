@@ -386,6 +386,16 @@ enum TokenUsageFormatter {
         return formatter.string(from: Date(timeIntervalSince1970: TimeInterval(epochS)))
     }
 
+    /// Format a UTC epoch second as `YYYY-MM-DD HH:mm UTC` for coordinator usage slices.
+    static func utcTimestampString(epochS: Int64) -> String {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd HH:mm 'UTC'"
+        return formatter.string(from: Date(timeIntervalSince1970: TimeInterval(epochS)))
+    }
+
     private static func append(_ existing: String?, _ extra: String) -> String {
         if let existing, !existing.isEmpty {
             return "\(existing) \(extra)"

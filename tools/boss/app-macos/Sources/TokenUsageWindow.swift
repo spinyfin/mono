@@ -39,6 +39,8 @@ enum TokenUsageCaptureScene: String, Equatable, Sendable {
     case overTime = "over-time"
     /// Over time tab grouped by driver, normalized per active hour.
     case overTimeGrouped = "over-time-grouped"
+    /// Over time tab grouped by execution kind, showing Coordinator alongside worker kinds.
+    case overTimeByKind = "over-time-by-kind"
     /// Over time tab over all history, showing the shaded pre-capture region.
     case overTimeAll = "over-time-all"
     /// Over time tab with the pointer readout on the normalized card.
@@ -46,7 +48,7 @@ enum TokenUsageCaptureScene: String, Equatable, Sendable {
 
     var isOverTime: Bool {
         switch self {
-        case .overTime, .overTimeGrouped, .overTimeAll, .overTimeHover: return true
+        case .overTime, .overTimeGrouped, .overTimeByKind, .overTimeAll, .overTimeHover: return true
         case .tree, .grouped, .captureBoundary, .inspector: return false
         }
     }
@@ -95,7 +97,7 @@ struct TokenUsageWindow: View {
         switch captureScene {
         case .captureBoundary, .overTimeAll:
             _range = State(initialValue: .all)
-        case .overTime, .overTimeGrouped, .overTimeHover:
+        case .overTime, .overTimeGrouped, .overTimeByKind, .overTimeHover:
             _range = State(initialValue: .d30)
         default:
             _range = State(initialValue: .d7)
@@ -106,6 +108,9 @@ struct TokenUsageWindow: View {
             _groupSecondary = State(initialValue: .model)
         case .overTimeGrouped:
             _groupPrimary = State(initialValue: .driver)
+            _groupSecondary = State(initialValue: nil)
+        case .overTimeByKind:
+            _groupPrimary = State(initialValue: .executionKind)
             _groupSecondary = State(initialValue: nil)
         default:
             _groupPrimary = State(initialValue: nil)
@@ -500,9 +505,9 @@ struct TokenUsageWindow: View {
     private func nameCell(_ node: TokenUsageTableNode) -> some View {
         HStack(spacing: 6) {
             Text(node.name)
-                .font(node.kind == .tasklessHeader ? .headline : .body)
+                .font(node.kind == .tasklessHeader || node.kind == .coordinator ? .headline : .body)
                 .lineLimit(1)
-            if node.kind == .task || node.kind == .revision {
+            if node.kind == .task || node.kind == .revision || node.kind == .coordinator {
                 Text(node.kindLabel)
                     .font(.caption2)
                     .padding(.horizontal, 5)
@@ -866,6 +871,18 @@ private struct TokenUsageInspector: View {
                             dominantCaveat: node.dominantCaveat
                         )
                     }
+                case .coordinator:
+                    if let measurement = node.measurement {
+                        measurementBlock(
+                            "Coordinator",
+                            measurement,
+                            containsGross: node.containsGross,
+                            dominantCaveat: node.dominantCaveat
+                        )
+                    }
+                    Text("Sums token usage across Boss coordinator sessions (including coordinator subagents) in this range.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
                 case .tasklessHeader, .tasklessKind:
                     Text("Executions with no task row (answer agent, review guide, automation triage). Totals live on each execution so this header does not add token counts.")
                         .font(.callout)
@@ -885,6 +902,7 @@ private struct TokenUsageInspector: View {
         case .execution: return node.kindLabel
         case .run: return "Run \(node.name)"
         case .group: return node.name
+        case .coordinator: return TokenUsageTree.coordinatorName
         case .tasklessHeader: return TokenUsageTree.tasklessHeaderName
         case .tasklessKind: return node.name
         }

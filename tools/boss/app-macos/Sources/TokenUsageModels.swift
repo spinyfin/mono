@@ -186,6 +186,8 @@ struct ExecutionUsageNode: Codable, Equatable, Hashable, Sendable, Identifiable 
     var modelLaunched: String?
     var prUrl: String?
     var startedAtEpochS: Int64?
+    /// Engine-supplied name for a non-worker execution (a coordinator session).
+    var displayLabel: String?
 
     var id: String { executionId }
 }
@@ -226,6 +228,7 @@ struct UsageGroup: Codable, Equatable, Hashable, Sendable {
     var subgroups: [UsageGroup]
     var tasks: [TaskUsageNode]
     var taskless: [ExecutionUsageNode]
+    var coordinatorMeasurement: CostMeasurement? = nil
 }
 
 struct UsageDimensionValue: Codable, Equatable, Hashable, Sendable, Identifiable {
@@ -280,6 +283,7 @@ struct TokenUsageRowsReport: Codable, Equatable, Hashable, Sendable {
     var pricingGaps: [String]
     var taskless: [ExecutionUsageNode]
     var tasks: [TaskUsageNode]
+    var coordinatorMeasurement: CostMeasurement? = nil
 
     static func parse(_ value: Any) -> TokenUsageRowsReport? {
         guard JSONSerialization.isValidJSONObject(value),

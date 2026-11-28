@@ -1732,5 +1732,13 @@ mod coordinator_tests {
         assert_eq!(json["unmeasured_coordinator"][0]["reason"], "Transcript unreadable");
         assert_eq!(json["rows"], serde_json::json!([]));
         assert!(json["unmeasured_coordinator"][0].get("total_tokens").is_none());
+        let mut without_reason = report;
+        without_reason.unmeasured_coordinator[0].reason = None;
+        let text = format_unmeasured_coordinators(&without_reason);
+        assert!(text.contains("usage UNKNOWN, not ranked and not counted as zero"));
+        assert!(!text.contains("Transcript unreadable"));
+        let json = serde_json::to_value(&without_reason).unwrap();
+        assert!(json["unmeasured_coordinator"][0]["reason"].is_null());
+        assert!(json["unmeasured_coordinator"][0].get("total_tokens").is_none());
     }
 }
