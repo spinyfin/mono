@@ -94,32 +94,67 @@ async fn first_prompt_sizes_by_driver_and_kind() {
 
 #[test]
 fn resolve_review_guide_spawn_config_pins_codex_astra_high() {
-    let config = resolve_review_guide_spawn_config(&crate::driver::DriverRegistry::default()).unwrap();
+    let config = resolve_review_guide_spawn_config(
+        &crate::driver::DriverRegistry::default(),
+        review_guide_profile(&crate::feature_flags::ExperimentArmSet::new()),
+    )
+    .unwrap();
     assert_eq!(config.driver, REVIEW_GUIDE_DRIVER);
     assert_eq!(config.model, "gpt-6-astra");
     assert_eq!(config.effort_value, Some("high"));
 }
 
 #[test]
+fn a_family_treated_in_review_guide_when_ready_runs_its_guide_at_codex_medium() {
+    use crate::feature_flags::{ExperimentArm, ExperimentArmSet, REVIEW_GUIDE_WHEN_READY_EXPERIMENT};
+    let registry = crate::driver::DriverRegistry::default();
+    let arms = |arm| -> ExperimentArmSet { [(REVIEW_GUIDE_WHEN_READY_EXPERIMENT, arm)].into_iter().collect() };
+
+    let treated =
+        resolve_review_guide_spawn_config(&registry, review_guide_profile(&arms(ExperimentArm::Treatment))).unwrap();
+    assert_eq!(treated.driver, REVIEW_GUIDE_DRIVER);
+    assert_eq!(treated.model, "gpt-6-astra");
+    assert_eq!(treated.effort_value, Some("medium"));
+
+    for untreated in [ExperimentArm::Control, ExperimentArm::Stopped] {
+        let config = resolve_review_guide_spawn_config(&registry, review_guide_profile(&arms(untreated))).unwrap();
+        assert_eq!(config.effort_value, Some("high"), "{untreated:?} keeps today's effort");
+    }
+}
+
+#[test]
 fn ensure_review_guide_profile_refuses_fallback_driver_model_or_effort() {
-    let ok = resolve_review_guide_spawn_config(&crate::driver::DriverRegistry::default()).unwrap();
-    ensure_review_guide_profile(&ok).unwrap();
+    let ok =
+        resolve_review_guide_spawn_config(&crate::driver::DriverRegistry::default(), REVIEW_GUIDE_PROFILE).unwrap();
+    ensure_review_guide_profile(&ok, REVIEW_GUIDE_PROFILE).unwrap();
 
     let mut wrong_driver = ok.clone();
     wrong_driver.driver = "claude".into();
-    let error = ensure_review_guide_profile(&wrong_driver).unwrap_err().to_string();
+    let error = ensure_review_guide_profile(&wrong_driver, REVIEW_GUIDE_PROFILE)
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("resolved driver"), "{error}");
     assert!(error.contains("claude"), "{error}");
 
     let mut wrong_model = ok.clone();
     wrong_model.model = "gpt-5.1".into();
-    let error = ensure_review_guide_profile(&wrong_model).unwrap_err().to_string();
+    let error = ensure_review_guide_profile(&wrong_model, REVIEW_GUIDE_PROFILE)
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("resolved model"), "{error}");
     assert!(error.contains("gpt-5.1"), "{error}");
 
     let mut wrong_effort = ok.clone();
     wrong_effort.effort_value = Some("medium");
-    let error = ensure_review_guide_profile(&wrong_effort).unwrap_err().to_string();
+    let error = ensure_review_guide_profile(&wrong_effort, REVIEW_GUIDE_PROFILE)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("effort value"), "{error}");
+
+    // The treated profile refuses today's effort the same way.
+    let error = ensure_review_guide_profile(&ok, REVIEW_GUIDE_WHEN_READY_PROFILE)
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("effort value"), "{error}");
 }
 

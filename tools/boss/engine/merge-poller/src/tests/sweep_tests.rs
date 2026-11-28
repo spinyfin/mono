@@ -6,6 +6,8 @@ use std::sync::Mutex;
 
 struct RecordingCompletionHandler {
     released: Mutex<Vec<String>>,
+    /// `(root_task_id, pr_url, head_sha)` of every ready-for-a-person observation.
+    ready: Mutex<Vec<(String, String, String)>>,
     enqueuer: NoopReviewBatchEnqueuer,
 }
 
@@ -13,6 +15,7 @@ impl Default for RecordingCompletionHandler {
     fn default() -> Self {
         Self {
             released: Mutex::new(Vec::new()),
+            ready: Mutex::new(Vec::new()),
             enqueuer: NoopReviewBatchEnqueuer,
         }
     }
@@ -77,6 +80,12 @@ impl CompletionRequests for RecordingCompletionHandler {
         _observation_sequence: i64,
     ) {
     }
+    fn review_guide_ready_from_probe(&self, root_task_id: &str, pr_url: &str, head_sha: &str) {
+        self.ready
+            .lock()
+            .unwrap()
+            .push((root_task_id.to_owned(), pr_url.to_owned(), head_sha.to_owned()));
+    }
     fn speculative_conflict_prediction_enabled(&self) -> bool {
         false
     }
@@ -88,6 +97,54 @@ impl CompletionRequests for RecordingCompletionHandler {
     }
     fn review_batch_enqueuer(&self) -> &dyn ReviewBatchEnqueuer {
         &self.enqueuer
+    }
+}
+
+/// The poller tells the completion service a PR is ready for a person only
+/// when its required checks are green and it has no conflict: a PR whose
+/// checks are failing or still running, or that conflicts with its base, is
+/// not something a guide should be generated for yet.
+#[tokio::test]
+async fn open_pr_is_reported_ready_for_a_guide_only_with_green_checks_and_no_conflict() {
+    use boss_observation_contracts::{OpenPrCiStatus, OpenPrMergeability, OpenPrStatus};
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let cases = [
+        ("clean", OpenPrMergeability::Clean, OpenPrCiStatus::Clean, true),
+        ("in-flight", OpenPrMergeability::Clean, OpenPrCiStatus::InFlight, false),
+        (
+            "failing",
+            OpenPrMergeability::Clean,
+            OpenPrCiStatus::Failing { failures: Vec::new() },
+            false,
+        ),
+        ("conflict", OpenPrMergeability::Conflict, OpenPrCiStatus::Clean, false),
+        ("unknown", OpenPrMergeability::Unknown, OpenPrCiStatus::Clean, false),
+    ];
+    for (n, (label, mergeability, ci, expect_ready)) in cases.into_iter().enumerate() {
+        let pr = format!("https://github.com/acme/widget/pull/{}", 100 + n);
+        let (_product_id, chore_id) = make_chore_in_review(&db, label, &pr);
+        let probe = StubProbe::new();
+        probe.set_with_base_head(
+            &pr,
+            PrLifecycleState::Open(OpenPrStatus { mergeability, ci }),
+            "base-sha",
+            "head-sha",
+        );
+        let publisher = Arc::new(RecordingPublisher::default());
+        let handler = RecordingCompletionHandler::default();
+        let _ = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, Some(&handler), None).await;
+        let ready = handler.ready.lock().unwrap().clone();
+        let mine: Vec<_> = ready.iter().filter(|(_, url, _)| url == &pr).collect();
+        if expect_ready {
+            assert_eq!(
+                mine,
+                [&(chore_id.clone(), pr.clone(), "head-sha".to_owned())],
+                "{label}: the PR's root and head are reported"
+            );
+        } else {
+            assert!(mine.is_empty(), "{label}: not ready, but reported {mine:?}");
+        }
     }
 }
 

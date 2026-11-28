@@ -54,7 +54,8 @@ use serde::{Deserialize, Serialize};
 mod experiments;
 pub use experiments::{
     BATCHED_SEARCH_AB_SPLIT_FLAG, BATCHED_SEARCH_EXPERIMENT, EXPERIMENT_FLAG_CATEGORY, EXPERIMENTS, ExperimentArm,
-    ExperimentArmSet, ExperimentLane, ExperimentSpec, ExperimentState, TOKEN_EXPERIMENTS_FLAG, TREATMENT_BUCKET_LIMIT,
+    ExperimentArmSet, ExperimentLane, ExperimentSpec, ExperimentState, REVIEW_GUIDE_WHEN_READY_AB_SPLIT_FLAG,
+    REVIEW_GUIDE_WHEN_READY_EXPERIMENT, TOKEN_EXPERIMENTS_FLAG, TREATMENT_BUCKET_LIMIT,
     WORKER_AUTOCOMPACT_AB_SPLIT_FLAG, WORKER_AUTOCOMPACT_EXPERIMENT, ab_split_flag_name, assign_arm, experiment_state,
     resolve_arms,
 };
@@ -552,6 +553,31 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
              share one arm. On: half of families are treated and the rest are control. Off: every family is \
              treated. Has no effect while `worker_autocompact` is off. DEFAULT ON, so switching \
              `worker_autocompact` on starts the split; turn this off to treat every family.",
+        category: EXPERIMENT_FLAG_CATEGORY,
+        default_enabled: true,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
+        name: REVIEW_GUIDE_WHEN_READY_EXPERIMENT,
+        description: "Experiment `review_guide_when_ready` (token-consumption investigation R6; no lane). For a \
+             treated PR family a new source capture no longer starts a review guide. One guide is generated when \
+             the PR is ready for a person (no live review batch or revision, required checks green as the merge \
+             poller sees them) or when someone opens the PR's guide and none exists for its current comparison, \
+             whichever comes first, at `small` effort (Codex `medium`) instead of `medium` (Codex `high`). Which \
+             families are treated is decided by `review_guide_when_ready_ab_split`, and every launch records its \
+             family's arm. Has no effect while `token_experiments` or `review_guide_generation` is off. DEFAULT \
+             OFF: ships inert. Kill switch: set false and the next capture and the next guide launch behave as \
+             before; a guide already running keeps the effort it started with.",
+        category: EXPERIMENT_FLAG_CATEGORY,
+        default_enabled: false,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
+        name: REVIEW_GUIDE_WHEN_READY_AB_SPLIT_FLAG,
+        description: "Run `review_guide_when_ready` as an A/B experiment on half of PR families, chosen by a stable \
+             hash of the PR family and the experiment key. On: half of families are treated and the rest are \
+             control. Off: every family is treated. Has no effect while `review_guide_when_ready` is off. DEFAULT \
+             ON, so switching `review_guide_when_ready` on starts the split; turn this off to treat every family.",
         category: EXPERIMENT_FLAG_CATEGORY,
         default_enabled: true,
         capability_id: None,

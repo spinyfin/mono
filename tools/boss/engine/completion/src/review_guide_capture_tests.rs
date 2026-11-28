@@ -348,7 +348,7 @@ async fn coalesced_arrival_after_equal_sequence_read_is_still_persisted() {
         "a coalesced arrival between the equal-sequence read and claim removal must still raise the watermark"
     );
 }
-use crate::feature_flags::FeatureFlagsStore;
+use crate::feature_flags::{ExperimentArm, FeatureFlagsStore};
 use crate::test_support::{create_active_chore, create_product, open_db, source_capture_packet};
 use crate::work::{FakePrStateChecker, PrOpenState, PublishReviewGuideOutcome, WorkDb};
 use boss_github::pr_files::PrComparisonMetadata;
@@ -1526,4 +1526,281 @@ async fn primary_completion_metadata_error_defers_without_capture_or_durable_err
 #[tokio::test]
 async fn revision_completion_metadata_error_records_durable_error() {
     completion_metadata_failure(true).await;
+}
+
+// ---- `review_guide_when_ready` -------------------------------------------
+
+const READY_PR_URL: &str = "https://github.com/acme/widget/pull/9";
+
+struct ReadyFixture {
+    _dir: tempfile::TempDir,
+    db: Arc<WorkDb>,
+    flags: Arc<FeatureFlagsStore>,
+    product: String,
+}
+
+impl ReadyFixture {
+    /// Flags: generation on, the experiment on for every family (split off).
+    fn new() -> Self {
+        let (dir, db) = open_db();
+        let product = create_product(&db);
+        let flags = Arc::new(FeatureFlagsStore::new(dir.path().join("flags.toml")));
+        flags.load().unwrap();
+        flags.set(REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, true).unwrap();
+        flags.set(REVIEW_GUIDE_GENERATION_FLAG, true).unwrap();
+        flags
+            .set(crate::feature_flags::REVIEW_GUIDE_WHEN_READY_EXPERIMENT, true)
+            .unwrap();
+        flags
+            .set(crate::feature_flags::REVIEW_GUIDE_WHEN_READY_AB_SPLIT_FLAG, false)
+            .unwrap();
+        Self {
+            _dir: dir,
+            db: Arc::new(db),
+            flags,
+            product,
+        }
+    }
+
+    /// A root with a repository whose captured comparison is at `head`.
+    fn root_with_capture(&self, head: &str) -> (String, PrReviewGuideSourceCapture) {
+        let root = create_active_chore(&self.db, &self.product, "ready fixture");
+        self.db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET repo_remote_url = ?1 WHERE id = ?2",
+                ["https://github.com/acme/widget.git", root.as_str()],
+            )
+            .unwrap();
+        let packet = crate::test_support::source_capture_packet(READY_PR_URL, "base", head);
+        let PrSourceCapturePersistOutcome::Stored(capture) = self
+            .db
+            .persist_pr_review_guide_source_capture(&root, 1, PrSourceCaptureTrigger::Creation, &packet)
+            .unwrap()
+        else {
+            panic!("capture must persist")
+        };
+        (root, capture)
+    }
+
+    fn ready(&self, root: &str, head: &str) -> bool {
+        enqueue_review_guide_when_ready(&self.db, &self.flags, root, READY_PR_URL, head)
+    }
+
+    fn attempts(&self, series: &str) -> i64 {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM pr_review_guide_attempts WHERE series_id = ?1",
+                [series],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn sql(&self, sql: &str, params: impl rusqlite::Params) {
+        self.db.connect().unwrap().execute(sql, params).unwrap();
+    }
+}
+
+#[test]
+fn capture_does_not_start_a_guide_for_a_treated_family() {
+    let f = ReadyFixture::new();
+    let (root, capture) = f.root_with_capture("head");
+    assert_eq!(
+        review_guide_when_ready_arm(&f.db, &f.flags, &root),
+        Some(ExperimentArm::Treatment)
+    );
+    enqueue_review_guide_generation(&f.db, &f.flags, &capture);
+    assert_eq!(
+        f.attempts(&capture.series_id),
+        0,
+        "the capture alone no longer starts a guide"
+    );
+}
+
+#[test]
+fn capture_still_starts_a_guide_for_a_control_family_and_when_the_experiment_is_off() {
+    let f = ReadyFixture::new();
+    f.flags
+        .set(crate::feature_flags::REVIEW_GUIDE_WHEN_READY_AB_SPLIT_FLAG, true)
+        .unwrap();
+    // Find one family drawn into each arm of the 50/50 split.
+    let mut control = None;
+    for n in 0..200 {
+        let root = create_active_chore(&f.db, &f.product, &format!("family {n}"));
+        if review_guide_when_ready_arm(&f.db, &f.flags, &root) == Some(ExperimentArm::Control) {
+            control = Some(root);
+            break;
+        }
+    }
+    let root = control.expect("some family draws control");
+    f.sql(
+        "UPDATE tasks SET repo_remote_url = 'https://github.com/acme/widget.git' WHERE id = ?1",
+        [&root],
+    );
+    let packet = crate::test_support::source_capture_packet(READY_PR_URL, "base", "head");
+    let PrSourceCapturePersistOutcome::Stored(capture) =
+        f.db.persist_pr_review_guide_source_capture(&root, 1, PrSourceCaptureTrigger::Creation, &packet)
+            .unwrap()
+    else {
+        panic!("capture must persist")
+    };
+    enqueue_review_guide_generation(&f.db, &f.flags, &capture);
+    assert_eq!(f.attempts(&capture.series_id), 1, "control keeps today's behaviour");
+
+    // With the experiment off, a family that would be treated gets today's behaviour too.
+    let g = ReadyFixture::new();
+    let (_, capture) = g.root_with_capture("head");
+    g.flags
+        .set(crate::feature_flags::REVIEW_GUIDE_WHEN_READY_EXPERIMENT, false)
+        .unwrap();
+    enqueue_review_guide_generation(&g.db, &g.flags, &capture);
+    assert_eq!(g.attempts(&capture.series_id), 1);
+}
+
+#[test]
+fn the_experiment_does_nothing_while_guide_generation_is_off() {
+    let f = ReadyFixture::new();
+    let (root, capture) = f.root_with_capture("head");
+    f.flags.set(REVIEW_GUIDE_GENERATION_FLAG, false).unwrap();
+    assert_eq!(review_guide_when_ready_arm(&f.db, &f.flags, &root), None);
+    assert!(!f.ready(&root, "head"));
+    assert_eq!(f.attempts(&capture.series_id), 0);
+}
+
+#[tokio::test]
+async fn a_treated_family_captured_through_the_reconciler_waits_for_the_ready_trigger() {
+    let f = ReadyFixture::new();
+    let root = create_active_chore(&f.db, &f.product, "reconciled");
+    f.sql(
+        "UPDATE tasks SET repo_remote_url = 'https://github.com/acme/widget.git' WHERE id = ?1",
+        [&root],
+    );
+    let packet = crate::test_support::source_capture_packet(READY_PR_URL, "base", "head");
+    let output = packet.clone();
+    let collect: PacketCollectFn = Arc::new(move |_, _, _, _| {
+        let packet = output.clone();
+        Box::pin(async move { Ok(packet) })
+    });
+    let request = SourceCaptureRequest::builder()
+        .root_task_id(root.clone())
+        .pr_url(READY_PR_URL)
+        .trigger(PrSourceCaptureTrigger::Poller)
+        .observed(PinnedComparison {
+            base_sha: "base".to_owned(),
+            head_sha: "head".to_owned(),
+        })
+        .build();
+    reconcile_review_guide_source_with_collector(
+        f.db.clone(),
+        f.flags.clone(),
+        request,
+        SourcePacketCollector::fixture(collect, packet),
+    )
+    .expect("capture is enabled")
+    .await
+    .unwrap();
+    let capture = f.db.get_latest_pr_review_guide_source_capture(&root).unwrap().unwrap();
+    assert_eq!(f.attempts(&capture.series_id), 0, "stored, but no guide yet");
+
+    assert!(f.ready(&root, "head"), "the poller sees the PR ready: the guide starts");
+    let live =
+        f.db.live_pr_review_guide_attempts_for_series(&capture.series_id)
+            .unwrap();
+    assert_eq!(live.len(), 1);
+    let execution = f.db.get_execution(live[0].execution_id.as_deref().unwrap()).unwrap();
+    assert_eq!(execution.kind, ExecutionKind::PrReviewGuide);
+}
+
+#[test]
+fn the_ready_trigger_generates_exactly_one_guide_per_comparison() {
+    let f = ReadyFixture::new();
+    let (root, capture) = f.root_with_capture("head");
+    assert!(f.ready(&root, "head"));
+    assert_eq!(f.attempts(&capture.series_id), 1);
+    for _ in 0..3 {
+        assert!(!f.ready(&root, "head"), "a later pass finds the live attempt");
+    }
+    assert_eq!(f.attempts(&capture.series_id), 1);
+}
+
+#[test]
+fn the_ready_trigger_does_not_relaunch_a_failed_guide() {
+    let f = ReadyFixture::new();
+    let (root, capture) = f.root_with_capture("head");
+    assert!(f.ready(&root, "head"));
+    let attempt =
+        f.db.live_pr_review_guide_attempts_for_series(&capture.series_id)
+            .unwrap()
+            .remove(0);
+    f.db.fail_pr_review_guide_attempt(&attempt.id, "fixture failure")
+        .unwrap();
+    assert!(!f.ready(&root, "head"), "a failure waits for a person to retry it");
+    assert_eq!(f.attempts(&capture.series_id), 1);
+}
+
+#[test]
+fn the_ready_trigger_waits_for_a_head_the_series_has_captured() {
+    let f = ReadyFixture::new();
+    let (root, capture) = f.root_with_capture("head");
+    assert!(
+        !f.ready(&root, "newer-head"),
+        "the poller's head has not been captured yet"
+    );
+    assert_eq!(f.attempts(&capture.series_id), 0);
+    assert!(f.ready(&root, "head"));
+}
+
+#[test]
+fn the_ready_trigger_waits_for_a_live_revision_review_batch_or_review() {
+    let f = ReadyFixture::new();
+    let (root, capture) = f.root_with_capture("head");
+
+    let revision = create_active_chore(&f.db, &f.product, "revision in flight");
+    f.sql(
+        "UPDATE tasks SET kind = 'revision', parent_task_id = ?1 WHERE id = ?2",
+        rusqlite::params![root, revision],
+    );
+    assert!(!f.ready(&root, "head"), "an active revision is still writing");
+    f.sql("UPDATE tasks SET status = 'in_review' WHERE id = ?1", [&revision]);
+
+    f.sql(
+        "INSERT INTO work_executions (id, work_item_id, kind, status, repo_remote_url, created_at)
+         VALUES ('review-1', ?1, 'pr_review', 'running', 'https://github.com/acme/widget.git', 'now')",
+        [&root],
+    );
+    assert!(!f.ready(&root, "head"), "a review is still running");
+    f.sql(
+        "UPDATE work_executions SET status = 'completed' WHERE id = 'review-1'",
+        [],
+    );
+    assert_eq!(
+        f.attempts(&capture.series_id),
+        0,
+        "nothing started while the family was busy"
+    );
+
+    assert!(f.ready(&root, "head"), "quiet at last: the guide starts");
+    assert_eq!(f.attempts(&capture.series_id), 1);
+}
+
+#[test]
+fn the_ready_trigger_leaves_control_families_alone() {
+    let f = ReadyFixture::new();
+    f.flags
+        .set(crate::feature_flags::REVIEW_GUIDE_WHEN_READY_AB_SPLIT_FLAG, true)
+        .unwrap();
+    let mut seen_control = false;
+    for n in 0..200 {
+        let root = create_active_chore(&f.db, &f.product, &format!("family {n}"));
+        if review_guide_when_ready_arm(&f.db, &f.flags, &root) == Some(ExperimentArm::Control) {
+            assert!(!f.ready(&root, "head"));
+            seen_control = true;
+            break;
+        }
+    }
+    assert!(seen_control, "some family draws control");
 }

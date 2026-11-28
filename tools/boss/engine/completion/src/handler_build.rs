@@ -44,6 +44,7 @@ impl WorkerCompletionHandler {
             merge_queue_timeline: None,
             branch_verifier_overridden: false,
             metrics: local_metrics,
+            review_guide_waits: Default::default(),
             merge_probe: Arc::new(NoopMergeProbe),
             pr_poll_state_writer: Arc::new(NoopPrPollStateWriter),
             conflict_unknown_backoff: conflict_stop_gate::DEFAULT_UNKNOWN_RETRY_BACKOFF,
@@ -452,6 +453,35 @@ impl WorkerCompletionHandler {
         );
     }
 
+    /// The merge poller has seen `pr_url` open at `head_sha` with green
+    /// required checks and nothing in flight on it. For a family treated in
+    /// `review_guide_when_ready`, that is the moment its guide is generated;
+    /// anything else is a no-op (see
+    /// [`crate::review_guide_capture::enqueue_review_guide_when_ready`]).
+    pub(crate) fn review_guide_ready_from_probe(&self, root_task_id: &str, pr_url: &str, head_sha: &str) {
+        if !crate::review_guide_capture::enqueue_review_guide_when_ready(
+            &self.work_db,
+            &self.feature_flags,
+            root_task_id,
+            pr_url,
+            head_sha,
+        ) {
+            return;
+        }
+        let db = self.work_db.clone();
+        let publisher = self.publisher.clone();
+        let root_task_id = root_task_id.to_owned();
+        boss_task_scope::spawn(async move {
+            crate::execution_publisher::notify_review_guide_changed(
+                &db,
+                &publisher,
+                &root_task_id,
+                "review_guide_ready_queued",
+            )
+            .await;
+        });
+    }
+
     pub async fn capture_review_guide_source_manually(&self, root_task_id: &str, pr_url: &str) -> Result<()> {
         crate::review_guide_capture::capture_review_guide_source_manually(
             &self.work_db,
@@ -640,6 +670,10 @@ impl CompletionRequests for WorkerCompletionHandler {
             },
             observation_sequence,
         );
+    }
+
+    fn review_guide_ready_from_probe(&self, root_task_id: &str, pr_url: &str, head_sha: &str) {
+        WorkerCompletionHandler::review_guide_ready_from_probe(self, root_task_id, pr_url, head_sha);
     }
 
     fn speculative_conflict_prediction_enabled(&self) -> bool {

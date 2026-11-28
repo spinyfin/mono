@@ -518,26 +518,58 @@ fn resolve_batch_reviewer_spawn(
 /// configuration must fail the spawn (a retryable pre-start failure through
 /// the normal execution retry path) rather than quietly run at a different
 /// model/effort. See design "Generation and read-only enforcement".
+///
+/// Only the effort differs between the two profiles: a family treated in
+/// `review_guide_when_ready` runs at `EffortLevel::Small` (provider
+/// `"medium"`), because it is generated once, when the PR is ready, rather
+/// than on every new comparison.
 const REVIEW_GUIDE_MODEL: &str = "gpt-6-astra";
-const REVIEW_GUIDE_EFFORT: EffortLevel = EffortLevel::Medium;
-const REVIEW_GUIDE_EFFORT_VALUE: &str = "high";
 
-fn resolve_review_guide_spawn_config(registry: &crate::driver::DriverRegistry) -> anyhow::Result<SpawnConfig> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReviewGuideProfile {
+    effort: EffortLevel,
+    effort_value: &'static str,
+}
+
+const REVIEW_GUIDE_PROFILE: ReviewGuideProfile = ReviewGuideProfile {
+    effort: EffortLevel::Medium,
+    effort_value: "high",
+};
+
+const REVIEW_GUIDE_WHEN_READY_PROFILE: ReviewGuideProfile = ReviewGuideProfile {
+    effort: EffortLevel::Small,
+    effort_value: "medium",
+};
+
+/// The guide profile a launch runs under: the treated profile only when the
+/// execution's recorded arm set says its family is treated.
+fn review_guide_profile(experiment_arms: &crate::feature_flags::ExperimentArmSet) -> ReviewGuideProfile {
+    if experiment_arms.is_treated(crate::feature_flags::REVIEW_GUIDE_WHEN_READY_EXPERIMENT) {
+        REVIEW_GUIDE_WHEN_READY_PROFILE
+    } else {
+        REVIEW_GUIDE_PROFILE
+    }
+}
+
+fn resolve_review_guide_spawn_config(
+    registry: &crate::driver::DriverRegistry,
+    profile: ReviewGuideProfile,
+) -> anyhow::Result<SpawnConfig> {
     let input = SpawnResolutionInput::builder()
-        .effort_level(REVIEW_GUIDE_EFFORT)
+        .effort_level(profile.effort)
         .model_override(REVIEW_GUIDE_MODEL)
         .task_driver(REVIEW_GUIDE_DRIVER)
         .build();
     let config = resolve_spawn_config_in(registry, &input)
         .map_err(|error| anyhow::anyhow!("review-guide Astra profile resolution: {error}"))?;
-    ensure_review_guide_profile(&config)?;
+    ensure_review_guide_profile(&config, profile)?;
     Ok(config)
 }
 
 /// The security-relevant assertion that a review-guide spawn refuses any
 /// driver/model/effort fallback. Split out so tests can exercise each
 /// refusal without swapping the production registry.
-fn ensure_review_guide_profile(config: &SpawnConfig) -> anyhow::Result<()> {
+fn ensure_review_guide_profile(config: &SpawnConfig, profile: ReviewGuideProfile) -> anyhow::Result<()> {
     anyhow::ensure!(
         config.driver == REVIEW_GUIDE_DRIVER,
         "review-guide Astra profile refused: resolved driver `{}`, expected `{REVIEW_GUIDE_DRIVER}` \
@@ -551,9 +583,10 @@ fn ensure_review_guide_profile(config: &SpawnConfig) -> anyhow::Result<()> {
         config.model,
     );
     anyhow::ensure!(
-        config.effort_value == Some(REVIEW_GUIDE_EFFORT_VALUE),
-        "review-guide Astra profile refused: resolved effort value {:?}, expected exactly {REVIEW_GUIDE_EFFORT_VALUE:?}",
+        config.effort_value == Some(profile.effort_value),
+        "review-guide Astra profile refused: resolved effort value {:?}, expected exactly {:?}",
         config.effort_value,
+        profile.effort_value,
     );
     Ok(())
 }
@@ -1300,7 +1333,7 @@ pub async fn compose_worker_spawn(
         )
     };
     let mut spawn_config = if execution.kind == ExecutionKind::PrReviewGuide {
-        let config = resolve_review_guide_spawn_config(&registry)?;
+        let config = resolve_review_guide_spawn_config(&registry, review_guide_profile(&experiment_arms))?;
         if let Ok(Some(attempt)) = work_db.pr_review_guide_attempt_for_execution(&execution.id)
             && let Err(error) = work_db.record_pr_review_guide_attempt_spawn_config(
                 &attempt.id,

@@ -76,7 +76,7 @@ struct ReviewGuideViewerHeader: View {
 
     private func openVersion(_ versionID: String) {
         if let inlineGuide { inlineGuide.openVersion(versionID) }
-        else { chatModel.openReviewGuide(versionId: versionID, rootTaskId: rootTaskId) }
+        else { chatModel.openReviewGuide(versionId: versionID, rootTaskId: rootTaskId, onOpen: false) }
     }
 
     var body: some View {

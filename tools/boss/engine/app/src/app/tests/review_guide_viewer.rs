@@ -54,6 +54,7 @@ async fn get_content(state: &Arc<ServerState>, version_id: &str) -> FrontendEven
         ctx,
         FrontendRequest::GetReviewGuideContent {
             version_id: version_id.to_owned(),
+            on_open: false,
         },
     )
     .await;

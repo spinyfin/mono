@@ -132,7 +132,7 @@ enum EngineEvent {
     /// Engine reply to `RetryReviewGuide`. `alreadyRequested` is true when
     /// the idempotency token matched an existing attempt rather than
     /// creating a new one.
-    case reviewGuideRetryQueued(rootTaskId: String, attempt: ReviewGuideAttempt, alreadyRequested: Bool)
+    case reviewGuideRetryQueued(rootTaskId: String, attempt: ReviewGuideAttempt, alreadyRequested: Bool, requestId: String? = nil)
     /// Engine reply to `EvaluateDispatchAdmission` — whether a work item
     /// would dispatch right now, the current dispatch-pause snapshot, and
     /// every non-overridable blocker. Drives the drag-to-Doing pause
