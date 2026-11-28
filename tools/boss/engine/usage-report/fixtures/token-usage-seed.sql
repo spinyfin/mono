@@ -62,7 +62,8 @@ INSERT INTO tasks (id, product_id, project_id, kind, name, status, created_at, u
   ('task_seed_g_unavailable','prod_seed_notes', NULL,              'chore',    'Rename the config key (seed)',       'done', '1784000000', '1784000000', (SELECT now - 5 * 3600 FROM seed_clock),   'https://github.com/example/notes/pull/10', 'standard', 'medium', 110, NULL),
   ('task_seed_h_precapture', 'prod_seed_boss',  NULL,              'chore',    'Old chore from before capture (seed)','done','1784000000', '1784000000', '1784000100',                                     'https://github.com/example/boss/pull/11',  'standard', 'medium', 111, NULL),
   ('task_seed_i_zero_synth', 'prod_seed_boss',  NULL,              'chore',    'Failed start and a synthetic run (seed)','done','1784000000','1784000000', (SELECT now - 3 * 3600 FROM seed_clock),   NULL,                                       'standard', 'medium', 112, NULL),
-  ('task_seed_j_design',     'prod_seed_boss',  'proj_seed_usage', 'design',   'Design the usage window (seed)',     'done', '1784000000', '1784000000', (SELECT now - 36 * 3600 FROM seed_clock),  NULL,                                       'high',     'xhigh',  113, NULL);
+  ('task_seed_j_design',     'prod_seed_boss',  'proj_seed_usage', 'design',   'Design the usage window (seed)',     'done', '1784000000', '1784000000', (SELECT now - 36 * 3600 FROM seed_clock),  NULL,                                       'high',     'xhigh',  113, NULL),
+  ('task_seed_k_future_source','prod_seed_boss',  NULL,              'chore',    'Work from a newer source (seed)',    'done', '1784000000', '1784000000', NULL,                                       NULL,                                       'standard', 'medium', 114, NULL);
 
 -- Executions. driver / model / effort_level are the launch tuple; the
 -- pre-capture execution predates it, so those columns are NULL and its driver
@@ -87,11 +88,14 @@ INSERT INTO work_executions (id, work_item_id, kind, status, repo_remote_url, cr
   ('exec_seed_i2', 'task_seed_i_zero_synth', 'chore_implementation',        'completed', 'https://github.com/example/boss',  (SELECT now - 4 * 3600 FROM seed_clock),   (SELECT now - 4 * 3600 FROM seed_clock),   (SELECT now - 3 * 3600 FROM seed_clock),   'claude', 'opus',          'medium', 'local', NULL),
   ('exec_seed_j1', 'task_seed_j_design',     'product_design',              'completed', 'https://github.com/example/boss',  (SELECT now - 36 * 3600 FROM seed_clock),  (SELECT now - 36 * 3600 FROM seed_clock),  (SELECT now - 35 * 3600 FROM seed_clock),  'claude', 'opus',          'xhigh',  'local', NULL),
   -- Pipeline-stage coverage: a reviewer-role pre-merge review, a post-merge
-  -- review, a project design, and a kind the classifier does not know.
+  -- review, a project design, and an implementation run whose task came from a
+  -- source the classifier does not know (unclassified). The unknown value is on
+  -- the task's created_via, which is read as plain text; an unknown execution
+  -- kind would make the work DB's execution listing fail for the whole task.
   ('exec_seed_p1', 'task_seed_a_claude',     'pr_review',                   'completed', 'https://github.com/example/boss',  (SELECT now - 24 * 3600 FROM seed_clock),  (SELECT now - 24 * 3600 FROM seed_clock),  (SELECT now - 23 * 3600 FROM seed_clock),  'claude', 'sonnet',        'medium', 'local', NULL),
   ('exec_seed_p2', 'task_seed_a_claude',     'pr_review',                   'completed', 'https://github.com/example/boss',  (SELECT now - 22 * 3600 FROM seed_clock),  (SELECT now - 22 * 3600 FROM seed_clock),  (SELECT now - 21 * 3600 FROM seed_clock),  'claude', 'sonnet',        'medium', 'local', NULL),
   ('exec_seed_p3', 'task_seed_j_design',    'project_design',              'completed', 'https://github.com/example/boss',  (SELECT now - 18 * 3600 FROM seed_clock),  (SELECT now - 18 * 3600 FROM seed_clock),  (SELECT now - 17 * 3600 FROM seed_clock),  'claude', 'opus',          'high',   'local', NULL),
-  ('exec_seed_p4', 'task_seed_a_claude',     'future_kind',                 'completed', 'https://github.com/example/boss',  (SELECT now - 16 * 3600 FROM seed_clock),  (SELECT now - 16 * 3600 FROM seed_clock),  (SELECT now - 15 * 3600 FROM seed_clock),  'claude', 'sonnet',        'medium', 'local', NULL),
+  ('exec_seed_p4', 'task_seed_k_future_source','chore_implementation',       'completed', 'https://github.com/example/boss',  (SELECT now - 16 * 3600 FROM seed_clock),  (SELECT now - 16 * 3600 FROM seed_clock),  (SELECT now - 15 * 3600 FROM seed_clock),  'claude', 'sonnet',        'medium', 'local', NULL),
   ('exec_seed_t1', 'comment_seed_1',         'answer_agent',                'completed', 'https://github.com/example/boss',  (SELECT now - 3 * 3600 FROM seed_clock),   (SELECT now - 3 * 3600 FROM seed_clock),   (SELECT now - 3 * 3600 FROM seed_clock),   'claude', 'sonnet',        'medium', 'local', NULL),
   ('exec_seed_t2', 'comparison_seed_1',      'pr_review_guide',             'completed', 'https://github.com/example/boss',  (SELECT now - 2 * 3600 FROM seed_clock),   (SELECT now - 2 * 3600 FROM seed_clock),   (SELECT now - 2 * 3600 FROM seed_clock),   'codex',  'gpt-6-astra',   'high',   'local', NULL),
   ('exec_seed_t3', 'automation_seed_1',      'automation_triage',           'completed', 'https://github.com/example/boss',  (SELECT now - 1 * 3600 FROM seed_clock),   (SELECT now - 1 * 3600 FROM seed_clock),   (SELECT now - 1 * 3600 FROM seed_clock),   'claude', 'haiku',         'low',    'local', NULL),
@@ -195,6 +199,7 @@ UPDATE work_executions SET experiment_arms = '{"batched_search":"control"}'
 UPDATE work_executions SET experiment_arms = '{"batched_search":"stopped"}'
  WHERE id IN ('exec_seed_c0', 'exec_seed_c1');
 UPDATE work_executions SET experiment_arms = '{}' WHERE id = 'exec_seed_d1';
+UPDATE tasks SET created_via = 'future_source:seed' WHERE id = 'task_seed_k_future_source';
 UPDATE tasks SET created_via = 'pr_review:seed_review' WHERE id = 'task_seed_b_rev1';
 UPDATE tasks SET created_via = 'ci-fix:seed_attempt' WHERE id = 'task_seed_b_rev2';
 UPDATE tasks SET created_via = 'merge-conflict:seed_attempt' WHERE id = 'task_seed_c_ghost_rev';

@@ -1493,6 +1493,10 @@ mod tests {
             "pre_merge_review",
             "post_merge_review",
             "project_design",
+            "progression",
+            "product_design",
+            "automation_triage",
+            "answer_agent",
             "unclassified",
         ] {
             assert!(stages.values.iter().any(|v| v.value == stage), "missing {stage}");
