@@ -423,7 +423,7 @@ fi
 if ! grep -q 'ci-env.sh' "$readme" || ! grep -q 'repobin and checkleft' "$readme"; then
   fail "README.md must say the CI step watchdog covers bazel clients repobin and checkleft launch"
 fi
-if ! grep -q '~15 s + 10 s (derived)' "$readme"; then
+if ! grep -q '~2 to 3.3 min (derived: 8 bad checks in a row)' "$readme"; then
   fail "README.md must mark the during-a-build bound as derived"
 fi
 

@@ -31,6 +31,11 @@ printf '%s\n' \
   'url=""' \
   'curl_exit="$(cat "${WATCHDOG_FIXTURES}/curl-exit" 2>/dev/null || echo 0)"' \
   'code="$(cat "${WATCHDOG_FIXTURES}/http-code" 2>/dev/null || echo 200)"' \
+  'if [[ -s "${WATCHDOG_FIXTURES}/http-seq" ]]; then' \
+  '  code="$(head -n 1 "${WATCHDOG_FIXTURES}/http-seq")"' \
+  '  tail -n +2 "${WATCHDOG_FIXTURES}/http-seq" > "${WATCHDOG_FIXTURES}/http-seq.next"' \
+  '  mv "${WATCHDOG_FIXTURES}/http-seq.next" "${WATCHDOG_FIXTURES}/http-seq"' \
+  'fi' \
   'while [[ $# -gt 0 ]]; do' \
   '  case "$1" in' \
   '    --output) output="$2"; shift 2 ;;' \
@@ -302,6 +307,72 @@ sweep_pidfile="${tmp}/dev-remote-watchdog-${sweep_target}.pid"
 kill -KILL "$(cat "$sweep_pidfile" 2> /dev/null)" "$live_pid" "$sweep_target" 2> /dev/null || true
 wait "$live_pid" "$sweep_target" 2> /dev/null || true
 
+# Consecutive rule: the loop stops its target only after
+# DEV_REMOTE_WATCHDOG_CONSECUTIVE_BAD bad ticks (503 or timeout) in a row; a
+# good tick resets the count; every bad tick is logged.
+# loop_run <codes...>: answers those codes in order, then 200; prints
+# "stopped" if the loop stopped its 1 s target, else "kept".
+loop_run() {
+  local t
+  printf '%s\n' "$@" > "${tmp}/http-seq"
+  printf '%s\n' 200 > "${tmp}/http-code"
+  printf '%s\n' 0 > "${tmp}/nc-status"
+  rm -f "${tmp}/dev-remote-watchdog-"*.reason
+  : > "${tmp}/dev-remote-watchdog.log"
+  sleep 2 &
+  t=$!
+  DEV_REMOTE_WATCHDOG_ENDPOINT="grpc://hub.test:50051" \
+    DEV_REMOTE_WATCHDOG_TARGET_PID="$t" \
+    DEV_REMOTE_WATCHDOG_INTERVAL_SECS=0 \
+    DEV_REMOTE_WATCHDOG_CONSECUTIVE_BAD=3 \
+    "$watchdog" --watchdog > /dev/null 2>&1
+  if [[ -s "${tmp}/dev-remote-watchdog-${t}.reason" ]]; then
+    echo stopped
+  else
+    echo kept
+  fi
+  kill -KILL "$t" 2> /dev/null || true
+  wait "$t" 2> /dev/null || true
+  : > "${tmp}/http-seq"
+}
+expect() {
+  if [[ "$1" != "$2" ]]; then
+    fail "$3: expected $1, got $2"
+  fi
+}
+expect kept "$(loop_run 503)" "one 503 then 200"
+expect 1 "$(grep -c 'bad status check (503), 1 of 3' "${tmp}/dev-remote-watchdog.log")" "one 503 is logged with its count"
+expect kept "$(loop_run 503 503)" "N-1 503s then 200"
+expect kept "$(loop_run 503 503 200 503 503)" "a good tick resets the count"
+expect kept "$(loop_run 000 000)" "N-1 timeouts then 200"
+expect stopped "$(loop_run 503 503 503)" "N consecutive 503s"
+if ! grep -q "stopping this build" "${tmp}"/dev-remote-watchdog-*.reason \
+  || ! grep -q "stopping this build after 3 consecutive bad status checks\. Re-run" "${tmp}"/dev-remote-watchdog-*.reason; then
+  fail "N 503s: reason line missing: $(cat "${tmp}"/dev-remote-watchdog-*.reason 2>/dev/null)"
+fi
+if ! grep -q "bad status check (503), 3 of 3" "${tmp}/dev-remote-watchdog.log"; then
+  fail "N 503s: bad ticks not logged: $(cat "${tmp}/dev-remote-watchdog.log")"
+fi
+expect stopped "$(loop_run 000 000 000)" "N consecutive timeouts count like 503"
+expect stopped "$(loop_run 503 000 503)" "mixed 503 and timeout count together"
+# An unreachable hub is never stuck, however long it lasts.
+printf '%s\n' 503 503 503 503 503 > "${tmp}/http-seq"
+sleep 2 &
+unreach=$!
+printf '%s\n' 1 > "${tmp}/nc-status"
+DEV_REMOTE_WATCHDOG_ENDPOINT="grpc://hub.test:50051" \
+  DEV_REMOTE_WATCHDOG_TARGET_PID="$unreach" \
+  DEV_REMOTE_WATCHDOG_INTERVAL_SECS=0 \
+  DEV_REMOTE_WATCHDOG_CONSECUTIVE_BAD=3 \
+  DEV_REMOTE_WATCHDOG_CONNECT_TIMEOUT_SECS=1 \
+  "$watchdog" --watchdog > /dev/null 2>&1
+if [[ -s "${tmp}/dev-remote-watchdog-${unreach}.reason" ]]; then
+  fail "unreachable hub: the loop stopped its target"
+fi
+kill -KILL "$unreach" 2> /dev/null || true
+wait "$unreach" 2> /dev/null || true
+: > "${tmp}/http-seq"
+printf '%s\n' 0 > "${tmp}/nc-status"
 if [[ "$failures" -ne 0 ]]; then
   echo "${failures} assertion(s) failed" >&2
   exit 1
