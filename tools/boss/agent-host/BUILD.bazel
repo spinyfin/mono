@@ -24,6 +24,22 @@ rust_library(
     deps = all_crate_deps(normal = True),
 )
 
+rust_library(
+    name = "agent_host_test_support",
+    testonly = True,
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    crate_features = ["test-support"],
+    crate_name = "boss_agent_host",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//visibility:private"],
+    deps = all_crate_deps(normal = True),
+)
+
 rust_test(
     name = "agent_host_test",
     size = "small",
@@ -91,7 +107,7 @@ rust_test(
         proc_macro = True,
         proc_macro_dev = True,
     ),
-    deps = [":agent_host"] + all_crate_deps(
+    deps = [":agent_host_test_support"] + all_crate_deps(
         normal = True,
         normal_dev = True,
     ),

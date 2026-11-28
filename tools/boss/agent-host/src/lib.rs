@@ -15,17 +15,34 @@
 //! change to any of it has to be one a client of the previous version can
 //! still use.
 //!
-//! - A client connects and sends one line, `{"replay_from":N}` (see
-//!   [`Handshake`]). A connection that sends anything else, or nothing for a
-//!   few seconds, is closed and displaces nobody.
+//! - A client connects and sends one line, `{"replay_from":N}` or
+//!   `{"replay_from":N,"takeover":true}` (see [`Handshake`]). `takeover` is
+//!   opt-in: it defaults to `false` when omitted and is omitted when
+//!   serialized as `false`, so older clients and hosts stay wire-compatible.
+//!   A connection that sends anything else, or nothing for a few seconds, is
+//!   closed and displaces nobody.
 //! - The host answers with journal records (see [`journal`]), one JSON object
 //!   per line, starting at sequence number `N`, then every later record as it
 //!   is written. Records for both directions arrive, including the client's
 //!   own lines, so a client's view is the journal's.
 //! - After the handshake every line the client sends is a line for the child.
 //!   A line without its terminator, cut off by the client dying, is dropped.
-//! - One client at a time. A connection that completes its handshake closes
-//!   the one before it, whether or not the older one was still alive.
+//! - One client at a time, with serialized takeover fencing. Handshakes are
+//!   serialized: a connection that completes its handshake takes and closes
+//!   the previous client and waits for the previous client's connection task
+//!   to finish before sampling the journal end and registering itself. Any
+//!   complete (`\n`-terminated) line the previous client had already read is
+//!   journalled and queued for the child before the fence completes; no
+//!   further lines are read from the kicked client. A concurrent third
+//!   handshake waits behind the fence so it cannot register unfenced or
+//!   overwrite a client without kicking it.
+//! - When `takeover` is `true`, the host sends one socket-only (non-journalled)
+//!   takeover boundary line ([`TAKEOVER_BOUNDARY_LINE`], recognized by
+//!   [`is_takeover_boundary_line`]) immediately after the fenced replay range
+//!   and before any live records. Everything from the previous client appears
+//!   before that boundary. Legacy clients (`takeover` omitted or `false`)
+//!   never receive the boundary line and continue to see only journal
+//!   [`journal::WireRecord`] lines.
 //! - The child's stderr is the host's stderr: a person attached to the pane
 //!   sees it. It is not journalled.
 //! - When the child exits, the host delivers what is queued to the client,
@@ -47,7 +64,9 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
 use tokio::signal::unix::{SignalKind, signal};
 
-pub use relay::Handshake;
+#[cfg(feature = "test-support")]
+pub use relay::{BeforeJournalClientLineHook, TestHooks};
+pub use relay::{Handshake, TAKEOVER_BOUNDARY_LINE, TakeoverBoundary, is_takeover_boundary_line};
 
 /// How long, after the child exits, the host waits for its remaining output
 /// and for the client to take what is queued for it. A grandchild that kept
@@ -73,6 +92,23 @@ pub struct Config {
 /// Runs the host until the child exits, and returns the exit code the host
 /// should exit with.
 pub async fn run(config: Config) -> io::Result<i32> {
+    #[cfg(feature = "test-support")]
+    {
+        run_with_hooks(config, TestHooks::default()).await
+    }
+    #[cfg(not(feature = "test-support"))]
+    {
+        run_impl(config).await
+    }
+}
+
+/// Runs the host with injected test hooks until the child exits.
+#[cfg(feature = "test-support")]
+pub async fn run_with_hooks(config: Config, hooks: TestHooks) -> io::Result<i32> {
+    run_impl(config, hooks).await
+}
+
+async fn run_impl(config: Config, #[cfg(feature = "test-support")] hooks: TestHooks) -> io::Result<i32> {
     let (program, args) = config
         .command
         .split_first()
@@ -90,7 +126,15 @@ pub async fn run(config: Config) -> io::Result<i32> {
             return Err(err);
         }
     };
-    let result = run_bound(program, args, journal, listener).await;
+    let result = run_bound(
+        program,
+        args,
+        journal,
+        listener,
+        #[cfg(feature = "test-support")]
+        hooks,
+    )
+    .await;
     let _ = std::fs::remove_file(&config.socket_path);
     result
 }
@@ -100,6 +144,7 @@ async fn run_bound(
     args: &[OsString],
     journal: journal::Journal,
     listener: UnixListener,
+    #[cfg(feature = "test-support")] hooks: TestHooks,
 ) -> io::Result<i32> {
     let mut child = Command::new(program)
         .args(args)
@@ -111,7 +156,12 @@ async fn run_bound(
     let stdin = child.stdin.take().expect("child stdin is piped");
     let stdout = child.stdout.take().expect("child stdout is piped");
 
-    let (relay, mut fatal) = relay::Relay::new(journal, stdin);
+    let (relay, mut fatal) = relay::Relay::new(
+        journal,
+        stdin,
+        #[cfg(feature = "test-support")]
+        hooks,
+    );
     let pump = tokio::spawn(relay.clone().pump_child_output(stdout));
     let accept = {
         let relay = relay.clone();
@@ -225,7 +275,15 @@ mod tests {
         let listener = UnixListener::bind(dir.path().join("h.sock")).unwrap();
         let program = OsString::from("/bin/sh");
         let args = [OsString::from("-c"), OsString::from("echo hello")];
-        let result = run_bound(&program, &args, unwritable_journal(dir.path()), listener).await;
+        let result = run_bound(
+            &program,
+            &args,
+            unwritable_journal(dir.path()),
+            listener,
+            #[cfg(feature = "test-support")]
+            TestHooks::default(),
+        )
+        .await;
         assert!(result.is_err(), "the child exited 0 but its output was not journalled");
     }
 }

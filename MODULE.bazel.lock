@@ -1384,7 +1384,7 @@
           "FILE:@@//tools/boss/engine/spoke-adapter/Cargo.toml e5c35d9397ba826587c353b874b5df2e24bb5b4f67daadec4defeb1892404f6d",
           "FILE:@@//tools/boss/trunk_auth/Cargo.toml b587b790d373b83f7d915d79936c7d01de8e2eae3fc6464b75c1942bb9e3d30e",
           "FILE:@@//tools/boss/acp_client/Cargo.toml 5713f8f9d816b11eac122af923f19ca9636cabc518024d28d0058850d12260e1",
-          "FILE:@@//tools/boss/agent-host/Cargo.toml b86e351219a37c5ab9ab1090a3a86ea185068723cffea46bec7ee4e5332176d1",
+          "FILE:@@//tools/boss/agent-host/Cargo.toml 369c2b36b059767b960ff018705f9c9cfdc2bec86d2fca0485ec34ad5c27ea71",
           "FILE:@@//tools/boss/cli/Cargo.toml 0783eae5e327840fc73b58e9aae55aad39feba9ec1f4e54e01c99a3364e97e8c",
           "FILE:@@//tools/boss/engine/blocked-pr-diagnosis/Cargo.toml 1b3a257b1b345357c920d55da7557a72b4fd2bc5c4177103d2281d8c3b3541c1",
           "FILE:@@//tools/boss/engine/coordinator-chat/Cargo.toml 65b6e6e461dca7c2fb3953d9ca4208615f5ccb8a62cef63dcd41b6d4d1c06177",
