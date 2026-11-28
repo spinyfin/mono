@@ -22,11 +22,33 @@ impl ReviewBatchEnqueuer for FixedHeadEnqueuer {
         pr_url: &str,
         review_pool_size: usize,
     ) -> Result<ReviewBatchDispatch> {
+        self.enqueue_with_mode(
+            work_db,
+            work_item_id,
+            repo_remote_url,
+            pr_url,
+            review_pool_size,
+            boss_observation_contracts::DeltaRereviewDecision::default(),
+        )
+        .await
+    }
+
+    async fn enqueue_with_mode(
+        &self,
+        work_db: &WorkDb,
+        work_item_id: &str,
+        repo_remote_url: &str,
+        pr_url: &str,
+        review_pool_size: usize,
+        decision: boss_observation_contracts::DeltaRereviewDecision,
+    ) -> Result<ReviewBatchDispatch> {
         // As the production enqueuer builds it: keyed on the cycle root, and
         // naming the candidate when that is a revision of the root.
         let root_id = work_db.review_cycle_root_id(work_item_id);
         let mut input = batch_input(root_id.clone(), pr_url, self.head);
         input.legacy_task_id = (work_item_id != root_id).then(|| work_item_id.to_owned());
+        input.single_reviewer_light = decision.single_reviewer_light;
+        input.delta_rereview_arm = decision.arm;
         work_db.create_pre_merge_review_batch_for_pool(input, repo_remote_url, review_pool_size)
     }
 }
@@ -109,12 +131,244 @@ async fn sweep(db: &WorkDb, publisher: &RecordingPublisher, head: &'static str) 
         db,
         publisher,
         &FixedHeadEnqueuer { head },
+        &|_, _| boss_observation_contracts::DeltaRereviewDecision::default(),
         None,
         16,
         &mut outcome,
     )
     .await;
     outcome
+}
+
+/// Test double for [`CompletionRequests`] that drives the production
+/// `pass.rs` and `sweep.rs` deferred-admission wiring (`handler.delta_rereview_decision`)
+/// with a scripted arm and deterministic PR metadata (`FixedHeadEnqueuer`).
+struct DeltaRoutingCompletionHandler {
+    enqueuer: FixedHeadEnqueuer,
+    arm: Option<boss_protocol::DeltaRereviewBatchArm>,
+    asked: std::sync::Mutex<Vec<String>>,
+}
+
+impl DeltaRoutingCompletionHandler {
+    fn new(head: &'static str, arm: Option<boss_protocol::DeltaRereviewBatchArm>) -> Self {
+        Self {
+            enqueuer: FixedHeadEnqueuer { head },
+            arm,
+            asked: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn asked(&self) -> Vec<String> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl CompletionRequests for DeltaRoutingCompletionHandler {
+    fn review_guide_source_capture_enabled(&self) -> bool {
+        false
+    }
+    fn pending_background_nudge_execution_ids(&self) -> Vec<String> {
+        Vec::new()
+    }
+    async fn recheck_background_nudge(&self, _execution_id: &str) -> Option<StopOutcome> {
+        None
+    }
+    fn review_batch_fanout_enabled(&self) -> bool {
+        true
+    }
+    fn review_pool_size(&self) -> usize {
+        16
+    }
+    async fn force_release(&self, _execution_id: &str) {}
+    async fn record_parent_pr_merge_cancellation(
+        &self,
+        _: &crate::work::WorkExecution,
+        _: boss_protocol::ExecutionStatus,
+        _: &str,
+    ) {
+    }
+    async fn force_stop_execution(&self, _execution_id: &str) {}
+    async fn recheck_for_pr(&self, _execution_id: &str) -> StopOutcome {
+        StopOutcome::AwaitingInput
+    }
+    async fn recheck_for_pr_late(&self, _candidate: &crate::work::LatePrCandidate) -> StopOutcome {
+        StopOutcome::AwaitingInput
+    }
+    fn reconcile_review_guide_source_from_probe(&self, _: &str, _: &str, _: &str, _: &str, _: i64) {}
+    fn speculative_conflict_prediction_enabled(&self) -> bool {
+        false
+    }
+    fn stacked_pr_auto_structuring_enabled(&self) -> bool {
+        false
+    }
+    fn mechanical_rebase_enabled(&self) -> bool {
+        false
+    }
+    fn review_batch_enqueuer(&self) -> &dyn ReviewBatchEnqueuer {
+        &self.enqueuer
+    }
+    fn delta_rereview_decision(
+        &self,
+        work_db: &WorkDb,
+        work_item_id: &str,
+    ) -> boss_observation_contracts::DeltaRereviewDecision {
+        self.asked.lock().unwrap().push(work_item_id.to_owned());
+        let root_id = work_db.review_cycle_root_id(work_item_id);
+        let (review_cycle, last_reviewed_sha) = work_db.get_task_review_cycle_state(&root_id).unwrap_or((0, None));
+        let is_repeat = review_cycle >= 1 && last_reviewed_sha.as_deref().is_some_and(|s| !s.is_empty());
+        boss_observation_contracts::DeltaRereviewDecision {
+            single_reviewer_light: is_repeat && self.arm == Some(boss_protocol::DeltaRereviewBatchArm::Treatment),
+            arm: self.arm,
+        }
+    }
+}
+
+fn seed_reaped_candidate(db: &WorkDb, review_cycle: i64, last_reviewed_sha: Option<&str>) -> (String, String) {
+    let root_id = in_review_root(db);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET review_cycle = ?2, last_reviewed_sha = ?3 WHERE id = ?1",
+            rusqlite::params![root_id, review_cycle, last_reviewed_sha],
+        )
+        .unwrap();
+    let (reaped, _) = settled_batch(db, &root_id, "head-a");
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE pr_review_batch_members SET status = 'failed' WHERE batch_id = ?1",
+            rusqlite::params![reaped.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE pr_review_batches SET status = 'failed' WHERE id = ?1",
+            rusqlite::params![reaped.id],
+        )
+        .unwrap();
+    }
+    (root_id, reaped.id)
+}
+
+/// Drive deferred admission through the production `run_one_pass_tracked`
+/// entry (`pass.rs`) with a `CompletionRequests` double: round 1 and control
+/// round 2 admit a full two-leaf batch, and treated round 2 admits a solo
+/// Light-tier batch, persisting `delta_rereview_arm` on each batch.
+#[tokio::test]
+async fn run_one_pass_routes_deferred_admission_through_completion_handler() {
+    use boss_protocol::DeltaRereviewBatchArm;
+    for (label, review_cycle, last_sha, arm, expected_solo, expected_members) in [
+        (
+            "round1_treated",
+            0,
+            None,
+            Some(DeltaRereviewBatchArm::Treatment),
+            false,
+            2,
+        ),
+        (
+            "round2_control",
+            1,
+            Some("head-0"),
+            Some(DeltaRereviewBatchArm::Control),
+            false,
+            2,
+        ),
+        (
+            "round2_treated",
+            1,
+            Some("head-0"),
+            Some(DeltaRereviewBatchArm::Treatment),
+            true,
+            1,
+        ),
+    ] {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let (root_id, reaped_id) = seed_reaped_candidate(&db, review_cycle, last_sha);
+        let probe = StubProbe::new();
+        probe.set(PR_URL, PrLifecycleState::Open(OpenPrStatus::clean()));
+        let handler = DeltaRoutingCompletionHandler::new("head-a", arm);
+        let state = PassState::default();
+
+        let (outcome, _) = run_one_pass_tracked(
+            &db,
+            probe.as_ref(),
+            &RecordingPublisher::default(),
+            SweepHandlers {
+                cube_client: None,
+                completion_handler: Some(&handler),
+                host: None,
+                parked_ids: None,
+            },
+            &state,
+            Duration::from_secs(30),
+        )
+        .await;
+
+        assert_eq!(outcome.review_admission_recovered, 1, "{label}");
+        assert_eq!(handler.asked(), vec![root_id.clone()], "{label}");
+        let batch = db
+            .review_batches_for_cycle_root(&root_id)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id != reaped_id)
+            .expect("batch admitted");
+        assert_eq!(batch.single_reviewer, expected_solo, "{label}");
+        assert_eq!(batch.delta_rereview_arm, arm, "{label}");
+        assert_eq!(
+            db.review_batch_members(&batch.id).unwrap().len(),
+            expected_members,
+            "{label}"
+        );
+    }
+}
+
+/// Drive deferred admission through the production `reconcile_batch` entry
+/// (`sweep.rs`) with a `CompletionRequests` double, asserting the targeted
+/// sweep calls `handler.delta_rereview_decision` and admits the matching shape.
+#[tokio::test]
+async fn reconcile_batch_routes_deferred_admission_through_completion_handler() {
+    use boss_protocol::DeltaRereviewBatchArm;
+    for (label, arm, expected_solo, expected_members) in [
+        ("round2_control", Some(DeltaRereviewBatchArm::Control), false, 2),
+        ("round2_treated", Some(DeltaRereviewBatchArm::Treatment), true, 1),
+    ] {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let (root_id, reaped_id) = seed_reaped_candidate(&db, 1, Some("head-0"));
+        let probe = StubProbe::new();
+        probe.set(PR_URL, PrLifecycleState::Open(OpenPrStatus::clean()));
+        let handler = DeltaRoutingCompletionHandler::new("head-a", arm);
+        let urls = vec![PR_URL.to_owned()];
+
+        let (outcome, _) = reconcile_batch(
+            &db,
+            probe.as_ref(),
+            &RecordingPublisher::default(),
+            None,
+            Some(&handler),
+            None,
+            &urls,
+        )
+        .await;
+
+        assert_eq!(outcome.review_admission_recovered, 1, "{label}");
+        assert_eq!(handler.asked(), vec![root_id.clone()], "{label}");
+        let batch = db
+            .review_batches_for_cycle_root(&root_id)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id != reaped_id)
+            .expect("batch admitted");
+        assert_eq!(batch.single_reviewer, expected_solo, "{label}");
+        assert_eq!(batch.delta_rereview_arm, arm, "{label}");
+        assert_eq!(
+            db.review_batch_members(&batch.id).unwrap().len(),
+            expected_members,
+            "{label}"
+        );
+    }
 }
 
 /// An `in_review` root whose newest batch was reaped gets generation 2 at
@@ -236,6 +490,7 @@ async fn sweep_skips_enqueue_for_roots_held_by_focus() {
         &db,
         &publisher,
         &PanicEnqueuer,
+        &|_, _| boss_observation_contracts::DeltaRereviewDecision::default(),
         None,
         16,
         &mut outcome,
@@ -401,6 +656,7 @@ async fn sweep_admits_the_review_of_a_launched_revisions_push_through_focus() {
                 &db,
                 &publisher,
                 &PanicEnqueuer,
+                &|_, _| boss_observation_contracts::DeltaRereviewDecision::default(),
                 None,
                 16,
                 &mut outcome,

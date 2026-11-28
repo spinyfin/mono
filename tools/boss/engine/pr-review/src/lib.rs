@@ -36,6 +36,7 @@
 
 mod blocks;
 mod brief;
+mod delta_render;
 mod parsing;
 mod post_merge_render;
 mod render;
@@ -47,6 +48,9 @@ pub use blocks::{render_boss_construct_sweep_block, render_supersession_flag_blo
 pub use brief::{
     BreakdownSection, DesignDocSection, ReviewBriefPacket, UnresolvedReviewInput, locate_design_section,
     locate_design_section_with_breakdown, render_brief_conformance_rubric, render_brief_packet_block,
+};
+pub use delta_render::{
+    DeltaRereviewContext, PriorReviewFinding, PriorReviewRound, render_delta_rereviewer_initial_prompt,
 };
 pub use parsing::{
     PrReviewMetadata, classify_changed_files, classify_pr_review_metadata, extract_review_result,

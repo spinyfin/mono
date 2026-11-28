@@ -258,7 +258,8 @@ fn apply_review_report(
     let member = tx
         .query_row(
             "SELECT members.id, members.status, members.report_proposal_id,
-                    batches.pr_url, batches.target_sha, batches.phase, members.role
+                    batches.pr_url, batches.target_sha, batches.phase, members.role,
+                    batches.single_reviewer
              FROM pr_review_batch_members AS members
              JOIN pr_review_batches AS batches ON batches.id = members.batch_id
              WHERE members.execution_id = ?1 AND members.batch_id = ?2",
@@ -272,6 +273,7 @@ fn apply_review_report(
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
+                    row.get::<_, bool>(7)?,
                 ))
             },
         )
@@ -280,12 +282,19 @@ fn apply_review_report(
     // (`payload.batch_id`), so a returned row's batch membership is
     // guaranteed to match by construction — no separate mismatch check is
     // needed or possible here.
-    let Some((member_id, status, existing_report, pr_url, target_sha, phase, role)) = member else {
+    let Some((member_id, status, existing_report, pr_url, target_sha, phase, role, single_reviewer)) = member else {
         return Ok(ApplyDecision::Rejected(format!(
             "this execution is not a member of review batch `{}`",
             payload.batch_id
         )));
     };
+    if single_reviewer {
+        return Ok(ApplyDecision::Rejected(format!(
+            "review batch `{}` is a single-reviewer batch; submit its verdict directly via \
+             `boss propose review-verdict` rather than `review-report`",
+            payload.batch_id
+        )));
+    }
     if payload.target_sha != target_sha {
         return Ok(ApplyDecision::Rejected(
             "submitted target SHA does not match batch target".to_owned(),
@@ -395,7 +404,7 @@ fn apply_review_verdict(
         .query_row(
             "SELECT members.id, members.role, members.status, members.report_proposal_id,
                     batches.status, batches.pr_url, batches.target_sha, batches.phase,
-                    batches.final_verdict_proposal_id
+                    batches.final_verdict_proposal_id, batches.single_reviewer
              FROM pr_review_batch_members AS members
              JOIN pr_review_batches AS batches ON batches.id = members.batch_id
              WHERE members.execution_id = ?1 AND members.batch_id = ?2",
@@ -411,6 +420,7 @@ fn apply_review_verdict(
                     row.get::<_, String>(6)?,
                     row.get::<_, String>(7)?,
                     row.get::<_, Option<String>>(8)?,
+                    row.get::<_, bool>(9)?,
                 ))
             },
         )
@@ -425,6 +435,7 @@ fn apply_review_verdict(
         target_sha,
         phase,
         _final_verdict_proposal_id,
+        single_reviewer,
     )) = member
     else {
         return Ok(ApplyDecision::Rejected(format!(
@@ -433,21 +444,19 @@ fn apply_review_verdict(
         )));
     };
     let role: ReviewBatchMemberRole = role.parse().map_err(anyhow::Error::msg)?;
-    // A pre-merge batch's verdict comes from its consolidating supervisor,
-    // reached once two-of-three leaves have reported (`supervising`). A
-    // post-merge batch has no leaf/supervisor split — its sole
-    // `PostMergeReviewer` member submits the verdict directly while the
-    // batch is still `collecting` (see `try_advance_review_batch_quorum_in_tx`'s
-    // `Collecting`-and-`PostMerge` arm, which reads this call's staged
-    // `report_proposal_id` straight off that member instead of through an
-    // intermediate supervisor dispatch).
+    // A multi-leaf pre-merge batch's verdict comes from its consolidating
+    // supervisor once leaves settle (`supervising`). A post-merge batch or a
+    // single-reviewer pre-merge batch has no leaf/supervisor split — its sole
+    // reviewer submits the verdict directly while the batch is `collecting`.
     let awaiting_status = match role {
         ReviewBatchMemberRole::Supervisor => ReviewBatchStatus::Supervising,
         ReviewBatchMemberRole::PostMergeReviewer => ReviewBatchStatus::Collecting,
+        ReviewBatchMemberRole::ClaudeReviewer if single_reviewer => ReviewBatchStatus::Collecting,
         _ => {
             return Ok(ApplyDecision::Rejected(format!(
                 "review batch member `{member_id}` is a `{role}`, which never submits a review-verdict \
-                 directly; only the batch's supervisor or a solo post-merge reviewer may",
+                 directly; only the batch's supervisor, a solo post-merge reviewer, or a single-reviewer \
+                 pre-merge member may",
             )));
         }
     };
@@ -481,7 +490,7 @@ fn apply_review_verdict(
             "review batch member `{member_id}` cannot accept a verdict while status is `{status}`",
         )));
     }
-    if let Some(reason) = review_verdict_unknown_source_reason(tx, &payload.batch_id, &verdict)? {
+    if let Some(reason) = review_verdict_unknown_source_reason(tx, &payload.batch_id, &verdict, single_reviewer)? {
         return Ok(ApplyDecision::Rejected(reason));
     }
 
@@ -542,8 +551,10 @@ fn review_verdict_unknown_source_reason(
     tx: &Transaction<'_>,
     batch_id: &str,
     verdict: &boss_pr_review::SupervisorVerdict,
+    single_reviewer: bool,
 ) -> Result<Option<String>> {
-    let errors = verdict.structural_errors();
+    let solo = single_reviewer || verdict.phase == boss_protocol::ReviewBatchPhase::PostMerge;
+    let errors = verdict.structural_errors_with_solo(solo);
     if !errors.is_empty() {
         return Ok(Some(
             errors
@@ -553,7 +564,14 @@ fn review_verdict_unknown_source_reason(
                 .join("; "),
         ));
     }
-    if verdict.phase == boss_protocol::ReviewBatchPhase::PostMerge {
+    if solo {
+        if single_reviewer && !verdict.contradictions.is_empty() {
+            return Ok(Some(
+                "verdict.contradictions: a single-reviewer verdict has no second reviewer to contradict; \
+                 `contradictions` must be empty"
+                    .to_owned(),
+            ));
+        }
         return Ok(None);
     }
     let mut statement = tx.prepare(

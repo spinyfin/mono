@@ -787,6 +787,19 @@ pub enum StopOutcome {
     PrBaseRefused { pr_url: String, detail: String },
 }
 
+/// Admission-time `delta_rereview` routing decision for one automatic
+/// pre-merge review batch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeltaRereviewDecision {
+    /// Admit a one-member Light-tier batch (`single_reviewer = true`).
+    pub single_reviewer_light: bool,
+    /// The `delta_rereview` arm drawn at admission (`None` when the experiment
+    /// was not running at admission). Persisted atomically on the batch so
+    /// every leaf, supervisor, retry and restarted execution resolves the same
+    /// arm regardless of later flag changes.
+    pub arm: Option<boss_protocol::DeltaRereviewBatchArm>,
+}
+
 /// Completion-side requests the merge poller makes after a probe.
 /// Production implements this on `WorkerCompletionHandler`; the poller
 /// holds `&dyn CompletionRequests` so it does not import the handler.
@@ -819,6 +832,19 @@ pub trait CompletionRequests: Send + Sync {
     fn stacked_pr_auto_structuring_enabled(&self) -> bool;
     fn mechanical_rebase_enabled(&self) -> bool;
     fn review_batch_enqueuer(&self) -> &dyn ReviewBatchEnqueuer;
+    /// Admission-time `delta_rereview` decision for an automatic pre-merge
+    /// review of `work_item_id`: both whether to admit the single-reviewer
+    /// Light-tier batch and the arm to persist on `pr_review_batches`.
+    fn delta_rereview_decision(&self, _work_db: &WorkDb, _work_item_id: &str) -> DeltaRereviewDecision {
+        DeltaRereviewDecision::default()
+    }
+    /// Whether an automatic pre-merge review for `work_item_id` should use the
+    /// single-reviewer Light-tier delta re-review path (round 2+ for treated
+    /// PR families under `delta_rereview`).
+    fn should_use_delta_rereview(&self, work_db: &WorkDb, work_item_id: &str) -> bool {
+        self.delta_rereview_decision(work_db, work_item_id)
+            .single_reviewer_light
+    }
 }
 
 /// Production or test strategy for creating a pre-merge review batch from
@@ -833,6 +859,27 @@ pub trait ReviewBatchEnqueuer: Send + Sync {
         pr_url: &str,
         review_pool_size: usize,
     ) -> anyhow::Result<ReviewBatchDispatch>;
+
+    /// Enqueue a pre-merge review batch with an explicit admission-time
+    /// `delta_rereview` decision (batch shape + persisted arm). The default
+    /// forwards a full-batch request to [`Self::enqueue`] so stubs that only
+    /// implement `enqueue` stay source-compatible, and refuses a
+    /// single-reviewer request rather than silently admitting the wrong shape.
+    async fn enqueue_with_mode(
+        &self,
+        work_db: &WorkDb,
+        work_item_id: &str,
+        repo_remote_url: &str,
+        pr_url: &str,
+        review_pool_size: usize,
+        decision: DeltaRereviewDecision,
+    ) -> anyhow::Result<ReviewBatchDispatch> {
+        if decision.single_reviewer_light {
+            anyhow::bail!("this review batch enqueuer does not support single-reviewer admission");
+        }
+        self.enqueue(work_db, work_item_id, repo_remote_url, pr_url, review_pool_size)
+            .await
+    }
 }
 
 /// Writes PR poll state after an on-transition CI pre-fetch.
@@ -961,6 +1008,14 @@ impl<T: CompletionRequests + ?Sized> CompletionRequests for std::sync::Arc<T> {
 
     fn review_batch_enqueuer(&self) -> &dyn ReviewBatchEnqueuer {
         T::review_batch_enqueuer(self.as_ref())
+    }
+
+    fn delta_rereview_decision(&self, work_db: &WorkDb, work_item_id: &str) -> DeltaRereviewDecision {
+        T::delta_rereview_decision(self.as_ref(), work_db, work_item_id)
+    }
+
+    fn should_use_delta_rereview(&self, work_db: &WorkDb, work_item_id: &str) -> bool {
+        T::should_use_delta_rereview(self.as_ref(), work_db, work_item_id)
     }
 }
 

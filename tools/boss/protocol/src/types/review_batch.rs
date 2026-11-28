@@ -336,6 +336,42 @@ impl std::str::FromStr for ReviewBatchMemberStatus {
     }
 }
 
+/// Admission-time `delta_rereview` experiment arm persisted on a pre-merge
+/// review batch (`NULL` when not enrolled).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeltaRereviewBatchArm {
+    Control,
+    Treatment,
+}
+
+impl DeltaRereviewBatchArm {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::Treatment => "treatment",
+        }
+    }
+}
+
+impl std::fmt::Display for DeltaRereviewBatchArm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for DeltaRereviewBatchArm {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "control" => Ok(Self::Control),
+            "treatment" => Ok(Self::Treatment),
+            _ => Err(format!("unknown delta_rereview batch arm: {value}")),
+        }
+    }
+}
+
 /// One immutable review target and its classification snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
@@ -376,6 +412,21 @@ pub struct ReviewBatch {
     /// an ordinary task/chore, or a batch that predates this column.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub producing_work_item_id: Option<String>,
+    /// True for a one-member pre-merge batch (e.g. a Light-tier delta
+    /// re-review with no consolidating supervisor). The sole member submits
+    /// `SupervisorVerdict` directly via `boss propose review-verdict` and
+    /// moves the batch `collecting -> applying`, while `classification`
+    /// retains the PR's whole-PR profile for post-merge eligibility.
+    #[serde(default)]
+    #[builder(default = false)]
+    pub single_reviewer: bool,
+    /// Admission-time `delta_rereview` experiment arm persisted with the batch
+    /// (`None` when the experiment was not running at admission or for
+    /// non-enrolled/explicit starts). Every leaf, supervisor, retry and
+    /// restarted execution of a pre-merge batch resolves its `delta_rereview`
+    /// arm from this column instead of live flags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_rereview_arm: Option<DeltaRereviewBatchArm>,
 }
 
 fn first_generation() -> i64 {

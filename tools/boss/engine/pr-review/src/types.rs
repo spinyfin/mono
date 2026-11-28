@@ -174,6 +174,23 @@ pub enum ReviewFindingCategory {
     AgentIsms,
 }
 
+impl ReviewFindingCategory {
+    /// The serialized (snake_case) name, matching the serde representation.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Correctness => "correctness",
+            Self::Regression => "regression",
+            Self::Architecture => "architecture",
+            Self::Readability => "readability",
+            Self::Tests => "tests",
+            Self::EdgeCase => "edgecase",
+            Self::Duplication => "duplication",
+            Self::DeferredScope => "deferred_scope",
+            Self::AgentIsms => "agent_isms",
+        }
+    }
+}
+
 /// Reviewer's confidence in a finding.
 ///
 /// `Low` means "suggestion — apply at the revising worker's discretion;

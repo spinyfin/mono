@@ -1116,6 +1116,7 @@ pub async fn run_one_pass_tracked(
                                     work_db,
                                     publisher,
                                     handler.review_batch_enqueuer(),
+                                    &|db, id| handler.delta_rereview_decision(db, id),
                                     None,
                                     pool_size,
                                     &mut outcome,

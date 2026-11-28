@@ -184,17 +184,7 @@ pub fn render_revision_instructions(result: &ReviewResult, origin: ReviewOrigin)
 
     for f in &findings {
         let loc = f.location.as_deref().map(|l| format!(" ({l})")).unwrap_or_default();
-        let category = match f.category {
-            ReviewFindingCategory::Correctness => "correctness",
-            ReviewFindingCategory::Regression => "regression",
-            ReviewFindingCategory::Architecture => "architecture",
-            ReviewFindingCategory::Readability => "readability",
-            ReviewFindingCategory::Tests => "tests",
-            ReviewFindingCategory::EdgeCase => "edgecase",
-            ReviewFindingCategory::Duplication => "duplication",
-            ReviewFindingCategory::DeferredScope => "deferred_scope",
-            ReviewFindingCategory::AgentIsms => "agent_isms",
-        };
+        let category = f.category.as_str();
         // Findings without ids or sources get no identity or provenance lines.
         let id_line =
             f.id.as_deref()
@@ -380,9 +370,9 @@ pub fn render_reviewer_claude_md(
             intro: "You are running inside a Boss-managed **reviewer** session. The engine\n\
                     spawned you in a leased cube workspace checked out to the PR head.",
             last_forbidden_bullet: "Running `cube pr create`/`cube pr update` or any Boss PR helper —\n\
-               this does NOT include the `\"$BOSS_BIN\" propose review-report` call named\n\
-               below, which is not a Boss PR helper: it reports findings, it does\n\
-               not touch the PR.",
+               this does NOT include the `\"$BOSS_BIN\" propose review-report` or\n\
+               `\"$BOSS_BIN\" propose review-verdict` call named below, which is not\n\
+               a Boss PR helper: it reports findings, it does not touch the PR.",
             permitted_write_section: "**The one permitted write** is whichever single delivery your task\n\
              prompt actually names:\n\
              \n\
@@ -392,12 +382,17 @@ pub fn render_reviewer_claude_md(
              - If it instead names a review-report body-file path and a\n\
                `\"$BOSS_BIN\" propose review-report` command: write the report JSON to\n\
                that body file, then run exactly that one `\"$BOSS_BIN\" propose` call to\n\
-               submit it. `\"$BOSS_BIN\" propose` is a local call to the engine control\n\
-               socket, not a write to the PR or repo.\n\
+               submit it.\n\
+             - If it instead names a verdict body-file path and a\n\
+               `\"$BOSS_BIN\" propose review-verdict` command: write the verdict JSON to\n\
+               that body file, then run exactly that one `\"$BOSS_BIN\" propose` call to\n\
+               submit it.\n\
              \n\
-             Either path is OUTSIDE every worker workspace, so making that one\n\
-             write (or write-then-submit) does not violate the read-only mandate.\n\
-             Do not write anywhere else, and do not use any other Boss PR helper.\n\
+             `\"$BOSS_BIN\" propose` is a local call to the engine control socket, not\n\
+             a write to the PR or repo. Each path is OUTSIDE every worker workspace,\n\
+             so making that one write (or write-then-submit) does not violate the\n\
+             read-only mandate. Do not write anywhere else, and do not use any other\n\
+             Boss PR helper.\n\
              \n\
              Anything you would \"fix\", describe as a finding in that output\n\
              instead. Your feedback stays inside Boss — **it is never posted to\n\
@@ -827,7 +822,7 @@ pub fn render_batch_reviewer_initial_prompt(
 /// The engine additionally halts auto-progression on a non-empty set (see
 /// `finalize_pr_review_pass`); this block ensures the reviewer also treats each
 /// entry as a gating regression rather than accepting a "supersedes" narrative.
-fn render_merged_parent_deletion_block(deletions: &[String]) -> String {
+pub(crate) fn render_merged_parent_deletion_block(deletions: &[String]) -> String {
     if deletions.is_empty() {
         return String::new();
     }
@@ -1105,6 +1100,10 @@ mod tests {
         assert!(
             rendered.contains("\"$BOSS_BIN\" propose review-report"),
             "reviewer CLAUDE.md must authorise the review-batch \"$BOSS_BIN\" propose call"
+        );
+        assert!(
+            rendered.contains("\"$BOSS_BIN\" propose review-verdict"),
+            "reviewer CLAUDE.md must authorise the solo-reviewer \"$BOSS_BIN\" propose review-verdict call"
         );
         assert!(
             !rendered.contains("**The one permitted write** is your `ReviewResult`"),

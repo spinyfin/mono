@@ -117,6 +117,20 @@ pub struct WorkerSpawnOpts {
     /// `{}` and is never treated.
     #[builder(default)]
     pub experiment_arms: crate::feature_flags::ExperimentArmSet,
+    /// Override for GitHub history and diff fetches on solo delta re-review
+    /// spawns. `None` uses the production `gh` helpers.
+    pub delta_diff_source: Option<std::sync::Arc<dyn DeltaDiffSource>>,
+}
+
+/// Injectable GitHub history and diff fetcher for solo delta re-review spawns.
+/// Production uses the `gh` helpers directly; tests inject a stub so
+/// [`compose_worker_spawn`] exercises linear vs rewritten diff selection,
+/// embedding caps, and `history_rewritten` wiring end to end.
+#[async_trait::async_trait]
+pub trait DeltaDiffSource: std::fmt::Debug + Send + Sync {
+    async fn fetch_delta_history(&self, repo_slug: &str, last_sha: &str, target_sha: &str) -> DeltaHistory;
+    async fn fetch_compare_diff(&self, repo_slug: &str, last_sha: &str, target_sha: &str) -> Option<String>;
+    async fn fetch_pr_diff(&self, pr_url: &str) -> Option<String>;
 }
 
 /// Fetch authoritative PR metadata for a reviewer worker's initial prompt.
@@ -267,6 +281,93 @@ async fn fetch_pr_diff(pr_url: &str) -> Option<String> {
             e
         })
         .ok()
+}
+
+/// Fetch the raw unified diff between two commits via GitHub's compare API
+/// (`gh api repos/<slug>/compare/<base>...<head> -H Accept: application/vnd.github.diff`).
+///
+/// Returns `None` on any error so callers degrade gracefully to the explicit
+/// compare / `jj diff` instructions in the delta re-review prompt.
+async fn fetch_compare_diff(repo_slug: &str, base_sha: &str, head_sha: &str) -> Option<String> {
+    let endpoint = boss_github::compare::gh_compare_endpoint(repo_slug, base_sha, head_sha);
+    let output = gh_scope(
+        callers::WORKER_SPAWN,
+        gh_output(&["api", &endpoint, "-H", "Accept: application/vnd.github.diff"]),
+    )
+    .await
+    .ok()?;
+
+    if !output.status.success() {
+        tracing::warn!(
+            repo_slug,
+            base_sha,
+            head_sha,
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "fetch_compare_diff: gh api compare diff failed; reviewer will fetch delta diff itself",
+        );
+        return None;
+    }
+
+    String::from_utf8(output.stdout)
+        .map_err(|e| {
+            tracing::warn!(
+                repo_slug,
+                base_sha,
+                head_sha,
+                error = %e,
+                "fetch_compare_diff: compare diff output is not valid UTF-8",
+            );
+            e
+        })
+        .ok()
+}
+
+/// Whether `last_reviewed_sha..target_sha` is a clean linear continuation, so
+/// that GitHub's compare diff is exactly what changed since the last review.
+///
+/// GitHub's `base...head` compare diffs from `merge-base(base, head)`. That
+/// equals `base` only when `base` is an ancestor of `head` (status `ahead` or
+/// `identical`). After a rebase or force-push the status is `diverged`/`behind`
+/// and the diff would hide removals relative to the reviewed head or drag in
+/// upstream changes. A merge commit in the range (main merged into the branch)
+/// also pulls base-branch changes into an otherwise `ahead` range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaHistory {
+    Linear,
+    Rewritten,
+}
+
+/// Parse the `<status>\t<merge-commit-count>` projection produced by
+/// [`fetch_delta_history`]. Anything unparseable counts as rewritten, so the
+/// reviewer falls back to the full PR diff instead of a possibly wrong delta.
+fn classify_delta_history(projection: &str) -> DeltaHistory {
+    let mut parts = projection.trim().split('\t');
+    let status = parts.next().unwrap_or("");
+    let merge_commits = parts.next().and_then(|n| n.trim().parse::<u64>().ok());
+    match (status, merge_commits) {
+        ("ahead" | "identical", Some(0)) => DeltaHistory::Linear,
+        _ => DeltaHistory::Rewritten,
+    }
+}
+
+/// Ask GitHub whether `last_sha` is still a linear ancestor of `target_sha`
+/// with no base-branch merge in between. Fails closed to `Rewritten`.
+async fn fetch_delta_history(repo_slug: &str, last_sha: &str, target_sha: &str) -> DeltaHistory {
+    const PROJECTION: &str =
+        r#"[.status, ([.commits[]? | select((.parents | length) > 1)] | length | tostring)] | join("\t")"#;
+    match boss_github::compare::gh_compare_jq(repo_slug, last_sha, target_sha, PROJECTION).await {
+        Ok(out) => classify_delta_history(&out),
+        Err(err) => {
+            tracing::warn!(
+                repo_slug,
+                last_sha,
+                target_sha,
+                error = %err,
+                "fetch_delta_history: compare status unavailable; treating history as rewritten",
+            );
+            DeltaHistory::Rewritten
+        }
+    }
 }
 
 /// The row-derived inputs that decide a worker's *model* (not its driver or
@@ -653,6 +754,7 @@ pub async fn compose_worker_spawn(
         repo_guidance,
         remote_workspace,
         experiment_arms,
+        delta_diff_source,
     } = editorial_opts;
     // Experiments reach the composer as plain options, never as keys.
     let batched_search = experiment_arms.is_treated(crate::feature_flags::BATCHED_SEARCH_EXPERIMENT);
@@ -937,6 +1039,52 @@ pub async fn compose_worker_spawn(
                     .build(),
             )
         } else {
+            // A member row existing is the same signal `finalize_pr_review_pass`
+            // uses to take the batch branch unconditionally (it never falls
+            // back to reading the legacy artifact once a member row exists).
+            // So once we observe a member row here, the batch destination is
+            // the ONLY delivery channel the finalizer will ever read for this
+            // execution: falling back to the legacy prompt in that case would
+            // render a prompt whose artifact/transcript delivery instructions
+            // the finalizer is guaranteed to ignore, silently discarding a
+            // review the worker actually completed. Fail the dispatch instead
+            // so the execution surfaces as a real failure rather than a
+            // reviewer that appears to succeed but whose report vanishes.
+            let member_and_batch = match work_db.review_batch_member_for_execution(&execution.id) {
+                Ok(Some(member)) => match work_db.review_batch(&member.batch_id) {
+                    Ok(Some(batch)) => Some((member, batch)),
+                    Ok(None) => {
+                        anyhow::bail!(
+                            "pr_review execution {} has review-batch member for batch {} but the batch row is \
+                             missing; refusing to dispatch with the legacy prompt, which finalize_pr_review_pass \
+                             would never read",
+                            execution.id,
+                            member.batch_id,
+                        );
+                    }
+                    Err(err) => {
+                        return Err(err).context(format!(
+                            "loading review batch {} for execution {} member row; refusing to dispatch with the \
+                             legacy prompt, which finalize_pr_review_pass would never read",
+                            member.batch_id, execution.id,
+                        ));
+                    }
+                },
+                Ok(None) => None,
+                Err(err) => {
+                    return Err(err).context(format!(
+                        "determining whether reviewer execution {} belongs to a review batch",
+                        execution.id,
+                    ));
+                }
+            };
+            let solo_delta_target_sha = member_and_batch
+                .as_ref()
+                .filter(|(_, batch)| batch.single_reviewer)
+                .map(|(_, batch)| batch.target_sha.clone());
+            let parsed_repo_slug = git_utils::repo_slug::parse_github_slug(&execution.repo_remote_url);
+            let reviewer_repo_slug = parsed_repo_slug.clone().unwrap_or_else(|| "<owner/repo>".to_owned());
+
             // Pre-fetch PR metadata so the reviewer starts with the full diff
             // context (base/head SHAs, changed files) rather than discovering
             // it turn-by-turn. Fail open on error — the URL-only prompt is
@@ -949,12 +1097,13 @@ pub async fn compose_worker_spawn(
             // otherwise) so the value reflects the PR's actual review
             // history rather than resetting for every fresh revision task
             // row — see `WorkDb::review_cycle_root_id`.
+            let cycle_root_id = work_db.review_cycle_root_id(&execution.work_item_id);
+            let last_reviewed_sha = work_db
+                .get_task_review_cycle_state(&cycle_root_id)
+                .ok()
+                .and_then(|(_, sha)| sha);
             if let Some(ref mut ctx) = pr_review_context {
-                let cycle_root_id = work_db.review_cycle_root_id(&execution.work_item_id);
-                ctx.last_reviewed_sha = work_db
-                    .get_task_review_cycle_state(&cycle_root_id)
-                    .ok()
-                    .and_then(|(_, sha)| sha);
+                ctx.last_reviewed_sha = last_reviewed_sha.clone();
             }
             if let Some(ref ctx) = pr_review_context {
                 tracing::info!(
@@ -973,13 +1122,73 @@ pub async fn compose_worker_spawn(
                     "pr_review execution: PR metadata fetch failed; reviewer will use URL-only prompt",
                 );
             }
-            // Fetch the diff unconditionally (independent of
-            // max_embed_diff_lines) so the mechanical Boss-construct sweep
-            // below always runs, even when diff embedding is disabled via
-            // BOSS_MAX_EMBED_DIFF_LINES=0. Embedding the fetched diff into
-            // the reviewer's initial prompt is still gated on
-            // max_embed_diff_lines so operators can disable that separately.
-            if let Some(ref mut ctx) = pr_review_context
+            // For a single-reviewer delta re-review round, fetch only the
+            // compare diff since `last_reviewed_sha` instead of the full PR
+            // diff. Other reviewer paths keep fetching the full PR diff
+            // unconditionally (independent of max_embed_diff_lines) so the
+            // mechanical Boss-construct sweep below always runs, even when
+            // diff embedding is disabled via BOSS_MAX_EMBED_DIFF_LINES=0.
+            let mut delta_diff_content: Option<String> = None;
+            let mut delta_history_rewritten = false;
+            if let Some(ref target_sha) = solo_delta_target_sha {
+                if let (Some(slug), Some(last_sha)) = (
+                    parsed_repo_slug.as_deref(),
+                    last_reviewed_sha.as_deref().filter(|s| !s.is_empty()),
+                ) && !target_sha.is_empty()
+                    && last_sha != target_sha
+                {
+                    let history = match delta_diff_source.as_deref() {
+                        Some(src) => src.fetch_delta_history(slug, last_sha, target_sha).await,
+                        None => fetch_delta_history(slug, last_sha, target_sha).await,
+                    };
+                    delta_history_rewritten = history == DeltaHistory::Rewritten;
+                    // A rebased, amended or main-merged head makes the compare
+                    // diff wrong, so review the full PR diff instead.
+                    let diff = if delta_history_rewritten {
+                        match delta_diff_source.as_deref() {
+                            Some(src) => src.fetch_pr_diff(pr_url).await,
+                            None => fetch_pr_diff(pr_url).await,
+                        }
+                    } else {
+                        match delta_diff_source.as_deref() {
+                            Some(src) => src.fetch_compare_diff(slug, last_sha, target_sha).await,
+                            None => fetch_compare_diff(slug, last_sha, target_sha).await,
+                        }
+                    };
+                    if let Some(diff) = diff {
+                        if let Some(ref mut ctx) = pr_review_context {
+                            let diff_hits = crate::boss_construct_scan::scan_diff_added_lines(&diff);
+                            ctx.boss_construct_refs
+                                .extend(crate::boss_construct_scan::hit_lines(&diff_hits));
+                        }
+                        let line_count = diff.lines().count() as u64;
+                        if max_embed_diff_lines > 0 && line_count <= max_embed_diff_lines {
+                            tracing::info!(
+                                execution_id = %execution.id,
+                                pr_url,
+                                last_sha,
+                                target_sha,
+                                line_count,
+                                max_embed_diff_lines,
+                                delta_history_rewritten,
+                                "pr_review execution: embedding diff in solo re-reviewer prompt",
+                            );
+                            delta_diff_content = Some(diff);
+                        } else {
+                            tracing::debug!(
+                                execution_id = %execution.id,
+                                pr_url,
+                                last_sha,
+                                target_sha,
+                                line_count,
+                                max_embed_diff_lines,
+                                "pr_review execution: diff too large to embed, or embedding disabled; \
+                                 reviewer will fetch it",
+                            );
+                        }
+                    }
+                }
+            } else if let Some(ref mut ctx) = pr_review_context
                 && let Some(diff) = fetch_pr_diff(pr_url).await
             {
                 // Mechanical assist for the agent-isms "Boss-construct
@@ -1020,47 +1229,6 @@ pub async fn compose_worker_spawn(
                     crate::pr_review::classify_changed_files(&files)
                 }
                 None => crate::pr_review::ReviewScope::Code,
-            };
-            let reviewer_repo_slug = git_utils::repo_slug::parse_github_slug(&execution.repo_remote_url)
-                .unwrap_or_else(|| "<owner/repo>".to_owned());
-            // A member row existing is the same signal `finalize_pr_review_pass`
-            // uses to take the batch branch unconditionally (it never falls
-            // back to reading the legacy artifact once a member row exists).
-            // So once we observe a member row here, the batch destination is
-            // the ONLY delivery channel the finalizer will ever read for this
-            // execution: falling back to the legacy prompt in that case would
-            // render a prompt whose artifact/transcript delivery instructions
-            // the finalizer is guaranteed to ignore, silently discarding a
-            // review the worker actually completed. Fail the dispatch instead
-            // so the execution surfaces as a real failure rather than a
-            // reviewer that appears to succeed but whose report vanishes.
-            let member_and_batch = match work_db.review_batch_member_for_execution(&execution.id) {
-                Ok(Some(member)) => match work_db.review_batch(&member.batch_id) {
-                    Ok(Some(batch)) => Some((member, batch)),
-                    Ok(None) => {
-                        anyhow::bail!(
-                            "pr_review execution {} has review-batch member for batch {} but the batch row is \
-                             missing; refusing to dispatch with the legacy prompt, which finalize_pr_review_pass \
-                             would never read",
-                            execution.id,
-                            member.batch_id,
-                        );
-                    }
-                    Err(err) => {
-                        return Err(err).context(format!(
-                            "loading review batch {} for execution {} member row; refusing to dispatch with the \
-                             legacy prompt, which finalize_pr_review_pass would never read",
-                            member.batch_id, execution.id,
-                        ));
-                    }
-                },
-                Ok(None) => None,
-                Err(err) => {
-                    return Err(err).context(format!(
-                        "determining whether reviewer execution {} belongs to a review batch",
-                        execution.id,
-                    ));
-                }
             };
             // The batch's cycle root (`execution.work_item_id` in the batch
             // path) is a revision's producing item collapsed for review-cycle
@@ -1104,6 +1272,7 @@ pub async fn compose_worker_spawn(
             let report_destination = match member_and_batch {
                 Some((member, batch)) => Some((
                     member.role,
+                    batch.single_reviewer,
                     crate::pr_review::ReviewerReportDestination::builder()
                         .batch_id(batch.id)
                         .pr_url(batch.pr_url)
@@ -1118,8 +1287,7 @@ pub async fn compose_worker_spawn(
                 None => None,
             };
             let prompt = match report_destination.as_ref() {
-                Some((ReviewBatchMemberRole::Supervisor, destination)) => {
-                    let cycle_root_id = work_db.review_cycle_root_id(&execution.work_item_id);
+                Some((ReviewBatchMemberRole::Supervisor, _, destination)) => {
                     let reports = load_batch_leaf_reports(work_db, &cycle_root_id, &destination.batch_id)
                         .context("loading accepted leaf reports for supervisor prompt")?;
                     let mut configured_roles = work_db
@@ -1136,7 +1304,7 @@ pub async fn compose_worker_spawn(
                         &reviewer_repo_slug,
                     )
                 }
-                Some((ReviewBatchMemberRole::PostMergeReviewer, destination)) => {
+                Some((ReviewBatchMemberRole::PostMergeReviewer, _, destination)) => {
                     crate::pr_review::render_post_merge_reviewer_initial_prompt(
                         &review_brief,
                         destination,
@@ -1144,7 +1312,40 @@ pub async fn compose_worker_spawn(
                         &reviewer_repo_slug,
                     )
                 }
-                Some((_, destination)) => crate::pr_review::render_batch_reviewer_initial_prompt(
+                Some((_, true, destination)) => {
+                    let prior_round = match work_db.latest_prior_pre_merge_review_round(
+                        &cycle_root_id,
+                        &destination.pr_url,
+                        Some(&destination.batch_id),
+                    ) {
+                        Ok(round) => round,
+                        Err(err) => {
+                            tracing::warn!(
+                                execution_id = %execution.id,
+                                batch_id = %destination.batch_id,
+                                cycle_root_id = %cycle_root_id,
+                                ?err,
+                                "pr_review execution: failed to load prior round findings for delta re-review brief",
+                            );
+                            None
+                        }
+                    };
+                    let delta_ctx = crate::pr_review::DeltaRereviewContext::builder()
+                        .maybe_prior_round(prior_round)
+                        .maybe_delta_diff_content(delta_diff_content)
+                        .history_rewritten(delta_history_rewritten)
+                        .maybe_last_reviewed_sha(last_reviewed_sha)
+                        .build();
+                    crate::pr_review::render_delta_rereviewer_initial_prompt(
+                        &review_brief,
+                        destination,
+                        scope,
+                        pr_review_context.as_ref(),
+                        &delta_ctx,
+                        &reviewer_repo_slug,
+                    )
+                }
+                Some((_, false, destination)) => crate::pr_review::render_batch_reviewer_initial_prompt(
                     &review_brief,
                     destination,
                     scope,

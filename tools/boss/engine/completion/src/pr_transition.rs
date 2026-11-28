@@ -18,20 +18,80 @@ struct BatchReviewPrView {
     deletions: Option<i64>,
 }
 
+/// Single routing decision for `delta_rereview`, shared across every automatic
+/// pre-merge review trigger site (`finalize_pr_transition`,
+/// `maybe_enqueue_declared_delivery_reviewer`, the merge poller's
+/// deferred-admission sweep, and unpark reconcile; the last two reach it
+/// through `CompletionRequests::delta_rereview_decision`).
+///
+/// Returns both:
+/// - `arm`: the admission-time `delta_rereview` arm for this PR family
+///   (`Treatment` / `Control` when `delta_rereview` is active in
+///   `pre_merge_review`, `None` when off or held, or on DB read error).
+/// - `single_reviewer_light`: `true` only when `arm == Some(Treatment)` AND
+///   the PR family is on round 2 or later (`review_cycle >= 1`) with a
+///   recorded `last_reviewed_sha` to compute a delta against.
+pub fn delta_rereview_decision(
+    feature_flags: &crate::feature_flags::FeatureFlagsStore,
+    work_db: &crate::work::WorkDb,
+    work_item_id: &str,
+) -> boss_observation_contracts::DeltaRereviewDecision {
+    let cycle_root_id = work_db.review_cycle_root_id(work_item_id);
+    let (review_cycle, last_reviewed_sha) = match work_db.get_task_review_cycle_state(&cycle_root_id) {
+        Ok(state) => state,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id,
+                cycle_root_id,
+                ?err,
+                "delta_rereview_decision: failed to read review cycle state; failing closed to full batch",
+            );
+            return boss_observation_contracts::DeltaRereviewDecision::default();
+        }
+    };
+    let state = feature_flags.experiment_state(crate::feature_flags::DELTA_REREVIEW_EXPERIMENT);
+    let bucket = crate::work::experiment_bucket(&cycle_root_id, crate::feature_flags::DELTA_REREVIEW_EXPERIMENT);
+    let arm = match crate::feature_flags::assign_arm(state, bucket) {
+        Some(crate::feature_flags::ExperimentArm::Treatment) => Some(boss_protocol::DeltaRereviewBatchArm::Treatment),
+        Some(crate::feature_flags::ExperimentArm::Control) => Some(boss_protocol::DeltaRereviewBatchArm::Control),
+        _ => None,
+    };
+    let is_repeat_round = review_cycle >= 1 && last_reviewed_sha.as_deref().is_some_and(|s| !s.is_empty());
+    boss_observation_contracts::DeltaRereviewDecision {
+        single_reviewer_light: is_repeat_round && arm == Some(boss_protocol::DeltaRereviewBatchArm::Treatment),
+        arm,
+    }
+}
+
+/// Convenience boolean projection of [`delta_rereview_decision`]: `true` when
+/// this automatic pre-merge review should use the single-reviewer Light-tier
+/// delta re-review path.
+pub fn should_use_delta_rereview(
+    feature_flags: &crate::feature_flags::FeatureFlagsStore,
+    work_db: &crate::work::WorkDb,
+    work_item_id: &str,
+) -> bool {
+    delta_rereview_decision(feature_flags, work_db, work_item_id).single_reviewer_light
+}
+
 /// Fetch and freeze the target metadata before handing it to the atomic DB
 /// creation path. Callers can retain the legacy path if this cannot establish
-/// an immutable target SHA. Shared by `finalize_pr_transition` and the
-/// merge poller's deferred-admission sweep.
-pub(crate) async fn enqueue_review_batch(
+/// an immutable target SHA. Shared by `finalize_pr_transition`,
+/// `maybe_enqueue_declared_delivery_reviewer`, and the merge poller's
+/// deferred-admission sweep.
+pub(crate) async fn enqueue_review_batch_with_mode(
     work_db: &crate::work::WorkDb,
     work_item_id: &str,
     repo_remote_url: &str,
     pr_url: &str,
     review_pool_size: usize,
+    decision: boss_observation_contracts::DeltaRereviewDecision,
 ) -> anyhow::Result<crate::work::ReviewBatchDispatch> {
     let root =
         boss_github::pr_files::fetch_pr_view_json(pr_url, "baseRefOid,headRefOid,files,additions,deletions").await?;
-    let input = review_batch_input_from_metadata(work_db, work_item_id, pr_url, root)?;
+    let mut input = review_batch_input_from_metadata(work_db, work_item_id, pr_url, root)?;
+    input.single_reviewer_light = decision.single_reviewer_light;
+    input.delta_rereview_arm = decision.arm;
     work_db.create_pre_merge_review_batch_for_pool(input, repo_remote_url, review_pool_size)
 }
 
@@ -76,6 +136,11 @@ pub fn review_batch_input_from_metadata(
 }
 
 /// Default enqueuer: fetch immutable SHAs from GitHub, then admit a batch.
+///
+/// It holds no feature-flag state: every trigger site computes the mode with
+/// [`should_use_delta_rereview`] (via `CompletionRequests`) and passes it to
+/// `enqueue_with_mode`, so the routing lives in one place. `enqueue` is the
+/// full multi-leaf batch.
 pub(crate) struct GhReviewBatchEnqueuer;
 
 #[async_trait]
@@ -88,7 +153,35 @@ impl ReviewBatchEnqueuer for GhReviewBatchEnqueuer {
         pr_url: &str,
         review_pool_size: usize,
     ) -> anyhow::Result<crate::work::ReviewBatchDispatch> {
-        enqueue_review_batch(work_db, work_item_id, repo_remote_url, pr_url, review_pool_size).await
+        enqueue_review_batch_with_mode(
+            work_db,
+            work_item_id,
+            repo_remote_url,
+            pr_url,
+            review_pool_size,
+            boss_observation_contracts::DeltaRereviewDecision::default(),
+        )
+        .await
+    }
+
+    async fn enqueue_with_mode(
+        &self,
+        work_db: &crate::work::WorkDb,
+        work_item_id: &str,
+        repo_remote_url: &str,
+        pr_url: &str,
+        review_pool_size: usize,
+        decision: boss_observation_contracts::DeltaRereviewDecision,
+    ) -> anyhow::Result<crate::work::ReviewBatchDispatch> {
+        enqueue_review_batch_with_mode(
+            work_db,
+            work_item_id,
+            repo_remote_url,
+            pr_url,
+            review_pool_size,
+            decision,
+        )
+        .await
     }
 }
 
@@ -433,14 +526,20 @@ impl WorkerCompletionHandler {
                             // same moment and would otherwise both enqueue a `pr_review`
                             // execution for the same unchanged head sha.
                             if self.feature_flags.is_enabled("review_batch_fanout") {
+                                let decision = delta_rereview_decision(
+                                    &self.feature_flags,
+                                    &self.work_db,
+                                    &producing.work_item_id,
+                                );
                                 match self
                                     .review_batch_enqueuer
-                                    .enqueue(
+                                    .enqueue_with_mode(
                                         &self.work_db,
                                         &producing.work_item_id,
                                         &producing.repo_remote_url,
                                         &pr_url,
                                         self.review_pool_size,
+                                        decision,
                                     )
                                     .await
                                 {

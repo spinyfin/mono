@@ -537,4 +537,101 @@ impl WorkDb {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
+
+    /// Load the immediately preceding informative pre-merge review round for
+    /// `cycle_root_id`'s `pr_url` (excluding `exclude_batch_id`, if any), to
+    /// seed a repeat delta re-review brief with the prior round's findings.
+    ///
+    /// Reads structured findings from `worker_proposals.payload_json` when the
+    /// prior round was a review batch (either a two-leaf + supervisor batch or
+    /// a prior single-reviewer delta batch). Falls back to the minted revision
+    /// task's rendered instructions when the prior round came from the legacy
+    /// single-reviewer path. Returns `None` when no informative pre-merge
+    /// verdict exists for this PR.
+    pub fn latest_prior_pre_merge_review_round(
+        &self,
+        cycle_root_id: &str,
+        pr_url: &str,
+        exclude_batch_id: Option<&str>,
+    ) -> Result<Option<boss_pr_review::PriorReviewRound>> {
+        let conn = self.connect()?;
+        let root = super::chain_helpers::chain_root(&conn, cycle_root_id)?;
+        let mut family_ids = super::chain_helpers::collect_chain_revision_ids_including_deleted(&conn, &root)?;
+        family_ids.push(root);
+        let id_placeholders = vec!["?"; family_ids.len()].join(", ");
+        let informative_outcomes = INFORMATIVE_GATE_OUTCOMES
+            .iter()
+            .map(|outcome| format!("'{outcome}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT v.head_sha, p.payload_json, t.description
+             FROM pr_review_verdicts v
+             LEFT JOIN worker_proposals p ON p.id = v.proposal_id
+             LEFT JOIN pr_review_batches b ON b.id = v.batch_id
+             LEFT JOIN work_executions e ON e.id = v.execution_id
+             LEFT JOIN tasks t ON t.id = v.revision_task_id
+             WHERE v.work_item_id IN ({id_placeholders})
+               AND v.gate_outcome IN ({informative_outcomes})
+               AND COALESCE(b.phase, 'pre_merge') = 'pre_merge'
+               AND COALESCE(b.pr_url, e.pr_url) = ?
+               AND (? IS NULL OR v.batch_id IS NULL OR v.batch_id != ?)
+             ORDER BY v.created_at DESC, v.id DESC
+             LIMIT 1"
+        );
+        let mut values: Vec<&dyn rusqlite::ToSql> = family_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        values.push(&pr_url);
+        values.push(&exclude_batch_id);
+        values.push(&exclude_batch_id);
+        let row: Option<(Option<String>, Option<String>, Option<String>)> = conn
+            .query_row(&sql, values.as_slice(), |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .optional()?;
+        let Some((head_sha, payload_json, revision_description)) = row else {
+            return Ok(None);
+        };
+        if let Some(payload_json) = payload_json {
+            let payload: boss_protocol::ReviewVerdictProposalPayload =
+                serde_json::from_str(&payload_json).context("parsing prior review_verdict proposal payload")?;
+            let verdict: boss_pr_review::SupervisorVerdict =
+                serde_json::from_value(payload.verdict).context("parsing prior SupervisorVerdict for delta brief")?;
+            let findings = verdict
+                .findings
+                .into_iter()
+                .map(|finding| {
+                    boss_pr_review::PriorReviewFinding::builder()
+                        .maybe_id(finding.id)
+                        .severity(finding.severity)
+                        .category(finding.category)
+                        .file(finding.file)
+                        .maybe_location(finding.location)
+                        .title(finding.title)
+                        .detail(finding.detail)
+                        .build()
+                })
+                .collect();
+            let resolved_head = if !verdict.target_sha.is_empty() {
+                Some(verdict.target_sha)
+            } else {
+                head_sha
+            };
+            return Ok(Some(
+                boss_pr_review::PriorReviewRound::builder()
+                    .maybe_head_sha(resolved_head)
+                    .summary(verdict.summary)
+                    .findings(findings)
+                    .build(),
+            ));
+        }
+        let legacy_instructions = revision_description
+            .map(|desc| desc.trim().to_owned())
+            .filter(|desc| !desc.is_empty());
+        Ok(Some(
+            boss_pr_review::PriorReviewRound::builder()
+                .maybe_head_sha(head_sha)
+                .maybe_legacy_revision_instructions(legacy_instructions)
+                .build(),
+        ))
+    }
 }

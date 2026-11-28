@@ -152,7 +152,26 @@ impl Fixture {
         Self::build(ScriptedBudget::unlimited(), Some(ladder))
     }
 
+    /// The engine with review-batch fan-out and the `delta_rereview`
+    /// experiment (A/B split on) enabled.
+    pub(super) fn with_delta_rereview() -> Self {
+        Self::build_with_flags(
+            ScriptedBudget::unlimited(),
+            None,
+            &[
+                "review_batch_fanout",
+                crate::feature_flags::TOKEN_EXPERIMENTS_FLAG,
+                crate::feature_flags::DELTA_REREVIEW_EXPERIMENT,
+                crate::feature_flags::DELTA_REREVIEW_AB_SPLIT_FLAG,
+            ],
+        )
+    }
+
     fn build(budget: Arc<ScriptedBudget>, ladder: Option<Arc<RecordingLadder>>) -> Self {
+        Self::build_with_flags(budget, ladder, &[])
+    }
+
+    fn build_with_flags(budget: Arc<ScriptedBudget>, ladder: Option<Arc<RecordingLadder>>, enabled: &[&str]) -> Self {
         let (dir, db) = open_db_arc();
         let probe = StubProbe::new();
         let events = Arc::new(RecordingDispatchEventSink::new());
@@ -163,6 +182,9 @@ impl Fixture {
         flags
             .set("conflict_ladder_mechanical_rebase", ladder.is_some())
             .unwrap();
+        for flag in enabled {
+            flags.set(flag, true).unwrap();
+        }
         let handler = Arc::new(
             WorkerCompletionHandler::new(
                 db.clone(),

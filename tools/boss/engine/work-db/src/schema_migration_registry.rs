@@ -581,6 +581,11 @@ pub(super) fn all() -> Vec<Migration> {
             },
         },
         Migration {
+            id: review_batch_solo::REVIEW_BATCH_SINGLE_REVIEWER_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: review_batch_solo::migrate_review_batch_single_reviewer,
+        },
+        Migration {
             id: review_guide_sources::RETENTION_INDEXES_MIGRATION_ID.into(),
             legacy_version: None,
             apply: review_guide_sources::migrate_retention_indexes,
@@ -860,6 +865,45 @@ mod tests {
             )
             .unwrap();
         assert_eq!(applied, 1, "the upgrade must record the named migration");
+        drop(dir);
+    }
+
+    #[test]
+    fn review_batch_single_reviewer_migration_defaults_existing_batches_to_zero_and_upgrades_cleanly() {
+        let (dir, db) = crate::test_support::open_db();
+        let path = db.path().to_path_buf();
+        {
+            let conn = db.connect().unwrap();
+            assert!(
+                super::super::table_has_column(&conn, "pr_review_batches", "single_reviewer").unwrap(),
+                "fresh schema must include pr_review_batches.single_reviewer"
+            );
+            assert!(
+                super::super::table_has_column(&conn, "pr_review_batches", "delta_rereview_arm").unwrap(),
+                "fresh schema must include pr_review_batches.delta_rereview_arm"
+            );
+            conn.execute_batch(
+                "ALTER TABLE pr_review_batches DROP COLUMN single_reviewer;
+                 ALTER TABLE pr_review_batches DROP COLUMN delta_rereview_arm;
+                 DELETE FROM schema_migrations WHERE id = '20261127_2200_review_batch_single_reviewer';",
+            )
+            .unwrap();
+            assert!(!super::super::table_has_column(&conn, "pr_review_batches", "single_reviewer").unwrap());
+            assert!(!super::super::table_has_column(&conn, "pr_review_batches", "delta_rereview_arm").unwrap());
+        }
+        drop(db);
+        let upgraded = crate::WorkDb::open(path).unwrap();
+        let conn = upgraded.connect().unwrap();
+        assert!(super::super::table_has_column(&conn, "pr_review_batches", "single_reviewer").unwrap());
+        assert!(super::super::table_has_column(&conn, "pr_review_batches", "delta_rereview_arm").unwrap());
+        let applied: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE id = '20261127_2200_review_batch_single_reviewer'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(applied, 1);
         drop(dir);
     }
 }
