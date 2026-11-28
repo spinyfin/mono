@@ -15,8 +15,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use boss_protocol::{
-    CostBucket, CostTopRow, DRIVER_SLUG_AGY, DRIVER_SLUG_GROK, ExecutionCostRow, TaskCostReport, TopCostReport,
-    WindowCostReport,
+    CostBucket, CostTopRow, CostUnmeasuredCoordinatorRow, DRIVER_SLUG_AGY, DRIVER_SLUG_GROK, ExecutionCostRow,
+    TaskCostReport, TopCostReport, WindowCostReport,
 };
 
 use boss_usage_report::{RunFold, RunSample, RunTokens, UsdOutcome, cause};
@@ -449,11 +449,33 @@ pub fn build_top_cost_report(
 ) -> TopCostReport {
     let mut gaps: BTreeSet<String> = BTreeSet::new();
     let mut excluded_unmeasured_count = 0u32;
+    let mut unmeasured_coordinator: BTreeMap<&str, CostUnmeasuredCoordinatorRow> = BTreeMap::new();
     let mut rows: Vec<CostTopRow> = Vec::new();
+    let measured_sessions: BTreeSet<&str> = records
+        .iter()
+        .filter(|record| run_tokens(record).is_measured())
+        .map(|record| record.execution_id.as_str())
+        .collect();
 
     for record in records {
         if !run_tokens(record).is_measured() {
             excluded_unmeasured_count += 1;
+            if record.execution_kind == boss_protocol::COORDINATOR_USAGE_KIND
+                && !measured_sessions.contains(record.execution_id.as_str())
+            {
+                // An unreadable coordinator is unknown, not absent: list its
+                // session (unranked) with the reason capture gave.
+                unmeasured_coordinator
+                    .entry(record.execution_id.as_str())
+                    .or_insert_with(|| {
+                        CostUnmeasuredCoordinatorRow::builder()
+                            .execution_id(record.execution_id.clone())
+                            .label(boss_protocol::coordinator_session_label(&record.execution_id))
+                            .status(record.run_status.clone())
+                            .maybe_reason(record.usage_unavailable.clone())
+                            .build()
+                    });
+            }
             continue;
         }
         let total_tokens = run_tokens(record).known_total();
@@ -510,6 +532,7 @@ pub fn build_top_cost_report(
     TopCostReport::builder()
         .rows(rows)
         .excluded_unmeasured_count(excluded_unmeasured_count)
+        .unmeasured_coordinator(unmeasured_coordinator.into_values().collect())
         .generated_at_epoch_s(generated_at_epoch_s)
         .limit(limit)
         .pricing_gaps(gaps.into_iter().collect())
@@ -863,5 +886,77 @@ mod tests {
             assert!(report.overall.estimated_usd.is_none());
             assert!(report.overall.estimated_usd_partial);
         }
+    }
+
+    fn coord_unknown_again() -> CostRunRecord {
+        let mut record = record("coord_run_9", "coord_sess_only");
+        record.execution_kind = boss_protocol::COORDINATOR_USAGE_KIND.to_owned();
+        record.usage_unavailable = Some("Coordinator transcript not found".to_owned());
+        record
+    }
+
+    #[test]
+    fn window_and_top_reports_include_coordinator_category_and_keep_unreadable_unknown() {
+        let worker = measured(record("run_worker", "exec_worker"), 100, 50, 0, 0);
+        let mut coord_measured = measured(record("coord_run_1", "coord_sess_a"), 1_000, 200, 300, 500);
+        coord_measured.execution_kind = boss_protocol::COORDINATOR_USAGE_KIND.to_owned();
+        coord_measured.work_item_id = boss_protocol::COORDINATOR_USAGE_KIND.to_owned();
+        coord_measured.work_item_name = "Coordinator session sess-a".to_owned();
+        coord_measured.driver = Some("claude".to_owned());
+        coord_measured.model = Some("claude-opus-4-6".to_owned());
+
+        let mut coord_unknown = record("coord_run_2", "coord_sess_b");
+        coord_unknown.execution_kind = boss_protocol::COORDINATOR_USAGE_KIND.to_owned();
+        coord_unknown.work_item_id = boss_protocol::COORDINATOR_USAGE_KIND.to_owned();
+        coord_unknown.work_item_name = "Coordinator session sess-b".to_owned();
+        coord_unknown.driver = Some("claude".to_owned());
+        coord_unknown.usage_unavailable = Some("Coordinator transcript unreadable".to_owned());
+
+        let window = build_window_cost_report(0, i64::MAX, &[worker.clone(), coord_measured.clone()], false, 0);
+        assert_eq!(window.overall.total_tokens, 150 + 2_000);
+        let coord_bucket = window
+            .by_kind
+            .iter()
+            .find(|b| b.label == boss_protocol::COORDINATOR_USAGE_KIND)
+            .expect("coordinator kind must appear in window report");
+        assert_eq!(coord_bucket.measurement.total_tokens, 2_000);
+
+        let unknown_window = build_window_cost_report(0, i64::MAX, &[coord_unknown.clone()], false, 0);
+        assert_eq!(unknown_window.overall.runs_measured, 0);
+        assert_eq!(unknown_window.overall.runs_unmeasured, 1);
+        assert_eq!(unknown_window.overall.input_tokens, None);
+        assert_eq!(unknown_window.by_kind[0].label, boss_protocol::COORDINATOR_USAGE_KIND);
+        assert_eq!(unknown_window.by_kind[0].measurement.runs_measured, 0);
+
+        let mut mixed_unknown = coord_unknown.clone();
+        mixed_unknown.execution_id = coord_measured.execution_id.clone();
+        for records in [
+            vec![mixed_unknown.clone(), coord_measured.clone()],
+            vec![coord_measured.clone(), mixed_unknown],
+        ] {
+            let mixed = build_top_cost_report(0, i64::MAX, 0, &records, false, 0);
+            assert!(
+                mixed.unmeasured_coordinator.is_empty(),
+                "measurement is checked before ranking truncates rows"
+            );
+        }
+
+        let top = build_top_cost_report(0, i64::MAX, 10, &[worker, coord_measured, coord_unknown], false, 0);
+        assert_eq!(top.rows.len(), 2);
+        assert_eq!(top.rows[0].kind, boss_protocol::COORDINATOR_USAGE_KIND);
+        assert_eq!(top.rows[0].total_tokens, 2_000);
+        assert_eq!(top.excluded_unmeasured_count, 1);
+        assert_eq!(top.unmeasured_coordinator.len(), 1);
+        assert_eq!(top.unmeasured_coordinator[0].execution_id, "coord_sess_b");
+        assert_eq!(top.unmeasured_coordinator[0].label, "Coordinator session b");
+        assert_eq!(
+            top.unmeasured_coordinator[0].reason.as_deref(),
+            Some("Coordinator transcript unreadable")
+        );
+
+        // A window holding only an unreadable coordinator still names it.
+        let only_unknown = build_top_cost_report(0, i64::MAX, 10, &[coord_unknown_again()], false, 0);
+        assert!(only_unknown.rows.is_empty());
+        assert_eq!(only_unknown.unmeasured_coordinator.len(), 1);
     }
 }

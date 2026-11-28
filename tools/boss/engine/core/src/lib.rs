@@ -66,6 +66,7 @@ mod conflict_workspace;
 pub mod coordinator_guidance;
 pub mod coordinator_handoff;
 pub mod coordinator_tmux;
+pub mod coordinator_usage;
 pub mod cost_pricing;
 pub mod cost_report;
 pub use boss_host_execution::cube as cube_commands;

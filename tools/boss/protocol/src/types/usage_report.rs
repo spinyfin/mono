@@ -34,6 +34,32 @@ use std::str::FromStr;
 
 use super::{CostBucket, CostMeasurement, default_true};
 
+/// Machine execution-kind value for Boss coordinator session usage rows,
+/// series cells, and `boss cost` reports. Coordinator sessions are not
+/// `work_executions` rows, so this lives here rather than on `ExecutionKind`.
+pub const COORDINATOR_USAGE_KIND: &str = "coordinator";
+
+/// Prefix of the synthetic `execution_id` projected from a coordinator session.
+pub const COORDINATOR_EXECUTION_ID_PREFIX: &str = "coord_sess_";
+
+/// Prefix of the placeholder `session_id` recorded for a live coordinator
+/// launch whose transcript could not be located or read yet.
+pub const COORDINATOR_UNREADABLE_SPAWN_PREFIX: &str = "spawn:";
+
+/// The one human-readable name for a coordinator session, derived from its
+/// session id, synthetic execution id, or placeholder id. The engine sends
+/// this as the label so the CLI and app never re-derive it.
+pub fn coordinator_session_label(id: &str) -> String {
+    let id = id.strip_prefix(COORDINATOR_EXECUTION_ID_PREFIX).unwrap_or(id);
+    let id = id.strip_prefix(COORDINATOR_UNREADABLE_SPAWN_PREFIX).unwrap_or(id);
+    let short: String = if id.len() > 24 {
+        id.chars().take(8).collect()
+    } else {
+        id.to_owned()
+    };
+    format!("Coordinator session {short}")
+}
+
 /// A way to slice usage: filter by it, group by it, or list its observed values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -389,6 +415,10 @@ pub struct ExecutionUsageNode {
     pub model_launched: Option<String>,
     pub pr_url: Option<String>,
     pub started_at_epoch_s: Option<i64>,
+    /// Engine-supplied display name for executions that are not worker
+    /// executions (a coordinator session). `None` for ordinary executions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_label: Option<String>,
 }
 
 /// One task with its own executions and, on a chain root, its revisions.
@@ -473,6 +503,11 @@ pub struct UsageGroup {
     #[serde(default)]
     #[builder(default)]
     pub taskless: Vec<ExecutionUsageNode>,
+    /// Direct sum of coordinator runs in this group when present. Always
+    /// included in `measurement`; carried so clients can render a top-level
+    /// Coordinator row without summing executions themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_measurement: Option<CostMeasurement>,
 }
 
 /// One observed value of a dimension and how many runs carry it.
@@ -573,6 +608,11 @@ pub struct TokenUsageRowsReport {
     #[serde(default)]
     #[builder(default)]
     pub tasks: Vec<TaskUsageNode>,
+    /// Direct sum of coordinator runs in this reply when present. Always
+    /// included in `overall`; carried so clients can render a top-level
+    /// Coordinator row without summing executions themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_measurement: Option<CostMeasurement>,
 }
 
 // ── Bucketed usage series (`GetTokenUsageSeries`) ─────────────────────────
@@ -682,7 +722,9 @@ pub struct UsageRatios {
     /// Bucket's measured `total_tokens / distinct_prs` (approximation: runs in
     /// a bucket may belong to PRs that finished in another bucket).
     pub tokens_per_pr: Option<f64>,
-    /// Bucket's measured `total_tokens / runs_measured`.
+    /// Bucket's measured `total_tokens / runs_measured` over worker runs only:
+    /// coordinator hour slices are not units of work, so they are left out of
+    /// both the tokens and the run count.
     pub tokens_per_run: Option<f64>,
 }
 

@@ -9,10 +9,65 @@
 
 use super::*;
 
+/// Minimum spacing between background coordinator usage refreshes.
+const COORDINATOR_USAGE_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(2);
+
 use boss_usage_report::{
     PricedTokens, UsageRowsQuery, UsageSeriesQuery, UsdEstimateResult, UsdEstimator, build_usage_rows_report,
     build_usage_series_report,
 };
+
+impl ServerState {
+    /// Refresh coordinator usage in the background and return immediately, so
+    /// a cost request or a supervisor tick never waits on transcript reads.
+    /// Overlapping refreshes collapse into the one already running; readers
+    /// see the stored slices and pick up new turns on their next request.
+    pub(crate) fn spawn_coordinator_usage_refresh(self: &Arc<Self>) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            state
+                .sync_coordinator_usage_best_effort(Some(COORDINATOR_USAGE_REFRESH_MIN_INTERVAL))
+                .await;
+        });
+    }
+
+    /// Best-effort sync of coordinator session token usage into `work_db`.
+    /// When `min_interval` is `Some`, skips if a sync completed more recently
+    /// than that bound. Never fails the caller: capture errors are logged so
+    /// cost reads and supervisor ticks remain resilient.
+    pub(crate) async fn sync_coordinator_usage_best_effort(&self, min_interval: Option<Duration>) {
+        let Ok(working_directory) = self.resolved_coordinator_session_directory() else {
+            return;
+        };
+        let live_record = self.work_db.coordinator_tmux_record().ok().flatten();
+        if live_record.is_none() && !working_directory.is_dir() {
+            return;
+        }
+        let context = boss_engine_runtime::coordinator_usage::CoordinatorUsageContext::builder()
+            .working_directory(working_directory)
+            .maybe_live_record(live_record)
+            .now_epoch_s(boss_engine_utils::epoch_time::now_epoch_secs())
+            .build();
+        let outcome = match min_interval {
+            Some(interval) => {
+                self.coordinator_usage_recorder
+                    .sync_if_stale(self.work_db.as_ref(), &context, interval)
+                    .await
+            }
+            None => {
+                self.coordinator_usage_recorder
+                    .sync(self.work_db.as_ref(), &context)
+                    .await
+            }
+        };
+        if let Err(error) = outcome {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "coordinator usage capture failed (best-effort)"
+            );
+        }
+    }
+}
 
 pub(super) async fn handle_stuck_report(ctx: Dispatch, req: FrontendRequest) {
     let FrontendRequest::GetStuckReport { minimum_age_secs } = req else {
@@ -83,6 +138,7 @@ pub(super) async fn handle_get_work_item_cost_report(ctx: Dispatch, req: Fronten
 
 pub(super) async fn handle_get_cost_window_report(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
+        server_state,
         work_db,
         sink,
         request_id,
@@ -96,6 +152,7 @@ pub(super) async fn handle_get_cost_window_report(ctx: Dispatch, req: FrontendRe
     else {
         unreachable!()
     };
+    server_state.spawn_coordinator_usage_refresh();
     {
         let records = match work_db.cost_records_for_window(since_epoch_s, until_epoch_s) {
             Ok(records) => records,
@@ -115,6 +172,7 @@ pub(super) async fn handle_get_cost_window_report(ctx: Dispatch, req: FrontendRe
 
 pub(super) async fn handle_get_top_cost_consumers(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
+        server_state,
         work_db,
         sink,
         request_id,
@@ -129,6 +187,7 @@ pub(super) async fn handle_get_top_cost_consumers(ctx: Dispatch, req: FrontendRe
     else {
         unreachable!()
     };
+    server_state.spawn_coordinator_usage_refresh();
     {
         let records = match work_db.cost_records_for_window(since_epoch_s, until_epoch_s) {
             Ok(records) => records,
@@ -179,6 +238,7 @@ const ENGINE_USD_ESTIMATOR: EngineUsdEstimator = EngineUsdEstimator;
 /// pure builder as data, so the builder crate owns none of them.
 pub(super) async fn handle_get_token_usage_rows(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
+        server_state,
         work_db,
         sink,
         request_id,
@@ -208,6 +268,7 @@ pub(super) async fn handle_get_token_usage_rows(ctx: Dispatch, req: FrontendRequ
     if let Err(message) = query.validate() {
         return send_work_error(&sink, &request_id, message);
     }
+    server_state.spawn_coordinator_usage_refresh();
     let records = match work_db.usage_records_for_window(since_epoch_s, until_epoch_s) {
         Ok(records) => records,
         Err(err) => return send_work_error(&sink, &request_id, &err),
@@ -220,6 +281,7 @@ pub(super) async fn handle_get_token_usage_rows(ctx: Dispatch, req: FrontendRequ
 /// range coverage notes.
 pub(super) async fn handle_get_token_usage_series(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
+        server_state,
         work_db,
         sink,
         request_id,
@@ -250,6 +312,7 @@ pub(super) async fn handle_get_token_usage_series(ctx: Dispatch, req: FrontendRe
     if let Err(message) = query.validate() {
         return send_work_error(&sink, &request_id, message);
     }
+    server_state.spawn_coordinator_usage_refresh();
     let records = match work_db.usage_series_records_for_window(since_epoch_s, until_epoch_s) {
         Ok(records) => records,
         Err(err) => return send_work_error(&sink, &request_id, &err),
@@ -504,5 +567,116 @@ mod tests {
             panic!("expected WorkError, got {payload:?}");
         };
         assert!(message.contains("until_epoch_s"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn cost_handlers_include_coordinator_usage_in_window_top_rows_and_series() {
+        let (state, _dir) = test_server_state();
+        state
+            .work_db
+            .upsert_coordinator_session_usage(
+                &boss_work_db::CoordinatorSessionSnapshot::builder()
+                    .session_id("sess-rpc-1")
+                    .slices(vec![
+                        boss_work_db::CoordinatorUsageSlice::builder()
+                            .session_id("sess-rpc-1")
+                            .source("claude_transcript")
+                            .driver("claude")
+                            .launched_model("opus")
+                            .bucket_start_epoch_s(3_600)
+                            .first_event_at(3_700)
+                            .last_event_at(4_100)
+                            .model("claude-opus-4-6")
+                            .input_tokens(600)
+                            .output_tokens(200)
+                            .cache_creation_tokens(100)
+                            .cache_read_tokens(1_100)
+                            .rounds(4)
+                            .agent_active_ms(10_000)
+                            .build(),
+                    ])
+                    .build(),
+            )
+            .unwrap();
+
+        let (_, rows_payload) = ask(&state, request(Vec::new(), Vec::new()), "req-coord-rows").await;
+        let FrontendEvent::TokenUsageRows { report: rows_report } = rows_payload else {
+            panic!("expected TokenUsageRows, got {rows_payload:?}");
+        };
+        assert_eq!(rows_report.overall.total_tokens, 2_000);
+        assert_eq!(
+            rows_report.coordinator_measurement.as_ref().map(|m| m.total_tokens),
+            Some(2_000)
+        );
+        assert_eq!(rows_report.taskless.len(), 1);
+        assert_eq!(rows_report.taskless[0].kind, boss_protocol::COORDINATOR_USAGE_KIND);
+
+        let series_req = FrontendRequest::GetTokenUsageSeries(
+            boss_protocol::TokenUsageSeriesRequest::builder()
+                .since_epoch_s(1_000)
+                .until_epoch_s(9_000)
+                .bucket(boss_protocol::UsageBucketWidth::Day)
+                .group_by(UsageDimension::ExecutionKind)
+                .build(),
+        );
+        let (_, series_payload) = ask_series(&state, series_req, "req-coord-series").await;
+        let FrontendEvent::TokenUsageSeries { report: series_report } = series_payload else {
+            panic!("expected TokenUsageSeries, got {series_payload:?}");
+        };
+        assert_eq!(series_report.groups, vec![boss_protocol::COORDINATOR_USAGE_KIND]);
+        assert_eq!(series_report.buckets[0].cells[0].measurement.total_tokens, 2_000);
+
+        let window_sink = make_session_sink();
+        handle_get_cost_window_report(
+            Dispatch::builder()
+                .server_state(state.clone())
+                .work_db(state.work_db.clone())
+                .sink(window_sink.clone())
+                .session_id("session-cost-window")
+                .request_id("req-coord-window")
+                .recv_instant(std::time::Instant::now())
+                .decode_ms(0.0)
+                .build(),
+            FrontendRequest::GetCostWindowReport {
+                since_epoch_s: 1_000,
+                until_epoch_s: 9_000,
+                estimate_usd: false,
+            },
+        )
+        .await;
+        window_sink.close();
+        let FrontendEvent::CostWindowReport { report: window_report } = window_sink.next().await.unwrap().payload
+        else {
+            panic!("expected CostWindowReport");
+        };
+        assert_eq!(window_report.overall.total_tokens, 2_000);
+        assert_eq!(window_report.by_kind[0].label, boss_protocol::COORDINATOR_USAGE_KIND);
+
+        let top_sink = make_session_sink();
+        handle_get_top_cost_consumers(
+            Dispatch::builder()
+                .server_state(state.clone())
+                .work_db(state.work_db.clone())
+                .sink(top_sink.clone())
+                .session_id("session-cost-top")
+                .request_id("req-coord-top")
+                .recv_instant(std::time::Instant::now())
+                .decode_ms(0.0)
+                .build(),
+            FrontendRequest::GetTopCostConsumers {
+                since_epoch_s: 1_000,
+                until_epoch_s: 9_000,
+                limit: 10,
+                estimate_usd: false,
+            },
+        )
+        .await;
+        top_sink.close();
+        let FrontendEvent::TopCostConsumers { report: top_report } = top_sink.next().await.unwrap().payload else {
+            panic!("expected TopCostConsumers");
+        };
+        assert_eq!(top_report.rows.len(), 1);
+        assert_eq!(top_report.rows[0].kind, boss_protocol::COORDINATOR_USAGE_KIND);
+        assert_eq!(top_report.rows[0].total_tokens, 2_000);
     }
 }

@@ -66,7 +66,7 @@ mod native;
 
 /// Placeholder model Claude stamps on locally synthesized assistant records;
 /// it never priced anything, so it is not an observed model.
-const SYNTHETIC_MODEL: &str = "<synthetic>";
+pub(crate) const SYNTHETIC_MODEL: &str = "<synthetic>";
 
 /// Where a capture's parent transcript came from, which decides whether its
 /// sibling `<stem>/subagents` directory can be found.
@@ -81,14 +81,108 @@ pub enum SubagentSource {
 
 #[derive(Debug, Clone, Default, bon::Builder)]
 #[builder(on(String, into))]
-struct MessageUsage {
-    output_tokens: i64,
-    input_tokens: i64,
-    cache_creation_tokens: i64,
-    cache_read_tokens: i64,
-    cache_creation_5m_tokens: i64,
-    cache_creation_1h_tokens: i64,
-    cache_creation_ttl_split_known: bool,
+pub(crate) struct MessageUsage {
+    pub(crate) output_tokens: i64,
+    pub(crate) input_tokens: i64,
+    pub(crate) cache_creation_tokens: i64,
+    pub(crate) cache_read_tokens: i64,
+    pub(crate) cache_creation_5m_tokens: i64,
+    pub(crate) cache_creation_1h_tokens: i64,
+    pub(crate) cache_creation_ttl_split_known: bool,
+}
+
+/// Decode one Claude assistant `message.usage` object.
+pub(crate) fn decode_claude_message_usage(usage: &serde_json::Map<String, Value>) -> MessageUsage {
+    let cache_creation_tokens = field(usage.get("cache_creation_input_tokens"));
+    let ttl_split = usage.get("cache_creation").and_then(Value::as_object);
+    MessageUsage {
+        output_tokens: field(usage.get("output_tokens")),
+        input_tokens: field(usage.get("input_tokens")),
+        cache_creation_tokens,
+        cache_read_tokens: field(usage.get("cache_read_input_tokens")),
+        cache_creation_5m_tokens: ttl_split
+            .map(|split| field(split.get("ephemeral_5m_input_tokens")))
+            .unwrap_or(0),
+        cache_creation_1h_tokens: ttl_split
+            .map(|split| field(split.get("ephemeral_1h_input_tokens")))
+            .unwrap_or(0),
+        // A zero cache write needs no pricing allocation. For a non-zero
+        // write, NULL split columns are preferable to pretending an absent
+        // breakdown was all one TTL.
+        cache_creation_ttl_split_known: cache_creation_tokens == 0 || ttl_split.is_some(),
+    }
+}
+
+/// The observed model of a Claude assistant message: trimmed, non-empty and
+/// never the synthetic placeholder.
+pub(crate) fn observed_claude_model(message: &serde_json::Map<String, Value>) -> Option<String> {
+    message
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && *model != SYNTHETIC_MODEL)
+        .map(str::to_owned)
+}
+
+/// Provider facts shared by worker and coordinator capture.
+pub(crate) enum ClaudeRecord {
+    Assistant {
+        message_id: String,
+        timestamp: Option<i64>,
+        model: Option<String>,
+        usage: Option<MessageUsage>,
+    },
+    TurnDuration {
+        key: Option<String>,
+        timestamp: Option<i64>,
+        duration_ms: i64,
+    },
+}
+
+pub(crate) fn merge_claude_chunk(existing: &mut Option<MessageUsage>, incoming: Option<MessageUsage>) {
+    if incoming.is_some() {
+        *existing = incoming;
+    }
+}
+
+pub(crate) fn decode_claude_record(value: &Value) -> Option<ClaudeRecord> {
+    let timestamp = value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(boss_engine_utils::iso8601::parse_iso8601_lenient);
+    match value.get("type").and_then(Value::as_str)? {
+        "assistant" => {
+            let message = value.get("message")?.as_object()?;
+            let message_id = message.get("id")?.as_str()?.trim();
+            if message_id.is_empty() {
+                return None;
+            }
+            Some(ClaudeRecord::Assistant {
+                message_id: message_id.into(),
+                timestamp,
+                model: observed_claude_model(message),
+                usage: message
+                    .get("usage")
+                    .and_then(Value::as_object)
+                    .map(decode_claude_message_usage),
+            })
+        }
+        "system" if value.get("subtype").and_then(Value::as_str) == Some("turn_duration") => {
+            Some(ClaudeRecord::TurnDuration {
+                key: value
+                    .get("uuid")
+                    .and_then(Value::as_str)
+                    .filter(|key| !key.is_empty())
+                    .map(str::to_owned),
+                timestamp,
+                duration_ms: value
+                    .get("durationMs")
+                    .or_else(|| value.get("duration_ms"))
+                    .and_then(nonnegative_i64)?,
+            })
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Default, bon::Builder)]
@@ -148,12 +242,8 @@ impl CostAccumulator {
         match value.get("type").and_then(Value::as_str) {
             Some("assistant") => self.ingest_assistant(value),
             Some("system") if value.get("subtype").and_then(Value::as_str) == Some("turn_duration") => {
-                if let Some(duration_ms) = value
-                    .get("durationMs")
-                    .or_else(|| value.get("duration_ms"))
-                    .and_then(nonnegative_i64)
-                {
-                    if let Some(id) = value.get("uuid").and_then(Value::as_str) {
+                if let Some(ClaudeRecord::TurnDuration { key, duration_ms, .. }) = decode_claude_record(value) {
+                    if let Some(id) = key {
                         self.duration_by_id.insert(format!("claude:{id}"), duration_ms);
                     } else {
                         self.anonymous_duration_ms = self.anonymous_duration_ms.saturating_add(duration_ms);
@@ -215,20 +305,15 @@ impl CostAccumulator {
         {
             self.saw_subagent_delegation = true;
         }
-        let Some(message_id) = message.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()) else {
+        let Some(ClaudeRecord::Assistant {
+            message_id,
+            model,
+            usage,
+            ..
+        }) = decode_claude_record(value)
+        else {
             return;
         };
-
-        if let Some(model) = message
-            .get("model")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|model| !model.is_empty() && *model != SYNTHETIC_MODEL)
-        {
-            self.model = Some(model.to_owned());
-            self.observed_models.insert(model.to_owned());
-        }
-
         // A synthesized assistant record is not a model call, and a sidechain
         // record belongs to a subagent's own context. Reserve the message id in
         // transcript order even when a record omits `usage`, so an absent-usage
@@ -239,48 +324,18 @@ impl CostAccumulator {
             && message.get("model").and_then(Value::as_str).map(str::trim) != Some(SYNTHETIC_MODEL)
         {
             match message.get("usage").and_then(Value::as_object) {
-                Some(usage) => self.context.observe_claude_call(message_id, claude_call_context(usage)),
-                None => self.context.reserve_claude_call(message_id),
+                Some(usage) => self
+                    .context
+                    .observe_claude_call(&message_id, claude_call_context(usage)),
+                None => self.context.reserve_claude_call(&message_id),
             }
         }
 
-        let usage = message.get("usage").and_then(Value::as_object).map(|usage| {
-            let cache_creation_tokens = field(usage.get("cache_creation_input_tokens"));
-            let ttl_split = usage.get("cache_creation").and_then(Value::as_object);
-            MessageUsage {
-                output_tokens: field(usage.get("output_tokens")),
-                input_tokens: field(usage.get("input_tokens")),
-                cache_creation_tokens,
-                cache_read_tokens: field(usage.get("cache_read_input_tokens")),
-                cache_creation_5m_tokens: ttl_split
-                    .map(|split| field(split.get("ephemeral_5m_input_tokens")))
-                    .unwrap_or(0),
-                cache_creation_1h_tokens: ttl_split
-                    .map(|split| field(split.get("ephemeral_1h_input_tokens")))
-                    .unwrap_or(0),
-                // A zero cache write needs no pricing allocation. For a
-                // non-zero write, NULL split columns are preferable to
-                // pretending an absent breakdown was all one TTL.
-                cache_creation_ttl_split_known: cache_creation_tokens == 0 || ttl_split.is_some(),
-            }
-        });
-
-        // Claude may emit multiple assistant JSONL records for one API
-        // response (thinking, text, tool use), all sharing message.id. Later
-        // records carry the more complete usage snapshot, so replacement
-        // both deduplicates rounds and avoids freezing an early partial
-        // output-token count.
-        match usage {
-            Some(usage) => {
-                self.messages.insert(message_id.to_owned(), Some(usage));
-            }
-            None => {
-                // Some split records omit usage entirely. They still prove a
-                // round exists, but must not erase a usage snapshot already
-                // observed on another record with the same message id.
-                self.messages.entry(message_id.to_owned()).or_insert(None);
-            }
+        if let Some(model) = model {
+            self.model = Some(model.clone());
+            self.observed_models.insert(model);
         }
+        merge_claude_chunk(self.messages.entry(message_id).or_default(), usage);
     }
 
     fn ingest_codex_usage_record(&mut self, transcript_path: &Path, value: &Value) {
@@ -522,11 +577,11 @@ fn claude_call_context(usage: &serde_json::Map<String, Value>) -> CallContext {
     }
 }
 
-fn field(value: Option<&Value>) -> i64 {
+pub(crate) fn field(value: Option<&Value>) -> i64 {
     value.and_then(nonnegative_i64).unwrap_or(0)
 }
 
-fn nonnegative_i64(value: &Value) -> Option<i64> {
+pub(crate) fn nonnegative_i64(value: &Value) -> Option<i64> {
     value
         .as_i64()
         .filter(|value| *value >= 0)
@@ -713,7 +768,7 @@ fn subagents_dir_for_transcript(transcript_path: &Path) -> Option<PathBuf> {
     Some(parent.join(stem).join("subagents"))
 }
 
-async fn enumerate_subagent_transcripts(transcript_path: &Path) -> Result<Vec<PathBuf>, String> {
+pub(crate) async fn enumerate_subagent_transcripts(transcript_path: &Path) -> Result<Vec<PathBuf>, String> {
     let Some(dir) = subagents_dir_for_transcript(transcript_path) else {
         return Ok(Vec::new());
     };

@@ -1233,6 +1233,20 @@ mod floor_tests {
                     .unwrap();
             }),
         ));
+        steps.push((
+            super::super::coordinator_usage::MIGRATION_ID,
+            Box::new(|c| {
+                super::super::coordinator_usage::migrate(c).unwrap();
+            }),
+        ));
+        steps.push((
+            "20261127_2215_coordinator_usage_facts",
+            Box::new(|c| super::super::coordinator_usage::migrate_facts(c).unwrap()),
+        ));
+        steps.push((
+            "20261127_2305_coordinator_usage_capture_state",
+            Box::new(|c| super::super::coordinator_usage::migrate_capture_state(c).unwrap()),
+        ));
         steps.sort_by_key(|(id, _)| *id);
         for (_, apply) in steps {
             apply(&expected);

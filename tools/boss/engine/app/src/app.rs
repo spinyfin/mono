@@ -881,6 +881,10 @@ struct ServerState {
     /// The dispatcher snapshots these counters to `work_runs` before any
     /// completion gate, preserving spend for runs that become orphaned.
     run_cost_capture: Arc<boss_engine_runtime::run_cost::RunCostCapture>,
+    /// Captures token usage for the Boss coordinator session behind the
+    /// pluggable `CoordinatorUsageSource` interface.
+    #[builder(default = Arc::new(boss_engine_runtime::coordinator_usage::CoordinatorUsageRecorder::for_claude_transcripts()))]
+    coordinator_usage_recorder: Arc<boss_engine_runtime::coordinator_usage::CoordinatorUsageRecorder>,
     /// Reads product markdown trees and documents from GitHub for the
     /// Designs tab. Holds the HEAD-validated per-repo listing cache and
     /// the revalidating body cache, so it lives on `ServerState`
@@ -1297,17 +1301,21 @@ impl ServerState {
     /// missing so an engine-only fixture can still start a coordinator), else
     /// the production directory under Application Support.
     fn coordinator_session_directory(&self) -> anyhow::Result<PathBuf> {
+        let directory = self.resolved_coordinator_session_directory()?;
+        if self.coordinator_working_directory_override.is_none() && self.coordinator_fixture.is_some() {
+            std::fs::create_dir_all(&directory)
+                .with_context(|| format!("create fixture coordinator session directory {}", directory.display()))?;
+        }
+        Ok(directory)
+    }
+
+    /// The directory [`Self::coordinator_session_directory`] resolves to,
+    /// without creating anything. Read paths (usage capture) use this so they
+    /// can never disagree with the directory the coordinator was launched in.
+    fn resolved_coordinator_session_directory(&self) -> anyhow::Result<PathBuf> {
         match (&self.coordinator_working_directory_override, &self.coordinator_fixture) {
             (Some(path), _) => Ok(path.clone()),
-            (None, Some(fixture)) => {
-                std::fs::create_dir_all(&fixture.session_directory).with_context(|| {
-                    format!(
-                        "create fixture coordinator session directory {}",
-                        fixture.session_directory.display()
-                    )
-                })?;
-                Ok(fixture.session_directory.clone())
-            }
+            (None, Some(fixture)) => Ok(fixture.session_directory.clone()),
             (None, None) => boss_engine_runtime::coordinator_tmux::coordinator_working_directory(),
         }
     }

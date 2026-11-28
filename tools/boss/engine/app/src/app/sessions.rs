@@ -834,6 +834,9 @@ impl CoordinatorReset {
                     },
                 );
             }
+            // Capture the outgoing coordinator session's final turns before
+            // replacing it so usage survives restarts and handoffs intact.
+            server_state.sync_coordinator_usage_best_effort(None).await;
             let active_tmux =
                 boss_engine_runtime::coordinator_tmux::resolve_active_handle(&tmux, legacy_tmux.as_ref()).await;
             boss_engine_runtime::coordinator_tmux::recreate_after_confirmation(

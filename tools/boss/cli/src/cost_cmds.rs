@@ -629,6 +629,24 @@ fn print_window_cost_report(report: &WindowCostReport, tz: &DisplayTz) {
     );
 }
 
+fn format_unmeasured_coordinators(report: &TopCostReport) -> String {
+    report
+        .unmeasured_coordinator
+        .iter()
+        .map(|row| {
+            format!(
+                "  {} ({}): usage UNKNOWN, not ranked and not counted as zero{}\n",
+                row.label,
+                row.status,
+                row.reason
+                    .as_deref()
+                    .map(|reason| format!(" — {reason}"))
+                    .unwrap_or_default()
+            )
+        })
+        .collect()
+}
+
 fn print_top_cost_report(report: &TopCostReport, tz: &DisplayTz) {
     println!(
         "Top {} cost consumers from {} to {} ({})",
@@ -643,6 +661,7 @@ fn print_top_cost_report(report: &TopCostReport, tz: &DisplayTz) {
             report.excluded_unmeasured_count,
         );
     }
+    print!("{}", format_unmeasured_coordinators(report));
     print_pricing_gaps(&report.pricing_gaps);
 
     if report.rows.is_empty() {
@@ -966,7 +985,11 @@ fn usage_tree_rows(
         push_task(&mut rows, task, false, depth, usd);
     }
     for execution in taskless {
-        let mut row = vec![format!("(no task) {}", execution.work_item_id)];
+        let heading = execution
+            .display_label
+            .clone()
+            .unwrap_or_else(|| format!("(no task) {}", execution.work_item_id));
+        let mut row = vec![heading];
         row.resize(11, String::new());
         if usd {
             row.push(String::new());
@@ -1456,6 +1479,23 @@ mod tests {
             at_execution[2]
         );
         assert!(!at_execution.iter().any(|row| row[0].contains("run ")));
+
+        let mut coord_exec = usage_execution(
+            vec![usage_run(
+                "coord_run_1",
+                boss_protocol::RunCoverage::Measured,
+                Some(50),
+                "estimate_only",
+            )],
+            Some("claude"),
+        );
+        coord_exec.execution_id = "coord_sess_abcd1234-5678-90ab-cdef-1234567890ab".into();
+        coord_exec.work_item_id = "coordinator:abcd1234-5678-90ab-cdef-1234567890ab".into();
+        coord_exec.kind = boss_protocol::COORDINATOR_USAGE_KIND.into();
+        coord_exec.spend_class = boss_protocol::SpendClass::Overhead;
+        coord_exec.display_label = Some(boss_protocol::coordinator_session_label(&coord_exec.execution_id));
+        let coord_rows = usage_tree_rows(&[], &[coord_exec], UsageDepth::Execution, false);
+        assert_eq!(coord_rows[0][0], "Coordinator session abcd1234");
     }
 
     #[test]
@@ -1664,5 +1704,33 @@ mod tests {
             !grok.contains("| 0.0%"),
             "unmeasured group never gets 0.0% share: {grok}"
         );
+    }
+}
+
+#[cfg(test)]
+mod coordinator_tests {
+    use super::*;
+
+    #[test]
+    fn unreadable_only_session_is_unknown_in_text_and_json() {
+        let label = boss_protocol::coordinator_session_label("short-session");
+        let report: TopCostReport = serde_json::from_value(serde_json::json!({
+            "since_epoch_s":0,"until_epoch_s":3600,"limit":10,"rows":[],
+            "excluded_unmeasured_count":1,"generated_at_epoch_s":3600,
+            "pricing_gaps":[], "truncated":false, "unmeasured_coordinator":[{
+                "execution_id":"coordinator:short-session", "label":label,
+                "status":"active", "reason":"Transcript unreadable"
+            }]
+        }))
+        .unwrap();
+        let text = format_unmeasured_coordinators(&report);
+        assert!(text.contains("Coordinator session short-session"));
+        assert!(text.contains("usage UNKNOWN, not ranked and not counted as zero"));
+        assert!(text.contains("Transcript unreadable"));
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["unmeasured_coordinator"][0]["label"], label);
+        assert_eq!(json["unmeasured_coordinator"][0]["reason"], "Transcript unreadable");
+        assert_eq!(json["rows"], serde_json::json!([]));
+        assert!(json["unmeasured_coordinator"][0].get("total_tokens").is_none());
     }
 }

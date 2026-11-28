@@ -31,10 +31,11 @@
 -- task is done, so the engine has nothing to dispatch or recover.
 --
 -- Expected result over the whole history (also pinned by a test in the work
--- database): 20 runs = 14 measured, 2 partial (Grok, Antigravity: no cache
--- creation), 1 zero, 3 unmeasured (one pre-capture, one with a recorded
--- `usage_unavailable` reason, one with no resolvable driver); 4 executions
--- with no task.
+-- database): 24 runs = 17 measured, 2 partial (Grok, Antigravity: no cache
+-- creation), 1 zero, 4 unmeasured (one pre-capture, one with a recorded
+-- `usage_unavailable` reason, one with no resolvable driver, one unreadable
+-- coordinator session); 7 taskless executions (4 worker overhead + 3
+-- coordinator sessions).
 
 CREATE TEMP TABLE seed_clock (now INTEGER NOT NULL);
 INSERT INTO seed_clock VALUES (CAST(strftime('%s', 'now') AS INTEGER));
@@ -127,5 +128,52 @@ INSERT INTO work_runs (id, execution_id, agent_id, status, created_at, started_a
   ('run_seed_t2_1', 'exec_seed_t2', 'guide-1',  'completed', (SELECT now - 2 * 3600 FROM seed_clock),   (SELECT now - 2 * 3600 FROM seed_clock),   (SELECT now - 2 * 3600 FROM seed_clock),   'local', 'gpt-6-astra',       40000,  1800,  0,     NULL,  NULL,  30000,  6,  90000,    NULL, 14000, 0, 32000, 0),
   ('run_seed_t3_1', 'exec_seed_t3', 'triage-1', 'completed', (SELECT now - 1 * 3600 FROM seed_clock),   (SELECT now - 1 * 3600 FROM seed_clock),   (SELECT now - 1 * 3600 FROM seed_clock),   'local', 'claude-haiku-5-5',  200,    300,   1000,  1000,  0,     20000,  2,  20000,    NULL, 6000, 5500, 8000, 0),
   ('run_seed_unresolved_1', 'exec_seed_unresolved', 'worker-0', 'completed', (SELECT now - 4 * 3600 FROM seed_clock), (SELECT now - 4 * 3600 FROM seed_clock), (SELECT now - 4 * 3600 FROM seed_clock), 'local', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'No provider token usage observed', NULL, NULL, NULL, NULL);
+
+-- Coordinator session usage slices: two measured sessions (including a Haiku
+-- subagent model slice under the historical Opus session, plus an active
+-- session) and one unmeasured session whose transcript could not be read.
+INSERT INTO coordinator_usage_slices (
+  id, session_id, spawn_token, source, driver, launched_model, host_id, status,
+  bucket_start_epoch_s, first_event_at, last_event_at, model_key, model,
+  input_tokens, output_tokens, cache_creation_tokens, cache_creation_5m_tokens,
+  cache_creation_1h_tokens, cache_read_tokens, rounds, agent_active_ms,
+  usage_unavailable, updated_at
+) VALUES
+  (
+    'coord_run_seed_prev_opus', 'coord_seed_prev', 'tok_seed_prev', 'claude_transcript', 'claude', 'opus', 'local', 'completed',
+    (SELECT ((now - 48 * 3600) / 3600) * 3600 FROM seed_clock),
+    (SELECT ((now - 48 * 3600) / 3600) * 3600 + 120 FROM seed_clock),
+    (SELECT ((now - 48 * 3600) / 3600) * 3600 + 2400 FROM seed_clock),
+    'claude-opus-5-5', 'claude-opus-5-5',
+    1800, 12000, 45000, 35000, 10000, 1200000, 38, 960000, NULL,
+    (SELECT now FROM seed_clock)
+  ),
+  (
+    'coord_run_seed_prev_haiku', 'coord_seed_prev', 'tok_seed_prev', 'claude_transcript', 'claude', 'opus', 'local', 'completed',
+    (SELECT ((now - 48 * 3600) / 3600) * 3600 FROM seed_clock),
+    (SELECT ((now - 48 * 3600) / 3600) * 3600 + 600 FROM seed_clock),
+    (SELECT ((now - 48 * 3600) / 3600) * 3600 + 1800 FROM seed_clock),
+    'claude-haiku-5-5', 'claude-haiku-5-5',
+    450, 1800, 6000, 6000, 0, 95000, 9, 180000, NULL,
+    (SELECT now FROM seed_clock)
+  ),
+  (
+    'coord_run_seed_live_opus', 'coord_seed_live', 'tok_seed_live', 'claude_transcript', 'claude', 'opus', 'local', 'active',
+    (SELECT ((now - 6 * 3600) / 3600) * 3600 FROM seed_clock),
+    (SELECT ((now - 6 * 3600) / 3600) * 3600 + 60 FROM seed_clock),
+    (SELECT ((now - 6 * 3600) / 3600) * 3600 + 2700 FROM seed_clock),
+    'claude-opus-5-5', 'claude-opus-5-5',
+    2200, 14500, 68000, 50000, 18000, 1650000, 52, 1320000, NULL,
+    (SELECT now FROM seed_clock)
+  ),
+  (
+    'coord_run_seed_unreadable', 'coord_seed_unreadable', 'tok_seed_bad', 'claude_transcript', 'claude', 'opus', 'local', 'completed',
+    (SELECT ((now - 30 * 3600) / 3600) * 3600 FROM seed_clock),
+    (SELECT ((now - 30 * 3600) / 3600) * 3600 + 300 FROM seed_clock),
+    (SELECT ((now - 30 * 3600) / 3600) * 3600 + 300 FROM seed_clock),
+    '', NULL,
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'Coordinator transcript unreadable',
+    (SELECT now FROM seed_clock)
+  );
 
 DROP TABLE seed_clock;

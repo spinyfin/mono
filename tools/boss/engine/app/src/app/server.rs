@@ -859,6 +859,9 @@ async fn serve_scoped(
                     } else {
                         coordinator_supervisor_state.clear_boss_pid();
                     }
+                    // Capture runs in the background so a slow transcript read
+                    // never delays attach and liveness handling.
+                    coordinator_supervisor_state.spawn_coordinator_usage_refresh();
                     if let (true, Some(record)) = (app_registered, record) {
                         let attached = coordinator_supervisor_state
                             .coordinator_attached_spawn_token

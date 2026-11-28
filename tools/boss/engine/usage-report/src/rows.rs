@@ -15,9 +15,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use boss_protocol::{
-    CallStats, CostBucket, CostMeasurement, ExecutionUsageNode, ModelUsage, RunCoverage, RunUsageRow, SpendClass,
-    TaskUsageNode, TokenUsageRowsReport, UsageCaveatCount, UsageCoverage, UsageDimension, UsageDimensionValue,
-    UsageDimensionValues, UsageFilter, UsageGroup, UsageGroupKey, UsageNote,
+    COORDINATOR_USAGE_KIND, CallStats, CostBucket, CostMeasurement, ExecutionUsageNode, ModelUsage, RunCoverage,
+    RunUsageRow, SpendClass, TaskUsageNode, TokenUsageRowsReport, UsageCaveatCount, UsageCoverage, UsageDimension,
+    UsageDimensionValue, UsageDimensionValues, UsageFilter, UsageGroup, UsageGroupKey, UsageNote,
+    coordinator_session_label,
 };
 
 use crate::classify::{ClassifyContext, RunFacts, UsdEstimator, classify, dimension_value, finalize_kept};
@@ -159,6 +160,7 @@ pub fn build_usage_rows_report(
     // 4. Totals, coverage, notes.
     let overall = measure(&kept);
     let overall_calls = call_stats(&kept);
+    let coordinator_measurement = coordinator_measure(&kept);
     let gaps = pricing_gaps(&kept);
     let coverage = coverage(query, &kept, &gaps, want_usd);
 
@@ -192,6 +194,7 @@ pub fn build_usage_rows_report(
         .pricing_gaps(gaps.into_iter().collect())
         .taskless(taskless)
         .tasks(task_nodes)
+        .maybe_coordinator_measurement(coordinator_measurement)
         .build()
 }
 
@@ -211,6 +214,15 @@ fn call_stats(runs: &[&RunFacts<'_>]) -> CallStats {
         fold.add(&facts.calls());
     }
     fold.finish()
+}
+
+fn coordinator_measure(runs: &[&RunFacts<'_>]) -> Option<CostMeasurement> {
+    let coord: Vec<&RunFacts<'_>> = runs
+        .iter()
+        .copied()
+        .filter(|facts| facts.rec.execution_kind == COORDINATOR_USAGE_KIND)
+        .collect();
+    (!coord.is_empty()).then(|| measure(&coord))
 }
 
 fn spend_class_buckets(runs: &[&RunFacts<'_>]) -> Vec<CostBucket> {
@@ -418,12 +430,14 @@ fn build_groups(
             });
             let measurement = measure(&members);
             let calls = call_stats(&members);
+            let coordinator_measurement = coordinator_measure(&members);
             if dims.len() > 1 {
                 UsageGroup::builder()
                     .key(key.clone())
                     .measurement(measurement)
                     .calls(calls)
                     .subgroups(build_groups(ctx, &members, &dims[1..], &key))
+                    .maybe_coordinator_measurement(coordinator_measurement)
                     .build()
             } else {
                 let (tasks, taskless) = build_tree(ctx, &members);
@@ -433,6 +447,7 @@ fn build_groups(
                     .calls(calls)
                     .tasks(tasks)
                     .taskless(taskless)
+                    .maybe_coordinator_measurement(coordinator_measurement)
                     .build()
             }
         })
@@ -563,6 +578,10 @@ fn execution_nodes(runs: &[&RunFacts<'_>]) -> Vec<ExecutionUsageNode> {
                 .spend_class(first.spend_class)
                 .status(&rec.execution_status)
                 .runs(members.iter().map(|facts| run_row(facts)).collect())
+                .maybe_display_label(
+                    (rec.execution_kind == COORDINATOR_USAGE_KIND)
+                        .then(|| coordinator_session_label(&rec.execution_id)),
+                )
                 .maybe_driver(first.driver.map(str::to_owned))
                 .maybe_effort_launched(rec.execution_effort.clone())
                 .maybe_finished_at_epoch_s(rec.execution_finished_at_epoch_s)

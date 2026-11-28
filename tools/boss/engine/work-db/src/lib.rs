@@ -882,6 +882,7 @@ pub use conflict_stop::{CONFLICT_WORKSPACE_FAILURE, MAX_RUNG1_LEASE_FAILURES, co
 mod coordinator_guidance_cache;
 mod coordinator_handoff_store;
 mod coordinator_tmux;
+pub mod coordinator_usage;
 mod cost_report_db;
 mod create_entities;
 mod critical_priority;
@@ -1038,6 +1039,10 @@ pub use coordinator_guidance_cache::{
 };
 pub use coordinator_handoff_store::HANDOFF_METADATA_KEY;
 pub use coordinator_tmux::CoordinatorTmuxRecord;
+pub use coordinator_usage::{
+    COORDINATOR_EXECUTION_ID_PREFIX, COORDINATOR_UNREADABLE_SPAWN_PREFIX, CoordinatorSessionSnapshot,
+    CoordinatorUsageSlice, coordinator_slice_id,
+};
 // Exported for core's attention_lifecycle; its references to this helper
 // use plain code spans rather than intra-doc links.
 pub use attention_filing::warn_if_lifecycle_undeclared;
