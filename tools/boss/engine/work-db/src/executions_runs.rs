@@ -598,13 +598,18 @@ impl WorkDb {
         let new_id = next_id("exec");
         let dispatch_not_before = dispatch_not_before_epoch.to_string();
         let branch_naming_json = serde_json::to_string(&dead.branch_naming).unwrap_or_default();
+        // Copy `owner_task_id` from the predecessor. A `pr_review_guide`
+        // successor binds to the same comparison; dropping the column would
+        // make its runs task-less even though the predecessor was attributed.
         tx.execute(
             "INSERT INTO work_executions (
                 id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority,
                 created_at, started_at, finished_at, prefer_is_soft,
-                transient_failure_count, dispatch_not_before, branch_naming, dispatch_not_before_source
-             ) VALUES (?1, ?2, ?3, 'ready', ?4, ?5, NULL, NULL, NULL, ?6, ?7, NULL, NULL, ?8, ?9, ?10, ?11, 'failure_backoff')",
+                transient_failure_count, dispatch_not_before, branch_naming, dispatch_not_before_source,
+                owner_task_id
+             ) VALUES (?1, ?2, ?3, 'ready', ?4, ?5, NULL, NULL, NULL, ?6, ?7, NULL, NULL, ?8, ?9, ?10, ?11, 'failure_backoff',
+                (SELECT owner_task_id FROM work_executions WHERE id = ?12))",
             params![
                 new_id,
                 dead.work_item_id,
@@ -617,6 +622,7 @@ impl WorkDb {
                 new_count,
                 dispatch_not_before,
                 branch_naming_json,
+                dead_execution_id,
             ],
         )?;
 

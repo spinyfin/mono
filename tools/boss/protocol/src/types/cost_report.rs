@@ -119,7 +119,9 @@ pub struct ExecutionCostRow {
 }
 
 /// Output shape for `boss cost task <id>` — cost for one work item,
-/// aggregated across every execution and run it has ever had.
+/// aggregated across every execution and run it has ever had, including
+/// the review guides generated for its PR (their `ExecutionCostRow::kind`
+/// is `pr_review_guide`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct TaskCostReport {
@@ -164,7 +166,11 @@ pub struct WindowCostReport {
 }
 
 /// One row of `boss cost top` — a single run, identified well enough
-/// to know what it was.
+/// to know what it was. `work_item_id`, `short_id` and `name` describe the
+/// task the run's spend belongs to; for a review guide that is the task that
+/// owns the PR. A run whose execution has no task (answer agent, automation
+/// triage) carries what its execution is bound to as `work_item_id`, no
+/// `short_id`, and the name `(no task)`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct CostTopRow {
@@ -215,6 +221,13 @@ pub struct CostUnmeasuredCoordinatorRow {
     pub reason: Option<String>,
 }
 
+/// How many unmeasured runs of one execution kind a `boss cost top` window
+/// excluded from its ranking.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnmeasuredKindCount {
+    pub kind: String,
+    pub count: u32,
+}
 /// Output shape for `boss cost top` — the highest-token-cost runs
 /// recorded in `[since_epoch_s, until_epoch_s)`, ranked descending by
 /// `total_tokens`.
@@ -233,6 +246,12 @@ pub struct TopCostReport {
     #[serde(default)]
     #[builder(default)]
     pub unmeasured_coordinator: Vec<CostUnmeasuredCoordinatorRow>,
+    /// `excluded_unmeasured_count` broken down by execution kind, so an
+    /// unmeasured run (a review guide, say) is still identifiable by kind.
+    /// Sorted by kind; counts sum to `excluded_unmeasured_count`.
+    #[serde(default)]
+    #[builder(default)]
+    pub excluded_unmeasured_by_kind: Vec<UnmeasuredKindCount>,
     pub generated_at_epoch_s: i64,
     pub limit: u32,
     pub pricing_gaps: Vec<String>,

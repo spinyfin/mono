@@ -43,9 +43,8 @@ impl RecordedDriver {
 }
 
 /// One `work_runs` row with its owning execution. Task context is looked up
-/// by [`Self::work_item_id`] in [`UsageWindowRecords::tasks`]; an execution
-/// whose work item has no task row (answer agent, review guide, automation
-/// triage) simply has no entry there.
+/// by [`Self::task_key`] in [`UsageWindowRecords::tasks`]; an execution with
+/// no task (answer agent, automation triage) simply has no entry there.
 #[derive(Debug, Clone, PartialEq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct UsageRunRecord {
@@ -96,6 +95,24 @@ pub struct UsageRunRecord {
     pub execution_model: Option<String>,
     /// `work_executions.effort_level`: the effort the execution launched with.
     pub execution_effort: Option<String>,
+    /// The task this run's spend belongs to when the execution binds to
+    /// something else: a review guide execution's `work_item_id` is a source
+    /// comparison, and this is `work_executions.owner_task_id` — the task
+    /// that owns the PR the guide explains, written when the execution is
+    /// created (the same value as `WorkExecution::owning_task_id` on list
+    /// paths). `None` for every execution that binds to its task directly,
+    /// for one that has no task, and for a guide whose owner was never
+    /// recorded: the comparison was already pruned before the owner column
+    /// was backfilled, or the root task row no longer exists.
+    pub owning_task_id: Option<String>,
+}
+
+impl UsageRunRecord {
+    /// The id to look this run's task up by: the owning task when the
+    /// execution does not bind to one itself, else the execution's work item.
+    pub fn task_key(&self) -> &str {
+        self.owning_task_id.as_deref().unwrap_or(&self.work_item_id)
+    }
 }
 
 /// One task a run belongs to, or the chain root of such a task.
@@ -164,6 +181,15 @@ pub struct UsageExecutionRecord {
     pub execution_model: Option<String>,
     /// `work_executions.effort_level`: the effort the execution launched with.
     pub execution_effort: Option<String>,
+    /// As [`UsageRunRecord::owning_task_id`].
+    pub owning_task_id: Option<String>,
+}
+
+impl UsageExecutionRecord {
+    /// As [`UsageRunRecord::task_key`].
+    pub fn task_key(&self) -> &str {
+        self.owning_task_id.as_deref().unwrap_or(&self.work_item_id)
+    }
 }
 
 /// Everything the series builder needs for one window.

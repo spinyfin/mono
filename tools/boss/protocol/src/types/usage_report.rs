@@ -392,8 +392,11 @@ pub struct RunUsageRow {
 #[builder(on(String, into))]
 pub struct ExecutionUsageNode {
     pub execution_id: String,
-    /// The execution's `work_item_id`; for a taskless execution this is a
-    /// comment, comparison or automation id, not a task.
+    /// The execution's `work_item_id`. This is not always a task: an answer
+    /// agent binds to a comment and automation triage to an automation (both
+    /// have no task), and a review guide binds to a source comparison. A
+    /// review guide execution is listed under the task that owns the PR it
+    /// explains, so this field can differ from the enclosing task's id.
     pub work_item_id: String,
     pub created_at_epoch_s: i64,
     pub driver_source: DriverSource,
@@ -499,7 +502,7 @@ pub struct UsageGroup {
     #[serde(default)]
     #[builder(default)]
     pub tasks: Vec<TaskUsageNode>,
-    /// Executions with no task row; leaf groups only.
+    /// Executions with no task; leaf groups only.
     #[serde(default)]
     #[builder(default)]
     pub taskless: Vec<ExecutionUsageNode>,
@@ -599,8 +602,9 @@ pub struct TokenUsageRowsReport {
     #[serde(default)]
     #[builder(default)]
     pub pricing_gaps: Vec<String>,
-    /// Executions with no `tasks` row (answer agent, review guide, automation
-    /// triage); empty when grouped.
+    /// Executions with no task (answer agent, automation triage, and a
+    /// review guide whose owning task can no longer be resolved); empty when
+    /// grouped.
     #[serde(default)]
     #[builder(default)]
     pub taskless: Vec<ExecutionUsageNode>,

@@ -205,7 +205,7 @@ pub fn build_usage_series_report(
         .iter()
         .filter(|run| seen_runs.insert(run.run_id.as_str()))
         .map(|run| {
-            let mut facts = classify(run, tasks.get(run.work_item_id.as_str()).copied());
+            let mut facts = classify(run, tasks.get(run.task_key()).copied());
             price_if_requested(&mut facts, &classify_ctx);
             facts
         })
@@ -248,7 +248,7 @@ pub fn build_usage_series_report(
             if !is_completed && pr_url.is_none() {
                 return None;
             }
-            let task = tasks.get(exec.work_item_id.as_str()).copied();
+            let task = tasks.get(exec.task_key()).copied();
             let exec_runs = runs_by_execution
                 .get(exec.execution_id.as_str())
                 .map(Vec::as_slice)
@@ -442,7 +442,7 @@ fn root_of<'t>(task: &'t UsageTaskRecord, tasks: &HashMap<&str, &UsageTaskRecord
 /// else any run in the chain.
 fn representative_run_for_task<'a>(root_task_id: &str, chain_runs: &[&'a RunFacts<'a>]) -> Option<&'a RunFacts<'a>> {
     latest_run(chain_runs.iter().copied().filter(|facts| {
-        facts.rec.work_item_id == root_task_id
+        facts.rec.task_key() == root_task_id
             && matches!(facts.spend_class, SpendClass::Implementation | SpendClass::Design)
     }))
     .or_else(|| {
@@ -450,7 +450,7 @@ fn representative_run_for_task<'a>(root_task_id: &str, chain_runs: &[&'a RunFact
             chain_runs
                 .iter()
                 .copied()
-                .filter(|facts| facts.rec.work_item_id == root_task_id),
+                .filter(|facts| facts.rec.task_key() == root_task_id),
         )
     })
     .or_else(|| latest_run(chain_runs.iter().copied()))

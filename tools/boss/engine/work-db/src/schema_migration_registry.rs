@@ -388,6 +388,11 @@ pub(super) fn all() -> Vec<Migration> {
             },
         },
         Migration {
+            id: cost_report_db::OWNER_TASK_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: cost_report_db::migrate_execution_owner_task,
+        },
+        Migration {
             id: wait_diagnostics::MIGRATION_ID.into(),
             legacy_version: None,
             apply: wait_diagnostics::migrate,

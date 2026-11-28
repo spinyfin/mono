@@ -415,6 +415,89 @@ fn attributed_task_cost_includes_out_of_window_root_and_revision_runs_without_do
     assert_eq!(day3.ratios.tokens_per_pr, None);
 }
 
+#[test]
+fn a_completed_tasks_cost_and_the_window_total_both_include_its_review_guide_runs() {
+    let since = DAY0;
+    let until = DAY0 + 5 * DAY;
+    let q = UsageSeriesQuery {
+        bucket: Some(UsageBucketWidth::Day),
+        group_by: Some(UsageDimension::ExecutionKind),
+        ..series_query(since, until)
+    };
+    let root = task("root", "root", Some(DAY0 + 2 * DAY + 100));
+    let implementation = with_tokens(
+        run("r_impl", "e_impl", "root", DAY0 + DAY + 10),
+        Some(1_000),
+        Some(100),
+        Some(0),
+        Some(0),
+        Some(60_000),
+    );
+    // The guide binds to a source comparison; the database attributes it to
+    // the task that owns the PR.
+    let mut guide = with_tokens(
+        run("r_guide", "e_guide", "prgc_1", DAY0 + DAY + 20),
+        Some(400),
+        Some(50),
+        Some(0),
+        Some(0),
+        None,
+    );
+    guide.execution_kind = "pr_review_guide".into();
+    guide.owning_task_id = Some("root".into());
+    let mut guide_exec = exec("e_guide", "prgc_1", "completed", DAY0 + DAY + 30);
+    guide_exec.execution_kind = "pr_review_guide".into();
+    guide_exec.owning_task_id = Some("root".into());
+
+    let recs = UsageSeriesRecords {
+        runs: vec![implementation, guide],
+        finished_executions: vec![exec("e_impl", "root", "completed", DAY0 + DAY + 30), guide_exec],
+        tasks: vec![root],
+    };
+    let report = build_usage_series_report(&q, &recs, None);
+    // Groups are ordered by tokens, largest first.
+    assert_eq!(report.groups, vec!["task_implementation", "pr_review_guide"]);
+
+    let day1 = &report.buckets[0];
+    let cell = |group: &str| {
+        let index = report.groups.iter().position(|g| g == group).unwrap();
+        &day1.cells[index]
+    };
+    assert_eq!(cell("pr_review_guide").measurement.total_tokens, 450);
+    assert_eq!(cell("pr_review_guide").measurement.runs_total, 1);
+    assert_eq!(cell("pr_review_guide").executions_completed, 1);
+    assert_eq!(cell("task_implementation").measurement.total_tokens, 1_100);
+
+    // The task completes on day 2. Its cost is its implementation run plus
+    // the guide generated for its PR, counted once.
+    let completed: i64 = report
+        .buckets
+        .iter()
+        .flat_map(|b| b.cells.iter())
+        .map(|c| c.tasks_completed_cost.total_tokens)
+        .sum();
+    let completed_runs: u32 = report
+        .buckets
+        .iter()
+        .flat_map(|b| b.cells.iter())
+        .map(|c| c.tasks_completed_cost.runs_total)
+        .sum();
+    assert_eq!((completed, completed_runs), (1_550, 2));
+
+    // Filtering by the task's product keeps the guide run: it carries its
+    // owning task's dimensions.
+    let filtered = UsageSeriesQuery {
+        group_by: None,
+        filters: vec![UsageFilter {
+            dimension: UsageDimension::Product,
+            values: vec!["prod_a".into()],
+        }],
+        ..q
+    };
+    let report = build_usage_series_report(&filtered, &recs, None);
+    assert_eq!(report.buckets[0].cells[0].measurement.total_tokens, 1_550);
+}
+
 // ── Executions completed, distinct PRs, grouping, share & filters ────────
 
 #[test]

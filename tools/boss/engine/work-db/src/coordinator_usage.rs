@@ -1428,7 +1428,7 @@ fn map_cost_record(row: &Row) -> rusqlite::Result<CostRunRecord> {
         run_id: row.get(0)?,
         execution_id: format!("{COORDINATOR_EXECUTION_ID_PREFIX}{session_id}"),
         work_item_id: COORDINATOR_USAGE_KIND.to_owned(),
-        work_item_name: coordinator_session_label(&session_id),
+        work_item_name: Some(coordinator_session_label(&session_id)),
         execution_kind: COORDINATOR_USAGE_KIND.to_owned(),
         execution_status: status.clone(),
         run_status: status,
@@ -1521,6 +1521,7 @@ fn map_usage_record(row: &Row) -> rusqlite::Result<UsageRunRecord> {
         driver,
         execution_model: launched_model,
         execution_effort: None,
+        owning_task_id: None,
     })
 }
 

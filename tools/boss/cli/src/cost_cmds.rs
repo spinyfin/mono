@@ -660,6 +660,9 @@ fn print_top_cost_report(report: &TopCostReport, tz: &DisplayTz) {
             "  {} run(s) in this window have no recorded tokens and are excluded from ranking (not scored as zero).",
             report.excluded_unmeasured_count,
         );
+        for entry in &report.excluded_unmeasured_by_kind {
+            println!("    {} x {}: unknown tokens", entry.count, entry.kind);
+        }
     }
     print!("{}", format_unmeasured_coordinators(report));
     print_pricing_gaps(&report.pricing_gaps);

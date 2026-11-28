@@ -129,12 +129,12 @@ pub fn build_usage_rows_report(
         .filter(|run| {
             run.run_created_at_epoch_s >= query.since_epoch_s && run.run_created_at_epoch_s < query.until_epoch_s
         })
-        .map(|run| classify(run, tasks.get(run.work_item_id.as_str()).copied()))
+        .map(|run| classify(run, tasks.get(run.task_key()).copied()))
         .collect();
 
     let mut in_window_per_task: HashMap<&str, u32> = HashMap::new();
     for facts in &in_window {
-        *in_window_per_task.entry(facts.rec.work_item_id.as_str()).or_default() += 1;
+        *in_window_per_task.entry(facts.rec.task_key()).or_default() += 1;
     }
 
     // 2. Filter chips count what each value would add, so a dimension's own
@@ -475,7 +475,7 @@ fn build_tree(ctx: &TreeCtx<'_>, runs: &[&RunFacts<'_>]) -> (Vec<TaskUsageNode>,
 
     let mut by_task: BTreeMap<&str, Vec<&RunFacts<'_>>> = BTreeMap::new();
     for facts in task_runs {
-        by_task.entry(facts.rec.work_item_id.as_str()).or_default().push(facts);
+        by_task.entry(facts.rec.task_key()).or_default().push(facts);
     }
     // Chain root → the tasks of that chain that have runs here.
     let mut chains: BTreeMap<&str, Vec<&str>> = BTreeMap::new();

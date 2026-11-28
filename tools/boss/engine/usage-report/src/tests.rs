@@ -1639,3 +1639,144 @@ fn coordinator_runs_are_included_in_totals_grouped_as_coordinator_and_omit_subag
     assert!(filtered.tasks.is_empty());
     assert_eq!(filtered.taskless.len(), 1);
 }
+
+// ── Review guide attribution ──────────────────────────────────────────────
+
+/// A review guide run: bound to a source comparison, owned by the task `owner`.
+fn guide_run(id: &str, execution: &str, owner: Option<&str>, created: i64) -> UsageRunRecord {
+    let mut record = with_driver(run(id, execution, "prgc_1", created), Some("codex"));
+    record.execution_kind = "pr_review_guide".into();
+    record.owning_task_id = owner.map(str::to_owned);
+    record
+}
+
+#[test]
+fn a_review_guide_run_is_listed_under_the_task_that_owns_its_pr() {
+    let recs = records(
+        vec![
+            tokens(run("r_impl", "e_impl", "t1", BASE_EPOCH_S), 100, 10, 0, 0),
+            tokens(
+                guide_run("r_guide", "e_guide", Some("t1"), BASE_EPOCH_S + 1),
+                200,
+                5,
+                0,
+                40,
+            ),
+            // A second guide attempt that recorded no usage.
+            guide_run("r_guide_failed", "e_guide_failed", Some("t1"), BASE_EPOCH_S + 2),
+        ],
+        // Four runs ever: the three here and one outside the window.
+        vec![task("t1", "t1", 4)],
+    );
+    let report = build(&window(), &recs);
+
+    assert!(
+        report.taskless.is_empty(),
+        "a guide with an owning task is not task-less"
+    );
+    let node = &report.tasks[0];
+    let kinds: Vec<(&str, &str)> = node
+        .executions
+        .iter()
+        .map(|e| (e.kind.as_str(), e.work_item_id.as_str()))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("task_implementation", "t1"),
+            ("pr_review_guide", "prgc_1"),
+            ("pr_review_guide", "prgc_1")
+        ],
+        "the guide keeps its own kind and the comparison it is bound to"
+    );
+    let guide = &node.executions[1];
+    assert_eq!(guide.spend_class, SpendClass::Overhead);
+    assert_eq!(guide.measurement.total_tokens, 245);
+    assert_eq!(guide.runs[0].input_convention, InputConvention::Gross);
+
+    assert_eq!(
+        node.direct.total_tokens,
+        110 + 245,
+        "the task's cost includes its guide"
+    );
+    assert_eq!(node.direct.runs_total, 3);
+    assert_eq!(node.runs_outside_window, 1);
+    assert_eq!(report.overall.total_tokens, 355);
+
+    // A guide run with no recorded usage is listed as unknown, never as zero.
+    let failed = &node.executions[2].runs[0];
+    assert_eq!(failed.coverage, RunCoverage::Unmeasured);
+    assert_eq!(failed.tokens, None);
+    assert_eq!(failed.total_tokens, None);
+    assert_eq!(node.direct.runs_unmeasured, 1);
+    assert_eq!(node.direct.runs_zero, 0);
+
+    let split: Vec<(&str, i64)> = node
+        .by_spend_class
+        .iter()
+        .map(|b| (b.label.as_str(), b.measurement.total_tokens))
+        .collect();
+    assert_eq!(split, [("overhead", 245), ("implementation", 110)]);
+}
+
+#[test]
+fn review_guide_runs_group_under_their_own_execution_kind_and_their_tasks_product() {
+    let recs = records(
+        vec![
+            tokens(run("r_impl", "e_impl", "t1", BASE_EPOCH_S), 100, 10, 0, 0),
+            tokens(
+                guide_run("r_guide", "e_guide", Some("t1"), BASE_EPOCH_S + 1),
+                200,
+                5,
+                0,
+                40,
+            ),
+        ],
+        vec![task("t1", "t1", 2)],
+    );
+    let mut by_kind = window();
+    by_kind.group_by = vec![UsageDimension::ExecutionKind];
+    let report = build(&by_kind, &recs);
+    let groups: Vec<(&str, i64, u32)> = report
+        .groups
+        .iter()
+        .map(|g| {
+            (
+                g.key[0].value.as_str(),
+                g.measurement.total_tokens,
+                g.measurement.runs_total,
+            )
+        })
+        .collect();
+    assert_eq!(groups, [("pr_review_guide", 245, 1), ("task_implementation", 110, 1)]);
+
+    let mut by_product = window();
+    by_product.group_by = vec![UsageDimension::Product];
+    let report = build(&by_product, &recs);
+    assert_eq!(report.groups.len(), 1, "the guide run takes its task's product");
+    assert_eq!(report.groups[0].key[0].value, "prod_a");
+    assert_eq!(report.groups[0].measurement.total_tokens, 355);
+}
+
+#[test]
+fn a_review_guide_whose_task_is_gone_is_still_counted_as_taskless() {
+    let recs = records(
+        vec![
+            tokens(
+                guide_run("r_deleted", "e_deleted", Some("t_deleted"), BASE_EPOCH_S),
+                7,
+                1,
+                0,
+                0,
+            ),
+            tokens(guide_run("r_unowned", "e_unowned", None, BASE_EPOCH_S + 1), 9, 1, 0, 0),
+        ],
+        Vec::new(),
+    );
+    let report = build(&window(), &recs);
+    assert!(report.tasks.is_empty());
+    assert_eq!(report.taskless.len(), 2);
+    assert!(report.taskless.iter().all(|e| e.kind == "pr_review_guide"));
+    assert_eq!(report.overall.total_tokens, 18);
+    assert_eq!(report.overall.runs_total, 2);
+}

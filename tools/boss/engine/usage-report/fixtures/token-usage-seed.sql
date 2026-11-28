@@ -4,8 +4,9 @@
 -- isolated engine has no usage to show. This file inserts a small, realistic
 -- history that exercises every row `boss cost rows` and the Token Usage window
 -- must render: all four drivers, every coverage state, every caveat, a
--- revision chain, a chain root with no run of its own in a recent window, and
--- executions that have no task.
+-- revision chain, a chain root with no run of its own in a recent window, a
+-- review guide attributed to the task that owns its PR, and executions that
+-- have no task.
 --
 -- Recipe (an isolated engine is a test fixture; never aim this at production):
 --
@@ -34,8 +35,9 @@
 -- database): 24 runs = 17 measured, 2 partial (Grok, Antigravity: no cache
 -- creation), 1 zero, 4 unmeasured (one pre-capture, one with a recorded
 -- `usage_unavailable` reason, one with no resolvable driver, one unreadable
--- coordinator session); 7 taskless executions (4 worker overhead + 3
--- coordinator sessions).
+-- coordinator session); 6 taskless executions (3 worker overhead + 3
+-- coordinator sessions). The review guide run counts toward "Fix cursor
+-- flicker (seed)".
 
 CREATE TEMP TABLE seed_clock (now INTEGER NOT NULL);
 INSERT INTO seed_clock VALUES (CAST(strftime('%s', 'now') AS INTEGER));
@@ -69,7 +71,9 @@ INSERT INTO tasks (id, product_id, project_id, kind, name, status, created_at, u
 -- is resolved from current routing (`driver_source = resolved`). The
 -- "not recorded" case is `exec_seed_unresolved` below.
 -- Executions whose work_item_id is not a task (answer agent, review guide,
--- automation triage) are deliberate: they have no tasks row.
+-- automation triage) are deliberate. The answer agent and automation triage
+-- have no task at all. The review guide binds to a source comparison, and its
+-- spend belongs to the task that owns the reviewed PR (the series below).
 INSERT INTO work_executions (id, work_item_id, kind, status, repo_remote_url, created_at, started_at, finished_at, driver, model, effort_level, host_id, pr_url) VALUES
   ('exec_seed_a1', 'task_seed_a_claude',     'chore_implementation',        'completed', 'https://github.com/example/boss',  (SELECT now - 30 * 3600 FROM seed_clock),  (SELECT now - 30 * 3600 FROM seed_clock),  (SELECT now - 28 * 3600 FROM seed_clock),  'claude', 'opus',          'high',   'local', 'https://github.com/example/boss/pull/101'),
   ('exec_seed_a2', 'task_seed_a_claude',     'pr_review',                   'completed', 'https://github.com/example/boss',  (SELECT now - 26 * 3600 FROM seed_clock),  (SELECT now - 26 * 3600 FROM seed_clock),  (SELECT now - 25 * 3600 FROM seed_clock),  'claude', 'sonnet',        'medium', 'local', NULL),
@@ -92,6 +96,19 @@ INSERT INTO work_executions (id, work_item_id, kind, status, repo_remote_url, cr
   -- Taskless, not a pool-bound kind, NULL launch tuple: resolution returns
   -- nothing, so driver_source stays unknown ("not recorded").
   ('exec_seed_unresolved', 'not_a_task_seed', 'progression',                'completed', 'https://github.com/example/boss',  (SELECT now - 4 * 3600 FROM seed_clock),   (SELECT now - 4 * 3600 FROM seed_clock),   (SELECT now - 4 * 3600 FROM seed_clock),   NULL,     NULL,            NULL,     'local', NULL);
+
+-- The review guide's source comparison and the series that names the task
+-- owning the PR: `exec_seed_t2` -> `comparison_seed_1` -> `series_seed_1` ->
+-- `task_seed_a_claude`; the execution records that owner itself, as the engine
+-- does when it creates a guide execution. No generation attempt is seeded, so the engine has
+-- nothing to dispatch for it.
+INSERT INTO pr_review_guide_source_series (id, root_task_id, canonical_pr_url, latest_observation_sequence, created_at, updated_at) VALUES
+  ('series_seed_1', 'task_seed_a_claude', 'https://github.com/example/boss/pull/101', 1, (SELECT now - 2 * 3600 FROM seed_clock), (SELECT now - 2 * 3600 FROM seed_clock));
+
+INSERT INTO pr_review_guide_source_comparisons (id, series_id, observation_sequence, observed_base_sha, merge_base_sha, head_sha, trigger, packet_hash, complete, captured_at) VALUES
+  ('comparison_seed_1', 'series_seed_1', 1, 'seedbase', 'seedbase', 'seedhead', 'creation', 'seedpackethash', 1, (SELECT now - 2 * 3600 FROM seed_clock));
+
+UPDATE work_executions SET owner_task_id = 'task_seed_a_claude' WHERE id = 'exec_seed_t2';
 
 -- Runs. Token columns follow what each driver's capture records:
 --   * Claude: every class, with the 5m/1h cache-write split when the provider

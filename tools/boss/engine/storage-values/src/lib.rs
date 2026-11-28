@@ -55,6 +55,14 @@ pub struct ProjectPropertyAuditEntry {
 /// rank it. The `work` DB layer's production mapper builds these with a
 /// struct literal (every column named explicitly, per this repo's DB
 /// mapper convention); tests may use the builder.
+///
+/// Every run is projected, whatever its execution binds to. `work_item_id`
+/// is the task the spend belongs to when there is one: the execution's own
+/// task, or, for a review guide execution (which binds to a source
+/// comparison), the task that owns the reviewed PR. For an execution with no
+/// such task (answer agent, automation triage, a guide whose owner can no
+/// longer be resolved) it is the execution's raw `work_item_id` and the task
+/// fields are `None`.
 #[derive(Debug, Clone, PartialEq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct CostRunRecord {
@@ -63,7 +71,8 @@ pub struct CostRunRecord {
     pub run_id: String,
     pub execution_id: String,
     pub work_item_id: String,
-    pub work_item_name: String,
+    /// The owning task's name; `None` when the run has no task.
+    pub work_item_name: Option<String>,
     pub execution_kind: String,
     pub execution_status: String,
     pub run_status: String,
