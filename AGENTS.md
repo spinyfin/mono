@@ -37,85 +37,7 @@ root-cause rule as the section below.
 
 ## Operational docs workers should know
 
-- Boss macOS app rules (no modal dialogs for non-actionable status or
-  error messages; which inline/banner/log surface to use instead):
-  [`tools/boss/app-macos/AGENTS.md`](tools/boss/app-macos/AGENTS.md)
-- Bazel / Xcode LaunchServices pin on macOS hosts:
-  [`tools/boss/docs/mac-toolchain-xcode-pinning.md`](tools/boss/docs/mac-toolchain-xcode-pinning.md)
-- Boss forensic surfaces (`engine-audit.log`, per-task cost / transcripts):
-  [`tools/boss/docs/forensic-surfaces.md`](tools/boss/docs/forensic-surfaces.md)
-- Worker liveness contract (what the agent indicator derives from; how the
-  engine converges when it has lost track of a live worker):
-  [`tools/boss/docs/worker-liveness-contract.md`](tools/boss/docs/worker-liveness-contract.md)
-- Worker prompt delivery (how a brief is pasted and submitted, what proves
-  the driver accepted it, when the engine presses Return again, and where
-  each step is logged):
-  [`tools/boss/docs/worker-prompt-delivery.md`](tools/boss/docs/worker-prompt-delivery.md)
-- Failure-signal lifecycle (what raises an attention item / the card's
-  "Failed to start" banner, and what specifically lowers it again):
-  [`tools/boss/docs/attention-lifecycle.md`](tools/boss/docs/attention-lifecycle.md)
-- Post-crash orphan recovery:
-  [`tools/boss/docs/post-crash-recovery.md`](tools/boss/docs/post-crash-recovery.md)
-- Revision review hold (why a finished revision stays `active`, the head its
-  hold is released by, what a completion records, and what to compare when
-  one stays held with nothing running):
-  [`tools/boss/docs/revision-review-hold.md`](tools/boss/docs/revision-review-hold.md)
-- Execution recovery pointers (the three bookmarks per execution, how they
-  get damaged, and how dispatch reconciles or retires them):
-  [`tools/boss/docs/execution-recovery-pointers.md`](tools/boss/docs/execution-recovery-pointers.md)
-- Self-update attempt log (where the durable update trail lives, how to
-  follow one attempt across the old app, the relaunch helper and the new
-  app, and where a rollback's reason is recorded):
-  [`tools/boss/docs/update-attempt-log.md`](tools/boss/docs/update-attempt-log.md)
-- Crash watchdog (why an abort always kills the app, and
-  `BOSS_CRASH_WATCHDOG_SECONDS`):
-  [`tools/boss/docs/crash-watchdog.md`](tools/boss/docs/crash-watchdog.md)
-- Coordinator session handoff (what the outgoing coordinator session
-  writes, how the incoming one is briefed, and the three states it can
-  report):
-  [`tools/boss/docs/coordinator-session-handoff.md`](tools/boss/docs/coordinator-session-handoff.md)
-- Per-product coordinator guidance (`BOSS_COORDINATOR.md` at a product
-  repo's root: coordinator-only rules, how the engine loads them from
-  GitHub, and why they never go in `AGENTS.md`):
-  [`tools/boss/docs/coordinator-product-guidance.md`](tools/boss/docs/coordinator-product-guidance.md)
-- Per-repo worker guidance (`BOSS.md` at a product repo's root: Boss-specific
-  rules injected into coding workers' prompts, which executions get it, what
-  the prompt carries when GitHub is down, and when to use it instead of
-  `CLAUDE.md` / `AGENTS.md`, `BOSS_COORDINATOR.md` or the dispatch preamble):
-  [`tools/boss/docs/repo-boss-guidance.md`](tools/boss/docs/repo-boss-guidance.md)
-- Worker tool environment (why bare `checkleft` resolves to the repo's
-  Bazel build in a worker, how the composed `PATH` is sealed across
-  driver tool shells, and what that seal does not cover):
-  [`tools/boss/docs/worker-tool-environment.md`](tools/boss/docs/worker-tool-environment.md)
-- Background-sweep telemetry (per-pass duration / items / pass-count
-  metrics for the envelope watchdog, terminal-work sweep, dead-pane
-  terminal scan, JSONL tail poll and recovery-pointer passes, tick
-  intervals for the two singleton sweeps, and what each one's cost scales
-  with):
-  [`tools/boss/docs/background-sweep-telemetry.md`](tools/boss/docs/background-sweep-telemetry.md)
-- Work DB read volume (how the engine attributes `state.db` page reads to
-  a caller and statement, the `work DB heavy read` / `db read summary` /
-  `database size report` log lines, and the rules and read-budget test that
-  keep a timer-driven read from walking a table):
-  [`tools/boss/docs/work-db-read-volume.md`](tools/boss/docs/work-db-read-volume.md)
-- Merge poller detection pass (the order a pass works in, what an abandoned
-  pass does and does not lose, the `merge_detection_stalled` health issue,
-  and the per-phase timing to read when a pass is slow):
-  [`tools/boss/docs/merge-poller-detection-pass.md`](tools/boss/docs/merge-poller-detection-pass.md)
-- Answer latency (the per-hop log lines from clicking an answer on a
-  question card to the card clearing, in the app and the engine, and which
-  reads an answer does and does not wait for):
-  [`tools/boss/docs/operator-answer-latency.md`](tools/boss/docs/operator-answer-latency.md)
-- Dispatch focus mode (`bossctl dispatch focus`: restrict automatic
-  dispatch to chosen projects/products; scope rules, precedence against the
-  pause and force-launch, the `focus_mode` hold reason):
-  [`tools/boss/docs/dispatch-focus-mode.md`](tools/boss/docs/dispatch-focus-mode.md)
-- Run process teardown (how the engine and cube find and kill what a run
-  left running in its workspace, why working directory rather than process
-  group, and how a workspace's Bazel server is told apart and spared):
-  [`tools/boss/docs/run-process-teardown.md`](tools/boss/docs/run-process-teardown.md)
-- Operator runbooks:
-  [`tools/boss/docs/runbooks/`](tools/boss/docs/runbooks/)
+Boss operational, forensic, recovery, and runbook docs live in [`tools/boss/docs/operational-docs.md`](tools/boss/docs/operational-docs.md) — read that index before guessing how an engine, app, or worker subsystem behaves.
 
 ## Prefer crates over modules for distinct units of functionality (Rust)
 
@@ -137,23 +59,7 @@ Required behavior: fix the real problem — split the oversized file, fix the li
 
 ### `change/file-count` failures: split vs keep in one PR
 
-A bypass is not the default answer to an over-limit change. When the change would exceed the limit (30 files in `CHECKS.yaml`), stop adding scope and report a proposed split: what lands in this PR now, and what becomes a prerequisite or follow-up PR along a capability boundary (for example storage plus migration, then protocol plus engine handler, then consumers; a new crate on its own first). Report it through the proposal mechanism below, recommend **Split** in it, and recommend **Bypass limit** only for the unsplittable cases named in `CHECKS.yaml` (coordinated renames, generated trees). Estimate the file count early from the costs of the change in this codebase (a new RPC verb or event variant is ~12-15 files; a new column plus migration is 4 fixed files plus one per writer; a new crate is 5 fixed files plus 2-3 per consumer) rather than from the number of deliverables.
-
-The proposal is a split-vs-bypass question. It is not a Yes/No: the repo owner sees two buttons named for the actions, and the explanation uses `Split:` and `Bypass limit:` sections instead of `Yes:` and `No:`. Both answers are real paths:
-
-- **Split** creates a prerequisite for the first coherent capability (a stacked PR along a capability boundary). This task delivers the remainder once that PR has merged.
-- **Bypass limit** authorizes a `change/file-count` exception for this PR only. The next run finishes in one PR by putting `BYPASS_CHANGE_FILE_COUNT=Split-vs-bypass question answered Bypass limit by the repo owner on <date>; one-PR exception for this PR only` in the commit description. Never apply that bypass without the recorded authorization in the task description. The authorization does not relax any other check.
-
-The question must state the projected upper-bound file count of the single-PR change, the limit, and the proposed split's PR boundaries. `--file-count` records the projected upper bound. Checkleft does not enforce the approved count: before pushing, compare the non-deleted file count from `jj diff --stat` against the PR base with the approved bound, and ask again if it is over. Use a free-form bypass reason without a numeric prefix, citing the recorded answer and date.
-
-Check the footprint early, not after the work is built. Once the shape of the change is clear, and again before final validation, run the file-count check or `jj diff --stat` against the base. If the change is heading past the limit, stop and ask before building the rest:
-
-- When the worker instructions enable completion declarations, ask with `"$BOSS_BIN" propose done --outcome blocked --summary "<blocker>" --answer-type create-prerequisite-task --prerequisite-name "<first PR title>" --prerequisite-brief "<standalone description of that first PR>" --file-count <n> --file-count-limit 30 --explanation-file /tmp/explanation.txt`. Pass `--file-count` as the projected upper-bound file count of the single-PR change, not a partial in-progress count. The brief must stand alone: a different worker picks it up cold. Split and Bypass limit in the explanation must each name the path that follows (create the first PR and wait, or keep all files in this PR under the exception).
-- If completion declarations are disabled, report the dependency through the blocker channel in the worker instructions so the repo owner can arrange the split or the exception.
-- Keep any split on capability boundaries, as above.
-- **Revisions re-check the footprint.** A revision re-runs `checkleft run` before every push. If addressing the review would push the PR past the limit, or past a previously approved bound, do not silently grow the PR: finish the in-scope work that fits, then report the proposed split (what stays in this PR, what moves to a prerequisite or follow-up) through the same proposal, with the same Split recommendation. An earlier approval covers only the file count it was given.
-- When completion declarations are enabled, do not file a plain blocker, a plain yes/no question or `boss propose followup-task` for this. A yes/no without `--file-count` does not authorize the exception, and `followup-task` is the non-blocking "nice to have later" path: it creates no task until a human batch-accepts it, and it adds no dependency edge, so the split never lands.
-- Coordinated renames and unsplittable generated trees remain the cases named in `CHECKS.yaml` for a file-count exception. Feature work uses the question above; workers never apply the bypass on their own.
+Do not bypass the 30-file `change/file-count` limit in `CHECKS.yaml` on your own. Estimate the footprint early; if the change will exceed 30 files, stop adding scope and follow the split-vs-bypass proposal protocol in [`tools/boss/docs/change-file-count-protocol.md`](tools/boss/docs/change-file-count-protocol.md).
 
 ## Builder pattern convention
 
