@@ -1261,7 +1261,7 @@ fn insufficient_quorum_attention(
                 if none_started {
                     "\"AI review failed to start\""
                 } else {
-                    "not reviewed"
+                    "\"No AI review scheduled\""
                 },
             ));
         } else {

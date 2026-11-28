@@ -1146,6 +1146,7 @@ impl WorkDb {
     /// per-owner review projections from `caches` instead of rebuilding
     /// them from point queries. Returns exactly the tree the uncached path
     /// would for the same snapshot.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn get_work_tree_cached(
         &self,
         product_id: &str,
@@ -1160,7 +1161,7 @@ impl WorkDb {
         )
     }
 
-    /// [`get_work_tree_cached`] evaluated at the caller's `now`.
+    /// `get_work_tree_cached` evaluated at the caller's `now`.
     pub(crate) fn get_work_tree_cached_at(
         &self,
         product_id: &str,
