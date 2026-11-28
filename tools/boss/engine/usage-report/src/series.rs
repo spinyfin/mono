@@ -83,7 +83,9 @@ const MS_PER_HOUR: f64 = 3_600_000.0;
 /// What a series request asks for, plus the engine constants the report
 /// depends on (so this crate owns none of them).
 #[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub struct UsageSeriesQuery {
+    pub experiment: Option<String>,
     pub since_epoch_s: i64,
     pub until_epoch_s: i64,
     pub generated_at_epoch_s: i64,
@@ -205,7 +207,8 @@ pub fn build_usage_series_report(
         .iter()
         .filter(|run| seen_runs.insert(run.run_id.as_str()))
         .map(|run| {
-            let mut facts = classify(run, tasks.get(run.work_item_id.as_str()).copied());
+            let mut facts = classify(run, tasks.get(run.work_item_id.as_str()).copied())
+                .select_experiment(query.experiment.as_deref());
             price_if_requested(&mut facts, &classify_ctx);
             facts
         })
@@ -253,13 +256,17 @@ pub fn build_usage_series_report(
                 .get(exec.execution_id.as_str())
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            let fact = ExecFact {
-                exec,
-                task,
-                runs: exec_runs,
-                is_completed,
-                pr_url,
-            };
+            let fact = ExecFact::builder()
+                .experiment_arm(crate::dimensions::experiment_value(
+                    exec.experiment_arms.as_deref(),
+                    query.experiment.as_deref(),
+                ))
+                .exec(exec)
+                .maybe_task(task)
+                .runs(exec_runs)
+                .is_completed(is_completed)
+                .maybe_pr_url(pr_url)
+                .build();
             fact.passes_filters(&compiled_filters).then_some(fact)
         })
         .collect();
@@ -410,6 +417,12 @@ pub fn build_usage_series_report(
     );
 
     TokenUsageSeriesReport::builder()
+        .observed_experiments(crate::dimensions::observed_experiments(classified_runs.iter().filter(
+            |f| {
+                f.rec.run_created_at_epoch_s >= query.since_epoch_s
+                    && f.rec.run_created_at_epoch_s < query.until_epoch_s
+            },
+        )))
         .bucket_secs(width.bucket_secs())
         .bucket_width(width)
         .capture_start_epoch_s(query.capture_start_epoch_s)
@@ -456,7 +469,10 @@ fn representative_run_for_task<'a>(root_task_id: &str, chain_runs: &[&'a RunFact
     .or_else(|| latest_run(chain_runs.iter().copied()))
 }
 
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 struct ExecFact<'a> {
+    experiment_arm: String,
     exec: &'a UsageExecutionRecord,
     task: Option<&'a UsageTaskRecord>,
     runs: &'a [&'a RunFacts<'a>],
@@ -484,9 +500,15 @@ impl<'a> ExecFact<'a> {
         }
     }
 
-    fn dimension_source(&self) -> DimensionSource<'a> {
+    fn dimension_source(&self) -> DimensionSource<'_> {
         let latest = self.latest_run();
         DimensionSource {
+            experiment_arm: Some(&self.experiment_arm),
+            pipeline_stage: Some(crate::dimensions::pipeline_stage(
+                &self.exec.execution_kind,
+                self.exec.review_member_role.as_deref(),
+                self.task,
+            )),
             task: self.task,
             execution_kind: Some(self.exec.execution_kind.as_str()),
             execution_status: Some(self.exec.execution_status.as_str()),
@@ -527,7 +549,7 @@ struct CompletedTaskFact<'a> {
 }
 
 impl<'a> CompletedTaskFact<'a> {
-    fn dimension_source(&self) -> DimensionSource<'a> {
+    fn dimension_source(&self) -> DimensionSource<'_> {
         match self.representative {
             Some(facts) => {
                 let mut src = DimensionSource::from_run(facts);
@@ -535,6 +557,8 @@ impl<'a> CompletedTaskFact<'a> {
                 src
             }
             None => DimensionSource {
+                experiment_arm: None,
+                pipeline_stage: None,
                 task: Some(self.task),
                 execution_kind: None,
                 execution_status: None,

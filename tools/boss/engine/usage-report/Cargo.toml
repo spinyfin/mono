@@ -6,6 +6,7 @@ workspace = "../../../.."
 
 [dependencies]
 bon = { workspace = true }
+boss-feature-flags = { path = "../feature-flags" }
 boss-protocol = { path = "../../protocol" }
 
 [dev-dependencies]

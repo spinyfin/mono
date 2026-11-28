@@ -2172,6 +2172,7 @@ name = "boss-usage-report"
 version = "0.1.0"
 dependencies = [
  "bon",
+ "boss-feature-flags",
  "boss-protocol",
  "serde_json",
 ]

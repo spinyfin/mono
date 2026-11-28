@@ -249,6 +249,7 @@ pub(super) async fn handle_get_token_usage_rows(ctx: Dispatch, req: FrontendRequ
         until_epoch_s,
         filters,
         group_by,
+        experiment,
         roll_up_revisions,
         estimate_usd,
     }) = req
@@ -262,6 +263,7 @@ pub(super) async fn handle_get_token_usage_rows(ctx: Dispatch, req: FrontendRequ
         .capture_start_epoch_s(boss_engine_runtime::cost_report::TOKEN_CAPTURE_START_EPOCH_S)
         .retention_max_age_secs(boss_work_db::DEFAULT_RETENTION_MAX_AGE_SECS)
         .filters(filters)
+        .maybe_experiment(experiment)
         .group_by(group_by)
         .roll_up_revisions(roll_up_revisions)
         .build();
@@ -292,6 +294,7 @@ pub(super) async fn handle_get_token_usage_series(ctx: Dispatch, req: FrontendRe
         until_epoch_s,
         bucket,
         group_by,
+        experiment,
         filters,
         estimate_usd,
     }) = req
@@ -308,6 +311,7 @@ pub(super) async fn handle_get_token_usage_series(ctx: Dispatch, req: FrontendRe
         .maybe_bucket(bucket)
         .maybe_group_by(group_by)
         .filters(filters)
+        .maybe_experiment(experiment)
         .build();
     if let Err(message) = query.validate() {
         return send_work_error(&sink, &request_id, message);
@@ -355,6 +359,7 @@ mod tests {
             until_epoch_s: 9_000,
             filters,
             group_by,
+            experiment: None,
             roll_up_revisions: true,
             estimate_usd: false,
         })
@@ -456,6 +461,7 @@ mod tests {
             until_epoch_s: 9_000,
             filters: Vec::new(),
             group_by: Vec::new(),
+            experiment: None,
             roll_up_revisions: true,
             estimate_usd: true,
         });

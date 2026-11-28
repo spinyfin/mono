@@ -31,7 +31,7 @@
 -- task is done, so the engine has nothing to dispatch or recover.
 --
 -- Expected result over the whole history (also pinned by a test in the work
--- database): 24 runs = 17 measured, 2 partial (Grok, Antigravity: no cache
+-- database): 28 runs = 21 measured, 2 partial (Grok, Antigravity: no cache
 -- creation), 1 zero, 4 unmeasured (one pre-capture, one with a recorded
 -- `usage_unavailable` reason, one with no resolvable driver, one unreadable
 -- coordinator session); 7 taskless executions (4 worker overhead + 3
@@ -62,7 +62,8 @@ INSERT INTO tasks (id, product_id, project_id, kind, name, status, created_at, u
   ('task_seed_g_unavailable','prod_seed_notes', NULL,              'chore',    'Rename the config key (seed)',       'done', '1784000000', '1784000000', (SELECT now - 5 * 3600 FROM seed_clock),   'https://github.com/example/notes/pull/10', 'standard', 'medium', 110, NULL),
   ('task_seed_h_precapture', 'prod_seed_boss',  NULL,              'chore',    'Old chore from before capture (seed)','done','1784000000', '1784000000', '1784000100',                                     'https://github.com/example/boss/pull/11',  'standard', 'medium', 111, NULL),
   ('task_seed_i_zero_synth', 'prod_seed_boss',  NULL,              'chore',    'Failed start and a synthetic run (seed)','done','1784000000','1784000000', (SELECT now - 3 * 3600 FROM seed_clock),   NULL,                                       'standard', 'medium', 112, NULL),
-  ('task_seed_j_design',     'prod_seed_boss',  'proj_seed_usage', 'design',   'Design the usage window (seed)',     'done', '1784000000', '1784000000', (SELECT now - 36 * 3600 FROM seed_clock),  NULL,                                       'high',     'xhigh',  113, NULL);
+  ('task_seed_j_design',     'prod_seed_boss',  'proj_seed_usage', 'design',   'Design the usage window (seed)',     'done', '1784000000', '1784000000', (SELECT now - 36 * 3600 FROM seed_clock),  NULL,                                       'high',     'xhigh',  113, NULL),
+  ('task_seed_k_future_source','prod_seed_boss',  NULL,              'chore',    'Work from a newer source (seed)',    'done', '1784000000', '1784000000', NULL,                                       NULL,                                       'standard', 'medium', 114, NULL);
 
 -- Executions. driver / model / effort_level are the launch tuple; the
 -- pre-capture execution predates it, so those columns are NULL and its driver
@@ -86,6 +87,15 @@ INSERT INTO work_executions (id, work_item_id, kind, status, repo_remote_url, cr
   ('exec_seed_i1', 'task_seed_i_zero_synth', 'chore_implementation',        'failed',    'https://github.com/example/boss',  (SELECT now - 5 * 3600 FROM seed_clock),   (SELECT now - 5 * 3600 FROM seed_clock),   (SELECT now - 5 * 3600 FROM seed_clock),   'claude', 'opus',          'medium', 'local', NULL),
   ('exec_seed_i2', 'task_seed_i_zero_synth', 'chore_implementation',        'completed', 'https://github.com/example/boss',  (SELECT now - 4 * 3600 FROM seed_clock),   (SELECT now - 4 * 3600 FROM seed_clock),   (SELECT now - 3 * 3600 FROM seed_clock),   'claude', 'opus',          'medium', 'local', NULL),
   ('exec_seed_j1', 'task_seed_j_design',     'product_design',              'completed', 'https://github.com/example/boss',  (SELECT now - 36 * 3600 FROM seed_clock),  (SELECT now - 36 * 3600 FROM seed_clock),  (SELECT now - 35 * 3600 FROM seed_clock),  'claude', 'opus',          'xhigh',  'local', NULL),
+  -- Pipeline-stage coverage: a reviewer-role pre-merge review, a post-merge
+  -- review, a project design, and an implementation run whose task came from a
+  -- source the classifier does not know (unclassified). The unknown value is on
+  -- the task's created_via, which is read as plain text; an unknown execution
+  -- kind would make the work DB's execution listing fail for the whole task.
+  ('exec_seed_p1', 'task_seed_a_claude',     'pr_review',                   'completed', 'https://github.com/example/boss',  (SELECT now - 24 * 3600 FROM seed_clock),  (SELECT now - 24 * 3600 FROM seed_clock),  (SELECT now - 23 * 3600 FROM seed_clock),  'claude', 'sonnet',        'medium', 'local', NULL),
+  ('exec_seed_p2', 'task_seed_a_claude',     'pr_review',                   'completed', 'https://github.com/example/boss',  (SELECT now - 22 * 3600 FROM seed_clock),  (SELECT now - 22 * 3600 FROM seed_clock),  (SELECT now - 21 * 3600 FROM seed_clock),  'claude', 'sonnet',        'medium', 'local', NULL),
+  ('exec_seed_p3', 'task_seed_j_design',    'project_design',              'completed', 'https://github.com/example/boss',  (SELECT now - 18 * 3600 FROM seed_clock),  (SELECT now - 18 * 3600 FROM seed_clock),  (SELECT now - 17 * 3600 FROM seed_clock),  'claude', 'opus',          'high',   'local', NULL),
+  ('exec_seed_p4', 'task_seed_k_future_source','chore_implementation',       'completed', 'https://github.com/example/boss',  (SELECT now - 16 * 3600 FROM seed_clock),  (SELECT now - 16 * 3600 FROM seed_clock),  (SELECT now - 15 * 3600 FROM seed_clock),  'claude', 'sonnet',        'medium', 'local', NULL),
   ('exec_seed_t1', 'comment_seed_1',         'answer_agent',                'completed', 'https://github.com/example/boss',  (SELECT now - 3 * 3600 FROM seed_clock),   (SELECT now - 3 * 3600 FROM seed_clock),   (SELECT now - 3 * 3600 FROM seed_clock),   'claude', 'sonnet',        'medium', 'local', NULL),
   ('exec_seed_t2', 'comparison_seed_1',      'pr_review_guide',             'completed', 'https://github.com/example/boss',  (SELECT now - 2 * 3600 FROM seed_clock),   (SELECT now - 2 * 3600 FROM seed_clock),   (SELECT now - 2 * 3600 FROM seed_clock),   'codex',  'gpt-6-astra',   'high',   'local', NULL),
   ('exec_seed_t3', 'automation_seed_1',      'automation_triage',           'completed', 'https://github.com/example/boss',  (SELECT now - 1 * 3600 FROM seed_clock),   (SELECT now - 1 * 3600 FROM seed_clock),   (SELECT now - 1 * 3600 FROM seed_clock),   'claude', 'haiku',         'low',    'local', NULL),
@@ -124,6 +134,10 @@ INSERT INTO work_runs (id, execution_id, agent_id, status, created_at, started_a
   ('run_seed_i1_1', 'exec_seed_i1', 'worker-1', 'failed',    (SELECT now - 5 * 3600 FROM seed_clock),   (SELECT now - 5 * 3600 FROM seed_clock),   (SELECT now - 5 * 3600 FROM seed_clock),   'local', NULL,                0,      0,     0,     NULL,  NULL,  0,       0,  0,       NULL, NULL, NULL, NULL, NULL),
   ('run_seed_i2_1', 'exec_seed_i2', 'worker-1', 'completed', (SELECT now - 4 * 3600 FROM seed_clock),   (SELECT now - 4 * 3600 FROM seed_clock),   (SELECT now - 3 * 3600 FROM seed_clock),   'local', '<synthetic>',       50,     200,   0,     0,     0,     1000,   1,  15000,    NULL, NULL, NULL, NULL, NULL),
   ('run_seed_j1_1', 'exec_seed_j1', 'worker-2', 'completed', (SELECT now - 36 * 3600 FROM seed_clock),  (SELECT now - 36 * 3600 FROM seed_clock),  (SELECT now - 35 * 3600 FROM seed_clock),  'local', 'claude-opus-5-5',   900,    6500,  30000, 30000, 0,     480000, 20, 540000,  NULL, 20500, 20000, 120000, 0),
+  ('run_seed_p1_1', 'exec_seed_p1', 'review-2', 'completed', (SELECT now - 24 * 3600 FROM seed_clock),  (SELECT now - 24 * 3600 FROM seed_clock),  (SELECT now - 23 * 3600 FROM seed_clock),  'local', 'claude-sonnet-5-5', 600,    2500,  8000,  8000,  0,     120000, 8,  250000,  NULL, 21000, 20000, 38000, 0),
+  ('run_seed_p2_1', 'exec_seed_p2', 'review-3', 'completed', (SELECT now - 22 * 3600 FROM seed_clock),  (SELECT now - 22 * 3600 FROM seed_clock),  (SELECT now - 21 * 3600 FROM seed_clock),  'local', 'claude-sonnet-5-5', 500,    2200,  7000,  7000,  0,     100000, 7,  220000,  NULL, 20500, 19500, 36000, 0),
+  ('run_seed_p3_1', 'exec_seed_p3', 'design-1', 'completed', (SELECT now - 18 * 3600 FROM seed_clock),  (SELECT now - 18 * 3600 FROM seed_clock),  (SELECT now - 17 * 3600 FROM seed_clock),  'local', 'claude-opus-5-5',   800,    5000,  25000, 25000, 0,     400000, 15, 500000,  NULL, 19800, 19000, 90000, 0),
+  ('run_seed_p4_1', 'exec_seed_p4', 'other-1',  'completed', (SELECT now - 16 * 3600 FROM seed_clock),  (SELECT now - 16 * 3600 FROM seed_clock),  (SELECT now - 15 * 3600 FROM seed_clock),  'local', 'claude-sonnet-5-5', 300,    1200,  4000,  4000,  0,     60000,  5,  120000,  NULL, 18000, 17500, 30000, 0),
   ('run_seed_t1_1', 'exec_seed_t1', 'answer-1', 'completed', (SELECT now - 3 * 3600 FROM seed_clock),   (SELECT now - 3 * 3600 FROM seed_clock),   (SELECT now - 3 * 3600 FROM seed_clock),   'local', 'claude-sonnet-5-5', 400,    900,   3000,  3000,  0,     60000,  4,  60000,    NULL, 12000, 11500, 20000, 0),
   ('run_seed_t2_1', 'exec_seed_t2', 'guide-1',  'completed', (SELECT now - 2 * 3600 FROM seed_clock),   (SELECT now - 2 * 3600 FROM seed_clock),   (SELECT now - 2 * 3600 FROM seed_clock),   'local', 'gpt-6-astra',       40000,  1800,  0,     NULL,  NULL,  30000,  6,  90000,    NULL, 14000, 0, 32000, 0),
   ('run_seed_t3_1', 'exec_seed_t3', 'triage-1', 'completed', (SELECT now - 1 * 3600 FROM seed_clock),   (SELECT now - 1 * 3600 FROM seed_clock),   (SELECT now - 1 * 3600 FROM seed_clock),   'local', 'claude-haiku-5-5',  200,    300,   1000,  1000,  0,     20000,  2,  20000,    NULL, 6000, 5500, 8000, 0),
@@ -175,5 +189,40 @@ INSERT INTO coordinator_usage_slices (
     NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'Coordinator transcript unreadable',
     (SELECT now FROM seed_clock)
   );
+
+-- Recorded experiments: overlapping sets, both arms, stopped, an empty set,
+-- and legacy NULL. Revisions retain their family's assignment.
+UPDATE work_executions SET experiment_arms = '{"batched_search":"treatment","worker_autocompact":"control"}'
+ WHERE id IN ('exec_seed_b0', 'exec_seed_b1', 'exec_seed_b2', 'exec_seed_t2');
+UPDATE work_executions SET experiment_arms = '{"batched_search":"control"}'
+ WHERE id IN ('exec_seed_a1', 'exec_seed_a2');
+UPDATE work_executions SET experiment_arms = '{"batched_search":"stopped"}'
+ WHERE id IN ('exec_seed_c0', 'exec_seed_c1');
+UPDATE work_executions SET experiment_arms = '{}' WHERE id = 'exec_seed_d1';
+UPDATE tasks SET created_via = 'future_source:seed' WHERE id = 'task_seed_k_future_source';
+UPDATE tasks SET created_via = 'pr_review:seed_review' WHERE id = 'task_seed_b_rev1';
+UPDATE tasks SET created_via = 'ci-fix:seed_attempt' WHERE id = 'task_seed_b_rev2';
+UPDATE tasks SET created_via = 'merge-conflict:seed_attempt' WHERE id = 'task_seed_c_ghost_rev';
+UPDATE tasks SET created_via = 'progression:seed_execution' WHERE id = 'task_seed_e_grok';
+UPDATE tasks SET created_via = 'pr_review:post_merge:seed_proposal' WHERE id = 'task_seed_f_agy';
+
+-- A completed supervisor batch, so the role is exercised by the SQL projection.
+INSERT INTO pr_review_batches (id, cycle_root_id, base_sha, classification_json, created_at, phase, pr_number, pr_url, status, target_sha, updated_at)
+ VALUES ('batch_seed', 'task_seed_a_claude', 'seed_base', '{}', '1784000000', 'pre_merge', 101, 'https://github.com/example/boss/pull/101', 'completed', 'seed_head', '1784000000');
+INSERT INTO pr_review_batch_members (id, batch_id, attempt, created_at, provider_effort, requested_driver, resolved_model, role, status, updated_at, execution_id)
+ VALUES ('member_seed', 'batch_seed', 1, '1784000000', 'medium', 'claude', 'sonnet', 'supervisor', 'reported', '1784000000', 'exec_seed_a2'),
+        ('member_seed_reviewer', 'batch_seed', 1, '1784000000', 'medium', 'claude', 'sonnet', 'claude_reviewer', 'reported', '1784000000', 'exec_seed_p1');
+
+-- A post-merge batch whose member is the post-merge reviewer.
+INSERT INTO pr_review_batches (id, cycle_root_id, base_sha, classification_json, created_at, phase, pr_number, pr_url, status, target_sha, updated_at)
+ VALUES ('batch_seed_post', 'task_seed_a_claude', 'seed_base', '{}', '1784000000', 'post_merge', 101, 'https://github.com/example/boss/pull/101', 'completed', 'seed_head', '1784000000');
+INSERT INTO pr_review_batch_members (id, batch_id, attempt, created_at, provider_effort, requested_driver, resolved_model, role, status, updated_at, execution_id)
+ VALUES ('member_seed_post', 'batch_seed_post', 1, '1784000000', 'medium', 'claude', 'sonnet', 'post_merge_reviewer', 'reported', '1784000000', 'exec_seed_p2');
+
+-- A guide's work item is its comparison, but its experiment family is the PR root.
+INSERT INTO pr_review_guide_source_series (id, root_task_id, canonical_pr_url, created_at, updated_at)
+ VALUES ('series_seed', 'task_seed_b_chain_root', 'https://github.com/example/boss/pull/102', '1784000000', '1784000000');
+INSERT INTO pr_review_guide_source_comparisons (id, series_id, observation_sequence, observed_base_sha, merge_base_sha, head_sha, trigger, packet_hash, complete, omission_count, captured_at)
+ VALUES ('comparison_seed_1', 'series_seed', 1, 'seed_base', 'seed_base', 'seed_head', 'seed', 'seed_hash', 1, 0, '1784000000');
 
 DROP TABLE seed_clock;

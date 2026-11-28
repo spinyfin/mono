@@ -10,12 +10,14 @@
 //! Nothing in this crate reads a database, a clock or a rate table: the engine
 //! hands each in as data.
 //!
-//! The dependency edge is one way. This crate depends on `boss_protocol`
-//! alone; the work database depends on it for the record types and the engine
+//! The dependency edges are one way: this crate uses `boss_protocol` and the
+//! launch-arm codec in `boss_feature_flags`. The work database depends on it
+//! for the record types and the engine
 //! depends on it for the builders, never the reverse. The USD rate table stays
 //! in the engine and reaches the builders through [`UsdEstimator`].
 
 pub mod classify;
+mod dimensions;
 pub mod fold;
 pub mod record;
 pub mod rows;

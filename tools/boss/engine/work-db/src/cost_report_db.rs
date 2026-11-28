@@ -122,7 +122,9 @@ const USAGE_RUN_COLUMNS: &str = "
     wr.first_call_context_tokens,
     wr.first_call_cache_write_tokens,
     wr.peak_context_tokens,
-    wr.compactions
+    wr.compactions,
+    we.experiment_arms,
+    (SELECT role FROM pr_review_batch_members WHERE execution_id = we.id)
 ";
 
 fn map_usage_run_record(row: &Row) -> rusqlite::Result<UsageRunRecord> {
@@ -163,7 +165,28 @@ fn map_usage_run_record(row: &Row) -> rusqlite::Result<UsageRunRecord> {
         first_call_cache_write_tokens: row.get(29)?,
         peak_context_tokens: row.get(30)?,
         compactions: row.get(31)?,
+        experiment_arms: row.get(32)?,
+        review_member_role: row.get(33)?,
+        experiment_family_id: None,
     })
+}
+
+/// Review guides use a comparison id rather than a task id. Resolve each
+/// distinct guide once in the same snapshot, using the launch assignment rule.
+fn fill_review_guide_families(conn: &Connection, runs: &mut [UsageRunRecord]) -> Result<()> {
+    let mut families = HashMap::new();
+    for run in runs.iter_mut().filter(|r| r.execution_kind == "pr_review_guide") {
+        let family = match families.entry(run.work_item_id.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(chain_helpers::experiment_family_root(
+                conn,
+                &boss_protocol::ExecutionKind::PrReviewGuide,
+                &run.work_item_id,
+            )?),
+        };
+        run.experiment_family_id = Some(family.clone());
+    }
+    Ok(())
 }
 
 /// Fill a NULL launch tuple from [`WorkDb::get_execution_driver_slugs_lenient`],
@@ -246,7 +269,9 @@ const USAGE_EXECUTION_COLUMNS: &str = "
     we.host_id,
     we.driver,
     we.model,
-    we.effort_level
+    we.effort_level,
+    we.experiment_arms,
+    (SELECT role FROM pr_review_batch_members WHERE execution_id = we.id)
 ";
 
 fn map_usage_execution_record(row: &Row) -> rusqlite::Result<UsageExecutionRecord> {
@@ -267,6 +292,8 @@ fn map_usage_execution_record(row: &Row) -> rusqlite::Result<UsageExecutionRecor
         driver,
         execution_model: row.get(10)?,
         execution_effort: row.get(11)?,
+        experiment_arms: row.get(12)?,
+        review_member_role: row.get(13)?,
     })
 }
 
@@ -286,7 +313,8 @@ const USAGE_SERIES_TASK_COLUMNS: &str = "
     CAST(t.completed_at AS INTEGER),
     t.reasoning,
     t.effort_level,
-    0
+    0,
+    t.created_via
 ";
 
 /// Task columns of [`UsageTaskRecord`] in field order of [`map_usage_task_record`],
@@ -308,13 +336,15 @@ const USAGE_TASK_COLUMNS: &str = "
     (SELECT COUNT(*)
        FROM work_executions we
        JOIN work_runs wr ON wr.execution_id = we.id
-      WHERE we.work_item_id = t.id)
+      WHERE we.work_item_id = t.id),
+    t.created_via
 ";
 
 fn map_usage_task_record(row: &Row, roots: &HashMap<String, String>) -> rusqlite::Result<UsageTaskRecord> {
     let task_id: String = row.get(0)?;
     let chain_root_id = roots.get(&task_id).cloned().unwrap_or_else(|| task_id.clone());
     Ok(UsageTaskRecord {
+        created_via: row.get(14)?,
         name: row.get(1)?,
         kind: row.get(2)?,
         status: row.get(3)?,
@@ -480,6 +510,7 @@ impl WorkDb {
                     map_usage_task_record(row, &roots)
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+            fill_review_guide_families(&tx, &mut runs)?;
             tx.commit()?;
         }
         fill_resolved_drivers(self, &mut runs);
@@ -715,6 +746,7 @@ impl WorkDb {
                     map_usage_task_record(row, &roots)
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+            fill_review_guide_families(&tx, &mut runs)?;
             tx.commit()?;
         }
         let mut resolved: HashMap<String, Option<String>> = HashMap::new();
@@ -1423,7 +1455,7 @@ mod tests {
             .expect("the seed fixture applies to a freshly migrated database");
         let now = boss_engine_utils::epoch_time::now_epoch_secs();
         let records = db.usage_records_for_window(0, now + 86_400).unwrap();
-        assert_eq!(records.runs.len(), 24);
+        assert_eq!(records.runs.len(), 28);
 
         let query = |since: i64| {
             UsageRowsQuery::builder()
@@ -1437,6 +1469,50 @@ mod tests {
         let priced = |model: &str, _tokens: boss_usage_report::PricedTokens| model.contains("claude").then_some(1.0);
         let report = build_usage_rows_report(&query(0), &records, Some(&priced));
 
+        let experiment = report
+            .observed_experiments
+            .iter()
+            .find(|e| e.experiment == "batched_search")
+            .unwrap();
+        let treatment = experiment.arms.iter().find(|a| a.arm == "treatment").unwrap();
+        assert_eq!((treatment.runs, treatment.families), (4, 1));
+        let stages = report
+            .dimension_values
+            .iter()
+            .find(|d| d.dimension == UsageDimension::PipelineStage)
+            .unwrap();
+        for stage in [
+            "filed_work",
+            "review_finding_revision",
+            "ci_fix_revision",
+            "conflict_revision",
+            "progression_minted_work",
+            "post_merge_follow_up",
+            "review_supervisor",
+            "review_guide",
+            "pre_merge_review",
+            "post_merge_review",
+            "project_design",
+            "progression",
+            "product_design",
+            "automation_triage",
+            "answer_agent",
+            "unclassified",
+        ] {
+            assert!(stages.values.iter().any(|v| v.value == stage), "missing {stage}");
+        }
+        let series_records = db.usage_series_records_for_window(0, now + 86_400).unwrap();
+        let supervisor = series_records
+            .finished_executions
+            .iter()
+            .find(|e| e.execution_id == "exec_seed_a2")
+            .unwrap();
+        assert_eq!(supervisor.review_member_role.as_deref(), Some("supervisor"));
+        assert_eq!(
+            supervisor.experiment_arms.as_deref(),
+            Some(r#"{"batched_search":"control"}"#)
+        );
+
         let coverage = &report.coverage;
         assert_eq!(
             (
@@ -1446,7 +1522,7 @@ mod tests {
                 coverage.runs_zero,
                 coverage.runs_unmeasured
             ),
-            (24, 17, 2, 1, 4)
+            (28, 21, 2, 1, 4)
         );
         assert_eq!(
             report.taskless.len(),
@@ -1524,7 +1600,7 @@ mod tests {
         // and Antigravity only the first and peak prompt, and the runs that
         // made no model call or were never captured record none.
         let calls = &report.overall_calls;
-        assert_eq!((calls.runs_with_rounds, calls.rounds), (20, 360));
+        assert_eq!((calls.runs_with_rounds, calls.rounds), (24, 395));
         // Coordinator hourly/model slices contribute their recorded rounds,
         // but do not invent worker-run first-call or compaction observations.
         let coordinator_rounds: i64 = report
@@ -1534,14 +1610,14 @@ mod tests {
             .map(|execution| execution.calls.rounds)
             .sum();
         assert_eq!(coordinator_rounds, 99);
-        assert_eq!(calls.rounds - coordinator_rounds, 261);
-        assert_eq!(calls.runs_with_first_call_context, 15);
-        assert_eq!(calls.runs_with_peak_context, 15);
+        assert_eq!(calls.rounds - coordinator_rounds, 296);
+        assert_eq!(calls.runs_with_first_call_context, 19);
+        assert_eq!(calls.runs_with_peak_context, 19);
         assert_eq!(calls.max_peak_context, Some(205_000));
         assert_eq!(
             (calls.runs_with_compactions_recorded, calls.runs_compacted),
-            (13, 3),
-            "Grok and Antigravity record no compactions; they are not 13 + 2 runs that did not compact"
+            (17, 3),
+            "Grok and Antigravity record no compactions; they are not 17 + 2 runs that did not compact"
         );
         for driver in ["grok", "agy"] {
             let (_, run) = all_runs
@@ -1707,10 +1783,10 @@ mod tests {
             .flat_map(|b| b.cells.iter())
             .map(|c| c.measurement.runs_total)
             .sum();
-        // Window has 22 runs (18 worker runs minus pre-capture h1 and 40d-old
+        // Window has 26 runs (22 worker runs minus pre-capture h1 and 40d-old
         // c0, plus 4 coordinator slices in the last 48h).
         // Completed tasks in 7d include ghost_root (which pulls in c0!).
-        assert_eq!(total_window_runs, 22);
+        assert_eq!(total_window_runs, 26);
         assert!(
             total_completed_task_runs > 0,
             "completed tasks in 7d must carry attributed chain runs"

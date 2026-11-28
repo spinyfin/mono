@@ -80,10 +80,12 @@ pub enum UsageDimension {
     ExecutionStatus,
     Coverage,
     Host,
+    ExperimentArm,
+    PipelineStage,
 }
 
 impl UsageDimension {
-    pub const ALL: [UsageDimension; 13] = [
+    pub const ALL: [UsageDimension; 15] = [
         Self::Product,
         Self::Project,
         Self::TaskKind,
@@ -97,6 +99,8 @@ impl UsageDimension {
         Self::ExecutionStatus,
         Self::Coverage,
         Self::Host,
+        Self::ExperimentArm,
+        Self::PipelineStage,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -114,6 +118,8 @@ impl UsageDimension {
             Self::ExecutionStatus => "execution_status",
             Self::Coverage => "coverage",
             Self::Host => "host",
+            Self::ExperimentArm => "experiment_arm",
+            Self::PipelineStage => "pipeline_stage",
         }
     }
 }
@@ -155,7 +161,11 @@ pub struct UsageFilter {
 /// add the optional pricing-table USD estimate. Serialised flat beside the
 /// request's `type` tag.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
 pub struct TokenUsageRowsRequest {
+    /// Experiment key selected by `experiment_arm`; absent means the whole recorded set.
+    #[serde(default)]
+    pub experiment: Option<String>,
     pub since_epoch_s: i64,
     pub until_epoch_s: i64,
     #[serde(default)]
@@ -565,10 +575,30 @@ pub struct UsageCoverage {
     pub runs_priceable: Option<u32>,
 }
 
+/// Counts of runs and distinct launch families in one recorded arm.
+/// A family can appear in multiple arms if its recorded assignments changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageExperimentArm {
+    pub arm: String,
+    pub runs: u32,
+    pub families: u32,
+}
+
+/// Experiment observed in the requested window, before filters and the row cap.
+/// Keys come from launch records, including experiments no longer registered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageObservedExperiment {
+    pub experiment: String,
+    pub arms: Vec<UsageExperimentArm>,
+}
+
 /// Reply to [`crate::FrontendRequest::GetTokenUsageRows`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct TokenUsageRowsReport {
+    #[serde(default)]
+    #[builder(default)]
+    pub observed_experiments: Vec<UsageObservedExperiment>,
     /// Fixed boundary before which no run has token data, echoed so a client
     /// does not hardcode it.
     pub capture_start_epoch_s: i64,
@@ -689,7 +719,11 @@ impl FromStr for UsageBucketWidth {
 /// OR within one), and whether to add the pricing-table USD estimate.
 /// Serialised flat beside the request's `type` tag.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
 pub struct TokenUsageSeriesRequest {
+    /// Experiment key selected by `experiment_arm`; absent means the whole recorded set.
+    #[serde(default)]
+    pub experiment: Option<String>,
     pub since_epoch_s: i64,
     pub until_epoch_s: i64,
     #[serde(default)]
@@ -805,6 +839,9 @@ pub struct UsageSeriesCoverage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct TokenUsageSeriesReport {
+    #[serde(default)]
+    #[builder(default)]
+    pub observed_experiments: Vec<UsageObservedExperiment>,
     /// Nominal width of one bucket in seconds (`3_600` for hour, `86_400` for
     /// day, `604_800` for week, nominal `2_592_000` for month). For
     /// [`UsageBucketWidth::Month`], buckets are UTC calendar months (28–31
@@ -959,6 +996,27 @@ mod tests {
         };
         assert!(!decoded.roll_up_revisions && decoded.estimate_usd);
         assert_eq!(decoded.group_by.len(), 2);
+    }
+
+    #[test]
+    fn experiment_requests_round_trip_both_new_dimensions() {
+        for request_type in ["get_token_usage_rows", "get_token_usage_series"] {
+            let group_by = if request_type.ends_with("rows") {
+                serde_json::json!(["experiment_arm", "pipeline_stage"])
+            } else {
+                serde_json::json!("experiment_arm")
+            };
+            let json = serde_json::json!({
+                "type": request_type, "since_epoch_s": 1, "until_epoch_s": 2,
+                "experiment": "retired_experiment", "group_by": group_by,
+                "filters": [{"dimension": "pipeline_stage", "values": ["review_supervisor"]}]
+            });
+            let request: FrontendRequest = serde_json::from_value(json.clone()).unwrap();
+            let encoded = serde_json::to_value(request).unwrap();
+            assert_eq!(encoded["experiment"], json["experiment"]);
+            assert_eq!(encoded["group_by"], group_by);
+            assert_eq!(encoded["filters"], json["filters"]);
+        }
     }
 
     #[test]

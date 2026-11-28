@@ -23,6 +23,7 @@ rust_library(
         "//tools/boss/engine/work-db:__pkg__",
     ],
     deps = [
+        "//tools/boss/engine/feature-flags",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
 )
@@ -37,6 +38,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//tools/boss/engine/feature-flags",
         "//tools/boss/protocol",
     ] + all_crate_deps(
         normal = True,

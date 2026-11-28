@@ -95,6 +95,14 @@ struct TokenClasses: Codable, Equatable, Hashable, Sendable {
     var cacheCreation5m: Int64?
     var cacheCreation1h: Int64?
     var cacheRead: Int64?
+
+    // Foundation capitalizes letters following digits when converting snake case.
+    // Match the converted wire keys so recorded cache durations remain present.
+    private enum CodingKeys: String, CodingKey {
+        case input, output, cacheCreation, cacheRead
+        case cacheCreation5m = "cacheCreation5M"
+        case cacheCreation1h = "cacheCreation1H"
+    }
 }
 
 struct ModelUsage: Codable, Equatable, Hashable, Sendable {
@@ -405,5 +413,50 @@ extension UsageRequestState where Report == TokenUsageRowsReport {
     @discardableResult
     mutating func receiveRows(_ report: TokenUsageRowsReport, requestId: String?, now: Date = Date()) -> Bool {
         receive(report, requestId: requestId, now: now)
+    }
+}
+
+/// Skip only unknown dimension names. A malformed entry for a known dimension
+/// still fails decoding, so forward compatibility cannot hide corrupt figures.
+private struct KnownUsageDimensionEntry<Value: Decodable>: Decodable {
+    var value: Value?
+    private enum CodingKeys: String, CodingKey { case dimension }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let name = try container.decode(String.self, forKey: .dimension)
+        value = UsageDimension(rawValue: name) == nil ? nil : try Value(from: decoder)
+    }
+}
+
+extension TokenUsageRowsReport {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        captureStartEpochS = try c.decode(Int64.self, forKey: .captureStartEpochS)
+        coverage = try c.decode(UsageCoverage.self, forKey: .coverage)
+        generatedAtEpochS = try c.decode(Int64.self, forKey: .generatedAtEpochS)
+        overall = try c.decode(CostMeasurement.self, forKey: .overall)
+        runCap = try c.decode(UInt32.self, forKey: .runCap)
+        sinceEpochS = try c.decode(Int64.self, forKey: .sinceEpochS)
+        spansCaptureBoundary = try c.decode(Bool.self, forKey: .spansCaptureBoundary)
+        truncated = try c.decode(Bool.self, forKey: .truncated)
+        untilEpochS = try c.decode(Int64.self, forKey: .untilEpochS)
+        dimensionValues = try c.decode([KnownUsageDimensionEntry<UsageDimensionValues>].self, forKey: .dimensionValues).compactMap(\.value)
+        groupBy = try c.decode([String].self, forKey: .groupBy).compactMap(UsageDimension.init(rawValue:))
+        groups = try c.decode([UsageGroup].self, forKey: .groups)
+        pricingGaps = try c.decode([String].self, forKey: .pricingGaps)
+        taskless = try c.decode([ExecutionUsageNode].self, forKey: .taskless)
+        tasks = try c.decode([TaskUsageNode].self, forKey: .tasks)
+    }
+}
+
+extension UsageGroup {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        key = try c.decode([KnownUsageDimensionEntry<UsageGroupKey>].self, forKey: .key).compactMap(\.value)
+        measurement = try c.decode(CostMeasurement.self, forKey: .measurement)
+        subgroups = try c.decode([UsageGroup].self, forKey: .subgroups)
+        tasks = try c.decode([TaskUsageNode].self, forKey: .tasks)
+        taskless = try c.decode([ExecutionUsageNode].self, forKey: .taskless)
     }
 }
