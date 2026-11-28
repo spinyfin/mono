@@ -376,6 +376,16 @@ impl WorkDb {
         Ok(out)
     }
 
+    /// Most-recent execution doing `work_item_id`'s own work: every kind
+    /// except `progression`, which is keyed by the stuck item it examines
+    /// but never owns that item's dispatch slot. The same row an explicit
+    /// start weighs when it decides between reusing an execution and
+    /// creating one. `Ok(None)` when the item has never had such an execution.
+    pub fn latest_dispatch_execution_for_work_item(&self, work_item_id: &str) -> Result<Option<WorkExecution>> {
+        let conn = self.connect()?;
+        query_latest_execution_for_work_item(&conn, work_item_id)
+    }
+
     /// Most-recent execution for `work_item_id`, ordered by creation.
     /// `Ok(None)` when the work item has never had an execution.
     pub fn latest_execution_for_work_item(&self, work_item_id: &str) -> Result<Option<WorkExecution>> {

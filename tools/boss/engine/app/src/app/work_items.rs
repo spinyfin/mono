@@ -1096,6 +1096,10 @@ pub(super) async fn apply_work_item_patch_from(
                 // anything past a pause, so `dispatch_pause_hold` must still
                 // be free to report a genuinely held row for those cases.
                 let mut claimed_past_pause = false;
+                // Set when this request claimed a worker for the item through
+                // the board launch below: nothing is left queued for a pause
+                // to hold.
+                let mut launched_now = false;
                 let product_id = item.product_id().to_string();
                 let mut topics = vec![work_product_topic(&product_id)];
                 if matches!(item, WorkItem::Product(_)) {
@@ -1156,45 +1160,36 @@ pub(super) async fn apply_work_item_patch_from(
                             .await;
                     });
                 }
-                // Kanban drop-into-Doing (and any other human
-                // path that flips a task/chore to `active` via
-                // UpdateWorkItem) must dispatch a worker — see
-                // `tools/boss/docs/designs/work-kanban.md` §
-                // "Doing column = live or queued". The macOS
-                // client also fires `RequestExecution` after
-                // the status patch, but doing it server-side
-                // closes the gap for older clients (or any
-                // future client that forgets the follow-up
-                // RPC), which is the failure shape the
-                // motivating bug exposed for `autostart=false`
-                // chores parked in `todo`: the autostart gate
-                // blocks creation-time dispatch, so until the
-                // human drags the card there is no execution
-                // at all, and a status flip with no follow-up
-                // RequestExecution leaves an `active` card
-                // with no worker.
+                // A task/chore that a person flips to `active` must get a
+                // worker — see `tools/boss/docs/designs/work-kanban.md` §
+                // "Doing column = live or queued". The engine does it in
+                // this request rather than trusting the client to follow
+                // up with `RequestExecution`: an `autostart=false` item
+                // parked in `todo` has no execution at all until then, and
+                // a status flip with no start leaves an `active` card with
+                // no worker. Three ways in, each with its own arm below:
                 //
-                // We only create a fresh execution when the
-                // work item has no live/queued one — an
-                // existing non-terminal execution already owns
-                // the dispatch slot, and replacing it would
-                // race the auto-dispatcher (and would void the
-                // execution id the client is already tracking).
-                // The reconcile / rescan paths handle
-                // re-dispatch of stale (worker-died) cases.
-                //
-                // Exception: an explicit operator pause-bypass
-                // (confirmed drag-to-Doing while dispatch is
-                // paused) must still reach
-                // `dispatch_with_pause_bypass` when the latest
-                // execution is `ready` and held by that pause.
-                // `work_item_needs_dispatch` is false for any
-                // non-terminal row, so gating the bypass arm
-                // on it made the force gesture a no-op in
-                // exactly the state the pause creates. The
-                // coordinator reuses the held `ready` row and
-                // early-returns if the execution is already
-                // live.
+                // - A card moved to Doing on the board is the owner's
+                //   explicit start. It launches now through
+                //   `launch_from_board_move`, as `bossctl agents launch`
+                //   does: past the focus set and the interactive cap, with
+                //   the launch recorded on the item. A real refusal (a
+                //   pause, a pool at its hard cap) reverts the move and is
+                //   answered with its reason.
+                // - The same move confirmed through the paused-dispatch
+                //   dialog is the pause-only override
+                //   (`dispatch_with_pause_bypass`). It is not gated on
+                //   `work_item_needs_dispatch`, which is false for the
+                //   `ready` row the pause is holding: the coordinator
+                //   reuses that row and returns early if the execution is
+                //   already live.
+                // - Any other `UpdateWorkItem` that sets `active` (the
+                //   CLI, an agent) is an ordinary start: it queues a
+                //   `ready` execution and kicks the scheduler, and only
+                //   when no implementation execution already owns the
+                //   item, so it never races the auto-dispatcher or voids
+                //   an execution id a client is tracking. The reconcile
+                //   and rescan paths re-dispatch stale (worker-died) rows.
                 if task_transitioned_to_active(&previous_task_status, &item) {
                     let work_item_id_for_event = work_item_id(&item);
                     let from_status = previous_task_status.clone();
@@ -1270,6 +1265,47 @@ pub(super) async fn apply_work_item_patch_from(
                             Err(err) => {
                                 let reason = format!("{err:#}");
                                 dispatch_failure = Some((err, BoardRefusalCode::PauseOverrideRefused));
+                                (None, false, Some(reason))
+                            }
+                        }
+                    } else if board_gesture {
+                        // A card moved to Doing is the owner's explicit start,
+                        // so it launches the way `bossctl agents launch` does
+                        // instead of queueing behind the focus set and the
+                        // interactive cap. Not gated on `needs_dispatch`: the
+                        // request decides whether an execution already owns
+                        // the item, and it is the one reader that tells an
+                        // implementation run from the progression run of a
+                        // stuck item. A refusal (a pause, a pool at its hard
+                        // cap) comes back as an error and takes the revert
+                        // path below, so the card never stays in Doing with
+                        // nothing running and nothing said.
+                        let dispatch_input = RequestExecutionInput::builder()
+                            .work_item_id(work_item_id_for_event.clone())
+                            .explicit_start(true)
+                            .audit_actor(actor)
+                            .audit_basis(start_basis.clone())
+                            .build();
+                        match server_state
+                            .execution_coordinator
+                            .launch_from_board_move(dispatch_input, server_state.live_worker_states.clone())
+                            .await
+                        {
+                            Ok(outcome) if outcome.launched => {
+                                launched_now = true;
+                                (Some(outcome.execution.id), true, None)
+                            }
+                            Ok(outcome) => {
+                                let reason = format!(
+                                    "an execution already has a worker, or one being started, for this work item \
+                                     (id={}, status={:?}); nothing was launched",
+                                    outcome.execution.id, outcome.execution.status
+                                );
+                                (Some(outcome.execution.id), false, Some(reason))
+                            }
+                            Err(err) => {
+                                let reason = format!("{err:#}");
+                                dispatch_failure = Some((err, BoardRefusalCode::DispatchRefused));
                                 (None, false, Some(reason))
                             }
                         }
@@ -1410,7 +1446,7 @@ pub(super) async fn apply_work_item_patch_from(
                     let pause_hold = server_state
                         .execution_coordinator
                         .dispatch_pause()
-                        .filter(|_| did_dispatch && !claimed_past_pause)
+                        .filter(|_| did_dispatch && !claimed_past_pause && !launched_now)
                         .map(|pause| {
                             serde_json::json!({
                                 "origin": pause.origin.as_metadata_str(),

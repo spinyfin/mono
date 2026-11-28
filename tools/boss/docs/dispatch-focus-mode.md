@@ -28,7 +28,7 @@ A work item is in scope when any of these holds (`tools/boss/engine/work-db/src/
 
 1. its `project_id` is a focused project. A project's design seed task is an ordinary task with `project_id` set, so it counts as the project;
 2. its `product_id` is a focused product (any project, or none);
-3. it was explicitly requested with `bossctl agents launch`. This fact is stored on the work item for its lifetime and survives engine restarts;
+3. it was explicitly started: `bossctl agents launch`, or its card moved to Doing on the board (see [Moving a card to Doing](#moving-a-card-to-doing)). This fact is stored on the work item for its lifetime and survives engine restarts;
 4. its lineage roots in an in-scope item. A `revision` (including engine-minted review, CI-fix and merge-conflict revisions) resolves through each parent in its chain. A `followup` (including a post-merge review followup) resolves through `origin_task_short_id` to the task it followed up. Both steps repeat.
 
 Executions keyed by something other than a task are attributed to the task that owns them:
@@ -55,9 +55,26 @@ The practical case is `bossctl agents launch <revision>` on a PR whose owning ro
 - The **global dispatch pause** overrides focus. The focus gate runs after the pause gate and only ever holds more, so focus never resumes anything while paused, and a paused row shows `dispatch_paused` rather than `focus_mode`. Under the default `new_work` pause, PR reviews stay exempt from the pause, so they follow focus instead. An `all_spawns` pause holds reviews too, so pre-merge admission defers those batches the same way focus does rather than letting them occupy reservations they cannot use.
 - The spawn-breaker's half-open recovery probe is an automatic path, so it respects focus: under a breaker pause it picks its canary only from ready rows inside the focus set, and admits nothing when every ready row is out of scope or scope cannot be resolved. Explicit launches and review-start requests grant focus admission. A breaker-origin pause is never overridable: persisted operator-forced admission does not dispatch through it.
 - `bossctl agents launch` (`force_dispatch`) bypasses focus, as it bypasses an operator-origin pause. Its engine-minted reviews, CI-fixes, merge-conflict revisions and post-merge reviews inherit focus admission for the lifetime of the explicitly launched item. A launched revision carries that admission to the pre-merge review of what it pushes, and no further (see [Reviews of a revision's push](#reviews-of-a-revisions-push)). That inherited admission does not bypass the pause or concurrency cap. `bossctl work start --force` (the pause-only override) does **not** bypass focus: the admission preview reports a `focus_mode` blocker and the request is refused with the same guidance.
+- Moving a card to Doing in the app is the same explicit start as `bossctl agents launch`, except that it never overrides a pause: see [Moving a card to Doing](#moving-a-card-to-doing).
 - The interactive concurrency cap applies as usual to in-scope rows.
 - `bossctl review start --pr <n>` records the same durable focus admission as an explicit launch, for every reviewer in the admitted batch and the item's later review follow-ups. Reservation capacity, pauses, and concurrency limits still apply; other out-of-focus items remain held.
 - A review guide (`prgc_…`, or its execution id) cannot be launched on its own: `agents launch` refuses with the parent's start command: `bossctl agents launch <root>` when a review execution is already queued, otherwise `bossctl review start --pr <n> --repo <owner/repo>` (launching a root whose PR is bound but never reviewed hits the bound-PR refusal). Both `dispatch diagnose` and the focus-held review attention name that command; a held answer-agent comment has no launch verb, so `diagnose` names none for it.
 - Priority `critical` bypasses the pause and the cap but not focus.
 - Answering a worker's blocking question mints a ready execution for the row; under focus mode an in-scope row dispatches without any force-launch.
 - Work created by answering an architectural-mismatch question carries a persisted operator-forced admission. Once that work is ready, the drain dispatches it through an operator-origin pause and outside the focus set. Writer exclusion, the claim, and the lease bound still apply. A breaker-origin pause holds the row as `dispatch_paused` and keeps the flag. The admission is consumed when the row is admitted or goes terminal.
+
+## Moving a card to Doing
+
+Dropping a card on Doing is the owner's explicit start gesture, and the engine treats it as one. In the request that moves the card it starts the item the way `bossctl agents launch` does:
+
+- the item's execution is created, or the one already queued for it is reused, by the same request path a launch uses. A stuck item's progression run is not such an execution and never stands in for one;
+- that execution is claimed past the focus set and the interactive concurrency cap, growing its pool by one slot up to the pool's hard cap;
+- the launch is recorded on the item (scope rule 3), so its reviews, CI-fixes, merge-conflict revisions and post-merge reviews stay admitted while focus excludes its project or product.
+
+The request answers once a worker slot is claimed, not once the worker is running. A start that then fails is retried or reported by the ordinary pre-start handling, as it is for any claimed row.
+
+The gesture differs from a launch in one way: it does not override a dispatch pause. The app asks before overriding a pause, and a confirmed override is the pause-only override described under [Precedence](#precedence), which keeps focus and the cap. A drop that reaches a paused engine without that confirmation is refused. A `critical` item keeps its exemption from a default-scope operator pause.
+
+When the engine cannot start the item (dispatch is paused, the pool is at its hard cap, too many workspaces are already being set up for the repository, startup checks are still running) the move is refused: the card returns to the column it came from and shows the reason. Nothing is left queued to start later and no launch is recorded. An execution that was already queued before the move is left as it was.
+
+Only the board gesture is a launch. Any other move to `active` (`boss task move --to active`, an agent's status edit) is an ordinary start: it queues a `ready` execution that waits for the focus set, the cap and a free slot like any other row.

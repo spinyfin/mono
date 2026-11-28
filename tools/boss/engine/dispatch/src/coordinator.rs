@@ -919,6 +919,7 @@ mod blocked_workspace;
 mod config;
 mod dispatch_admission;
 mod execution;
+mod launch;
 mod lease_limiter;
 mod permanent_start_failure;
 mod predecessor_hold;
@@ -933,6 +934,7 @@ use unexplained_wait::UnexplainedWaitWatch;
 
 pub use config::{LOCAL_CAPABILITY_DISCOVERY_PENDING_REASON, STARTUP_RECOVERY_PENDING_REASON};
 pub use dispatch_admission::{PauseBypassOutcome, pause_bypass_decision};
+pub use launch::{BoardLaunchOutcome, ForcedDispatchRefusal};
 pub use run::PANE_SPAWN_FAILED_ATTENTION_KIND;
 pub use scheduler::ANSWER_AGENT_READY_AGE_ATTENTION_KIND;
 

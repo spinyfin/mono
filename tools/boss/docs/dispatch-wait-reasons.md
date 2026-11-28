@@ -119,8 +119,10 @@ A review-findings follow-up and its eligible initial execution are committed tog
 
 The startup sequence is `ready` → `claimed` → `running`. The durable claim projects as `dispatching` (“preparing the worker launch”); admission preserves the old queue hold and its age until it succeeds, then records the startup phase. Before the cube lease call, the engine records `leasing_workspace`; after acquisition it records `preparing_workspace` while positioning and preparing the worker's checkout. The card renders those engine phrases. Starting the run clears the reason; releasing a claim or recovering it after a restart clears startup phases so the ready row can acquire its next queue reason. The claim itself names dispatch in progress; genuinely unexplained waiting states remain unclassified.
 
-## A move to Doing stays queued
+## A move to Doing is started or stays queued
 
-Moving a card to Doing mints a `ready` execution and reports `did_dispatch: true`. The same request then reconciles the product. The reconciler holds every project task but the first unfinished one in `waiting_dependency` (the project's ordinal chain), and applying that to the row the move had just minted would leave it where no scheduler pass looks, with no worker and no reason.
+Dropping a card on Doing launches the item in the same request: its execution is claimed for a worker before the request answers, or the move is refused with the reason and the card returns to its column (see [Moving a card to Doing](dispatch-focus-mode.md#moving-a-card-to-doing)). Any other move to `active` (`boss task move --to active`, an agent's status edit) mints a `ready` execution for the scheduler to take from the queue. Both report `did_dispatch: true`.
+
+The same request then reconciles the product. The reconciler holds every project task but the first unfinished one in `waiting_dependency` (the project's ordinal chain), and applying that to the row the move had just minted would leave it where no scheduler pass looks, with no worker and no reason.
 
 The chain decides which task the engine starts next, so it no longer applies to a task that is already `active`. A declared `blocks` prerequisite still gates an active task.

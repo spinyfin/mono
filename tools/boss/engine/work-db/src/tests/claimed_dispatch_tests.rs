@@ -335,3 +335,27 @@ fn release_stale_claimed_executions_reverts_leftover_claimed_rows() {
     assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Ready);
     assert!(db.release_stale_claimed_executions().unwrap().is_empty());
 }
+
+#[test]
+fn board_restore_does_not_take_a_drains_claim() {
+    let db = WorkDb::open(temp_db_path("board-restore-claimed")).unwrap();
+    let (product_id, first, _) = two_incomplete_project_tasks(&db);
+    db.reconcile_product_executions(&product_id).unwrap();
+    let execution_id = db.list_executions(Some(&first.id)).unwrap()[0].id.clone();
+    assert!(db.restore_ready_to_waiting_dependency(&execution_id).unwrap());
+    db.request_execution(
+        boss_protocol::RequestExecutionInput::builder()
+            .work_item_id(&first.id)
+            .build(),
+    )
+    .unwrap();
+    assert_eq!(
+        db.claim_execution_for_dispatch(&execution_id).unwrap(),
+        DispatchClaimOutcome::Won
+    );
+    assert!(!db.restore_ready_to_waiting_dependency(&execution_id).unwrap());
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Claimed
+    );
+}

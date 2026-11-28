@@ -879,6 +879,19 @@ impl BoardRefusal {
                 },
             };
         }
+        // A start the dispatcher itself refused (a pause, a pool at its hard
+        // cap, a lease storm): the card says why, without execution ids.
+        if let Some(refusal) = err.downcast_ref::<boss_engine_dispatch::coordinator::ForcedDispatchRefusal>() {
+            return Self::phrased(
+                fallback,
+                format!(
+                    "Can't start {} right now: {}.",
+                    item_label(work_db, id),
+                    refusal.plain_reason()
+                ),
+                err,
+            );
+        }
         if fallback == boss_protocol::BoardRefusalCode::MissingRepo {
             return Self::phrased(
                 fallback,
@@ -1456,16 +1469,20 @@ pub(super) fn task_status_for_id(work_db: &WorkDb, id: &str) -> Option<TaskStatu
     }
 }
 
-/// True iff the work item has no execution at all, or its latest
-/// execution is in a terminal status. Used by the UpdateWorkItem
-/// handler's drop-into-Doing dispatch to decide whether to create a
-/// fresh execution after a human flips status to `active`. An
-/// existing non-terminal execution (`ready` / `running` /
-/// `waiting_*`) already owns the dispatch slot, so we leave it alone
-/// — the steady-state rescan and the dispatcher's normal flow take
-/// care of stale ones.
+/// True iff the work item has no execution of its own work at all, or
+/// the latest one is in a terminal status. Used by the UpdateWorkItem
+/// handler to decide whether to create a fresh execution after a status
+/// flip to `active`. An existing non-terminal execution (`ready` /
+/// `running` / `waiting_*`) already owns the dispatch slot, so we leave
+/// it alone — the steady-state rescan and the dispatcher's normal flow
+/// take care of stale ones.
+///
+/// A progression run is not such an execution. It is keyed by the stuck
+/// item it examines, so while one is queued or running it is that item's
+/// newest row, but it never does the item's work. Counting it would let a
+/// move to `active` flip the status and start nothing.
 pub(super) fn work_item_needs_dispatch(work_db: &WorkDb, work_item_id: &str) -> bool {
-    match work_db.latest_execution_for_work_item(work_item_id) {
+    match work_db.latest_dispatch_execution_for_work_item(work_item_id) {
         Ok(Some(existing)) => matches!(
             existing.status.as_str(),
             "completed" | "failed" | "abandoned" | "cancelled" | "orphaned"
