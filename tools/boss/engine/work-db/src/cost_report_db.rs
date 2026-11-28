@@ -1455,7 +1455,7 @@ mod tests {
             .expect("the seed fixture applies to a freshly migrated database");
         let now = boss_engine_utils::epoch_time::now_epoch_secs();
         let records = db.usage_records_for_window(0, now + 86_400).unwrap();
-        assert_eq!(records.runs.len(), 24);
+        assert_eq!(records.runs.len(), 28);
 
         let query = |since: i64| {
             UsageRowsQuery::builder()

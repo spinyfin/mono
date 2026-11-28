@@ -741,6 +741,9 @@ fn map_usage_record(row: &Row) -> rusqlite::Result<UsageRunRecord> {
         driver,
         execution_model: launched_model,
         execution_effort: None,
+        experiment_family_id: None,
+        experiment_arms: None,
+        review_member_role: None,
     })
 }
 
