@@ -33,7 +33,8 @@ Refreshed on 2026-11-25, after the spike. Evidence for each line is in [coordina
 - Claude Code's cross-session inbox does exist in an adapter-hosted session, and a peer message is answered (S10).
 - How a headless coordinator's usage is metered is stated by Anthropic's help centre today, but that policy changed twice during 2026. The spike's sessions reported the plan's seven-day window (S8). Whether that is acceptable is still the repo owner's decision. See [Usage metering and account policy](#usage-metering-and-account-policy).
 - The isolation gap described in the findings below was closed by mono#3920 while the spike ran. The spike did not depend on it: it rendered its own session directory and set the engine socket itself, and it did not run an isolated engine with a registered app.
-- Still unobserved: the agent host, journal replay, the intent log, handoff delivery, engine and app restarts, and any session longer than a few turns.
+- The engine chat service ran against the real agent host, the real adapter (0.110.0), Claude Code 2.1.332 and the real login on 2026-11-27, through `live_adapter_probe` (see [coordinator-acp-spike.md](../investigations/coordinator-acp-spike.md), S15). An engine restart in the middle of a turn, with a second message queued behind it, lost nothing: the new service took the adapter's answer to the earlier process's prompt and then sent the queued message. A restart while the agent waited on a permission request recovered the request, whose id was 0 while the client's ids had reached 7, answered it by direction as well as id, and the allowed command ran.
+- Still unobserved: handoff delivery, app restarts, the coordinator lifecycle on this backend, and any session longer than a few turns.
 
 ## Findings that shape the design
 

@@ -13,6 +13,7 @@ rust_library(
     visibility = [
         "//tools/boss/engine/agy-home-retention:__pkg__",
         "//tools/boss/engine/codex-rollout-retention:__pkg__",
+        "//tools/boss/engine/coordinator-chat:__pkg__",
         "//tools/boss/engine/grok-home-retention:__pkg__",
     ],
     deps = all_crate_deps(normal = True),

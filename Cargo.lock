@@ -712,6 +712,7 @@ dependencies = [
  "boss-engine-board-gesture",
  "boss-engine-comment-classifier",
  "boss-engine-completion",
+ "boss-engine-coordinator-chat",
  "boss-engine-design-docs",
  "boss-engine-dispatch",
  "boss-engine-driver",
@@ -906,13 +907,21 @@ dependencies = [
 name = "boss-engine-coordinator-chat"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "bon",
  "boss-acp-client",
  "boss-agent-host",
+ "boss-backoff",
+ "boss-engine-driver-home-retention",
  "boss-engine-utils",
  "boss-protocol",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

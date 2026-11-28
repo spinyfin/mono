@@ -2,7 +2,7 @@
 //!
 //! A successful write is not delivery: inbound policy can hold or refuse the
 //! message. A correlated transcript input or delivered receipt confirms delivery.
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -456,10 +456,8 @@ async fn inject(
     let mut turn_file = tokio::fs::File::open(transcript).await?;
     turn_file.seek(std::io::SeekFrom::Start(cursor)).await?;
     let directory = path.parent().context("inbox has no parent directory")?;
-    let metadata = std::fs::symlink_metadata(directory)?;
-    let uid = unsafe { libc::geteuid() };
-    if !metadata.is_dir() || metadata.uid() != uid || metadata.permissions().mode() & 0o077 != 0 {
-        bail!("coordinator inbox directory must be private and owned by the engine user");
+    if let Some(problem) = boss_engine_utils::host::private_directory_problem(directory)? {
+        bail!("coordinator inbox directory must be private and owned by the engine user ({problem})");
     }
     let mut stream = UnixStream::connect(path)
         .await
