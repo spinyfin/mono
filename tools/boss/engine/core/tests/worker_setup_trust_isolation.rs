@@ -37,6 +37,7 @@ fn write_workspace_files_does_not_pre_trust_claude_json_for_non_claude_driver() 
         is_review_supervisor: false,
         is_post_merge_reviewer: false,
         checkout_positioned_on_pr_head: false,
+        slim_worker_brief: false,
     };
 
     let mut descriptor = stub_descriptor();

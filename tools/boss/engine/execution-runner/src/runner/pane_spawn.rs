@@ -1005,6 +1005,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         // Resolved before composing, so the brief and the launch record the
         // dispatch site writes come from one set; see `experiment_arms`.
         let experiment_arms = resolve_launch_experiment_arms(&self.feature_flags, &self.work_db, execution);
+        let slim_worker_brief = experiment_arms.is_treated(crate::feature_flags::SLIM_WORKER_BRIEF_EXPERIMENT);
         let compose_began = std::time::Instant::now();
         let ComposedWorkerSpawn {
             prompt_text,
@@ -1467,6 +1468,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                     .is_post_merge_reviewer(is_post_merge_reviewer)
                     .checkout_positioned_on_pr_head(checkout_positioned_on_pr_head)
                     .launch_options(launch_options)
+                    .slim_worker_brief(slim_worker_brief)
                     .build(),
                 StdDuration::from_secs(30),
             )

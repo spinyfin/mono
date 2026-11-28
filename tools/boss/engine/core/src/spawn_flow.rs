@@ -718,6 +718,7 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
         .is_review_supervisor(input.is_review_supervisor)
         .is_post_merge_reviewer(input.is_post_merge_reviewer)
         .checkout_positioned_on_pr_head(input.checkout_positioned_on_pr_head)
+        .slim_worker_brief(input.slim_worker_brief)
         .build();
     let workspace_files_began = std::time::Instant::now();
     let written = write_workspace_files_with_options(&setup, input.driver.as_ref(), &input.launch_options)

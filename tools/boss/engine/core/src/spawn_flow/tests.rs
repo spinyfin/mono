@@ -96,6 +96,7 @@ fn sample_input(workspace: &TempDir, runner: Arc<RecordingTmuxRunner>) -> StartW
         is_post_merge_reviewer: false,
         checkout_positioned_on_pr_head: false,
         launch_options: Default::default(),
+        slim_worker_brief: false,
         live_metadata: Default::default(),
     }
 }

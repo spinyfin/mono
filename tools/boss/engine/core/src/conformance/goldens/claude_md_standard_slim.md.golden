@@ -1,0 +1,405 @@
+# Worker rules
+
+You are running inside a managed worker session. The engine
+spawned you in a leased cube workspace and observes this session
+via claude hooks.
+For ordinary pre-push validation, run `checkleft run` with no flags; use
+`checkleft --all` only in CI, when modifying checkleft itself, or with a
+strong stated justification.
+Do not wrap `bazel build`, `bazel test`, `bazel run`, or `checkleft run`
+in a shell `timeout`.
+
+## Pull requests are the deliverable
+
+**A task is not complete until a PR exists.** Local commits are NOT enough.
+
+### Before every PR branch push
+
+Stacked changes are not supported. Never create, bind, or retarget a PR to any branch other than the repository default branch. If required code exists only in another open PR, stop and declare blocked with `--answer-type link-prerequisite-task --prerequisite-pr <that PR's URL>` so the engine links the task that owns that PR and holds this work until the PR lands in the default branch. Use `create-prerequisite-task` only when no open task owns the PR. Wait until its PR lands in the default branch before continuing; do not base work on its branch, auto-retarget, or treat a merge into another branch as completion.
+
+Before the first push and every later push (`"$CUBE_BIN" pr create` or `"$CUBE_BIN" pr update`), fetch and compare the branch's base with its current upstream tip; do not rely on the base recorded at dispatch or an earlier check. Use `"$CUBE_BIN" workspace local-rebase --pr <bound-pr-number> --json` for an existing PR: it resolves the actual GitHub remote and PR base, which must be the repository default branch. Before a PR exists, use the same flow with `"$CUBE_BIN" workspace local-rebase --base <intended-pr-base-branch> --json`, naming the repository default branch: the engine refuses to complete a new PR whose base is any other branch.
+
+The command fetches that remote and rebases the preserved working-copy history onto the freshly fetched tracking ref without publishing, repositioning the working copy, or collapsing commits. Use `jj` and the returned `destination` to compare ancestry and inspect the result. If the base has advanced, the branch must include the latest base before pushing. Resolve every conflicted commit from the base upward, integrating both sides' intent; never discard upstream changes, take either side wholesale, drop commits, squash, or reword existing descriptions. Preserve published PR bookmarks after rebasing.
+
+After a rebase, re-run the builds and tests affected by the upstream changes and conflict resolutions before pushing, even when the rebase looked clean. Verify with `jj` that no commit to be pushed has unresolved conflicts. If the rebase or resolution cannot be completed cleanly, stop and report the conflicting files and reason; never push a half-resolved branch. Only then publish with the existing PR tooling.
+
+- Open a PR with `"$CUBE_BIN" pr create` once commits exist and tests pass. **If a PR already exists** (resuming or addressing review), push new commits to it with `"$CUBE_BIN" pr update` instead of opening a duplicate — check first with `"$BOSS_BIN" pr status` (see below).
+- Do not hard-wrap PR bodies; write every PR body to a temp file and pass `--body-file` (see the recipe below).
+- **Every PR body must contain an evidence section.** Show concretely how
+the change achieves its stated intent: commands run and their results,
+repeated-run counts for flake fixes, measurements, before/after behavior,
+and screenshots registered via `"$BOSS_BIN" attach`, as applicable. Describe
+registered screenshots by caption and what you verified; keep attachment
+URLs out of the PR body. A bare "tests pass" is not enough. Where evidence
+could not be gathered, state the specific limitation and what would be
+needed to gather it. Distinguish observed results from expectations.
+- **Declare work that ships inert prominently in the PR body.** If your change
+does not take effect on deploy (a default-off flag, per-environment config,
+unscheduled task, missing capability, or other human action), state that it
+ships inert, the specific action that makes it live, and who can take it.
+Treat this as disclosure, not an approval step or merge gate.
+- Print the PR URL on its own line as the last thing in your final response.
+- Confirm the published PR contains your commit with `gh pr view` and
+its head SHA; pass `-R owner/repo` in a jj workspace (resolve the slug
+from the PR URL or `jj git remote`).
+
+## Empty diff and no-changes-needed
+
+Before pushing, run `jj diff -r @`. Never commit, push, or open an empty or cosmetic PR to manufacture a diff.
+
+If this run has no existing PR and the diff is empty because the work is already done (the change is already present on `main` and nothing is left to change), that is a legitimate, successful outcome. Declare it as your last action:
+
+```
+"$BOSS_BIN" propose done --outcome no-changes-needed --summary "<what you verified>"
+```
+
+End your turn after submitting; the engine verifies command evidence at that boundary and closes the task without nudging. If refused, verify again and redeclare. Prose alone is not a signal the engine can act on. Do not declare `no-changes-needed` for work that is hard or blocked — call `"$BOSS_BIN" propose blocked --reason "..."` instead. If a PR already exists and `jj diff -r @` is empty, stop and explain rather than declaring a no-op.
+
+## Checking your own PR's state
+
+The engine already stores most of what you'd otherwise ask GitHub for.
+These read your own PR only — never another run's — and cost one
+local round trip against the engine, not a GitHub API call:
+
+- `"$BOSS_BIN" pr status` — includes your resolved `pr_url`, the
+cheapest way to answer "do I already have a PR?" before
+deciding between `"$CUBE_BIN" pr create` and `"$CUBE_BIN" pr update`. Prefer
+this over `"$BOSS_BIN" context`'s `task.pr_url` field: that field is
+NULL for a revision task by design (the chain root owns the PR,
+not the revision), so it reads as "no PR" even when one exists.
+`"$BOSS_BIN" pr status` also returns `mergeable`, `merge_state_status`,
+`head_sha`, and `observed_at` for your own PR, e.g.:
+```sh
+"$BOSS_BIN" pr status --json
+```
+This is the engine's **last stored observation from the merge poller,
+not live GitHub truth** — `observed_at` (Unix epoch seconds) is
+the timestamp of that observation, not of your call. Right after
+a push, the stored snapshot usually still reflects the *pre-push*
+state. If you need current state (e.g. right after `"$CUBE_BIN" pr
+update` to see whether the push cleared a conflict), pass
+`--refresh` for one bounded, rate-limited live check:
+```sh
+"$BOSS_BIN" pr status --refresh --json
+```
+A refresh can be silently throttled (`refresh_throttled: true`
+in the response) if the engine-wide budget is exhausted — in
+that case you still get the last stored snapshot, never an error
+or a hang. Never loop calling `--refresh` waiting for a state
+change: the engine's own merge poller is what watches your PR to
+green after you push. Do not babysit CI with `gh pr checks` or
+`gh pr view` loops either. Finish required post-push artifacts, then
+complete the run using its enabled completion channel. Required checks
+are effectively green at SUCCESS, NEUTRAL, or SKIPPED; still-running
+and human-gated checks do not block completion. A genuinely failed
+check must be classified using the CI failure classification below;
+a CI-fix revision is no substitute for a fix you can make in this run.
+- `"$BOSS_BIN" pr body` — the PR title and body/description the
+engine snapshotted when this run started, for a read-modify-write of
+the description without a `gh pr view` round trip. If the
+response's `body` is null (`--json`) or says "(none stored)"
+(text), it means this run began a brand-new PR flow — there is
+nothing to diff against yet, you are about to write the first
+description via `"$CUBE_BIN" pr
+create --body-file`. It does NOT mean the PR has an empty
+description; an intentionally empty one is stored as `""`, not
+null. Only fall back to `gh pr view --json body` if you must
+confirm the null case is not a fetch failure rather than a
+new-PR flow.
+
+If a `"$BOSS_BIN"` command fails to run at all — not found, or it exits
+non-zero without answering — that is a finding, not noise. Say so
+explicitly in your final response and name the command. Do NOT
+quietly drop the step and carry on: a create-vs-update decision
+made without `"$BOSS_BIN" pr status` is a decision made blind, and
+nobody downstream can tell that from a clean transcript.
+
+## Your workspace
+
+- Workspace path: `/Users/brianduff/Documents/dev/workspaces/mono-agent-007`
+- Cube lease id: `lease-conformance-golden`
+
+Lease held for the lifetime of this run. Do not lease, release,
+or mutate cube state.
+
+## Always use absolute paths — never `cd`
+
+Your shell already starts in your workspace, so a `cd` buys you nothing
+and costs you the run: the agent harness refuses to auto-approve a
+compound command that pairs a `cd` with a relative file read (and, for
+`grep`/`rg`/`diff`/`git`/`cp`/`mv`, refuses outright), so the session
+stops on a permission dialog with no human watching it.
+
+- Do NOT write `cd <dir> && <command>`, and do not `cd` as a separate
+step either.
+- Address every file and directory by its absolute path:
+`cat /abs/path/to/file.rs`, `rg pattern /abs/path/to/dir`,
+`sed -n '1,40p' /abs/path/to/file.rs`.
+- For a tool that must run from a directory, use its own flag rather
+than a `cd` — e.g. `git -C <abs dir> …`, `make -C <abs dir> …`.
+
+This is about the command shape, not about what you may access: the
+engine's guards resolve every path the same way however it is spelled,
+so writing paths in full is never a way around a boundary.
+
+## VCS
+
+Use `jj` for all VCS. Do not invoke `git` directly except via `gh`.
+
+- `jj git fetch` to sync; `jj new main@origin` for a fresh task;
+`jj edit <bookmark>` to resume.
+- `jj describe -m '...'` to set commit messages;
+`jj bookmark set <name> -r @` to create or advance a bookmark.
+- **NEVER push branches or open PRs with bare VCS commands** (`jj git push`,
+`git push`, `gh pr create`). A PreToolUse hook blocks these. Use:
+- `"$CUBE_BIN" pr create --branch <name>` — new PR (pushes branch + opens PR, jj-aware, no GIT_DIR needed)
+- `"$CUBE_BIN" pr update --branch <name>` — existing PR (pushes new commits to it)
+- Never `jj git push --deleted` or `git push --delete`
+without explicit user approval.
+- **Never run raw `git` against cube's shared source store** — the
+checkout your workspace's `.jj/repo` pointer names, under cube's repos
+root — whether by `cd`-ing into it or by pointing `GIT_DIR`, `--git-dir`
+or `-C` at it. A PreToolUse hook refuses every git write there and every
+shallow `fetch`/`pull`/`clone` (`--depth`, `--shallow-since`, …) that
+would touch it: one such fetch turns the shared store into a shallow
+clone and breaks every dispatch for that repository. Read-only git
+against the store (`log`, `show`, `diff`, `rev-parse`, …) is allowed.
+To reproduce a CI script that runs raw git, clone into a throwaway
+directory under your own temp dir and run it there.
+- `.claude/` is gitignored by the engine. Do not force-track
+or commit anything inside it (no `--force`,
+no `jj file track .claude/...`).
+
+### Commit messages must be inline
+
+Always pass `-m "…"` to `git commit`, `git rebase`, `jj commit`,
+`jj describe`, and amend/squash flows (`git commit --amend`,
+`jj squash`). The worker environment has no usable
+`$EDITOR` — commands that fall through to one fail. Fix by
+re-running with `-m`. For splitting on jj 0.26 through 0.46, use
+`jj split --config 'ui.editor="true"' <paths>`, then
+`jj describe -r <revision> -m "message"` on each half.
+
+## Creating a PR from a jj workspace
+
+Cube workspaces are secondary jj workspaces. There is no `.git/`
+at the workspace root, so bare `gh` calls fail with
+`fatal: not a git repository` (pass `-R <owner/repo>` to `gh`).
+`"$CUBE_BIN" pr create` and `"$CUBE_BIN" pr update` push to GitHub by URL and
+resolve `-R <owner/repo>` from `jj git remote` automatically.
+
+### Canonical PR creation recipe
+
+**NEVER pass a PR body or comment as `--body "<inline text>"`** — the shell
+evaluates backticks, `$(...)`, and `${VAR}` inside double-quoted strings,
+corrupting inline code. Always write the body to a temp file and pass `--body-file`:
+
+```sh
+jj describe -m "your commit message"
+jj bookmark set my-feature -r @
+body=$(mktemp)
+cat > "$body" << 'PRBODY'
+## Summary
+Your description here. Inline code like `crate-name` and `$(cmd)` is safe.
+PRBODY
+"$CUBE_BIN" pr create --branch my-feature --title "Your PR title" --body-file "$body"
+```
+
+`"$CUBE_BIN" pr create` is safe to retry: if an open PR already exists for
+the branch, it returns that PR's URL instead of erroring, without
+pushing again. Use `"$CUBE_BIN" pr update --branch my-feature` only when
+you have new commits to push onto an already-open PR (it errors if
+none exists). `"$CUBE_BIN" pr create` handles the push and `--allow-new`
+automatically.
+
+### `origin` is the real GitHub upstream (shared object store)
+
+Every cube workspace is a **secondary jj workspace** that SHARES one
+object store with its siblings — there is no per-workspace clone. That
+store has a single `origin` remote pointing at the real GitHub upstream.
+
+- Because the store is shared, a `jj git fetch` in ANY workspace
+advances the remote-tracking bookmarks (e.g. `main@origin`) seen by
+ALL of them. Don't be alarmed if refs move without you fetching.
+- A solid belt-and-suspenders check that a push actually landed is to
+compare your local commit against GitHub's head sha (do not infer
+success from the push command's own output alone):
+
+```sh
+# local commit you intended to ship
+jj log -r my-feature --no-graph -T commit_id
+# what GitHub actually has (must match)
+gh api repos/<owner>/<repo>/branches/my-feature --jq .commit.sha
+# for a specific PR head:
+gh api repos/<owner>/<repo>/pulls/<n> --jq .head.sha
+```
+
+## Fix failing checks at the root cause
+
+**Hard constraint — fix failing checks at the root cause; never bypass them.**
+Do not suppress failures with exclusions/allowlists (`CHECKS.yaml`, checkleft), lint-disable comments, `allow_bypass` or override flags, `--no-verify` or skipped hooks, broad `#[allow(...)]` / `// swiftlint:disable` / `# noqa`, deleted/ignored/xfail/skipped tests, weakened assertions, or raised thresholds/limits. Fix the underlying code, tests, lint, or file size instead. A genuinely necessary check relaxation requires approval by the repo owner with full justification: STOP and surface it. Use the typed question flags on a blocked declaration when that channel is enabled; never decide autonomously.
+
+## Long-running build and test commands
+
+Bazel's own per-test timeouts (test size and timeout attributes) are what bound tests; do not wrap other build or test commands in a shell `timeout` either. A build that is still compiling with no errors is making progress, even when it is slow because other builds share the machine. If a wait bound is needed (for example a polling yield), keep polling the running command instead of killing it. If a hard cap is ever unavoidable for some other command, it must be at least two hours, and a timeout must never be treated as a reason to rerun the same command under the same cap. To diagnose a command, inspect only this invocation's output base and logs; never infer ownership or blockage from global process-name matches.
+
+## Merge-conflict telemetry
+
+If you ever run `"$CUBE_BIN" workspace rebase` mid-task (e.g. to sync with
+`main` before pushing, or because a push was rejected) and it reports
+`REBASED_WITH_CONFLICTS`, resolve the conflicts as normal, then
+AFTER resolving run:
+
+```sh
+"$BOSS_BIN" engine conflicts record-producer --execution-id <your execution id> \
+--head-branch <branch> --base-branch <main_branch> --files <comma-separated conflicted paths>
+```
+
+using the `branch`, `main_branch`, and conflicted-file list `cube
+workspace rebase` printed (or `jj resolve --list` if you need it
+again). This is telemetry only — best-effort, never blocks or
+reverts your actual work — but it is the only way the engine learns
+about conflicts you resolve on your own, before they'd ever reach
+the reviewed in-PR conflict-resolution flow.
+
+## Reuse before you build
+
+Before implementing any cross-cutting capability (an API/HTTP client,
+config loading, caching, logging wiring, retry/backoff, or similar
+infrastructure), search the repo for an existing implementation
+first. If one exists, reuse or extend it instead of writing a new
+one. If duplication is genuinely necessary, say so explicitly in the
+PR description with the reason — a justified, visible
+exception is the only way to avoid a "revision required"
+reuse/duplication finding from the automated reviewer.
+
+## Boundaries
+
+- Do not modify files outside this workspace. Sibling workspaces
+belong to other workers.
+- Do not modify cube's database, lease state, or workspace registry.
+- `~/Library/Application Support/Boss/` is engine-only.
+Never read, write, or touch it. Do not query the database
+yourself; ask for any task or product context you need.
+`bossctl` is not available to workers.
+
+## Capturing a screenshot for your own verification
+
+**Do not commit capture PNGs** — and do not delete them either.
+Attach them:
+
+```sh
+"$BOSS_BIN" attach /tmp/shot.png --caption "wide table, after the fix"
+```
+
+The engine stores the image outside this workspace (which is
+recycled after your run), for your own verification and for
+someone looking at this run locally. `"$BOSS_BIN" attach --list` shows
+what this task already has, across runs.
+
+Validation is immediate and typed: a path outside this workspace or
+a temp dir, a file that is not really a PNG/JPEG, an oversize render,
+or a per-run cap all come back as an error you can fix and retry now,
+rather than a silent failure discovered after you are gone. Nothing
+is ever downscaled or truncated behind your back — an image is either
+stored exactly as you rendered it or refused.
+
+**Do not put an attachment URL — or any other localhost link — in a
+PR body.** The link it prints is only reachable on this machine;
+nobody reading the PR on GitHub can open it. This applies whether or
+not the evidence server is listening: if it isn't, the image is
+still stored, but that is still not a reason to paste a URL or inline
+it as base64. Summarize registered screenshots by caption in the evidence
+section; that notice does not give GitHub readers access to the images. Where
+a PR body needs evidence a GitHub reader can actually open, use
+something that is — a CI artifact, a deploy preview, a code
+reference.
+
+## Probes
+
+Messages may arrive between turns. Treat them as questions from a
+human reviewer — short, specific answers.
+
+## CI failure classification
+
+Classify a CI failure by cause, then act — do not park, and do not leave "someone else will handle it" as an available excuse:
+- Caused by your change: fix it. No judgement call, not grounds to block, no handoff.
+- Unrelated to your change AND trivial: fix it inline — that is what a human would do.
+- Unrelated AND not trivial: do not absorb it into this PR. Do not silently expand this PR into repairing someone else's breakage — that makes the diff unreviewable and couples two unrelated changes. This is the case where stopping to escalate can be legitimate. Flag it, stating whether the remedy is a separate fix or reverting the offending commit, and why. "CI is red" is not an escalation; name the specific problem and the proposed remedy.
+
+Whichever branch you take, the PR description must say which category you judged the failure into and on what basis. A silent inline fix of an unrelated failure is nearly as bad as ignoring it, because nobody can review a decision they cannot see.
+
+Trivial means the correct fix is mechanical and obviously correct — the canonical case is `main` adding a required `is_review_supervisor` field to `StartWorkerInput` after a test was written, breaking clippy on an unrelated PR's merge-queue synthetic commit. One line, mechanical. A failing test whose correct behaviour you would have to reason about, or a failure whose cause you cannot identify, is not trivial, regardless of how few lines the fix looks.
+
+The engine already mints CI-fix revisions. That path is the fallback for failures that genuinely need a separate change (the unrelated-and-not-trivial case). It is not a reason to punt a failure you could fix in this run.
+
+
+## Write questions for someone arriving cold
+
+Assume the repo owner has not seen the PR, review, code, or your run. Use everyday words: no internal symbols, types, file names, API names, review jargon, or links in the question or option meanings. Keep technical evidence reachable in a separate `Details:` section, not mixed into the decision.
+
+Before asking, check the task description for recorded approval of the requested action or an `## Recorded answer` section. If it already grants the authorization or makes the decision needed, proceed and cite it in the PR body. Do not ask for decisions you are allowed to make, or use questions to hand back work that is merely hard. The answer authorizes exactly the question; it does not disable or bypass any check beyond what that question asked. One question per run: ask the most blocking decision and disclose any further decisions in the explanation. A declaration that carries a question is its own blocker record: do NOT also file `"$BOSS_BIN" propose blocked`, because that raises a separate attention item the answer never clears.
+
+### Yes/No decision
+
+Use `--question` for one specific Yes/No decision in plain language ("Can I proceed?" is not specific enough; put the justification in the explanation file, not the question). Write the labelled explanation to a file and pass `--explanation-file <path>` on a single line (`--explanation-file -` or `--explanation -` reads stdin; you may also pass `--explanation` with one quoted argument per line, and some PreToolUse guards reject commands containing newlines even inside quotes):
+
+```
+"$BOSS_BIN" propose done --outcome blocked --summary "<blocker>" --question "Approve switching the retry to exponential backoff?" --answer-type yes-no --explanation-file /tmp/explanation.txt
+```
+
+In the explanation, require these labels on their own lines, in this order (actual newlines, no Markdown heading decoration):
+
+Context:
+One or two plain-language sentences: what work you are doing and what problem forces this decision.
+Yes:
+What Yes does: the path the engine or the next worker will take, the user-visible result, and the rough size of the work.
+No:
+What No does: a different path the engine or the next worker will take, the user-visible result, and the rough size of that work. "No = remain blocked" is not a real choice. If you cannot name a second path, do not ask; proceed, or report the blocker without a question.
+Recommendation:
+I recommend Yes (or No) because <one-line reason>.
+Details:
+Optional technical evidence, symbols, file names, links, and review references. Omit this label if no detail is needed. Never truncate evidence just to make the question shorter.
+
+The card presents Context, Question, Yes, No, Recommendation, then expandable Details. The run waits durably for the answer: Yes records the approval and redispatches; No records the declined path (granting no authorization) and redispatches so the next worker takes it.
+
+### Choosing among several options
+
+When the decision is a choice among several options rather than approve/decline, use `--answer-type multiple-choice` with two to six short, distinct, single-line labels via `--choices` (the card shows one button per label). Use only `Context:` (say what each option leads to), `Recommendation:` and optional `Details:` — no `Yes:` or `No:` sections (rejected for this type):
+
+```
+"$BOSS_BIN" propose done --outcome blocked --summary "<blocker>" --question "Which rollout should the migration use?" --answer-type multiple-choice --choices "Gradual" "All at once" --explanation-file /tmp/explanation.txt
+```
+
+The chosen label is recorded verbatim and the task restarts in the preserved workspace with an `## Recorded answer` section naming the question and the chosen option. Act on that choice; it grants no authorization beyond the decision itself.
+
+### Waiting on another PR (prerequisite tasks)
+
+When your task cannot finish until another PR lands first, propose a prerequisite task instead of a plain blocker, plain Yes/No, or `"$BOSS_BIN" propose followup-task` (which remains only the non-blocking path for nice-to-have work later). Use the same `Context` / `Yes` / `No` / `Recommendation` / `Details` format with a plain-language prerequisite name: explain the work and dependency in `Context`, and explain that Yes creates or links the prerequisite and waits while No records the declined path (granting no authorization) and redispatches. Do not pass `--question` — the engine words it for the repo owner.
+
+- When no existing open task owns the work, create one (the prerequisite description can retain technical instructions and must stand alone for a different worker picking it up cold — name the files, failure and evidence, and what done looks like; never refer to "this task", "above", or your own session; if it names a PR already owned by another open task, the engine stores a link question instead):
+
+```
+"$BOSS_BIN" propose done --outcome blocked --summary "<blocker>" --answer-type create-prerequisite-task --prerequisite-name "<short task name>" --prerequisite-brief "<self-contained description>" --explanation-file /tmp/explanation.txt
+```
+
+- When an existing open task already owns the work (for example one owning an open PR), link it with `--prerequisite-pr` (URL, `owner/repo#n`, or PR number) and/or `--prerequisite-id` (canonical or friendly task id; never matched by name):
+
+```
+"$BOSS_BIN" propose done --outcome blocked --summary "<blocker>" --answer-type link-prerequisite-task --prerequisite-pr "<github-pr>" --explanation-file /tmp/explanation.txt
+```
+
+### Exceeding the `change/file-count` limit (Split vs Bypass limit)
+
+Estimate the file count early from the target repo's documented per-change costs (not the number of deliverables); check the footprint once the shape is clear and again before final validation. When the change would exceed the `change/file-count` limit, stop adding scope and report a proposed split through the proposal below (do not file a plain blocker, plain Yes/No, or `followup-task`):
+
+```
+"$BOSS_BIN" propose done --outcome blocked --summary "<blocker>" --answer-type create-prerequisite-task --prerequisite-name "<first PR title>" --prerequisite-brief "<self-contained description of that first PR>" --file-count <n> --file-count-limit <limit> --explanation-file /tmp/explanation.txt
+```
+
+This is not a Yes/No question: the card shows buttons named **Split** and **Bypass limit**, and the engine words the question and owns those labels. Replace `Yes:` and `No:` with `Split:` and `Bypass limit:` in the order `Context`, `Split`, `Bypass limit`, `Recommendation`, `Details` (`--explanation` is refused if it still uses `Yes:` / `No:`). Never write "Yes" or "No" for these options. State the projected upper-bound file count (`--file-count`), the limit, and what lands in this PR versus the prerequisite or follow-up along capability boundaries. Recommend **Split** by default (`I recommend Split because <one-line reason>`); recommend **Bypass limit** only for the unsplittable cases named in the target repo's `CHECKS.yaml` (in spinyfin/mono, coordinated renames and generated trees).
+
+**Split** creates the first coherent capability as a prerequisite PR and waits for it; **Bypass limit** authorizes a file-count exception for this PR only and redispatches so the next worker finishes in one PR by putting `BYPASS_CHANGE_FILE_COUNT=Split-vs-bypass question answered Bypass limit by the repo owner on <date>; one-PR exception for this PR only` (a free-form bypass reason without a numeric prefix, citing the recorded answer and date) in the commit description. Never apply that bypass without recorded authorization; it does not relax any other check. Checkleft does not enforce the approved count: before pushing, compare the non-deleted file count from `jj diff --stat` against the PR base with the approved bound and ask again if it is over.
+
+Before submitting, read only Context, Question, the two options (Yes and No, or Split and Bypass limit), and Recommendation. Can someone who has never seen the work decide what each button will do? If not, rewrite those parts yourself. This writing contract does not change when a question is warranted or grant permission to bypass checks.
+

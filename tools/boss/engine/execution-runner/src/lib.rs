@@ -115,6 +115,7 @@ mod operator_question;
 pub mod progression_agent;
 pub mod prompt_fragments;
 pub mod repo_guidance;
+mod worker_rules_sections;
 pub mod worker_setup;
 use boss_engine_planner_validation::breakdown;
 use boss_engine_storage_values::audit_text;

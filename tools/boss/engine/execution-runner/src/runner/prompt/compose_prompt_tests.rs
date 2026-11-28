@@ -19,6 +19,8 @@ mod non_bazel_gate;
 mod prepush_rebase;
 #[path = "compose_prompt_tests/revision_rebase.rs"]
 mod revision_rebase;
+#[path = "compose_prompt_tests/slim_worker_brief.rs"]
+mod slim_worker_brief;
 #[path = "compose_prompt_tests/vocabulary_leakage.rs"]
 mod vocabulary_leakage;
 
@@ -1808,7 +1810,7 @@ fn merge_queue_brief_names_failure_source_and_requires_rebased_bazel_evidence() 
     attempt.before_commit_sha = Some("queue-commit".into());
     attempt.failed_checks = r#"[{"name":"bazel-build-test","conclusion":"FAILURE","target_url":"https://buildkite.com/flunge/mono/builds/20619","provider":"buildkite"}]"#.into();
     attempt.queue_base_sha = Some("historical-base".into());
-    let prompt = compose_ci_remediation_fragment(&attempt, Some(true));
+    let prompt = compose_ci_remediation_fragment(&attempt, Some(true), false);
     for required in [
         "Failure source: the failing merge-queue build",
         "builds/20619",
@@ -1826,18 +1828,18 @@ fn merge_queue_brief_names_failure_source_and_requires_rebased_bazel_evidence() 
     }
     attempt.failed_checks = "[]".into();
     attempt.queue_base_sha = Some("empty-capture-base".into());
-    assert!(compose_ci_remediation_fragment(&attempt, Some(true)).contains("empty-capture-base"));
+    assert!(compose_ci_remediation_fragment(&attempt, Some(true), false).contains("empty-capture-base"));
     attempt.failure_kind = Some("trunk_queue_eviction".into());
     attempt.failed_checks = "{malformed".into();
-    assert!(compose_ci_remediation_fragment(&attempt, Some(true)).contains("Merge-queue CI verification"));
+    assert!(compose_ci_remediation_fragment(&attempt, Some(true), false).contains("Merge-queue CI verification"));
     let legacy = compose_ci_remediation_prompt(
         &ci_remediation_execution(&attempt.pr_url),
         &chore_without_pr(),
         std::path::Path::new("/tmp/workspace"),
         None,
         &attempt,
-        None,
         Some(true),
+        false,
     );
     assert!(legacy.contains("Merge-queue CI verification"));
     assert!(!prompt.contains("rely on CI to verify the push"));

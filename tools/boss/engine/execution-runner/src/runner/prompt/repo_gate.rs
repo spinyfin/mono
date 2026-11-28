@@ -41,6 +41,7 @@ pub(super) fn non_bazel_gate_text(
     workspace_path: Option<&Path>,
     conflict_resolution: bool,
     worker_signal_seam_enabled: bool,
+    slim_worker_brief: bool,
 ) -> String {
     let manifests = workspace_path.map(detected_manifests).unwrap_or_default();
     let detected = if manifests.is_empty() {
@@ -69,6 +70,11 @@ pub(super) fn non_bazel_gate_text(
             "Run the repo's documented compile, type-check and test commands (for example `npm run typecheck` and `npm test`, `cargo build` and `cargo test`, `go build ./... && go test ./...`). Regenerate any lockfile your change invalidated with the repo's own package manager.",
         )
     };
+    let timeout_clause = if slim_worker_brief {
+        crate::prompt_fragments::long_running_commands_pointer()
+    } else {
+        "Do not wrap them in a shell `timeout`."
+    };
     format!(
         "\n## {heading}\n\
          \n\
@@ -79,7 +85,7 @@ pub(super) fn non_bazel_gate_text(
          Required BEFORE you push:\n\
          - Discover the commands from the repo itself, in this order: `AGENTS.md` / `CLAUDE.md`, the README and contributor docs, `package.json` `scripts` (or the Cargo / Go / Gradle / Maven / Make equivalent), and any CI workflow under `.github/workflows/`. Prefer the commands CI runs.\n\
          - {tests}\n\
-         - Run them in the FOREGROUND, read each exit code directly, and report the commands and their exit codes in your Validation section. Do not wrap them in a shell `timeout`.\n\
+         - Run them in the FOREGROUND, read each exit code directly, and report the commands and their exit codes in your Validation section. {timeout_clause}\n\
          - Every command must exit 0 before you push. If a command fails, fix the cause; do NOT push code that does not compile or type-check.\n\
          - If you cannot find ANY documented build, type-check or test command, do not invent one and do not skip validation silently: say explicitly that no build command was found, then {blocked_action}.\n"
     )
@@ -101,6 +107,7 @@ pub(super) fn unresolved_gate_text(
     conflict_resolution: bool,
     worker_signal_seam_enabled: bool,
     run_done_seam_enabled: bool,
+    slim_worker_brief: bool,
 ) -> String {
     let blocked_action = if worker_signal_seam_enabled {
         "call `\"$BOSS_BIN\" propose blocked --reason \"...\"` naming that no build command was found and stop"
@@ -124,9 +131,14 @@ pub(super) fn unresolved_gate_text(
         "- If any of those Bazel markers is present, apply the conditional Bazel policy below."
     };
     let bazel_gate = if conflict_resolution {
-        super::bazel_conflict_resolution_gate_text(worker_signal_seam_enabled)
+        super::bazel_conflict_resolution_gate_text(worker_signal_seam_enabled, slim_worker_brief)
     } else {
-        super::bazel_prepush_gate_text(worker_signal_seam_enabled, run_done_seam_enabled)
+        super::bazel_prepush_gate_text(worker_signal_seam_enabled, run_done_seam_enabled, slim_worker_brief)
+    };
+    let timeout_clause = if slim_worker_brief {
+        crate::prompt_fragments::long_running_commands_pointer()
+    } else {
+        "Do not wrap them in a shell `timeout`."
     };
     // Reuse the complete requirements without claiming discovery already succeeded.
     let requirements = bazel_gate.find("Required ").expect("Bazel gate requirements");
@@ -142,7 +154,7 @@ pub(super) fn unresolved_gate_text(
          - On this session's cwd, look for `MODULE.bazel`, `WORKSPACE`, `WORKSPACE.bazel` at the workspace root.\n\
          {bazel_bullet}\n\
          - If none is present, discover the repo's documented compile, type-check and test commands from `AGENTS.md` / `CLAUDE.md`, the README, package-manager manifests, and CI workflows, then run those. Prefer the commands CI runs. Every required non-Bazel command must exit 0 before you push.\n\
-         - Run them in the FOREGROUND, read each exit code directly, and report the commands and their exit codes in your Validation section. Do not wrap them in a shell `timeout`.\n\
+         - Run them in the FOREGROUND, read each exit code directly, and report the commands and their exit codes in your Validation section. {timeout_clause}\n\
          - If nothing is discoverable, do not invent a command and do not skip validation silently: say explicitly that no build command was found, then {blocked_action}.\n\
          \n### Conditional policy: only if Bazel markers are present\n{conditional_bazel_policy}\n"
     )

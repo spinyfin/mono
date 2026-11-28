@@ -38,6 +38,7 @@ fn golden_input() -> WorkerSetupInput {
         is_review_supervisor: false,
         is_post_merge_reviewer: false,
         checkout_positioned_on_pr_head: false,
+        slim_worker_brief: false,
     }
 }
 
@@ -310,6 +311,26 @@ fn golden_claude_md_standard_worker() {
 }
 
 #[test]
+fn golden_claude_md_standard_slim_worker() {
+    let input = WorkerSetupInput {
+        run_done_proposals_seam_enabled: true,
+        worker_signal_proposals_seam_enabled: true,
+        slim_worker_brief: true,
+        ..golden_input()
+    };
+    let driver = ClaudeDriver;
+    let rendered = render_claude_md(&input, driver.agent_rules_preamble(), driver.descriptor().config_dir);
+    assert!(
+        rendered.contains(driver.agent_rules_preamble()),
+        "slim CLAUDE.md must embed the driver's agent_rules_preamble verbatim",
+    );
+    assert_eq!(
+        rendered, GOLDEN_CLAUDE_MD_STANDARD_SLIM,
+        "slim CLAUDE.md must match the golden byte-for-byte through the driver preamble + renderer",
+    );
+}
+
+#[test]
 fn golden_claude_md_starts_with_driver_preamble() {
     // Belt: even if the body drifts in a tolerated way, the driver-owned
     // preamble (the part that names "claude hooks") must still lead the file
@@ -339,3 +360,4 @@ fn golden_claude_md_starts_with_driver_preamble() {
 // byte-exact snapshots the harness pins.
 const GOLDEN_SETTINGS_STANDARD: &str = include_str!("goldens/settings_standard.json.golden");
 const GOLDEN_CLAUDE_MD_STANDARD: &str = include_str!("goldens/claude_md_standard.md.golden");
+const GOLDEN_CLAUDE_MD_STANDARD_SLIM: &str = include_str!("goldens/claude_md_standard_slim.md.golden");

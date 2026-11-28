@@ -79,6 +79,7 @@ def runtime_libraries():
             # src/conformance/claude_goldens.rs.
             "src/conformance/goldens/settings_standard.json.golden",
             "src/conformance/goldens/claude_md_standard.md.golden",
+            "src/conformance/goldens/claude_md_standard_slim.md.golden",
             # Planner parser regressions read these live docs directly so their
             # expectations cannot drift from the source of truth.
             "//tools/boss/docs:operator_forced_dispatch_design_doc",

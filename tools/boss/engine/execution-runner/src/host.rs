@@ -258,6 +258,11 @@ pub struct StartWorkerInput {
     /// today's launch: no auto-compact window and no compact instructions.
     #[builder(default)]
     pub launch_options: crate::driver::LaunchOptions,
+    /// Forwarded to `WorkerSetupInput` to select the slimmed Standard worker
+    /// rules variant paired with the treated brief. Ignored for non-Standard
+    /// worker kinds.
+    #[builder(default)]
+    pub slim_worker_brief: bool,
     /// Badge type, project, host, and start-time stamps for the resulting
     /// `LiveWorkerState`. Production dispatch resolves these from the
     /// execution; tests may leave them empty.

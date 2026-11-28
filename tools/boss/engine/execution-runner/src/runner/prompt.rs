@@ -24,6 +24,8 @@ mod design;
 mod repo_gate;
 #[path = "prompt/revision_rebase.rs"]
 mod revision_rebase;
+#[path = "prompt/run_done.rs"]
+mod run_done;
 #[path = "prompt/tool_use.rs"]
 mod tool_use;
 use block_boundary::block_boundary_fragment;
@@ -99,7 +101,7 @@ pub(super) struct ExecutionPromptParams<'a> {
     followup_proposals_seam_enabled: bool,
     /// Whether `run_done_proposals_seam` is on — gates the worker-facing
     /// prompt half of the terminal-declaration migration:
-    /// [`run_done_directive`], and the sentence
+    /// [`run_done::render`], and the sentence
     /// [`pr_terminal_directive`] adds about declaring before the terminal
     /// push. `false` (the flag's registry default) omits the general
     /// "Declaring your run finished" section (the no-op prompts still teach
@@ -133,6 +135,10 @@ pub(super) struct ExecutionPromptParams<'a> {
     /// reads issued together in one turn. Applies to Standard workers only.
     #[builder(default)]
     batched_search: bool,
+    /// Whether this run gets the slimmed, deduplicated and kind-gated brief
+    /// text (paired with slim worker rules). Applies to Standard workers only.
+    #[builder(default)]
+    slim_worker_brief: bool,
 }
 
 /// The structured-output payload this execution's prompt is built around —
@@ -245,7 +251,9 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
         bazel_workspace,
         remote_workspace,
         batched_search: _,
+        slim_worker_brief,
     } = params;
+    let slim_worker_brief = slim_worker_brief && worker_kind_for_execution(&execution.kind) == WorkerKind::Standard;
     let bazel_workspace = if remote_workspace {
         bazel_workspace
     } else {
@@ -264,8 +272,8 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
             workspace_path,
             cube_change_id,
             attempt,
-            /* test_command */ None,
             bazel_workspace,
+            slim_worker_brief,
         );
     }
     let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
@@ -374,7 +382,7 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
         }
         ExecutionKind::InvestigationImplementation => {
             prompt.push_str(&compose_investigation_directive());
-            prompt.push_str(check_bypass_prohibition_text());
+            prompt.push_str(check_bypass_prohibition(slim_worker_brief));
         }
         ExecutionKind::RevisionImplementation => {
             prompt.push_str(&compose_revision_directive(
@@ -384,21 +392,22 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
                 conflict_attempt,
                 ci_attempt,
                 merge_order_preservation,
-                (
-                    bookmark_recovery.is_some_and(|(_, has_work)| *has_work),
-                    worker_signal_proposals_seam_enabled,
-                    deferred_scope_proposals_seam_enabled,
-                    run_done_proposals_seam_enabled,
-                    bazel_workspace,
-                    remote_workspace,
-                ),
+                RevisionDirectiveOpts::builder()
+                    .recovered_work(bookmark_recovery.is_some_and(|(_, has_work)| *has_work))
+                    .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
+                    .deferred_scope_proposals_seam_enabled(deferred_scope_proposals_seam_enabled)
+                    .run_done_proposals_seam_enabled(run_done_proposals_seam_enabled)
+                    .maybe_bazel_workspace(bazel_workspace)
+                    .remote_workspace(remote_workspace)
+                    .slim_worker_brief(slim_worker_brief)
+                    .build(),
             ));
         }
         ExecutionKind::TaskImplementation | ExecutionKind::ChoreImplementation => {
             prompt.push_str(
                 "Expected outcome for this run:\n- implement the requested change in the workspace,\n- run relevant local validation when practical,\n- stop once the work is ready for a human to review or redirect.\n",
             );
-            prompt.push_str(check_bypass_prohibition_text());
+            prompt.push_str(check_bypass_prohibition(slim_worker_brief));
         }
         ExecutionKind::AnswerAgent => {
             // Read-only answer agent: it never touches the workspace or opens a
@@ -437,7 +446,7 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
                 "Expected outcome for this run:\n- make concrete progress on the assigned work,\n- leave the workspace in a reviewable state,\n- stop with a concise review summary.\n",
             );
             if execution.kind == ExecutionKind::ConflictResolution {
-                prompt.push_str(check_bypass_prohibition_text());
+                prompt.push_str(check_bypass_prohibition(slim_worker_brief));
             }
         }
     }
@@ -448,7 +457,11 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
             | ExecutionKind::ProjectDesign
             | ExecutionKind::InvestigationImplementation
     ) {
-        prompt.push_str(&crate::prompt_fragments::prepush_rebase_fragment());
+        if slim_worker_brief {
+            prompt.push_str(crate::prompt_fragments::prepush_rebase_pointer());
+        } else {
+            prompt.push_str(&crate::prompt_fragments::prepush_rebase_fragment());
+        }
     }
     // Issue #804: code-touching implementation chores were pushing to PR
     // branches without a local build, and CI repeatedly caught errors a
@@ -470,6 +483,7 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
             false,
             worker_signal_proposals_seam_enabled,
             run_done_proposals_seam_enabled,
+            slim_worker_brief,
         ));
     }
     if matches!(
@@ -526,7 +540,10 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
         // Warn that PR creation is terminal — the engine reaps the worker
         // immediately after the PR is opened. Workers must finish everything
         // BEFORE opening the PR; no followup turn is possible.
-        prompt.push_str(&pr_terminal_directive(run_done_proposals_seam_enabled));
+        prompt.push_str(&pr_terminal_directive(
+            run_done_proposals_seam_enabled,
+            slim_worker_brief,
+        ));
         // Issue #899: hand the worker the engine's CI-completion definition
         // so it stops once CI is effectively green rather than polling
         // forever on human-gated checks (e.g. LinkedIn's `Owner Approval`).
@@ -561,7 +578,10 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
                 ExecutionKind::TaskImplementation | ExecutionKind::ChoreImplementation
             )
         {
-            prompt.push_str(&no_op_completion_directive(worker_signal_proposals_seam_enabled));
+            prompt.push_str(&no_op_completion_directive(
+                worker_signal_proposals_seam_enabled,
+                slim_worker_brief,
+            ));
         }
     }
     // Attentions creation pipeline (design: attentions.md): implementation
@@ -585,12 +605,17 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
     // PR (reviews, triage, conflict resolutions, revisions) are exactly the
     // ones whose ending the engine could otherwise only infer, so scoping
     // this to PR-producing kinds would miss the cases it exists for.
-    prompt.push_str(&run_done_directive(
-        run_done_proposals_seam_enabled,
-        worker_signal_proposals_seam_enabled,
-        conflict_attempt.is_some(),
-        worker_kind_for_execution(&execution.kind) == WorkerKind::Standard,
-        bazel_workspace,
+    prompt.push_str(&run_done::render(
+        run_done::RunDoneParams::builder()
+            .seam_enabled(run_done_proposals_seam_enabled)
+            .worker_signal_seam_enabled(worker_signal_proposals_seam_enabled)
+            .conflict_resolution(conflict_attempt.is_some())
+            .standard_worker(worker_kind_for_execution(&execution.kind) == WorkerKind::Standard)
+            .execution_kind(&execution.kind)
+            .existing_pr_url(existing_pr_url.is_some())
+            .maybe_bazel_workspace(bazel_workspace)
+            .slim_worker_brief(slim_worker_brief)
+            .build(),
     ));
     prompt.push_str("\nRespond with concise markdown using exactly these sections:\n");
     prompt.push_str("## Summary\n## Validation\n## Open Questions\n");
@@ -640,12 +665,25 @@ fn prepush_gate_text(
     conflict_resolution: bool,
     worker_signal_seam_enabled: bool,
     run_done_seam_enabled: bool,
+    slim_worker_brief: bool,
 ) -> String {
     match bazel_workspace {
-        Some(true) if conflict_resolution => bazel_conflict_resolution_gate_text(worker_signal_seam_enabled),
-        Some(true) => bazel_prepush_gate_text(worker_signal_seam_enabled, run_done_seam_enabled),
-        Some(false) => repo_gate::non_bazel_gate_text(workspace_path, conflict_resolution, worker_signal_seam_enabled),
-        None => repo_gate::unresolved_gate_text(conflict_resolution, worker_signal_seam_enabled, run_done_seam_enabled),
+        Some(true) if conflict_resolution => {
+            bazel_conflict_resolution_gate_text(worker_signal_seam_enabled, slim_worker_brief)
+        }
+        Some(true) => bazel_prepush_gate_text(worker_signal_seam_enabled, run_done_seam_enabled, slim_worker_brief),
+        Some(false) => repo_gate::non_bazel_gate_text(
+            workspace_path,
+            conflict_resolution,
+            worker_signal_seam_enabled,
+            slim_worker_brief,
+        ),
+        None => repo_gate::unresolved_gate_text(
+            conflict_resolution,
+            worker_signal_seam_enabled,
+            run_done_seam_enabled,
+            slim_worker_brief,
+        ),
     }
 }
 
@@ -682,13 +720,17 @@ fn bazel_no_shell_timeout_clause(run_done_seam_enabled: bool) -> &'static str {
 /// `run_done_seam_enabled` mirrors `run_done_proposals_seam`. When off, a
 /// real failure or timeout is an absolute stop: do not push red code.
 /// When on, that absolute stop is replaced by the same evidence-gated
-/// unattributable-failure exception [`run_done_directive`] teaches for the
+/// unattributable-failure exception [`run_done::render`] teaches for the
 /// terminal outcome, so a worker who reaches this gate is told they MAY
 /// push a still-red target that is evidenced as pre-existing or
 /// environmental — not merely which outcome to declare after the fact.
 /// The two flags are independently toggleable; this function must not
 /// teach `propose blocked` unless `worker_signal_seam_enabled` is on.
-pub(crate) fn bazel_prepush_gate_text(worker_signal_seam_enabled: bool, run_done_seam_enabled: bool) -> String {
+pub(super) fn bazel_prepush_gate_text(
+    worker_signal_seam_enabled: bool,
+    run_done_seam_enabled: bool,
+    slim_worker_brief: bool,
+) -> String {
     let blocked_action = if worker_signal_seam_enabled {
         "Call `\"$BOSS_BIN\" propose blocked --reason \"...\"` naming the failing/timed-out command and its output, and stop (see \"If you are blocked or the work is bigger than estimated\" below for the exact syntax)"
     } else {
@@ -699,15 +741,35 @@ pub(crate) fn bazel_prepush_gate_text(worker_signal_seam_enabled: bool, run_done
     } else {
         "- Both `bazel build` and `bazel test` must finish clean — exit 0, no build errors, no failing tests — before you push. Clippy/lint is not reported by bazel; it runs at push time via the checkleft guard (and in CI).\n"
     };
-    let timeout_clause = bazel_no_shell_timeout_clause(run_done_seam_enabled);
     let background_wait = crate::prompt_fragments::background_wait_declaration("\"$BOSS_BIN\"");
+    let timeout_and_diag = if slim_worker_brief {
+        let other_timeout = if run_done_seam_enabled {
+            "On a timeout of some other command, follow the failure paragraph below (retry the specific target; a timeout is not by itself a reason to stop), do not idle."
+        } else {
+            "On a timeout of some other command, treat it as a blocker (below), do not retry-and-idle."
+        };
+        format!(
+            "{} {other_timeout}",
+            crate::prompt_fragments::long_running_commands_pointer(),
+        )
+    } else {
+        let timeout_clause = bazel_no_shell_timeout_clause(run_done_seam_enabled);
+        format!(
+            "{timeout_clause} To diagnose a command, inspect only this invocation's output base and logs; never infer ownership or blockage from global process-name matches."
+        )
+    };
+    let wedged_sentence = if slim_worker_brief {
+        "A command producing no output and no progress is wedged: inspect that invocation's logs rather than guessing, and keep polling a still-running command."
+    } else {
+        "A command producing no output and no progress is wedged: inspect that invocation's logs rather than guessing, and do not wrap `bazel build`, `bazel test`, `bazel run`, or `checkleft run` in a shell `timeout` to force a result — keep polling a still-running command."
+    };
     let failure_sentence = if run_done_seam_enabled {
         format!(
-            "If the build or tests actually fail or actually time out — a real command that ran and returned a failing or timed-out result — do NOT idle waiting on them. Deciding on your own that the run has gone on long enough is not a failure or a timeout. A command still producing output is slow, not wedged — wait for it. A command producing no output and no progress is wedged: inspect that invocation's logs rather than guessing, and do not wrap `bazel build`, `bazel test`, `bazel run`, or `checkleft run` in a shell `timeout` to force a result — keep polling a still-running command. For failure attribution, bounded retries, base reproduction, and the evidence-backed exception allowing a still-red target to be pushed, follow the validation-failure rule in \"Declaring your run finished\" below. That rule governs both this push and the terminal outcome. If the failure is attributable to your change and you cannot fix it, do NOT push red code. {blocked_action}. Escalating a blocker is correct; pushing a known-broken branch you caused — or hanging on a wedged build — is not.\n"
+            "If the build or tests actually fail or actually time out — a real command that ran and returned a failing or timed-out result — do NOT idle waiting on them. Deciding on your own that the run has gone on long enough is not a failure or a timeout. A command still producing output is slow, not wedged — wait for it. {wedged_sentence} For failure attribution, bounded retries, base reproduction, and the evidence-backed exception allowing a still-red target to be pushed, follow the validation-failure rule in \"Declaring your run finished\" below. That rule governs both this push and the terminal outcome. If the failure is attributable to your change and you cannot fix it, do NOT push red code. {blocked_action}. Escalating a blocker is correct; pushing a known-broken branch you caused — or hanging on a wedged build — is not.\n"
         )
     } else {
         format!(
-            "If the build or tests actually fail or actually time out — a real command that ran and returned a failing or timed-out result — do NOT push red code and do NOT idle waiting on them. Deciding on your own that the run has gone on long enough is not a failure or a timeout, and is never a reason to stop short of a clean result. A command still producing output is slow, not wedged — wait for it. A command producing no output and no progress is wedged: inspect that invocation's logs rather than guessing, and do not wrap `bazel build`, `bazel test`, `bazel run`, or `checkleft run` in a shell `timeout` to force a result — keep polling a still-running command. {blocked_action}. Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
+            "If the build or tests actually fail or actually time out — a real command that ran and returned a failing or timed-out result — do NOT push red code and do NOT idle waiting on them. Deciding on your own that the run has gone on long enough is not a failure or a timeout, and is never a reason to stop short of a clean result. A command still producing output is slow, not wedged — wait for it. {wedged_sentence} {blocked_action}. Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
         )
     };
     format!(
@@ -721,7 +783,7 @@ pub(crate) fn bazel_prepush_gate_text(worker_signal_seam_enabled: bool, run_done
          - If a CI workflow file exists (`.github/workflows/*.yml`), open it and mirror the exact bazel target set it builds/tests (these repos typically run `bazel build //...` or a curated rollup). Run that same command locally so your gate matches what CI will enforce.\n\
          {clean_bullet}\
          \n\
-         Prefer to run every long-running build-class command (Bazel, checkleft, tests, etc.) in the FOREGROUND and read its exit code directly. For a tool that yields a session, FOREGROUND means keep polling that session until it returns `exit_code`; it does not mean issue one invocation and discard its session handle. Backgrounding one (a trailing shell `&` or a backgrounded/asynchronous invocation) is the exception, not the default. {background_wait} {timeout_clause} To diagnose a command, inspect only this invocation's output base and logs; never infer ownership or blockage from global process-name matches.\n\
+         Prefer to run every long-running build-class command (Bazel, checkleft, tests, etc.) in the FOREGROUND and read its exit code directly. For a tool that yields a session, FOREGROUND means keep polling that session until it returns `exit_code`; it does not mean issue one invocation and discard its session handle. Backgrounding one (a trailing shell `&` or a backgrounded/asynchronous invocation) is the exception, not the default. {background_wait} {timeout_and_diag}\n\
          \n\
          {failure_sentence}"
     )
@@ -750,9 +812,14 @@ pub(crate) fn bazel_prepush_gate_text(worker_signal_seam_enabled: bool, run_done
 /// filesystem probe. Remote composition selects it via the Bazel override
 /// on [`ExecutionPromptParams`]. See [`bazel_prepush_gate_text`] for what
 /// `seam_enabled` selects.
-pub(crate) fn bazel_conflict_resolution_gate_text(seam_enabled: bool) -> String {
+pub(super) fn bazel_conflict_resolution_gate_text(seam_enabled: bool, slim_worker_brief: bool) -> String {
     let background_wait =
         crate::prompt_fragments::background_wait_declaration(boss_engine_worker_bin::WORKER_BOSS_INVOCATION);
+    let timeout_clause = if slim_worker_brief {
+        crate::prompt_fragments::long_running_commands_pointer()
+    } else {
+        "Do not wrap `bazel build` in a shell `timeout`."
+    };
     let failure_sentence = if seam_enabled {
         "If `bazel build` or the affected-test run fails or times out, do NOT push. A successful build and a passing affected-test run are required before delivery. Deciding on your own that the run has gone on long enough is not a build failure, and is never a reason to stop short of a clean build. Fix the resolution, or — if it needs a human decision — follow the stop conditions below. Do NOT idle waiting on a wedged build; call `\"$BOSS_BIN\" propose blocked --reason \"...\"` naming the failure and stop.\n"
     } else {
@@ -766,7 +833,7 @@ pub(crate) fn bazel_conflict_resolution_gate_text(seam_enabled: bool) -> String 
          Required BEFORE you push (step 4):\n\
          - Regenerate any generated/lock artifact the rebase invalidated and include it in your commit. The common one is `MODULE.bazel.lock`: run `bazel mod deps --lockfile_mode=update` (or build any target, which refreshes it) and stage the result.\n\
          - `bazel build` the targets your resolution touched AND the targets the rebased-in upstream change touches. Use `bazel query` to resolve labels if unsure. The merged code MUST COMPILE — a conflict resolution that does not build is wrong and must not be pushed.\n\
-         - Run the build in the FOREGROUND and read its exit code directly. Do not wrap `bazel build` in a shell `timeout`. {background_wait}\n\
+         - Run the build in the FOREGROUND and read its exit code directly. {timeout_clause} {background_wait}\n\
          \n\
          - After the build is clean, run the tests for the targets affected by the files that had conflicts — NOT the whole suite. Resolve them with `bazel query 'kind(\".*_test rule\", rdeps(//..., set(<conflicted source files>))) except attr(tags, \"requires-credentials\", //...)'` (or the repo's equivalent), then run `bazel test` on that set and report the exact command and its exit code. Excluding only `requires-credentials`-tagged targets (credential-only live probes that cannot run in a credential-stripped worker sandbox) keeps credential-free affected tests, including manual loopback and fixture targets, in scope. Every source file that conflicted always selects its dependent tests, including tests of the upstream change you merged with (a merge that compiles can still violate an ordering or registry invariant that a fast unit test checks).\n\
          - Lockfiles regenerated deterministically as part of the resolution (e.g. `MODULE.bazel.lock`, `Cargo.lock`) do NOT on their own select tests: their reverse dependencies are effectively everything. Leave them out of the query set. If no source file conflicted, there is no affected-test set to run.\n\
@@ -824,6 +891,14 @@ fn check_bypass_prohibition_text() -> &'static str {
 **Hard constraint — fix failing checks at the root cause; never bypass them.**
 Do not suppress failures with exclusions/allowlists (`CHECKS.yaml`, checkleft), lint-disable comments, `allow_bypass` or override flags, `--no-verify` or skipped hooks, broad `#[allow(...)]` / `// swiftlint:disable` / `# noqa`, deleted/ignored/xfail/skipped tests, weakened assertions, or raised thresholds/limits. Fix the underlying code, tests, lint, or file size instead. A genuinely necessary check relaxation requires approval by the repo owner with full justification: STOP and surface it. Use the typed question flags on a blocked declaration when that channel is enabled; never decide autonomously.
 "#
+}
+
+fn check_bypass_prohibition(slim_worker_brief: bool) -> &'static str {
+    if slim_worker_brief {
+        crate::prompt_fragments::check_bypass_prohibition_pointer()
+    } else {
+        check_bypass_prohibition_text()
+    }
 }
 
 /// Render the `[editorial-rules]` block for the worker prompt (chore #5).
@@ -937,7 +1012,7 @@ fn render_editorial_rules_block(
 /// the PR was created, so the review was never consumed. This universal
 /// guidance applies to every execution kind and prevents that pattern.
 ///
-/// `seam_enabled` mirrors `run_done_proposals_seam`. When on, [`run_done_directive`]'s
+/// `seam_enabled` mirrors `run_done_proposals_seam`. When on, [`run_done::render`]'s
 /// declaration — not PR creation — is the act that is ALWAYS terminal:
 /// `boss propose done` ends the run synchronously the instant it is accepted
 /// (`completion::run_done_declaration` finalizes it at submit, no Stop
@@ -946,10 +1021,14 @@ fn render_editorial_rules_block(
 /// when the push was the only thing that could reap a worker. Getting this
 /// backwards now would kill the worker's pane before it ever reaches `cube
 /// pr create`.
-fn pr_terminal_directive(seam_enabled: bool) -> String {
+fn pr_terminal_directive(seam_enabled: bool, slim_worker_brief: bool) -> String {
     let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
     let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
-    let terminal = if seam_enabled {
+    let terminal = if seam_enabled && slim_worker_brief {
+        format!(
+            "## Important: declaring done is your terminal act\nFinish everything, open or update the PR with `{cube} pr create` / `{cube} pr update`, then call `{boss} propose done` as your last tool call (see \"Declaring your run finished\" below).\n"
+        )
+    } else if seam_enabled {
         format!(
             "## Important: declaring done is your terminal act\nFinish everything, open or update the PR with `{cube} pr create` / `{cube} pr update`, then call `{boss} propose done` as your last tool call. An accepted declaration ends the run immediately, before you see its response; PR creation/update still gives you a turn to declare. Never declare before pushing.\n"
         )
@@ -1078,257 +1157,6 @@ pub(crate) fn worker_escalation_protocol_directive(seam_enabled: bool) -> String
         .to_string()
 }
 
-/// Validation-failure / gate-exception paragraph for [`run_done_directive`].
-/// Built from named pieces chosen by the resolved build system so a Bazel
-/// rewording cannot silently leave Bazel commands in a non-Bazel prompt,
-/// and an unresolved probe is not collapsed to non-Bazel.
-fn run_done_gate_exception(conflict_resolution: bool, bazel_workspace: Option<bool>) -> &'static str {
-    match (conflict_resolution, bazel_workspace) {
-        (true, Some(true)) => {
-            "The merge-correctness pre-push gate is not covered by any unattributable-failure exception. \
-             If `bazel build` fails or times out, do NOT push: the merged code MUST COMPILE. \
-             A still-red compile is a reason to stop without delivery, not a reason to push, even if the \
-             failure looks pre-existing or environmental. Only the full test suite is deferred to CI; \
-             a successful `bazel build` and a passing run of the tests affected by the conflicted files are preconditions for this push. Bazel \
-             remains the source of truth: do not bypass or weaken checks, and still stop for required \
-             approval to relax a check, missing credentials or authorization, genuine instruction \
-             conflicts or contradictory requirements."
-        }
-        (true, Some(false)) => {
-            "The merge-correctness pre-push gate is not covered by any unattributable-failure exception. \
-             If the repo's documented compile, type-check or test command fails or times out, do NOT push: \
-             the merged code MUST compile, type-check, and pass those tests. \
-             A still-red command is a reason to stop without delivery, not a reason to push, even if the \
-             failure looks pre-existing or environmental. A successful run of those documented commands is \
-             a precondition for this push. The repo's own checks remain the source of truth: do not \
-             bypass or weaken checks, and still stop for required approval to relax a check, missing \
-             credentials or authorization, genuine instruction conflicts or contradictory requirements."
-        }
-        (true, None) => {
-            "The merge-correctness pre-push gate is not covered by any unattributable-failure exception. \
-             If the discovered compile, type-check or test command fails or times out, do NOT push: \
-             discover the build system on this execution host first, then apply the matching merge-correctness policy. \
-             A still-red command is a reason to stop without delivery, not a reason to push, even if the \
-             failure looks pre-existing or environmental. A successful run of the matching commands is \
-             a precondition for this push. Those checks remain the source of truth: do not \
-             bypass or weaken checks, and still stop for required approval to relax a check, missing \
-             credentials or authorization, genuine instruction conflicts or contradictory requirements."
-        }
-        (false, Some(true)) => {
-            "For validation failures, this is a narrow exception to the earlier gate/stop rules, including \
-             the pre-push Bazel gate: a failing gate warrants stopping without delivery only when it is \
-             reproducible AND attributable to your change — fix it; if attribution remains unresolved, \
-             the failure still stands. A Bazel test TIMEOUT result, a full-suite failure that passes in \
-             isolation, or a failure in untouched code is not by itself a reason to stop or to refuse the push: retry the \
-             specific Bazel target (two or three attempts maximum), and if it keeps failing, check whether \
-             it reproduces on an unmodified base revision. Separately, a shell-timeout of `bazel` or `checkleft run` is \
-             not a reason to rerun the same command under the same cap — keep polling a still-running \
-             command instead, and do not wrap those commands in `timeout`. You MAY push despite a still-red target, and \
-             declare `delivered`, only with evidence that the failure is pre-existing or environmental (a \
-             base reproduction, a passing rerun/isolation run, or a concrete code-path argument showing why \
-             your change cannot cause it), recording the target, failure, attempts and evidence in the \
-             PR body; merely calling it flaky is not evidence. Bazel remains the source of truth: do not \
-             bypass or weaken checks, and still stop for required approval to relax a check, missing \
-             credentials or authorization, genuine instruction conflicts or contradictory requirements."
-        }
-        (false, Some(false)) => {
-            "For validation failures, this is a narrow exception to the earlier gate/stop rules, including \
-             the pre-push build gate: a failing gate warrants stopping without delivery only when it is \
-             reproducible AND attributable to your change — fix it; if attribution remains unresolved, \
-             the failure still stands. A test TIMEOUT result, a full-suite failure that passes in \
-             isolation, or a failure in untouched code is not by itself a reason to stop or to refuse the push: retry the \
-             specific failing command (two or three attempts maximum), and if it keeps failing, check whether \
-             it reproduces on an unmodified base revision. Separately, a shell-timeout of a build, test or `checkleft run` command is \
-             not a reason to rerun the same command under the same cap — keep polling a still-running \
-             command instead, and do not wrap those commands in `timeout`. You MAY push despite a still-red target, and \
-             declare `delivered`, only with evidence that the failure is pre-existing or environmental (a \
-             base reproduction, a passing rerun/isolation run, or a concrete code-path argument showing why \
-             your change cannot cause it), recording the target, failure, attempts and evidence in the \
-             PR body; merely calling it flaky is not evidence. The repo's own checks remain the source of truth: do not \
-             bypass or weaken checks, and still stop for required approval to relax a check, missing \
-             credentials or authorization, genuine instruction conflicts or contradictory requirements."
-        }
-        (false, None) => {
-            "For validation failures, this is a narrow exception to the earlier gate/stop rules, including \
-             the pre-push build gate: a failing gate warrants stopping without delivery only when it is \
-             reproducible AND attributable to your change — fix it; if attribution remains unresolved, \
-             the failure still stands. A test TIMEOUT result, a full-suite failure that passes in \
-             isolation, or a failure in untouched code is not by itself a reason to stop or to refuse the push: retry the \
-             specific failing command (two or three attempts maximum), and if it keeps failing, check whether \
-             it reproduces on an unmodified base revision. Separately, a shell-timeout of a build, test or `checkleft run` command is \
-             not a reason to rerun the same command under the same cap — keep polling a still-running \
-             command instead, and do not wrap those commands in `timeout`. You MAY push despite a still-red target, and \
-             declare `delivered`, only with evidence that the failure is pre-existing or environmental (a \
-             base reproduction, a passing rerun/isolation run, or a concrete code-path argument showing why \
-             your change cannot cause it), recording the target, failure, attempts and evidence in the \
-             PR body; merely calling it flaky is not evidence. The checks you discovered on this execution host remain the source of truth: do not \
-             bypass or weaken checks, and still stop for required approval to relax a check, missing \
-             credentials or authorization, genuine instruction conflicts or contradictory requirements."
-        }
-    }
-}
-
-/// Terminal run-done declaration directive — the worker-facing half of the
-/// `run_done_proposals_seam` migration. `seam_enabled` mirrors the flag the
-/// engine's read path checks; with it off this contributes nothing, keeping
-/// the prompt at today's baseline.
-///
-/// Emitted for **every** execution kind, unlike every other seam directive,
-/// because revisions, CI fixes, conflict resolutions and reviewer passes all
-/// terminate without creating anything the engine can point at — precisely
-/// the runs whose ending was previously guessed at.
-///
-/// The declaration ends the run synchronously the instant it is accepted
-/// (`completion::run_done_declaration` finalizes it at submit, no turn
-/// boundary needed) — the worker gets no turn after the call commits, not
-/// even to see the response. It must therefore come *after* the push, as
-/// the very last tool call of the run: declaring first would end the run
-/// before the push ever happens (see [`pr_terminal_directive`]). And not
-/// declaring is no shortcut to being left alone: the wording states the
-/// real consequence — held, then asked, then failed visibly, never
-/// quietly successful.
-///
-/// `worker_signal_seam_enabled` mirrors `worker_signal_proposals_seam`.
-/// Teaching `"$BOSS_BIN" propose blocked` is that flag's job (see
-/// [`worker_escalation_protocol_directive`]); this directive must not
-/// teach the verb when that flag is off, even if `run_done_proposals_seam`
-/// is on — the two flags are independently defaulted off, and a worker
-/// must never be taught a verb the engine won't yet read proposals-first
-/// for. The `propose done` verb itself remains gated only on `seam_enabled`.
-///
-/// `conflict_resolution` is true when this prompt also carries a
-/// conflict-resolution merge-correctness gate (Bazel or non-Bazel). That
-/// gate is an absolute compile-or-do-not-push stop and never receives the
-/// unattributable-failure exception; the closing paragraph here must not
-/// read as overriding it.
-/// The marker fallback (`worker_signal_seam_enabled` off) must also not
-/// claim a `[blocked]` marker records synchronously: that parser runs only
-/// at the Stop boundary (`completion::stop`), never from
-/// `finalize_declared_run_done`, so a marker emitted immediately before
-/// this terminal call is lost. The mixed-flag path therefore stores the
-/// blocker in `--summary` instead.
-///
-/// `standard_worker` is true when
-/// [`crate::worker_setup::worker_kind_for_execution`] maps this execution to
-/// [`crate::worker_setup::WorkerKind::Standard`]. Question flags
-/// (`--question` / `--explanation`) and the pointer to the generated-rules
-/// writing contract are Standard-only: that contract lives in Standard
-/// workers' rules, and Reviewer / Triage / AnswerAgent / ReviewGuide
-/// workers cannot file those questions. Non-standard fallbacks of this
-/// generic composer (a PrReview without a PR URL, an AutomationTriage
-/// without an automation row) still get `propose done`.
-pub(crate) fn run_done_directive(
-    seam_enabled: bool,
-    worker_signal_seam_enabled: bool,
-    conflict_resolution: bool,
-    standard_worker: bool,
-    bazel_workspace: Option<bool>,
-) -> String {
-    if !seam_enabled {
-        return String::new();
-    }
-    let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
-    let (blocked_file, blocked_while_continuing) = if worker_signal_seam_enabled {
-        let question_carve_out = if standard_worker {
-            ", unless the declaration carries a question as described below"
-        } else {
-            ""
-        };
-        (
-            format!(
-                "File `{boss} propose blocked --reason \"...\"` alongside it (before this call){question_carve_out}"
-            ),
-            format!("`{boss} propose blocked --reason \"...\"` alone records"),
-        )
-    } else {
-        (
-            "Put the blocker reason in this call's `--summary` (a `[blocked] reason=\"...\"` marker \
-             emitted immediately before this call is never parsed — the marker is Stop-boundary-only)"
-                .to_string(),
-            "a `[blocked] reason=\"...\"` marker is parsed only at the Stop boundary (when the turn \
-             ends without a terminal `propose done`) and records"
-                .to_string(),
-        )
-    };
-    let gate_exception = run_done_gate_exception(conflict_resolution, bazel_workspace);
-    let operator_question_block = if standard_worker {
-        let question_companion = if worker_signal_seam_enabled {
-            format!(
-                " A declaration that carries a question is its own blocker record: do NOT also file \
-                 `{boss} propose blocked`, because that raises a separate attention item the answer never clears."
-            )
-        } else {
-            String::new()
-        };
-        format!(
-            "When delivery requires a human decision, attach one specific Yes/No question to that blocked declaration. Write the labelled explanation to a file first, then pass `--explanation-file <path>` on a single line (`--explanation-file -` or `--explanation -` reads stdin). Inline `--explanation` is accepted when the command can contain newlines; some PreToolUse guards reject any command string that contains a newline, even inside quotes.\n\n\
-     ```\n\
-     {boss} propose done --outcome blocked --summary \"<blocker>\" --question \"Approve switching the retry to exponential backoff?\" --answer-type yes-no --explanation-file /tmp/explanation.txt\n\
-     ```\n\n\
-     Say in plain words what is blocked and what each answer will do; put check names and numbers in Details. \"Can I proceed?\" is not specific enough. Put the justification in the explanation file, not the question.{question_companion} One question per run: ask the most blocking decision and disclose any further decisions in the explanation. The run waits durably for the answer. Yes records the approval and redispatches. No records the declined path (granting no authorization) and redispatches so the next worker takes it. Both Yes and No must name an actionable path the engine or the next worker will take; \"No = remain blocked\" is not a real choice. If there is only one viable path, do not ask; proceed, or report the blocker without a question.\n\n\
-     Follow the question-writing contract in the generated worker rules.\n\n\
-     **When the decision is a choice among several options rather than approve/decline, use `--answer-type multiple-choice`.** Pass two to six short, distinct, single-line labels with `--choices`; the card shows one button per label. Use `--question` for the decision itself and an explanation with only `Context:` (say what each option leads to), `Recommendation:` and optional `Details:` — no `Yes:` or `No:` sections, which are rejected for this type. Example:\n\n\
-     ```\n\
-     {boss} propose done --outcome blocked --summary \"<blocker>\" --question \"Which rollout should the migration use?\" --answer-type multiple-choice --choices \"Gradual\" \"All at once\" --explanation-file /tmp/explanation.txt\n\
-     ```\n\n\
-     The same one-question-per-run rule applies. The chosen label is recorded verbatim and the task restarts in the preserved workspace; your next run's task description ends with a `## Recorded answer` section naming the question and the chosen option. Act on that choice; it grants no authorization beyond the decision itself.\n\n\
-     **When your task cannot finish until another PR lands first, ask to create a prerequisite task instead of a plain Yes/No.** Example: a CI-fix revision finds that a pre-existing test fixture races retention cleanup; that needs its own fix on main before the PR's CI can go green, and it is out of scope for you. Do not file a plain blocker, a plain yes/no question or `followup-task` for that case. Propose that work as its own task:\n\n\
-     ```\n\
-     {boss} propose done --outcome blocked --summary \"<blocker>\" --answer-type create-prerequisite-task --prerequisite-name \"<short task name>\" --prerequisite-brief \"<self-contained description>\" --explanation-file /tmp/explanation.txt\n\
-     ```\n\n\
-     The description must stand alone: the prerequisite becomes a separate task that a different worker picks up cold, seeing only that description. Name the files, the failure and its evidence, and what done looks like; never refer to \"this task\", \"above\", or your own session. Do not pass `--question` — the engine words it for the repo owner (\"Create prerequisite task '<name>'? This task will wait for it.\"). The repo owner still answers Yes or No. Yes creates the task in this product (or, if an equivalent open task already exists, links to it instead), makes your task depend on it, appends a dated note to your task description, and redispatches your task once the prerequisite is done. No records the declined path (granting no authorization) and redispatches so the next worker takes it. `{boss} propose followup-task` remains only the non-blocking path for nice-to-have work later. The one-question-per-run rule applies here too.\n\n\
-     **When that work already belongs to an existing open task** (for example one that owns an open PR), ask to wait for that task instead of creating a duplicate. Pass `--answer-type link-prerequisite-task` with `--prerequisite-pr` (a GitHub URL, `owner/repo#n`, or PR number) and/or `--prerequisite-id` (the canonical or friendly task id). The engine resolves the task from that id or PR; it never matches by name. Do not pass `--question` — the engine words it after it resolves the task (\"Wait for '<name>'? This task will wait for it.\"). Yes adds a dependency on that task and parks this one until it is done. No records the declined path and redispatches. Keep `--answer-type create-prerequisite-task` only when no existing open task owns the work. If a create request names a PR that already belongs to another open task, the engine stores a link question instead.\n\n\
-     ```\n\
-     {boss} propose done --outcome blocked --summary \"<blocker>\" --answer-type link-prerequisite-task --prerequisite-pr \"<github-pr>\" --explanation-file /tmp/explanation.txt\n\
-     ```\n\n\
-     **When the change would exceed the `change/file-count` limit, stop adding scope and report a proposed split through the proposal below.** Estimate the file count early from the target repo's documented per-change costs, not the number of deliverables; check the footprint once the shape is clear and again before final validation. Describe what lands in this PR and what becomes a prerequisite or follow-up along capability boundaries. Recommend **Split** by default; recommend **Bypass limit** only for the unsplittable cases named in the target repo's `CHECKS.yaml` (in spinyfin/mono, coordinated renames and generated trees). Use the existing proposal: ask the split-vs-bypass question — both answers act. State the projected upper-bound file count of the single-PR change, the limit, and the proposed split's PR boundaries. `--file-count` records the projected upper bound. Checkleft does not enforce the approved count: before pushing, compare the non-deleted file count from `jj diff --stat` against the PR base with the approved bound, and ask again if it is over. Use a free-form bypass reason without a numeric prefix, citing the recorded answer and date. This is not a Yes/No question: the repo owner sees two buttons named for the actions, Split and Bypass limit, and `--explanation` uses `Split:` and `Bypass limit:` sections instead of `Yes:` and `No:`. Split creates the first coherent capability as a prerequisite (a standalone description of that first PR, split along a capability boundary); this task delivers the remainder once that PR has merged. Bypass limit authorizes a file-count exception for this PR only, records that approval, and redispatches so the next worker finishes in one PR by putting `BYPASS_CHANGE_FILE_COUNT=Split-vs-bypass question answered Bypass limit by the repo owner on <date>; one-PR exception for this PR only` in the commit description. Never apply that bypass without the recorded authorization. It does not relax any other check. Do not file a plain blocker, a plain yes/no question or `followup-task` for an over-limit change. **Revisions re-check the footprint:** re-run `checkleft run` before every push. If addressing review would push the PR past the limit or a previously approved bound, stop adding scope, finish the in-scope work that fits, and report the proposed split through the same proposal, recommending Split; never silently grow the PR. An earlier approval covers only the file count it was given.\n\n\
-     ```\n\
-     {boss} propose done --outcome blocked --summary \"<blocker>\" --answer-type create-prerequisite-task --prerequisite-name \"<first PR title>\" --prerequisite-brief \"<self-contained description of that first PR>\" --file-count <n> --file-count-limit <limit> --explanation-file /tmp/explanation.txt\n\
-     ```\n\n\
-     Before asking, check the task description for recorded approval of the requested action or an `## Recorded answer` section. If it already grants the authorization or makes the decision needed, proceed and cite it in the PR body. Do not ask for decisions you are allowed to make, or use questions to hand back work that is merely hard. The answer authorizes exactly the question; it does not disable or bypass any check beyond what that question asked.\n\n"
-        )
-    } else {
-        String::new()
-    };
-    let superseded_ask_hint = if standard_worker {
-        " To request that approval first, declare `--outcome blocked --answer-type yes-no --superseded-by <PR>` with `--question` and `--explanation-file`."
-    } else {
-        ""
-    };
-    format!(
-        "\n## Declaring your run finished\n\n\
-     When your run is over, say so — as the ABSOLUTE LAST thing you do:\n\n\
-     ```\n\
-     {boss} propose done --outcome <delivered|no-changes-needed|blocked> --summary \"<one line>\"\n\
-     ```\n\n\
-     **An accepted `delivered` or `blocked` declaration ends your run** — the engine tears your pane \
-     down, with no turn after it, not even to see the response. Finish every other thing first, \
-     including opening or updating the PR; only declare once nothing is left to do.\n\n\
-     Pick the outcome that is true:\n\n\
-     - `delivered` — the deliverable exists (you opened or pushed to the PR, wrote the review, \
-     posted the reply). If you closed the bound PR as superseded with approval, also pass \
-     `--superseded-by <PR>` (URL, `owner/repo#N`, `#N`, or PR number) so the engine records \
-     a non-merged completion instead of treating the closed PR as a failure.{superseded_ask_hint}\n\
-     - `no-changes-needed` — you verified there was nothing to produce. End your turn after submitting; \
-     the engine checks command evidence at that boundary. If refused, verify again and redeclare.\n\
-     - `blocked` — a genuine external blocker or mandated approval stop prevents delivery. This fails \
-     the execution, releases its resources, and records the explanation on the task; it does not \
-     park a live worker or automatically retry the same attempt. Fix recoverable failures first. \
-     Never relax a repository check without approval. Include the exact failed command, missing \
-     credential, or decision needed in the summary. {blocked_file} so the blocker itself is \
-     recorded, not just the fact that you stopped.\n\n\
-     {operator_question_block}\
-     {gate_exception}\n\n\
-     To flag a concern while continuing, {blocked_while_continuing} the blocker and pauses the \
-     nudge loop; it does NOT end the run. Only `{boss} propose done --outcome blocked` ends the \
-     run, releases the slot and lease, and parks the row for a human.\n\n\
-     If you simply stop without declaring, you are not left alone: the engine holds the run open \
-     while it can see you working, then asks you once whether you are finished, then fails the attempt \
-     with a visible diagnostic. That is worse for you and for the human than \
-     one command.\n"
-    )
-}
-
 /// `[deferred-scope]` marker protocol directive (root-caused to PR #765).
 /// A worker that deliberately narrows its own scope — delivers part of the
 /// brief and consciously defers a piece of it, rather than merely running
@@ -1452,7 +1280,14 @@ pub(crate) fn deferred_scope_directive(seam_enabled: bool) -> String {
 /// broader "Declaring your run finished" section, but the engine reads the
 /// no-op declaration's durable stamp unconditionally, so the verb must always
 /// be taught here.
-fn no_op_completion_directive(seam_enabled: bool) -> String {
+fn no_op_completion_directive(seam_enabled: bool, slim_worker_brief: bool) -> String {
+    if slim_worker_brief {
+        return "\n## If the work is already done: signal a sanctioned no-op\n\n\
+             If `jj diff -r @` is empty because the change is already on `main`, follow \"Empty diff \
+             and no-changes-needed\" in the worker rules to declare a sanctioned no-op instead of \
+             pushing an empty PR.\n"
+            .to_owned();
+    }
     let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
     let blocked_pointer = if seam_enabled {
         "call `\"$BOSS_BIN\" propose blocked --reason \"...\"` instead"
@@ -1506,7 +1341,14 @@ fn no_op_completion_directive(seam_enabled: bool) -> String {
 /// conflict/CI-remediation framing, because the engine's
 /// `worker_signalled_no_op` check is itself unconditional on
 /// `revision_implementation` executions.
-fn revision_no_op_completion_directive(seam_enabled: bool) -> String {
+fn revision_no_op_completion_directive(seam_enabled: bool, slim_worker_brief: bool) -> String {
+    if slim_worker_brief {
+        return "\n## If the finding needs no code change: signal a sanctioned no-op\n\n\
+             If, after investigating, the finding needs no code change, follow \"Empty diff and \
+             no-changes-needed\" in the worker rules (the mandatory rebase still applies and GitHub \
+             must report `MERGEABLE` before declaring).\n"
+            .to_owned();
+    }
     let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
     let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     let blocked_pointer = if seam_enabled {
@@ -1706,6 +1548,17 @@ fn compose_investigation_directive() -> String {
 /// `unify-pr-remediation-on-revisions.md`): the existing diagnosis/log
 /// rendering from the bespoke composers is lifted into the shared revision
 /// directive rather than duplicated across three nearly-identical prompts.
+#[derive(bon::Builder)]
+struct RevisionDirectiveOpts {
+    recovered_work: bool,
+    worker_signal_proposals_seam_enabled: bool,
+    deferred_scope_proposals_seam_enabled: bool,
+    run_done_proposals_seam_enabled: bool,
+    bazel_workspace: Option<bool>,
+    remote_workspace: bool,
+    slim_worker_brief: bool,
+}
+
 fn compose_revision_directive(
     execution: &crate::work::WorkExecution,
     work_item: &WorkItem,
@@ -1713,20 +1566,17 @@ fn compose_revision_directive(
     conflict_attempt: Option<&ConflictResolution>,
     ci_attempt: Option<&CiRemediation>,
     merge_order_preservation: &[String],
-    // (recovered_work, worker_signal_proposals_seam_enabled,
-    //  deferred_scope_proposals_seam_enabled, run_done_proposals_seam_enabled,
-    //  bazel_workspace)
-    // — bundled to keep the parameter count under clippy::too_many_arguments.
-    recovery_and_proposals: (bool, bool, bool, bool, Option<bool>, bool),
+    opts: RevisionDirectiveOpts,
 ) -> String {
-    let (
+    let RevisionDirectiveOpts {
         recovered_work,
         worker_signal_proposals_seam_enabled,
         deferred_scope_proposals_seam_enabled,
         run_done_proposals_seam_enabled,
         bazel_workspace,
         remote_workspace,
-    ) = recovery_and_proposals;
+        slim_worker_brief,
+    } = opts;
     let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     let parent_pr_url = execution.pr_url.as_deref().unwrap_or("(unknown)");
     let pr_number = boss_github::pr_url::pr_number_from_url(parent_pr_url)
@@ -1761,12 +1611,18 @@ fn compose_revision_directive(
              guide reconciliation and does not resolve the comment by itself.\n",
         );
     }
-    out.push_str(&format!(
-        "\n**`gh` requires `--repo` in this workspace:** This repo is `{repo_slug}`. \
-         `gh` cannot auto-detect the repo in a jj workspace (there is no `.git` \
-         directory at the root — only `.jj/`). Pass `--repo {repo_slug}` on every \
-         `gh` command: `gh pr view`, `gh pr checks`, `gh pr diff`, `gh api`, etc.\n"
-    ));
+    if slim_worker_brief {
+        out.push_str(&format!(
+            "\nPass `--repo {repo_slug}` on every `gh` command (jj workspace; see \"Creating a PR from a jj workspace\" in the worker rules).\n"
+        ));
+    } else {
+        out.push_str(&format!(
+            "\n**`gh` requires `--repo` in this workspace:** This repo is `{repo_slug}`. \
+             `gh` cannot auto-detect the repo in a jj workspace (there is no `.git` \
+             directory at the root — only `.jj/`). Pass `--repo {repo_slug}` on every \
+             `gh` command: `gh pr view`, `gh pr checks`, `gh pr diff`, `gh api`, etc.\n"
+        ));
+    }
     // Issue #804: revision chores on PR #250 were the worst
     // offenders for pushing red code. Apply the pre-push build gate for
     // the detected build system. Bazel conflict-resolution revisions
@@ -1781,6 +1637,7 @@ fn compose_revision_directive(
         is_conflict_resolution,
         worker_signal_proposals_seam_enabled,
         run_done_proposals_seam_enabled,
+        slim_worker_brief,
     ));
     out.push('\n');
     out.push_str("## Workspace state\n");
@@ -1842,13 +1699,20 @@ fn compose_revision_directive(
     ));
     out.push_str("   b. Compare the title and description carefully against what the PR NOW does after your change. Pay special attention to any section that describes behaviour, scope, or approach that this revision REVERSES, supersedes, or obsoletes — those sections MUST be corrected or removed. A description that tells a reviewer the exact opposite of what the code does is worse than a terse one.\n");
     out.push_str(&format!("   b2. **PR title — check it explicitly.** If the revision changes or overturns the PR's scope or conclusion (e.g. the original PR claimed something was not a bug but this revision fixes the bug), the title MUST be updated to reflect the final state. A title that contradicts the committed code is a defect. Update it with: `gh pr edit {pr_number} --title \"<accurate new title>\" -R {repo_slug}`\n"));
-    out.push_str("   c. If any part of the description is now inaccurate, write the corrected body to a temp file and apply it:\n");
-    out.push_str(&format!(
-        "      `body=$(mktemp) && <write corrected body to $body> && gh pr edit {pr_number} --body-file \"$body\" -R {repo_slug}`\n"
-    ));
-    out.push_str(
-        "      Never pass the body as an inline `--body` argument — the shell evaluates backticks and `$(...)`.\n",
-    );
+    if slim_worker_brief {
+        out.push_str("   c. If any part of the description is now inaccurate, write the corrected body to a temp file and apply it (never inline `--body`; see \"Canonical PR creation recipe\" in the worker rules):\n");
+        out.push_str(&format!(
+            "      `body=$(mktemp) && <write corrected body to $body> && gh pr edit {pr_number} --body-file \"$body\" -R {repo_slug}`\n"
+        ));
+    } else {
+        out.push_str("   c. If any part of the description is now inaccurate, write the corrected body to a temp file and apply it:\n");
+        out.push_str(&format!(
+            "      `body=$(mktemp) && <write corrected body to $body> && gh pr edit {pr_number} --body-file \"$body\" -R {repo_slug}`\n"
+        ));
+        out.push_str(
+            "      Never pass the body as an inline `--body` argument — the shell evaluates backticks and `$(...)`.\n",
+        );
+    }
     out.push_str("   d. What to write: rewrite the description so it is accurate and self-contained for reviewers NOW. The main summary must describe the CURRENT state — what the PR does, not what it used to do. Do NOT append a changelog that leaves a contradictory original summary above it; instead correct the summary in place. A short \"Changes in this revision\" note may follow the corrected summary if it adds context, but it must never contradict or overshadow the corrected summary.\n");
     out.push_str("   e. A revision may skip steps c–d ONLY if it changes ZERO source files (e.g. a PR-description-only fix or a pure markdown/comment edit) AND involves no rebase, merge, or conflict resolution. Rebase and conflict-resolution revisions do NOT qualify for this skip — they touch compiled output and must go through the full description review. The title check (step b2) is NEVER skippable — always verify it.\n");
     out.push_str("   f. If, after the comparison in step b, the description already matches the PR's current state, do NOT edit it just to have touched it — leave it as-is and say so explicitly in your final response (e.g. \"PR description verified accurate against this revision's diff; no edit needed\"). The bar is whether the description describes the PR's current state, not whether this revision left a visible mark on it.\n");
@@ -1925,30 +1789,36 @@ fn compose_revision_directive(
     out.push_str("For a rebase-only result, leave an empty editable child uncommitted: if `jj diff -r @` is empty and `@` is the fresh child the engine created, advance the parent PR bookmark to `@-`, not `@`, and skip `jj describe`. Push that rebased head after validation. This does not authorize dropping any existing PR commit.\n");
     out.push('\n');
     out.push_str("Constraints:\n");
-    out.push_str(&format!(
-        "- A revision never opens a new PR. Do NOT run `gh pr create` or `{cube} pr create`. Push in-scope commits to the existing parent PR with `{cube} pr update --branch <parent-branch-name>`.\n"
-    ));
-    // Stored questions do not finalize the worker with the completion seam off.
-    if run_done_proposals_seam_enabled {
-        out.push_str(
-        "- Work that must land in another PR before this revision can finish goes through `\"$BOSS_BIN\" propose done --outcome blocked --summary \"<blocker>\" --answer-type create-prerequisite-task --prerequisite-name \"<short task name>\" --prerequisite-brief \"<self-contained description>\" --explanation-file /tmp/explanation.txt` when that work has no existing owner, or `--answer-type link-prerequisite-task --prerequisite-pr \"<github-pr>\"` (and/or `--prerequisite-id`) when an existing open task already owns it; the revision waits for it and is redispatched once it is done. `\"$BOSS_BIN\" propose followup-task --name \"<short title>\" --description \"<one paragraph of scope>\" --rationale \"<why a separate PR>\"` is only for non-blocking work that can happen later. Finish the in-scope work on this parent PR. Do not declare you could not complete.\n",
-    );
+    if slim_worker_brief {
+        out.push_str(&format!(
+            "- Follow \"Revisions\" and \"Empty diff and no-changes-needed\" in the worker rules: push in-scope commits only to the existing parent PR with `{cube} pr update --branch <parent-branch-name>`, never open a new PR, and stop if `jj diff -r @` is empty on a non-rebase-only revision.\n\n"
+        ));
     } else {
-        out.push_str("- If another PR must land first, report the dependency using the blocker channel taught below. Use followup-task only for non-blocking work that can happen later. Finish the in-scope work on the parent PR.\n");
-    }
-    if worker_signal_proposals_seam_enabled {
-        out.push_str(
-            "- If a guard, policy, or decision blocks progress, use `\"$BOSS_BIN\" propose blocked --reason \"<specific question>\"` instead of declaring you could not complete.\n",
+        out.push_str(&format!(
+            "- A revision never opens a new PR. Do NOT run `gh pr create` or `{cube} pr create`. Push in-scope commits to the existing parent PR with `{cube} pr update --branch <parent-branch-name>`.\n"
+        ));
+        // Stored questions do not finalize the worker with the completion seam off.
+        if run_done_proposals_seam_enabled {
+            out.push_str(
+            "- Work that must land in another PR before this revision can finish goes through `\"$BOSS_BIN\" propose done --outcome blocked --summary \"<blocker>\" --answer-type create-prerequisite-task --prerequisite-name \"<short task name>\" --prerequisite-brief \"<self-contained description>\" --explanation-file /tmp/explanation.txt` when that work has no existing owner, or `--answer-type link-prerequisite-task --prerequisite-pr \"<github-pr>\"` (and/or `--prerequisite-id`) when an existing open task already owns it; the revision waits for it and is redispatched once it is done. `\"$BOSS_BIN\" propose followup-task --name \"<short title>\" --description \"<one paragraph of scope>\" --rationale \"<why a separate PR>\"` is only for non-blocking work that can happen later. Finish the in-scope work on this parent PR. Do not declare you could not complete.\n",
         );
-    } else {
-        out.push_str(
-            "- If a guard, policy, or decision blocks progress, emit a `[blocked] reason=\"<specific question>\"` marker instead of declaring you could not complete.\n",
-        );
+        } else {
+            out.push_str("- If another PR must land first, report the dependency using the blocker channel taught below. Use followup-task only for non-blocking work that can happen later. Finish the in-scope work on the parent PR.\n");
+        }
+        if worker_signal_proposals_seam_enabled {
+            out.push_str(
+                "- If a guard, policy, or decision blocks progress, use `\"$BOSS_BIN\" propose blocked --reason \"<specific question>\"` instead of declaring you could not complete.\n",
+            );
+        } else {
+            out.push_str(
+                "- If a guard, policy, or decision blocks progress, emit a `[blocked] reason=\"<specific question>\"` marker instead of declaring you could not complete.\n",
+            );
+        }
+        out.push_str("- Push to the existing parent branch.\n");
+        out.push_str("- Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty and this is NOT a rebase-only revision, stop and explain.\n");
+        out.push('\n');
     }
-    out.push_str("- Push to the existing parent branch.\n");
-    out.push_str("- Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty and this is NOT a rebase-only revision, stop and explain.\n");
-    out.push('\n');
-    out.push_str(check_bypass_prohibition_text());
+    out.push_str(check_bypass_prohibition(slim_worker_brief));
     out.push('\n');
     // Include the escalation section so every revision gate (Bazel, non-Bazel
     // or unresolved) has the blocker syntax, --level sibling verb, and
@@ -1959,14 +1829,23 @@ fn compose_revision_directive(
     out.push_str(&deferred_scope_directive(deferred_scope_proposals_seam_enabled));
     out.push_str(&revision_no_op_completion_directive(
         worker_signal_proposals_seam_enabled,
+        slim_worker_brief,
     ));
     out.push_str("The revision's post-push steps remain your responsibility: finish them before your final response; a push or staged PR URL alone does not mean the revision is done. The driver-resolved boundary after that response is the completion handshake.\n");
     if let Some(attempt) = conflict_attempt {
-        out.push_str(&compose_conflict_resolution_fragment(attempt, bazel_workspace));
+        out.push_str(&compose_conflict_resolution_fragment(
+            attempt,
+            bazel_workspace,
+            slim_worker_brief,
+        ));
         out.push_str(&compose_merge_order_preservation_fragment(merge_order_preservation));
     }
     if let Some(attempt) = ci_attempt {
-        out.push_str(&compose_ci_remediation_fragment(attempt, bazel_workspace));
+        out.push_str(&compose_ci_remediation_fragment(
+            attempt,
+            bazel_workspace,
+            slim_worker_brief,
+        ));
     }
     out
 }
@@ -2198,7 +2077,11 @@ fn conflict_porting_and_stop_conditions(attempt: &ConflictResolution) -> String 
 /// is already covered by the shared revision directive, so this fragment
 /// covers only the signal-specific parts: the diagnosis block, rebase
 /// instructions, stop conditions, and post-resolution PR comment template.
-fn compose_conflict_resolution_fragment(attempt: &ConflictResolution, bazel_workspace: Option<bool>) -> String {
+fn compose_conflict_resolution_fragment(
+    attempt: &ConflictResolution,
+    bazel_workspace: Option<bool>,
+    slim_worker_brief: bool,
+) -> String {
     let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     let mut out = String::new();
     out.push_str("\n---\n\n");
@@ -2276,6 +2159,14 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution, bazel_work
          very resolution orphaned it. Absent a design-doc citation that says one surface \
          replaces the other, both surfaces must survive.\n\n",
     );
+    let inline_commit_note = if slim_worker_brief {
+        "**Non-interactive env:** follow \"Commit messages must be inline\" in the worker rules (`EDITOR=false`).\n\n"
+    } else {
+        "**Non-interactive env:** ALWAYS pass `-m \"…\"` to `jj describe`, `jj squash`, \
+         `jj commit`, and `jj new`. The worker environment has no usable editor \
+         (`EDITOR=false`); any jj command that opens an editor hard-fails with \
+         \"Editor 'false' exited\". Never rely on the interactive editor.\n\n"
+    };
     out.push_str(&format!(
         "### How to resolve jj conflicts (first-class conflicts — stacked branches)\n\n\
          **jj records conflicts IN each commit independently.** `jj git push` refuses to push \
@@ -2306,10 +2197,7 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution, bazel_work
          and run the full build and test gate before `{cube} pr update --branch <branch>`.\n\n\
          **Do NOT** squash or resolve only at the working-copy tip — it cannot clear an \
          ancestor's conflict.\n\n\
-         **Non-interactive env:** ALWAYS pass `-m \"…\"` to `jj describe`, `jj squash`, \
-         `jj commit`, and `jj new`. The worker environment has no usable editor \
-         (`EDITOR=false`); any jj command that opens an editor hard-fails with \
-         \"Editor 'false' exited\". Never rely on the interactive editor.\n\n\
+         {inline_commit_note}\
          **Structural edit — NOT line-range surgery:**\n\n\
          jj materializes each conflict as annotated regions directly in the file. \
          Resolve by **editing those regions in place**:\n\n\
@@ -2475,7 +2363,11 @@ fn compose_conflict_ground_truth_fragment(attempt: &ConflictResolution) -> Strin
 /// that the worker needs to fix the failing CI — identical in content to the
 /// bespoke `compose_ci_remediation_prompt` except that the branch/push spine
 /// is already covered by the shared revision directive.
-fn compose_ci_remediation_fragment(attempt: &CiRemediation, bazel_workspace: Option<bool>) -> String {
+fn compose_ci_remediation_fragment(
+    attempt: &CiRemediation,
+    bazel_workspace: Option<bool>,
+    slim_worker_brief: bool,
+) -> String {
     if crate::work::queue_ci_evidence::queue_ci_verification_required(attempt) {
         return compose_queue_ci_fragment(attempt, bazel_workspace);
     }
@@ -2677,10 +2569,16 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation, bazel_workspace: Opt
              jj edit <lowest-conflicted-change-id>\n\
              # verify: output must contain no 'true'\n\
              jj log -r '::<branch>' -T 'conflict ++ \"\\n\"'\n\
-             ```\n\
-             Always pass `-m \"…\"` to `jj describe`/`jj squash`/`jj commit`/`jj new` — \
-             `EDITOR=false` in this environment; any command that opens an editor hard-fails.\n\n",
+             ```\n",
         );
+        if slim_worker_brief {
+            out.push_str("Follow \"Commit messages must be inline\" in the worker rules (`EDITOR=false`).\n\n");
+        } else {
+            out.push_str(
+                "Always pass `-m \"…\"` to `jj describe`/`jj squash`/`jj commit`/`jj new` — \
+                 `EDITOR=false` in this environment; any command that opens an editor hard-fails.\n\n",
+            );
+        }
         out.push_str(
             "Wait for the re-run's required checks to settle (`gh pr checks --watch`). Then:\n\n\
              - **If post-rebase CI is green**, call \
@@ -2737,13 +2635,21 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation, bazel_workspace: Opt
     }
 
     out.push_str("### Stop conditions\n\n");
-    out.push_str(
-        "- **You are not adding scope.** The only allowed change is one that makes the failing \
-         required checks pass (rebase, infra retrigger, or a focused fix).\n\
-         - **Do not close the PR yourself.** Closing is the human's call.\n\
-         - **Always pass `-m \"…\"` to `jj describe` / `jj squash`.** The worker \
-         environment has no usable `$EDITOR`.\n\n",
-    );
+    if slim_worker_brief {
+        out.push_str(
+            "- **You are not adding scope.** The only allowed change is one that makes the failing \
+             required checks pass (rebase, infra retrigger, or a focused fix).\n\
+             - **Do not close the PR yourself.** Closing is the human's call.\n\n",
+        );
+    } else {
+        out.push_str(
+            "- **You are not adding scope.** The only allowed change is one that makes the failing \
+             required checks pass (rebase, infra retrigger, or a focused fix).\n\
+             - **Do not close the PR yourself.** Closing is the human's call.\n\
+             - **Always pass `-m \"…\"` to `jj describe` / `jj squash`.** The worker \
+             environment has no usable `$EDITOR`.\n\n",
+        );
+    }
     out.push('\n');
     out
 }
@@ -2758,8 +2664,8 @@ fn compose_ci_remediation_prompt(
     workspace_path: &Path,
     cube_change_id: Option<&str>,
     attempt: &CiRemediation,
-    _test_command: Option<&str>,
     bazel_workspace: Option<bool>,
+    slim_worker_brief: bool,
 ) -> String {
     let mut prompt = String::new();
 
@@ -2788,7 +2694,7 @@ fn compose_ci_remediation_prompt(
 
     if crate::work::queue_ci_evidence::queue_ci_verification_required(attempt) {
         prompt.push_str(&compose_queue_ci_fragment(attempt, bazel_workspace));
-        prompt.push_str(check_bypass_prohibition_text());
+        prompt.push_str(check_bypass_prohibition(slim_worker_brief));
         return prompt;
     }
 

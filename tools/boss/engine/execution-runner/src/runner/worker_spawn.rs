@@ -656,6 +656,7 @@ pub async fn compose_worker_spawn(
     } = editorial_opts;
     // Experiments reach the composer as plain options, never as keys.
     let batched_search = experiment_arms.is_treated(crate::feature_flags::BATCHED_SEARCH_EXPERIMENT);
+    let slim_worker_brief = experiment_arms.is_treated(crate::feature_flags::SLIM_WORKER_BRIEF_EXPERIMENT);
     // For any project-scoped task (the synthetic `kind = 'design'`
     // task and ordinary `project_task` rows alike), the richer
     // brief — what the project is for, what its goal is — lives
@@ -1203,6 +1204,7 @@ pub async fn compose_worker_spawn(
                 .maybe_bazel_workspace(bazel_workspace)
                 .remote_workspace(remote_workspace)
                 .batched_search(batched_search)
+                .slim_worker_brief(slim_worker_brief)
                 .build(),
         )
     };
