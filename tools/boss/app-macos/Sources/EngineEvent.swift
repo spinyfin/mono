@@ -429,7 +429,7 @@ enum EngineEvent {
     /// Reply to `comments_create` / `comments_dismiss` / `comments_set_status`
     /// / `comments_update_anchor` — the single-comment `comment_result` echo of
     /// the persisted `WorkComment` row.
-    case commentResult(comment: WorkComment)
+    case commentResult(comment: WorkComment, requestId: String?)
     /// Reply to `comments_list` — each comment with its thread entries and the
     /// answer-agent-running flag, for the artifact.
     case commentsList(artifactKind: String, artifactId: String, comments: [CommentWithThread])

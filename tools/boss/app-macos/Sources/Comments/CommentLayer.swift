@@ -107,6 +107,16 @@ final class CommentLayer: NSObject, ObservableObject {
     /// `Created` outcome is reflected by the topic-invalidation-triggered
     /// reload instead). Clears itself a few seconds after being set.
     @Published private(set) var reviseDocMessage: String? = nil
+    /// Kind picked for a comment whose `CommentsSetIntent` call
+    /// has not been answered yet, by comment id. The badge renders it with a
+    /// trailing ellipsis; it is never copied onto the comment — the engine's
+    /// `comment_result` echo (`applyCommentResult`) or its refusal
+    /// (`applyIntentRefusal`) is what settles the picker.
+    @Published private(set) var pendingIntents: [String: CommentIntent] = [:]
+    /// The engine's reason for refusing the last kind change, by comment id,
+    /// rendered inline under the row's badges. Clears itself after a few
+    /// seconds, or on the next pick.
+    @Published private(set) var intentRefusals: [String: String] = [:]
 
     // NSEvent monitor tokens; stored nonisolated(unsafe) because the opaque Any
     // tokens are installed/removed only on the main actor.
@@ -803,10 +813,20 @@ final class CommentLayer: NSObject, ObservableObject {
     func setIntent(_ intent: CommentIntent, for comment: Comment) {
         guard !isReadOnly else { return }
         if let backend, isEngineBacked {
+            intentRefusals[comment.id] = nil
+            pendingIntents[comment.id] = intent
             backend.setIntent(commentId: comment.id, intent: intent.rawValue)
             return
         }
         guard let index = comments.firstIndex(where: { $0.id == comment.id }) else { return }
+        // Mirrors the engine's admission gate (`refuse_comment_reclassification`):
+        // a claimed, terminal, or anchor-less comment cannot be re-homed, so
+        // the fallback refuses with the same kind of reason instead of
+        // relabelling a comment that routes nowhere.
+        if let reason = Self.fallbackIntentRefusal(for: comments[index]) {
+            applyIntentRefusal(commentId: comment.id, reason: reason)
+            return
+        }
         comments[index].intent = intent
         comments[index].intentOverriddenByUser = true
 
@@ -818,7 +838,7 @@ final class CommentLayer: NSObject, ObservableObject {
             // stood down rather than waited on. `.inRevision` is deliberately
             // untouched: it's already claimed by a task whose directive is
             // immutable.
-            if [.answering, .answered, .awaitingFollowup].contains(comments[index].status) {
+            if [.answering, .answered, .answerFailed, .awaitingFollowup].contains(comments[index].status) {
                 comments[index].status = .active
                 comments[index].statusActor = "user"
             }
@@ -828,10 +848,74 @@ final class CommentLayer: NSObject, ObservableObject {
             // `question` immediately spawns the answer agent. Guarded on
             // `.active`, mirroring the engine's `rehome_reclassified_comment`:
             // a comment already `.answering`/`.answered`/`.awaitingFollowup`
-            // must not spawn a second run, and a comment claimed `.inRevision`
-            // must not spawn one behind the revision's back.
+            // must not spawn a second run.
             comments[index].status = .answering
             runAnswerAgent(for: comment.id)
+        }
+    }
+
+    /// The kind the picker is waiting on the engine to confirm for `comment`,
+    /// or `nil` when nothing is in flight.
+    func pendingIntent(for comment: Comment) -> CommentIntent? {
+        pendingIntents[comment.id]
+    }
+
+    /// The engine's reason for refusing the last kind change on `comment`,
+    /// while it is still worth showing.
+    func intentRefusal(for comment: Comment) -> String? {
+        intentRefusals[comment.id]
+    }
+
+    /// Settle the picker from the engine's single-comment echo: the row the
+    /// engine replied with is authoritative, so copy its routing fields onto
+    /// the local comment right away (the follow-up `reload()` brings thread
+    /// entries and run state). Only the echo for the latest intent request
+    /// settles its pending selection and clears its notice.
+    func applyCommentResult(_ wire: WorkComment, settlesIntent: Bool = true) {
+        if settlesIntent {
+            pendingIntents[wire.id] = nil
+            intentRefusals[wire.id] = nil
+        }
+        guard let index = comments.firstIndex(where: { $0.id == wire.id }) else { return }
+        comments[index].intent = wire.intent.flatMap(CommentIntent.init(rawValue:))
+        comments[index].intentOverriddenByUser = wire.intentOverriddenBy != nil
+        comments[index].status = CommentStatus(rawValue: wire.status) ?? comments[index].status
+        comments[index].statusActor = wire.statusActor
+        comments[index].reviseTaskId = wire.reviseTaskId
+        comments[index].reopenedAt = wire.reopenedAt
+    }
+
+    func showIntentRetryNotice(commentId: String) {
+        intentRefusals[commentId] = "Will send on Retry."
+    }
+
+    /// The engine refused the last kind change on `commentId`: the picker
+    /// reverts (nothing was ever written locally, so dropping the pending
+    /// kind is the revert) and `reason` shows inline until it ages out.
+    func applyIntentRefusal(commentId: String, reason: String) {
+        pendingIntents[commentId] = nil
+        intentRefusals[commentId] = reason
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(8))
+            if self?.intentRefusals[commentId] == reason { self?.intentRefusals[commentId] = nil }
+        }
+    }
+
+    /// Why the artifact-less fallback cannot re-home `comment`, mirroring the
+    /// engine's `refuse_comment_reclassification` case for case.
+    static func fallbackIntentRefusal(for comment: Comment) -> String? {
+        switch comment.status {
+        case .inRevision:
+            let task = comment.reviseTaskId.map { "revision \($0)" } ?? "a revision"
+            return "Already being addressed by \(task). Its kind can change once that revision finishes or is abandoned."
+        case .resolved:
+            return "This comment is resolved. Reopen it before changing its kind."
+        case .dismissed:
+            return "This comment was dismissed; its kind can no longer be changed."
+        case .orphaned:
+            return "This comment's anchor was lost in the current document. It can't be routed until it re-anchors."
+        case .active, .answering, .answered, .answerFailed, .awaitingFollowup:
+            return nil
         }
     }
 

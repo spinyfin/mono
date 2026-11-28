@@ -85,6 +85,15 @@ final class CommentEngineBridge: CommentBackend {
     /// to the oldest still-pending call.
     private var pendingReviseDocArtifacts: [(kind: String, id: String)] = []
 
+    /// In-flight `comments_set_intent` calls, keyed by the envelope request
+    /// id `EngineClient.sendLine` stamped on them, so a `work_error` reply
+    /// can be routed back to the comment whose picker sent it — rather than
+    /// falling through to the kanban-oriented `workError` handling, which
+    /// cannot tell a refused reclassification from a failed board move.
+    /// Settled by the `comment_result` echo or the correlated error.
+    private(set) var pendingIntentRequests: [String: String] = [:]
+    private var latestIntentRequest: [String: String] = [:]
+
     init(engine: EngineClient, author: String = CommentAuthor.current, draftStore: GuideCommentDrafts = GuideCommentDrafts()) {
         self.draftStore = draftStore
         self.engine = engine
@@ -170,7 +179,32 @@ final class CommentEngineBridge: CommentBackend {
     }
 
     func setIntent(commentId: String, intent: String) {
-        engine.sendCommentsSetIntent(commentId: commentId, intent: intent)
+        guard let requestId = engine.sendCommentsSetIntent(commentId: commentId, intent: intent) else {
+            // Rejected sends have no reply to settle the picker.
+            latestIntentRequest[commentId] = nil
+            forEachLayer(containing: commentId) {
+                $0.applyIntentRefusal(commentId: commentId, reason: "Kind change was not sent. Connect to the engine or clear the Retry queue, then try again.")
+            }
+            return
+        }
+        pendingIntentRequests[requestId] = commentId
+        latestIntentRequest[commentId] = requestId
+        if engine.isAwaitingRetry(requestId) {
+            forEachLayer(containing: commentId) { $0.showIntentRetryNotice(commentId: commentId) }
+        }
+    }
+
+    /// A `work_error` reply that answers an in-flight `comments_set_intent`:
+    /// the engine refused the reclassification and `message` is its reason.
+    /// Returns `false` when `requestId` is not one of ours, so the caller's
+    /// generic handling still applies to every other error.
+    func settleIntentRefusal(message: String, requestId: String?) -> Bool {
+        guard let requestId, let commentId = pendingIntentRequests.removeValue(forKey: requestId) else { return false }
+        if latestIntentRequest[commentId] == requestId {
+            latestIntentRequest[commentId] = nil
+            forEachLayer(containing: commentId) { $0.applyIntentRefusal(commentId: commentId, reason: message) }
+        }
+        return true
     }
 
     func fetchBannerState(artifactKind: String, artifactId: String) {
@@ -209,9 +243,15 @@ final class CommentEngineBridge: CommentBackend {
     /// A single-comment mutation echo. The origin session may not receive its
     /// own topic invalidation, so reload the owning artifact's layer(s) here to
     /// stay fresh after a self-initiated create/dismiss.
-    func handleCommentResult(_ comment: WorkComment) {
+    func handleCommentResult(_ comment: WorkComment, requestId: String? = nil) {
         draftStore.acknowledge(comment)
-        forEachLayer(kind: comment.artifactKind, id: comment.artifactId) { $0.reload() }
+        let matchesIntent = requestId.flatMap { pendingIntentRequests.removeValue(forKey: $0) } == comment.id
+        let settlesSelection = matchesIntent && latestIntentRequest[comment.id] == requestId
+        if settlesSelection { latestIntentRequest[comment.id] = nil }
+        forEachLayer(kind: comment.artifactKind, id: comment.artifactId) {
+            $0.applyCommentResult(comment, settlesIntent: settlesSelection)
+            $0.reload()
+        }
     }
 
     func handleCommentsBannerState(artifactKind: String, artifactId: String, state: CommentsBannerState) {
@@ -244,6 +284,10 @@ final class CommentEngineBridge: CommentBackend {
     /// On reconnect the engine dropped every subscription; re-subscribe each
     /// active artifact and reload its layers.
     func handleReconnected() {
+        // Replies to requests sent before the drop are gone with the old
+        // session; the reload below re-reads the engine's state instead.
+        abandonIntentRequests(pendingIntentRequests.keys.filter { !engine.isAwaitingRetry($0) },
+                              reason: "Request interrupted by reconnect. Pick a kind to try again.")
         var resubscribed = Set<String>()
         for reg in registrations.values {
             guard let layer = reg.layer else { continue }
@@ -252,6 +296,21 @@ final class CommentEngineBridge: CommentBackend {
                 engine.sendSubscribe(topics: [topic])
             }
             layer.reload()
+        }
+    }
+
+    func handleDiscardedRequests(_ requestIds: [String]) {
+        abandonIntentRequests(requestIds, reason: "Kind change discarded.")
+    }
+
+    private func abandonIntentRequests(_ requestIds: [String], reason: String) {
+        for requestId in requestIds {
+            guard let commentId = pendingIntentRequests.removeValue(forKey: requestId),
+                  latestIntentRequest[commentId] == requestId else { continue }
+            latestIntentRequest[commentId] = nil
+            forEachLayer(containing: commentId) {
+                $0.applyIntentRefusal(commentId: commentId, reason: reason)
+            }
         }
     }
 
@@ -267,6 +326,15 @@ final class CommentEngineBridge: CommentBackend {
     private func forEachLayer(kind: String, id: String, _ body: (CommentLayer) -> Void) {
         for reg in registrations.values where reg.artifactKind == kind && reg.artifactId == id {
             if let layer = reg.layer { body(layer) }
+        }
+    }
+
+    /// Every registered layer currently showing `commentId` — for replies
+    /// that identify a comment but not its artifact (a `work_error`).
+    private func forEachLayer(containing commentId: String, _ body: (CommentLayer) -> Void) {
+        for reg in registrations.values {
+            guard let layer = reg.layer, layer.comments.contains(where: { $0.id == commentId }) else { continue }
+            body(layer)
         }
     }
 }
