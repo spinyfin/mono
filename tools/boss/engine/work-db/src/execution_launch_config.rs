@@ -45,7 +45,7 @@ pub enum StoredExperimentArms {
 
 /// Parse an arm set's canonical text, or `None` when it is not a JSON object
 /// of known arms.
-fn parse_arm_set(text: &str) -> Option<BTreeMap<String, String>> {
+pub(crate) fn parse_arm_set(text: &str) -> Option<BTreeMap<String, String>> {
     let map: BTreeMap<String, String> = serde_json::from_str(text).ok()?;
     map.values()
         .all(|arm| ARM_VALUES.contains(&arm.as_str()))
@@ -100,7 +100,9 @@ impl WorkDb {
     /// The single launch-record writer: driver, model, effort level and the
     /// experiment arm set, in one transaction.
     ///
-    /// The first launch of an execution writes all of them. A later launch
+    /// The first launch of an execution writes all of them, and, when it is the
+    /// first launch of its PR family, opens the family's row in the outcome
+    /// ledger (see `family_outcomes`). A later launch
     /// leaves the tuple as the first one wrote it, and changes the arm set only
     /// by marking keys `stopped` (see [`ExecutionLaunchRecord::experiment_arms`]).
     /// An arm set that is not canonical text is not stored, because a malformed
@@ -160,6 +162,9 @@ impl WorkDb {
         )?;
         let updated = query_execution(&tx, execution_id)?
             .with_context(|| format!("missing execution after launch-config update: {execution_id}"))?;
+        // The family's first launch opens its row in the outcome ledger, in the
+        // transaction that records the launch.
+        family_outcomes::open_at_first_launch(&tx, &updated, record.driver, &now_string())?;
         tx.commit()?;
         Ok(updated)
     }

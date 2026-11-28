@@ -900,12 +900,7 @@ pub(super) mod sol_selection {
     /// never enrolled. Shared by the merge poller and the worker-completion
     /// path that finds its PR already merged.
     pub(crate) fn record_merge(conn: &Connection, work_item_id: &str, now: &str) -> Result<()> {
-        let root = crate::chain_helpers::chain_root(conn, work_item_id)?;
-        conn.execute(
-            "UPDATE sol_pr_outcomes SET merged_at=COALESCE(merged_at,?2) WHERE work_item_id=?1",
-            params![root, now],
-        )?;
-        Ok(())
+        crate::family_outcomes::ledger_record_merge(conn, "sol_pr_outcomes", work_item_id, now)
     }
 
     fn percentage(conn: &Connection) -> Result<u8> {
@@ -929,28 +924,12 @@ pub(super) mod sol_selection {
     /// Families that never enrolled have no outcome row, so this is two cheap
     /// primary-key updates for them.
     pub(crate) fn observe_ci(conn: &Connection, item: &str, head: Option<&str>, state: &str) -> Result<()> {
-        let Some(head) = head else { return Ok(()) };
-        let root = crate::chain_helpers::chain_root(conn, item)?;
-        conn.execute(
-            "UPDATE sol_pr_outcomes
-             SET first_head=COALESCE(first_head, CASE WHEN ?2 IS NOT baseline_head THEN ?2 END)
-             WHERE work_item_id=?1 AND first_ci IS NULL",
-            params![root, head],
-        )?;
-        conn.execute(
-            "UPDATE sol_pr_outcomes SET first_ci=?3
-             WHERE work_item_id=?1 AND first_ci IS NULL AND first_head=?2 AND ?3 IN ('success','fail')",
-            params![root, head, state],
-        )?;
-        Ok(())
+        crate::family_outcomes::ledger_observe_ci(conn, "sol_pr_outcomes", item, head, state)
     }
 
     /// Reuse the indexed review-family walk, including tombstoned revisions.
     pub(crate) fn family_cte() -> String {
-        format!(
-            "{}, roots AS (SELECT DISTINCT id AS task_id,root AS cycle_root_id FROM family)",
-            review_badge::review_family_cte("?1", review_badge::ReviewKey::Owner)
-        )
+        crate::family_outcomes::family_cte("?1")
     }
 
     #[cfg(test)]

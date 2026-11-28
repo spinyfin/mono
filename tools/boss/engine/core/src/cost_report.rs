@@ -23,6 +23,8 @@ use boss_usage_report::{RunFold, RunSample, RunTokens, UsdOutcome, cause};
 
 use crate::cost_pricing;
 
+pub mod outcomes;
+
 pub mod sol {
     //! PR-family aggregation. Retried and revised work stays in its enrollment arm.
     use super::{RunFold, fold_record};

@@ -1042,6 +1042,9 @@ pub enum FrontendEvent {
     CodexSolPercentage { percentage: u8 },
     #[worker(passthrough)]
     SolComparisonReport { report: crate::SolComparisonReport },
+    /// Response to [`FrontendRequest::GetExperimentOutcomes`].
+    #[worker(passthrough)]
+    ExperimentOutcomesReport { report: crate::ExperimentOutcomesReport },
     /// Response to [`FrontendRequest::GetTopCostConsumers`].
     #[worker(passthrough)]
     TopCostConsumers { report: crate::TopCostReport },

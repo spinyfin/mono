@@ -358,6 +358,7 @@ impl WorkDb {
         if matches!(target, WorkerPrCompletionTarget::Done) && !stale_merge {
             merge_evidence::record_in_tx(&tx, &task.id, pr_url, &now)?;
             driver_allocation::sol_selection::record_merge(&tx, &task.id, &now)?;
+            family_outcomes::record_merge(&tx, &task.id, &now)?;
         }
 
         let mut pending = PendingEvents::new();
@@ -1605,6 +1606,7 @@ impl WorkDb {
         let now = now_string();
         let evidence_changed = merge_evidence::record_in_tx(&tx, work_item_id, pr_url, &now)?;
         driver_allocation::sol_selection::record_merge(&tx, work_item_id, &now)?;
+        family_outcomes::record_merge(&tx, work_item_id, &now)?;
         let prior_queue_state = task.merge_queue_state.clone().filter(|state| !state.is_empty());
         if task.status == TaskStatus::Done || task.status == TaskStatus::Archived || task.human_driven {
             // Human-driven rows close only through the human completion ritual.
@@ -1901,6 +1903,7 @@ impl WorkDb {
                 input.pr_head_sha,
                 input.ci_required_state,
             )?;
+            family_outcomes::observe_ci(&tx, work_item_id, input.pr_head_sha, input.ci_required_state)?;
         }
         let prior_ci_state = before.as_ref().and_then(|row| row.ci_required_state.clone());
         let prior_mergeable = before.as_ref().and_then(|row| row.pr_mergeable_state.as_deref());

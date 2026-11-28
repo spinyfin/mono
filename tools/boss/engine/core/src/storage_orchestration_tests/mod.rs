@@ -23,6 +23,7 @@ use crate::work::{ReviewBatchCreateInput, SubmitWorkerProposalInput, SubmitWorke
 mod automation_triage_context;
 mod board_notification_bridge;
 mod cost_report;
+mod experiment_outcomes;
 mod persona_live_state;
 mod project_postmortem;
 mod queue_ci_evidence;

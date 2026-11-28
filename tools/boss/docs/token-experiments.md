@@ -6,16 +6,16 @@ Every experiment ships **inert**: its flag is off, and a build that contains it 
 
 ## What is on and what is not yet
 
-The mechanism and its first experiment are in the engine. The things that make an experiment readable are not:
+The mechanism, its first experiment and the outcomes report are in the engine. The usage-row and app readers are not:
 
-- **Landed:** the experiment registry and flags, the arm assigned to every launch, the `experiment_arms` column in the launch record, and the `pane_spawned` dispatch event carrying the arm set.
-- **Not landed:** the usage-rows dimension `experiment_arm` (so `boss cost rows --experiment <key> --group-by experiment_arm` does not exist yet), the per-family outcomes report, and the Token Usage window picker.
+- **Landed:** the experiment registry and flags, the arm assigned to every launch, the `experiment_arms` column in the launch record, the `pane_spawned` dispatch event carrying the arm set, the family outcome ledger, and the per-family outcomes report (`boss cost experiment`, see [Reading outcomes](#reading-outcomes-boss-cost-experiment)).
+- **Not landed:** the usage-rows dimension `experiment_arm` (so `boss cost rows --experiment <key> --group-by experiment_arm` does not exist yet) and the Token Usage window picker.
 
-**Do not switch an experiment on until the usage dimension and the outcomes report have landed.** Until then nothing in the Token Usage window can tell the two arms apart, and an experiment running for a month without a reader is a month of data nobody can use. The recorded arms are durable, so work launched in the meantime is still readable afterwards; but the experiment's treatment is live for its treated half the whole time.
+**Do not switch an experiment on until the usage dimension has landed.** Until then the only reader is `boss cost experiment`, which reads whole-PR outcomes and cannot isolate the stage an experiment changes, and an experiment running for a month without its primary reader is a month of data nobody can use. The recorded arms are durable, so work launched in the meantime is still readable afterwards; but the experiment's treatment is live for its treated half the whole time.
 
 ## Starting, splitting and stopping
 
-All switches are in the macOS app under **Debug → Feature Flags**, section `experiments`. There is no new request, command or setting.
+All switches are in the macOS app under **Debug → Feature Flags**, section `experiments`. There is no request, command or setting for starting or stopping one; `boss cost experiment` only reads.
 
 | Flag                | Default | Effect                                                                                                |
 | ------------------- | ------- | ----------------------------------------------------------------------------------------------------- |
@@ -35,7 +35,7 @@ The flags are read live on every launch. Nothing is cached and nothing needs an 
 
 ### Flipping flags mixes families in flight
 
-A PR family is assigned an arm at each of its executions' first launch, from the flags as they are then. If you flip a flag while a family is in flight, its later executions can launch under a different arm, or under none, and the family is mixed. A retry of one execution is different: it reuses the arm its first launch recorded, or is marked `stopped` if the experiment was turned off in between (see below). The family outcomes report (not landed yet) is designed to leave mixed families, and any family with a `stopped` execution, out of its comparison and count them. **Flipping a split on and off repeatedly throws away most of a week.** Turn an experiment on once, leave it, and turn it off once.
+A PR family is assigned an arm at each of its executions' first launch, from the flags as they are then. If you flip a flag while a family is in flight, its later executions can launch under a different arm, or under none, and the family is mixed. A retry of one execution is different: it reuses the arm its first launch recorded, or is marked `stopped` if the experiment was turned off in between (see below). The family outcomes report (`boss cost experiment <key>`) leaves mixed families, and any family with a `stopped` execution, out of its comparison and counts them. **Flipping a split on and off repeatedly throws away most of a week.** Turn an experiment on once, leave it, and turn it off once.
 
 ## Who is in which arm
 
@@ -98,7 +98,41 @@ Run at most four experiments at once. The fall-back read for a surprising result
 | Guardrail             | Review findings per PR, from the outcomes report.                                                                                                                                                                                                                                                                          |
 | Stop early when       | A treated run cannot start, or ends in a state the engine cannot classify. No other condition beyond the general rules below.                                                                                                                                                                                              |
 
-To run it: switch `batched_search` on (a half-and-half split starts), switch `batched_search_ab_split` off to treat every family, switch `batched_search` off to stop. To read it, once the usage dimension lands: `boss cost rows --experiment batched_search --group-by experiment_arm`.
+To run it: switch `batched_search` on (a half-and-half split starts), switch `batched_search_ab_split` off to treat every family, switch `batched_search` off to stop. To read it, once the usage dimension lands: `boss cost rows --experiment batched_search --group-by experiment_arm`. The guardrail is read now with `boss cost experiment batched_search`.
+
+## Reading outcomes: `boss cost experiment`
+
+`boss cost experiment` lists every registered experiment and where it stands. `boss cost experiment <key>` adds that experiment's outcomes per arm. `boss --json cost experiment <key>` prints the whole reply. Nothing here changes any state.
+
+**The listing** has one line per experiment, in registration order, with its state, its lane and whether it splits:
+
+| State     | Meaning                                                                                      |
+| --------- | -------------------------------------------------------------------------------------------- |
+| `off`     | Its own flag or `token_experiments` is off. Nothing is recorded for it.                      |
+| `split`   | Running on half of PR families.                                                              |
+| `all`     | Running on every PR family, with no control.                                                 |
+| `held`    | Switched on, but another experiment in the same lane runs instead. The line names it.        |
+| `waiting` | Switched on, but a flag it requires is off, so it resolves to off. The line names the flags. |
+
+The listing is what the flags say now. Which arm a family was in is what its executions recorded when they launched, so stopping an experiment changes the listing and not the figures.
+
+**The outcomes** are per PR family, the unit an arm is drawn on:
+
+- **Enrolment.** A family is in the arm its first launched execution that recorded the key drew. If another launched execution recorded the other arm, or recorded nothing for the key, the family is _mixed_. If any execution recorded `stopped`, it is _stopped_. Both are left out of the arms and counted on the line `Left out`, and a family no execution of which recorded the key is not counted at all. A run on a remote host records an empty arm set, so a family that ran partly on one is mixed. Executions created but never launched record nothing and do not count.
+- **Per arm** (`treatment`, then `control`; both always shown) and, beneath it, **per driver of the family's first launched execution**: families; merged families; first-attempt CI passes over families whose first CI was observed; revisions per merged PR; review batches per PR; review findings per PR; post-merge follow-ups per merged PR; tokens per merged family.
+- **Denominators are their own.** Revisions and follow-ups are counted over merged families, batches and findings over every family, merged or open. A ratio with nothing to divide by is `unknown`, never `0`.
+- **Tokens per merged family** average only the merged families whose every run, up to the merge, was measured; the number left out is printed beside the figure (`merged unmeasured`). An unmeasured run is never priced as zero. Post-merge reviews run after the merge and are read with `boss cost rows`, not here.
+- **Review batches** are pre-merge batches started, of any status, so the figure is zero for a PR reviewed without batch fan-out. **Findings** are the accepted automated review verdicts before the merge. **Follow-ups** are the tasks a post-merge review minted that still exist.
+- **A family is only read once it has a PR,** and not when it has been deleted, as the Sol comparison reads them.
+
+With no key, the same figures cover every PR family as a single arm, `all`: the tokens per merged PR with no experiment selected, and the baseline an arm is read against. Nothing is left out of it.
+
+### The family outcome ledger
+
+The report reads the family outcome ledger, `pr_family_outcomes`: one row per PR family, opened **in the transaction that records the family's first launch**, whatever experiments are running. It holds the PR head published at that moment, the first head published after it with that head's first terminal CI result, and the merge time. The merge poller and the worker-completion path that finds its PR already merged keep it current.
+
+- **Families that launched before the ledger existed are not tracked.** Their first launch is gone, and opening a row at a later execution would call a family in mid-life new. A family that spans the upgrade is therefore absent from every report.
+- **It is not the Sol comparison's ledger.** `boss cost sol` keeps its own, which re-baselines each time a Sol-eligible execution enrols and so judges CI on the first head after _Sol_ enrolled, which can be a later revision of a family a different driver started. The family ledger judges the first head after the family's first launch, which is what a family-level experiment compares. `boss cost sol` output is unchanged.
 
 ### `worker_autocompact`
 

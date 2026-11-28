@@ -1042,6 +1042,10 @@ mod floor_tests {
                 Box::new(|c| super::super::project_postmortem::migrate_task_changed_trigger_project_index(c).unwrap()),
             ),
             (
+                family_outcomes::MIGRATION_ID,
+                Box::new(|c| family_outcomes::migrate(c).unwrap()),
+            ),
+            (
                 "20261109_1930_preserved_archive_cleanup",
                 Box::new(|c| preserved_cleanup::migrate_archive_cleanup(c).unwrap()),
             ),

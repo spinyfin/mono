@@ -206,6 +206,77 @@ pub(super) async fn handle_get_top_cost_consumers(ctx: Dispatch, req: FrontendRe
     }
 }
 
+/// PR-family outcomes per arm of one experiment (or for every family), plus the
+/// registered experiments and where each stands. The flag store is read only for
+/// the listing: which arm a family is in comes from what its executions recorded
+/// at launch, never from the flags as they are now.
+pub(super) async fn handle_get_experiment_outcomes(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        work_db,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::GetExperimentOutcomes { experiment } = req else {
+        unreachable!()
+    };
+    if let Some(key) = experiment.as_deref()
+        && !boss_feature_flags::is_valid_key(key)
+    {
+        return send_work_error(
+            &sink,
+            &request_id,
+            format!("{key:?} is not an experiment key: keys are lowercase snake case, like `batched_search`"),
+        );
+    }
+    let records = match work_db.family_outcome_records(experiment.as_deref()) {
+        Ok(records) => records,
+        Err(err) => return send_work_error(&sink, &request_id, &err),
+    };
+    let mut outcomes =
+        boss_engine_runtime::cost_report::outcomes::build_experiment_outcomes(experiment.as_deref(), &records);
+    let listing = server_state.feature_flags.list_experiments();
+    if let Some(key) = experiment.as_deref()
+        && !listing.iter().any(|entry| entry.key == key)
+    {
+        // An experiment that was adopted or dropped leaves its recorded arms
+        // behind, so the key still reads; a typo reads as an empty experiment.
+        outcomes.notes.insert(
+            0,
+            format!("`{key}` is not a registered experiment. The figures are what executions recorded under that key, which is nothing if it is misspelled."),
+        );
+    }
+    let report = boss_protocol::ExperimentOutcomesReport {
+        master_switch_on: server_state
+            .feature_flags
+            .is_enabled(boss_feature_flags::TOKEN_EXPERIMENTS_FLAG),
+        experiments: listing.into_iter().map(experiment_list_entry).collect(),
+        outcomes,
+    };
+    send_response(&sink, &request_id, FrontendEvent::ExperimentOutcomesReport { report });
+}
+
+fn experiment_list_entry(listing: boss_feature_flags::ExperimentListing) -> boss_protocol::ExperimentListEntry {
+    use boss_feature_flags::ExperimentListState as State;
+    let (state, waiting_on, held_by) = match listing.state {
+        State::Off => ("off", Vec::new(), None),
+        State::WaitingOn(flags) => ("waiting", flags.into_iter().map(str::to_owned).collect(), None),
+        State::Held { holder } => ("held", Vec::new(), Some(holder.to_owned())),
+        State::Split => ("split", Vec::new(), None),
+        State::All => ("all", Vec::new(), None),
+    };
+    boss_protocol::ExperimentListEntry::builder()
+        .key(listing.key)
+        .state(state)
+        .maybe_lane(listing.lane.map(|lane| lane.as_str().to_owned()))
+        .splits(listing.splits)
+        .requires(listing.requires.iter().map(|flag| (*flag).to_owned()).collect())
+        .waiting_on(waiting_on)
+        .maybe_held_by(held_by)
+        .build()
+}
+
 struct EngineUsdEstimator;
 
 impl UsdEstimator for EngineUsdEstimator {
@@ -678,5 +749,203 @@ mod tests {
         assert_eq!(top_report.rows.len(), 1);
         assert_eq!(top_report.rows[0].kind, boss_protocol::COORDINATOR_USAGE_KIND);
         assert_eq!(top_report.rows[0].total_tokens, 2_000);
+    }
+
+    async fn ask_experiment(
+        state: &Arc<ServerState>,
+        experiment: Option<&str>,
+        request_id: &str,
+    ) -> (Option<String>, FrontendEvent) {
+        let sink = make_session_sink();
+        let dispatch = Dispatch::builder()
+            .server_state(state.clone())
+            .work_db(state.work_db.clone())
+            .sink(sink.clone())
+            .session_id("session-experiment")
+            .request_id(request_id)
+            .recv_instant(std::time::Instant::now())
+            .decode_ms(0.0)
+            .build();
+        let request = FrontendRequest::GetExperimentOutcomes {
+            experiment: experiment.map(str::to_owned),
+        };
+        handle_get_experiment_outcomes(dispatch, request).await;
+        sink.close();
+        let envelope = sink.next().await.expect("the handler sends a reply");
+        assert!(sink.next().await.is_none(), "the handler sends exactly one reply");
+        (envelope.request_id, envelope.payload)
+    }
+
+    /// A family with a published PR whose first execution launched under `arms`.
+    fn seed_family(state: &Arc<ServerState>, product: &str, name: &str, arms: &str, merged: bool) {
+        use boss_work_db::test_support::{create_ready_chore_execution, create_test_chore};
+        let db = &state.work_db;
+        let root = create_test_chore(db, product, name);
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET pr_url = 'https://github.com/org/repo/pull/1' WHERE id = ?1",
+                [&root.id],
+            )
+            .unwrap();
+        let execution = create_ready_chore_execution(db, &root.id);
+        db.record_execution_launch(&boss_work_db::ExecutionLaunchRecord {
+            execution_id: &execution.id,
+            driver: "claude",
+            model: "model",
+            effort_level: None,
+            experiment_arms: Some(arms),
+        })
+        .unwrap();
+        if merged {
+            // Launch times must sit before the merge stamp, or the merge cutoff
+            // would drop the family's own enrolment.
+            db.connect()
+                .unwrap()
+                .execute(
+                    "UPDATE work_executions SET created_at = '10', started_at = '10' WHERE id = ?1",
+                    [&execution.id],
+                )
+                .unwrap();
+            db.connect()
+                .unwrap()
+                .execute(
+                    "UPDATE pr_family_outcomes SET merged_at = '100' WHERE work_item_id = ?1",
+                    [&root.id],
+                )
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn experiment_outcomes_reads_arms_from_the_launch_record_and_lists_every_experiment() {
+        let (state, _dir) = test_server_state();
+        let product = boss_work_db::test_support::create_product(&state.work_db);
+        seed_family(
+            &state,
+            &product,
+            "treated, merged",
+            r#"{"batched_search":"treatment"}"#,
+            true,
+        );
+        seed_family(
+            &state,
+            &product,
+            "treated, open",
+            r#"{"batched_search":"treatment"}"#,
+            false,
+        );
+        seed_family(
+            &state,
+            &product,
+            "control, merged",
+            r#"{"batched_search":"control"}"#,
+            true,
+        );
+        seed_family(&state, &product, "stopped", r#"{"batched_search":"stopped"}"#, false);
+        seed_family(&state, &product, "other experiment", r#"{"other":"treatment"}"#, false);
+
+        let (request_id, payload) = ask_experiment(&state, Some("batched_search"), "req-experiment-1").await;
+        assert_eq!(request_id.as_deref(), Some("req-experiment-1"));
+        let FrontendEvent::ExperimentOutcomesReport { report } = payload else {
+            panic!("expected ExperimentOutcomesReport, got {payload:?}");
+        };
+        let outcomes = &report.outcomes;
+        assert_eq!(outcomes.experiment.as_deref(), Some("batched_search"));
+        let families = |arm: &str| {
+            let arm = outcomes.arms.iter().find(|a| a.arm == arm).unwrap();
+            (arm.outcomes.families, arm.outcomes.merged_families)
+        };
+        assert_eq!(families("treatment"), (2, 1));
+        assert_eq!(families("control"), (1, 1));
+        assert_eq!((outcomes.mixed_families, outcomes.stopped_families), (0, 1));
+        let by_driver = &outcomes.arms[0].by_driver;
+        assert_eq!(by_driver.len(), 1);
+        assert_eq!(by_driver[0].driver, "claude");
+
+        // The listing names every registered experiment and its state, from the flags.
+        assert!(report.master_switch_on);
+        let listed = report
+            .experiments
+            .iter()
+            .find(|entry| entry.key == "batched_search")
+            .expect("batched_search is listed");
+        assert_eq!(listed.state, "off", "experiments ship inert");
+        assert_eq!(listed.lane.as_deref(), Some("worker_prompt"));
+        state.feature_flags.set("batched_search", true).unwrap();
+        let (_, payload) = ask_experiment(&state, Some("batched_search"), "req-experiment-2").await;
+        let FrontendEvent::ExperimentOutcomesReport { report } = payload else {
+            panic!("expected ExperimentOutcomesReport, got {payload:?}");
+        };
+        assert_eq!(report.experiments[0].state, "split");
+        // Switching it on changes the listing, not what the families recorded.
+        assert_eq!(report.outcomes.arms[0].outcomes.families, 2);
+        state.feature_flags.set("batched_search", false).unwrap();
+        let (_, payload) = ask_experiment(&state, Some("batched_search"), "req-experiment-3").await;
+        let FrontendEvent::ExperimentOutcomesReport { report } = payload else {
+            panic!("expected ExperimentOutcomesReport, got {payload:?}");
+        };
+        assert_eq!(report.experiments[0].state, "off");
+        assert_eq!(report.outcomes.arms[0].outcomes.families, 2);
+    }
+
+    #[tokio::test]
+    async fn experiment_outcomes_without_a_key_reads_every_family_as_one_arm() {
+        let (state, _dir) = test_server_state();
+        let product = boss_work_db::test_support::create_product(&state.work_db);
+        seed_family(&state, &product, "no experiment", "{}", true);
+        seed_family(&state, &product, "treated", r#"{"batched_search":"treatment"}"#, false);
+        let (_, payload) = ask_experiment(&state, None, "req-experiment-all").await;
+        let FrontendEvent::ExperimentOutcomesReport { report } = payload else {
+            panic!("expected ExperimentOutcomesReport, got {payload:?}");
+        };
+        assert_eq!(report.outcomes.experiment, None);
+        assert_eq!(report.outcomes.arms.len(), 1);
+        assert_eq!(report.outcomes.arms[0].arm, "all");
+        assert_eq!(report.outcomes.arms[0].outcomes.families, 2);
+        assert_eq!(report.outcomes.arms[0].outcomes.merged_families, 1);
+        assert!(!report.experiments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn experiment_outcomes_says_when_the_key_is_not_registered_and_rejects_a_malformed_one() {
+        let (state, _dir) = test_server_state();
+        let (_, payload) = ask_experiment(&state, Some("batched_serach"), "req-experiment-typo").await;
+        let FrontendEvent::ExperimentOutcomesReport { report } = payload else {
+            panic!("expected ExperimentOutcomesReport, got {payload:?}");
+        };
+        assert_eq!(report.outcomes.arms.iter().map(|a| a.outcomes.families).sum::<u64>(), 0);
+        assert!(
+            report.outcomes.notes[0].contains("`batched_serach` is not a registered experiment"),
+            "{:?}",
+            report.outcomes.notes
+        );
+
+        let (_, payload) = ask_experiment(&state, Some("Batched Search"), "req-experiment-bad").await;
+        let FrontendEvent::WorkError { message } = payload else {
+            panic!("expected WorkError, got {payload:?}");
+        };
+        assert!(message.contains("lowercase snake case"), "{message}");
+    }
+
+    #[test]
+    fn the_listing_entry_carries_what_a_waiting_or_held_experiment_needs() {
+        use boss_feature_flags::{ExperimentLane, ExperimentListState, ExperimentListing};
+        let listing = |state| ExperimentListing {
+            key: "delta",
+            lane: Some(ExperimentLane::PreMergeReview),
+            requires: &["review_batch_fanout"],
+            splits: true,
+            state,
+        };
+        let waiting = experiment_list_entry(listing(ExperimentListState::WaitingOn(vec!["review_batch_fanout"])));
+        assert_eq!(waiting.state, "waiting");
+        assert_eq!(waiting.waiting_on, ["review_batch_fanout"]);
+        assert_eq!(waiting.requires, ["review_batch_fanout"]);
+        assert_eq!(waiting.lane.as_deref(), Some("pre_merge_review"));
+        let held = experiment_list_entry(listing(ExperimentListState::Held { holder: "alpha" }));
+        assert_eq!((held.state.as_str(), held.held_by.as_deref()), ("held", Some("alpha")));
+        assert!(held.waiting_on.is_empty());
+        assert_eq!(experiment_list_entry(listing(ExperimentListState::All)).state, "all");
     }
 }

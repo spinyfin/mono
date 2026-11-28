@@ -222,6 +222,71 @@ pub fn experiment_state(specs: &[ExperimentSpec], key: &str, flag: &dyn Fn(&str)
     }
 }
 
+/// Where an experiment stands, as `boss cost experiment` lists it.
+///
+/// [`ExperimentState`] answers "does a launch get an arm", so it folds every
+/// reason an experiment is not running into [`ExperimentState::Off`]. The
+/// listing distinguishes an experiment that is switched on but waiting on a
+/// required flag from one that is switched off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExperimentListState {
+    /// Not running: its own flag or the master switch is off.
+    Off,
+    /// Switched on, but these required flags are off, so it resolves to off.
+    WaitingOn(Vec<&'static str>),
+    /// Switched on, but another experiment holds its lane.
+    Held {
+        /// The experiment that holds the lane.
+        holder: &'static str,
+    },
+    /// Running on half of PR families.
+    Split,
+    /// Running on every PR family.
+    All,
+}
+
+/// One registered experiment and its state, for the experiment listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExperimentListing {
+    pub key: &'static str,
+    pub lane: Option<ExperimentLane>,
+    pub requires: &'static [&'static str],
+    pub splits: bool,
+    pub state: ExperimentListState,
+}
+
+/// Every experiment in `specs`, in registration order, with its state under
+/// the flag values `flag` reports.
+pub fn list_experiments(specs: &[ExperimentSpec], flag: &dyn Fn(&str) -> bool) -> Vec<ExperimentListing> {
+    specs
+        .iter()
+        .map(|spec| {
+            let waiting: Vec<&'static str> = spec
+                .requires
+                .iter()
+                .copied()
+                .filter(|required| !flag(required))
+                .collect();
+            let state = match experiment_state(specs, spec.key, flag) {
+                ExperimentState::Off if flag(TOKEN_EXPERIMENTS_FLAG) && flag(spec.key) && !waiting.is_empty() => {
+                    ExperimentListState::WaitingOn(waiting)
+                }
+                ExperimentState::Off => ExperimentListState::Off,
+                ExperimentState::Held { holder } => ExperimentListState::Held { holder },
+                ExperimentState::Split => ExperimentListState::Split,
+                ExperimentState::All => ExperimentListState::All,
+            };
+            ExperimentListing {
+                key: spec.key,
+                lane: spec.lane,
+                requires: spec.requires,
+                splits: spec.splits,
+                state,
+            }
+        })
+        .collect()
+}
+
 /// The arm a family with `bucket` (in `[0, 100)`) is assigned in an
 /// experiment in `state`, or `None` when it is not running.
 pub fn assign_arm(state: ExperimentState, bucket: u8) -> Option<ExperimentArm> {
@@ -428,6 +493,12 @@ impl FeatureFlagsStore {
         experiment_state(EXPERIMENTS, key, &|name| self.is_enabled(name))
     }
 
+    /// Every registered experiment and where it stands right now, from the
+    /// live flag values.
+    pub fn list_experiments(&self) -> Vec<ExperimentListing> {
+        list_experiments(EXPERIMENTS, &|name| self.is_enabled(name))
+    }
+
     /// The arm set a family launches under right now. `bucket_for_key` is the
     /// family's bucket for one experiment key.
     pub fn resolve_experiment_arms(&self, bucket_for_key: impl Fn(&str) -> u8) -> ExperimentArmSet {
@@ -620,6 +691,71 @@ mod tests {
         for key in ["alpha", "gamma", "delta"] {
             assert!(resolved.get(key).is_some(), "{key} runs alongside the others");
         }
+    }
+
+    fn listed(on: &[&str], key: &str) -> ExperimentListState {
+        list_experiments(SPECS, &|name| on.contains(&name))
+            .into_iter()
+            .find(|listing| listing.key == key)
+            .unwrap_or_else(|| panic!("{key} is listed"))
+            .state
+    }
+
+    #[test]
+    fn the_listing_names_every_experiment_in_registration_order() {
+        let listings = list_experiments(SPECS, &|_| false);
+        let keys: Vec<_> = listings.iter().map(|listing| listing.key).collect();
+        assert_eq!(keys, ["alpha", "beta", "gamma", "delta"]);
+        assert_eq!(listings[0].lane, Some(ExperimentLane::WorkerPrompt));
+        assert_eq!(listings[2].requires, ["review_batch_fanout"]);
+        assert!(!listings[3].splits);
+        assert!(listings.iter().all(|listing| listing.state == ExperimentListState::Off));
+    }
+
+    #[test]
+    fn the_listing_tells_off_split_and_all_apart() {
+        let on = [TOKEN_EXPERIMENTS_FLAG, "alpha", "alpha_ab_split", "delta"];
+        assert_eq!(listed(&on, "alpha"), ExperimentListState::Split);
+        assert_eq!(listed(&on, "delta"), ExperimentListState::All);
+        assert_eq!(listed(&on, "beta"), ExperimentListState::Off);
+        // Without the master switch everything is off, whatever its own flag says.
+        assert_eq!(listed(&["alpha", "delta"], "alpha"), ExperimentListState::Off);
+    }
+
+    #[test]
+    fn the_listing_names_the_experiment_holding_a_lane() {
+        let on = [TOKEN_EXPERIMENTS_FLAG, "alpha", "beta"];
+        assert_eq!(listed(&on, "alpha"), ExperimentListState::All);
+        assert_eq!(listed(&on, "beta"), ExperimentListState::Held { holder: "alpha" });
+    }
+
+    #[test]
+    fn the_listing_names_the_required_flags_an_experiment_is_waiting_on() {
+        let on = [TOKEN_EXPERIMENTS_FLAG, "gamma", "gamma_ab_split"];
+        assert_eq!(
+            listed(&on, "gamma"),
+            ExperimentListState::WaitingOn(vec!["review_batch_fanout"])
+        );
+        let satisfied = [TOKEN_EXPERIMENTS_FLAG, "gamma", "gamma_ab_split", "review_batch_fanout"];
+        assert_eq!(listed(&satisfied, "gamma"), ExperimentListState::Split);
+        // Switched off, it is not waiting for anything: off is the answer.
+        assert_eq!(listed(&[TOKEN_EXPERIMENTS_FLAG], "gamma"), ExperimentListState::Off);
+        assert_eq!(listed(&["gamma"], "gamma"), ExperimentListState::Off);
+    }
+
+    #[test]
+    fn the_store_lists_batched_search_as_off_then_split() {
+        let (_tmp, store) = store();
+        let listing = || {
+            store
+                .list_experiments()
+                .into_iter()
+                .find(|listing| listing.key == BATCHED_SEARCH_EXPERIMENT)
+                .expect("batched_search is registered")
+        };
+        assert_eq!(listing().state, ExperimentListState::Off);
+        store.set(BATCHED_SEARCH_EXPERIMENT, true).unwrap();
+        assert_eq!(listing().state, ExperimentListState::Split);
     }
 
     #[test]
