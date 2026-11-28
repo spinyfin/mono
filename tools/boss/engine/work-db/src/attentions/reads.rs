@@ -66,6 +66,27 @@ impl WorkDb {
         let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
         list_groups_with_members(&tx, product_id, project_id, task_id, kind, state)
     }
+
+    /// Open `Attention` items (`answer_state = 'open'`) inside non-terminal
+    /// groups (`state IN ('open', 'partially_answered')`) for `product_id`,
+    /// each paired with its parent `AttentionGroup`. Used by the notification
+    /// dedup prefilter (creation and sweep paths) so cross-task and cross-card
+    /// candidates are fetched from one consistent snapshot.
+    pub fn list_open_attentions_for_product(&self, product_id: &str) -> Result<Vec<(Attention, AttentionGroup)>> {
+        let mut connection = self.connect()?;
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+        let (groups, members) = list_groups_with_members(&tx, product_id, None, None, None, None)?;
+        let group_by_id: HashMap<&str, &AttentionGroup> = groups.iter().map(|g| (g.id.as_str(), g)).collect();
+        Ok(members
+            .into_iter()
+            .filter(|member| member.answer_state == "open")
+            .filter_map(|member| {
+                group_by_id
+                    .get(member.group_id.as_str())
+                    .map(|group| (member, (*group).clone()))
+            })
+            .collect())
+    }
 }
 
 /// Direct associations only: product tree attentions feed the tracker-sync banner.
