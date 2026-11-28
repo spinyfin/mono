@@ -347,9 +347,15 @@ pub(super) fn attempt_for_question(conn: &Connection, question_id: &str) -> Resu
 }
 
 fn question_for(pr_number: i64, evidence: &ArchitecturalMismatchEvidence) -> OperatorQuestion {
-    let choices = vec![
-        CONFLICT_MISMATCH_CHOICE_REWRITE.to_owned(),
-        CONFLICT_MISMATCH_CHOICE_FORCE_MERGE.to_owned(),
+    let options = vec![
+        boss_protocol::OperatorChoiceOption::new(
+            CONFLICT_MISMATCH_CHOICE_REWRITE,
+            boss_protocol::ChoiceDisposition::RewriteOntoBase,
+        ),
+        boss_protocol::OperatorChoiceOption::new(
+            CONFLICT_MISMATCH_CHOICE_FORCE_MERGE,
+            boss_protocol::ChoiceDisposition::ForceMerge,
+        ),
     ];
     let explanation = format!(
         "Context:\n\
@@ -371,7 +377,7 @@ What was attempted: {}",
     );
     OperatorQuestion {
         text: format!("Rewrite PR #{pr_number} onto the new base, or force a merge?"),
-        answer_type: OperatorAnswerType::MultipleChoice { choices },
+        answer_type: OperatorAnswerType::multiple_choice(options),
         explanation,
     }
 }
@@ -421,8 +427,12 @@ pub(super) fn answer_in_tx(
         "UPDATE conflict_resolutions SET mismatch_exit_barred = 1, mismatch_evidence_json = NULL WHERE id = ?1",
         [attempt_id],
     )?;
-    match choice {
-        CONFLICT_MISMATCH_CHOICE_FORCE_MERGE => {
+    // Dispatch on the card's structured disposition, never on label text.
+    let Some(disposition) = question.answer_type.choice_disposition(choice) else {
+        bail!("`{choice}` is not an offered answer for this question");
+    };
+    match disposition {
+        boss_protocol::ChoiceDisposition::ForceMerge => {
             let block = force_merge_block(question, &timestamp);
             let minted_execution =
                 super::pr_flow::restart_after_answer_from(pending, tx, asker, question, &block, restart, attribution)?
@@ -436,7 +446,7 @@ pub(super) fn answer_in_tx(
                 minted_execution,
             })
         }
-        CONFLICT_MISMATCH_CHOICE_REWRITE => {
+        boss_protocol::ChoiceDisposition::RewriteOntoBase => {
             let Some(parent_id) = asker.parent_task_id.clone() else {
                 bail!("conflict revision {} has no parent PR to rewrite", asker.id);
             };
@@ -485,7 +495,7 @@ pub(super) fn answer_in_tx(
                 minted_execution: false,
             })
         }
-        other => bail!("`{other}` is not an offered answer for this question"),
+        other => bail!("disposition `{other}` is not an action for this question"),
     }
 }
 
@@ -535,7 +545,7 @@ mod tests {
             recommendation: "Rewrite around the dispatcher.".into(),
         };
         let question = question_for(3405, &evidence);
-        let OperatorAnswerType::MultipleChoice { choices } = &question.answer_type else {
+        let OperatorAnswerType::MultipleChoice { choices, .. } = &question.answer_type else {
             panic!("expected a multiple-choice question");
         };
         assert_eq!(

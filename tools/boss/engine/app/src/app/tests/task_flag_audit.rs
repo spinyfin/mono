@@ -523,13 +523,11 @@ async fn answering_a_ladder_question_records_the_socket_caller_on_autostart_rest
         OperatorQuestion {
             text: boss_work_db::QUESTION_TEXT.into(),
             explanation: "Progression spent its attempts.".into(),
-            answer_type: OperatorAnswerType::MultipleChoice {
-                choices: vec![
-                    boss_work_db::PARK_IT.into(),
-                    boss_work_db::ARCHIVE_IT.into(),
-                    boss_work_db::KEEP_TRYING.into(),
-                ],
-            },
+            answer_type: OperatorAnswerType::multiple_choice(vec![
+                boss_protocol::OperatorChoiceOption::park(boss_work_db::PARK_IT),
+                boss_protocol::OperatorChoiceOption::archive(boss_work_db::ARCHIVE_IT),
+                boss_protocol::OperatorChoiceOption::resume(boss_work_db::KEEP_TRYING),
+            ]),
         },
     );
     state

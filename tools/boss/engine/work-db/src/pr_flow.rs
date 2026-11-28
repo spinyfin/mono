@@ -2509,6 +2509,10 @@ pub(super) fn insert_question_with_liveness(
     question: &OperatorQuestion,
     worker: Option<&super::stuck_report::QuestionWorkerObservation>,
 ) -> Result<()> {
+    question
+        .answer_type
+        .validate_for_creation()
+        .map_err(anyhow::Error::msg)?;
     let execution = query_execution(conn, execution_id).require("execution", execution_id)?;
     // Every work-item kind that can run a worker gets a question row: a
     // chore or followup that stops on a human decision is waiting on that
@@ -2727,11 +2731,12 @@ impl WorkDb {
         let mut archive_reason = None;
         let ladder_question = crate::progression_ladder::is_ladder_question(&tx, &question.question.id)?;
         let mismatch_attempt = super::conflict_mismatch::attempt_for_question(&tx, &question.question.id)?;
-        // Only the owner's choice of an item-local disposition acts on the item;
-        // any other answerer's choice of the same label resumes the worker.
+        // Only the owner's choice of a structured item-local disposition acts on
+        // the item; non-owner answerers and `resume` options resume as normal,
+        // and label wording never affects which branch runs.
         let disposition = match &answer {
-            OperatorAnswer::MultipleChoice { value } if actor == LAST_STATUS_ACTOR_HUMAN => {
-                crate::operator_disposition::known_choice(value)
+            OperatorAnswer::MultipleChoice { value } => {
+                crate::operator_disposition::owner_choice_disposition(actor, &question.question, value)
             }
             _ => None,
         };
@@ -2744,6 +2749,7 @@ impl WorkDb {
                     &mut pending,
                     &tx,
                     &task,
+                    &question.question,
                     &value,
                     &now,
                     crate::task_status_audit::WriteAttribution { actor, provenance },
@@ -2819,12 +2825,12 @@ impl WorkDb {
                 dispatch_work_item_id = restart.dispatch_work_item_id;
             }
             (OperatorAnswer::MultipleChoice { .. }, OperatorAnswerType::MultipleChoice { .. })
-                if disposition == Some(crate::operator_disposition::Disposition::Archive) =>
+                if disposition == Some(boss_protocol::ChoiceDisposition::Archive) =>
             {
                 archive_reason = Some("the owner chose to archive this item in an operator question");
             }
             (OperatorAnswer::MultipleChoice { value }, OperatorAnswerType::MultipleChoice { .. })
-                if disposition == Some(crate::operator_disposition::Disposition::Park) =>
+                if disposition == Some(boss_protocol::ChoiceDisposition::Park) =>
             {
                 let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
                 let block = choice_block(&question.question, &value, &timestamp);

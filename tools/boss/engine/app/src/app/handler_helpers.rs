@@ -1530,6 +1530,45 @@ pub(super) fn terminal_chore_execution(work_db: &WorkDb, item: &WorkItem) -> Opt
     }
 }
 
+/// Every execution on a newly terminal task/chore that may still hold a
+/// worker pane or a cube workspace lease: the newest execution overall plus
+/// any earlier execution that still carries a lease id or is the newest
+/// non-progression execution (needed when a progression run asked the question
+/// that archived the item after an earlier worker run).
+pub(super) fn terminal_chore_executions_to_release(work_db: &WorkDb, item: &WorkItem) -> Vec<String> {
+    let task = match item {
+        WorkItem::Task(t) | WorkItem::Chore(t) => t,
+        _ => return Vec::new(),
+    };
+    if !matches!(task.status, TaskStatus::Done | TaskStatus::Archived) {
+        return Vec::new();
+    }
+    let mut ids = Vec::new();
+    let mut push_unique = |id: String| {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    };
+    if let Some(latest) = terminal_chore_execution(work_db, item) {
+        push_unique(latest);
+    }
+    if let Ok(executions) = work_db.list_executions(Some(&task.id)) {
+        if let Some(latest_work) = executions
+            .iter()
+            .rev()
+            .find(|exec| exec.kind != boss_protocol::ExecutionKind::Progression)
+        {
+            push_unique(latest_work.id.clone());
+        }
+        for exec in executions {
+            if exec.cube_lease_id.as_deref().is_some_and(|lease| !lease.is_empty()) {
+                push_unique(exec.id);
+            }
+        }
+    }
+    ids
+}
+
 /// If `item` is a task or chore that has just entered `in_review`
 /// status, return the id of its most recent execution so the caller
 /// can tear down its worker pane and cube workspace. Returns `None`

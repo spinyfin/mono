@@ -240,7 +240,7 @@ fn a_mismatch_raises_a_question_and_leaves_no_dead_end() {
     );
     let questions = open_questions(&f);
     assert_eq!(questions.len(), 1, "{questions:?}");
-    let OperatorAnswerType::MultipleChoice { choices } = &questions[0].question.answer_type else {
+    let OperatorAnswerType::MultipleChoice { choices, .. } = &questions[0].question.answer_type else {
         panic!("expected a multiple-choice question");
     };
     assert_eq!(
@@ -570,7 +570,7 @@ fn declare_outcome_keyed(f: &Fixture, outcome: RunDoneOutcome, key: &str) {
 fn assert_one_open_linked_question_still_answers(f: &Fixture) {
     assert_eq!(open_questions(f).len(), 1, "{:?}", open_questions(f));
     assert_eq!(open_linked_question_count(f), 1);
-    let OperatorAnswerType::MultipleChoice { choices } = &open_questions(f)[0].question.answer_type else {
+    let OperatorAnswerType::MultipleChoice { choices, .. } = &open_questions(f)[0].question.answer_type else {
         panic!("expected a multiple-choice question");
     };
     assert_eq!(
@@ -725,4 +725,105 @@ fn dismissing_a_mismatch_question_leaves_the_revision_as_the_live_fix_vehicle() 
     assert_eq!(attempt.status, "pending");
     assert_eq!(attempt.failure_reason, None);
     assert_eq!(attempt.revision_task_id.as_deref(), Some(f.revision_id.as_str()));
+}
+
+/// Rename a stored button without touching its disposition.
+fn relabel(f: &Fixture, from: &str, to: &str) {
+    f.db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE operator_questions SET question_json = REPLACE(question_json, ?1, ?2) WHERE work_item_id = ?3",
+            params![format!("\"{from}\""), format!("\"{to}\""), f.revision_id],
+        )
+        .unwrap();
+}
+
+#[test]
+fn each_mismatch_choice_states_its_own_engine_action() {
+    let f = fixture();
+    raise_question(&f);
+    let answer_type = open_questions(&f)[0].question.answer_type.clone();
+    assert_eq!(
+        answer_type.choice_disposition(CONFLICT_MISMATCH_CHOICE_REWRITE),
+        Some(boss_protocol::ChoiceDisposition::RewriteOntoBase)
+    );
+    assert_eq!(
+        answer_type.choice_disposition(CONFLICT_MISMATCH_CHOICE_FORCE_MERGE),
+        Some(boss_protocol::ChoiceDisposition::ForceMerge)
+    );
+}
+
+#[test]
+fn a_relabelled_rewrite_choice_still_ports_the_change() {
+    let f = fixture();
+    raise_question(&f);
+    relabel(&f, CONFLICT_MISMATCH_CHOICE_REWRITE, "Port it over");
+
+    let outcome =
+        f.db.answer_operator_question_with(
+            &f.revision_id,
+            OperatorAnswer::MultipleChoice {
+                value: "Port it over".into(),
+            },
+            &open_pr(),
+        )
+        .unwrap();
+
+    let port_id = outcome.dispatch_work_item_id.expect("the port revision is launched");
+    assert_ne!(port_id, f.revision_id);
+    assert_eq!(task_status(&f.db, &f.revision_id), "archived");
+}
+
+#[test]
+fn a_relabelled_force_merge_choice_still_resolves_in_place() {
+    let f = fixture();
+    raise_question(&f);
+    relabel(&f, CONFLICT_MISMATCH_CHOICE_FORCE_MERGE, "Just merge it");
+
+    let outcome =
+        f.db.answer_operator_question_with(
+            &f.revision_id,
+            OperatorAnswer::MultipleChoice {
+                value: "Just merge it".into(),
+            },
+            &open_pr(),
+        )
+        .unwrap();
+
+    assert_eq!(outcome.dispatch_work_item_id.as_deref(), Some(f.revision_id.as_str()));
+    assert_ne!(task_status(&f.db, &f.revision_id), "archived");
+    assert!(!mismatch_evidence_present(&f));
+}
+
+#[test]
+fn a_stored_mismatch_card_without_options_is_repaired_by_the_migration() {
+    let f = fixture();
+    raise_question(&f);
+    let legacy = serde_json::json!({
+        "text": open_questions(&f)[0].question.text,
+        "explanation": open_questions(&f)[0].question.explanation,
+        "answer_type": {
+            "kind": "multiple_choice",
+            "choices": [CONFLICT_MISMATCH_CHOICE_REWRITE, CONFLICT_MISMATCH_CHOICE_FORCE_MERGE],
+        },
+    });
+    {
+        let conn = f.db.connect().unwrap();
+        conn.execute(
+            "UPDATE operator_questions SET question_json = ?2 WHERE work_item_id = ?1",
+            params![f.revision_id, legacy.to_string()],
+        )
+        .unwrap();
+        crate::operator_disposition::migrate(&conn).unwrap();
+    }
+
+    let answer_type = open_questions(&f)[0].question.answer_type.clone();
+    assert_eq!(
+        answer_type.choice_disposition(CONFLICT_MISMATCH_CHOICE_REWRITE),
+        Some(boss_protocol::ChoiceDisposition::RewriteOntoBase)
+    );
+    assert_eq!(
+        answer_type.choice_disposition(CONFLICT_MISMATCH_CHOICE_FORCE_MERGE),
+        Some(boss_protocol::ChoiceDisposition::ForceMerge)
+    );
 }

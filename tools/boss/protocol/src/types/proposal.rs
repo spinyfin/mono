@@ -1160,11 +1160,125 @@ pub enum OperatorAnswerType {
     },
     /// One of `choices` is selected; the answer is
     /// [`OperatorAnswer::MultipleChoice`] carrying the chosen string verbatim.
-    /// The card renders one button per choice. Producers must keep `choices`
-    /// valid per [`OperatorAnswerType::validate_choices`].
+    /// The card renders one button per choice, and the engine executes the
+    /// chosen option's structured [`ChoiceDisposition`] rather than matching
+    /// button wording. `choices` mirrors `options` labels on the wire and lets
+    /// historical rows stored before `options` existed still decode.
     MultipleChoice {
         choices: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        options: Vec<OperatorChoiceOption>,
     },
+}
+
+/// Closed set of engine-executable item dispositions for a multiple-choice option.
+///
+/// The answer handler dispatches exclusively on this field — never on option
+/// label text — so rephrasing a button label cannot change behaviour.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChoiceDisposition {
+    /// Record the chosen option (and optional `addendum`) in the item's brief
+    /// and resume (re-dispatch the worker, or return to progression when a
+    /// progression run asked).
+    Resume,
+    /// Archive the item as the repo owner in the answer transaction. Non-owner
+    /// answerers fall back to [`Self::Resume`].
+    Archive,
+    /// Park the item (or its chain root for a revision) as the repo owner in
+    /// the answer transaction. Non-owner answerers fall back to [`Self::Resume`].
+    Park,
+    /// Engine-reserved: re-dispatch the parked merge-conflict revision with an
+    /// instruction to resolve the conflicts in place against the refactored
+    /// code. Only the engine's architectural-mismatch card carries it; workers
+    /// cannot request it.
+    ForceMerge,
+    /// Engine-reserved: archive the parked merge-conflict revision and mint a
+    /// port-sized revision on the same PR. Only the engine's
+    /// architectural-mismatch card carries it; workers cannot request it.
+    RewriteOntoBase,
+}
+
+impl ChoiceDisposition {
+    /// Every disposition a worker may request on a card it files.
+    pub const ALL: [Self; 3] = [Self::Resume, Self::Archive, Self::Park];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Resume => "resume",
+            Self::Archive => "archive",
+            Self::Park => "park",
+            Self::ForceMerge => "force_merge",
+            Self::RewriteOntoBase => "rewrite_onto_base",
+        }
+    }
+
+    /// Whether a worker may request this disposition on a card it files.
+    /// Engine-reserved dispositions belong to cards the engine builds itself.
+    pub const fn is_worker_assignable(self) -> bool {
+        matches!(self, Self::Resume | Self::Archive | Self::Park)
+    }
+}
+
+impl std::fmt::Display for ChoiceDisposition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ChoiceDisposition {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "resume" => Ok(Self::Resume),
+            "archive" => Ok(Self::Archive),
+            "park" => Ok(Self::Park),
+            other => Err(format!(
+                "unknown choice disposition `{other}`; expected one of: resume, archive, park"
+            )),
+        }
+    }
+}
+
+/// One option on a [`OperatorAnswerType::MultipleChoice`] card.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorChoiceOption {
+    pub disposition: ChoiceDisposition,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub addendum: Option<String>,
+}
+
+impl OperatorChoiceOption {
+    pub fn new(label: impl Into<String>, disposition: ChoiceDisposition) -> Self {
+        Self {
+            disposition,
+            label: label.into(),
+            addendum: None,
+        }
+    }
+
+    pub fn resume(label: impl Into<String>) -> Self {
+        Self::new(label, ChoiceDisposition::Resume)
+    }
+
+    pub fn resume_with_addendum(label: impl Into<String>, addendum: impl Into<String>) -> Self {
+        Self {
+            disposition: ChoiceDisposition::Resume,
+            label: label.into(),
+            addendum: Some(addendum.into()),
+        }
+    }
+
+    pub fn archive(label: impl Into<String>) -> Self {
+        Self::new(label, ChoiceDisposition::Archive)
+    }
+
+    pub fn park(label: impl Into<String>) -> Self {
+        Self::new(label, ChoiceDisposition::Park)
+    }
 }
 
 impl OperatorAnswerType {
@@ -1176,6 +1290,97 @@ impl OperatorAnswerType {
     pub const MAX_CHOICES: usize = 6;
     /// Longest single choice, in characters; it is a button label.
     pub const MAX_CHOICE_CHARS: usize = 80;
+    /// Longest per-option brief addendum, in characters.
+    pub const MAX_CHOICE_ADDENDUM_CHARS: usize = 4_000;
+
+    /// Construct a validated-shape multiple-choice answer type from structured options.
+    pub fn multiple_choice(options: Vec<OperatorChoiceOption>) -> Self {
+        let choices = options.iter().map(|option| option.label.clone()).collect();
+        Self::MultipleChoice { choices, options }
+    }
+
+    /// Look up the structured option matching `choice`, when present.
+    pub fn choice_option(&self, choice: &str) -> Option<&OperatorChoiceOption> {
+        match self {
+            Self::MultipleChoice { options, .. } => options.iter().find(|option| option.label == choice),
+            _ => None,
+        }
+    }
+
+    /// Look up the structured disposition for `choice`, when present.
+    pub fn choice_disposition(&self, choice: &str) -> Option<ChoiceDisposition> {
+        self.choice_option(choice).map(|option| option.disposition)
+    }
+
+    /// Validate structured multiple-choice options: count, labels, and that
+    /// every option's disposition + addendum combination is executable.
+    pub fn validate_options(options: &[OperatorChoiceOption]) -> Result<(), String> {
+        let labels: Vec<String> = options.iter().map(|option| option.label.clone()).collect();
+        Self::validate_choices(&labels)?;
+        for (index, option) in options.iter().enumerate() {
+            if let Some(addendum) = option.addendum.as_deref() {
+                if addendum.trim().is_empty() {
+                    return Err(format!("choice {} addendum must not be empty", index + 1));
+                }
+                if addendum.trim() != addendum {
+                    return Err(format!(
+                        "choice {} addendum has leading or trailing whitespace",
+                        index + 1
+                    ));
+                }
+                if addendum.chars().count() > Self::MAX_CHOICE_ADDENDUM_CHARS {
+                    return Err(format!(
+                        "choice {} addendum is longer than {} characters",
+                        index + 1,
+                        Self::MAX_CHOICE_ADDENDUM_CHARS
+                    ));
+                }
+                if option.disposition == ChoiceDisposition::Archive {
+                    return Err(format!(
+                        "choice `{}` has disposition `archive` and cannot carry a resume addendum",
+                        option.label
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::validate_options`] for a card a worker files: additionally
+    /// refuses the engine-reserved dispositions.
+    pub fn validate_worker_options(options: &[OperatorChoiceOption]) -> Result<(), String> {
+        Self::validate_options(options)?;
+        if let Some(option) = options.iter().find(|option| !option.disposition.is_worker_assignable()) {
+            return Err(format!(
+                "choice `{}` has disposition `{}`, which is reserved for engine-built cards; expected one of: resume, archive, park",
+                option.label, option.disposition
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate a question at card-creation time: every multiple-choice option
+    /// must carry an explicit executable disposition and match `choices`.
+    pub fn validate_for_creation(&self) -> Result<(), String> {
+        if let Self::MultipleChoice { choices, options } = self {
+            if options.is_empty() {
+                return Err(
+                    "every multiple-choice option must declare an explicit disposition (resume, archive, or park)"
+                        .into(),
+                );
+            }
+            Self::validate_options(options)?;
+            if choices.len() != options.len()
+                || choices
+                    .iter()
+                    .zip(options)
+                    .any(|(choice, option)| choice != &option.label)
+            {
+                return Err("multiple-choice `choices` must match `options` labels in order".into());
+            }
+        }
+        Ok(())
+    }
 
     /// Check a multiple-choice option list: [`Self::MIN_CHOICES`] to
     /// [`Self::MAX_CHOICES`] entries, each a non-empty single line of at most
@@ -1224,7 +1429,7 @@ impl OperatorAnswerType {
                 Self::YesNo | Self::CreatePrerequisiteTask { .. } | Self::LinkPrerequisiteTask { .. },
                 OperatorAnswer::YesNo { .. },
             ) => Ok(()),
-            (Self::MultipleChoice { choices }, OperatorAnswer::MultipleChoice { value }) => {
+            (Self::MultipleChoice { choices, .. }, OperatorAnswer::MultipleChoice { value }) => {
                 if choices.contains(value) {
                     Ok(())
                 } else {
@@ -1555,15 +1760,48 @@ mod tests {
 
     #[test]
     fn multiple_choice_question_and_answer_round_trip() {
-        let question = OperatorAnswerType::MultipleChoice {
-            choices: choices(&["Ship now", "Wait a week"]),
-        };
+        let question = OperatorAnswerType::multiple_choice(vec![
+            OperatorChoiceOption::resume("Ship now"),
+            OperatorChoiceOption::park("Wait a week"),
+        ]);
         let json = serde_json::to_value(&question).unwrap();
         assert_eq!(
             json,
-            serde_json::json!({"kind": "multiple_choice", "choices": ["Ship now", "Wait a week"]})
+            serde_json::json!({
+                "kind": "multiple_choice",
+                "choices": ["Ship now", "Wait a week"],
+                "options": [
+                    {"disposition": "resume", "label": "Ship now"},
+                    {"disposition": "park", "label": "Wait a week"}
+                ]
+            })
         );
         assert_eq!(serde_json::from_value::<OperatorAnswerType>(json).unwrap(), question);
+        assert!(question.validate_for_creation().is_ok());
+        assert_eq!(
+            question.choice_disposition("Wait a week"),
+            Some(ChoiceDisposition::Park)
+        );
+
+        // Legacy rows stored before `options` existed still decode, while creation rejects them.
+        let legacy: OperatorAnswerType = serde_json::from_value(
+            serde_json::json!({"kind": "multiple_choice", "choices": ["Ship now", "Wait a week"]}),
+        )
+        .unwrap();
+        assert!(legacy.validate_for_creation().is_err());
+
+        // Non-executable disposition combinations (archive + addendum) or unknown dispositions are rejected.
+        let bad = OperatorAnswerType::multiple_choice(vec![
+            OperatorChoiceOption {
+                disposition: ChoiceDisposition::Archive,
+                label: "Archive it".into(),
+                addendum: Some("Keep running".into()),
+            },
+            OperatorChoiceOption::resume("Retry"),
+        ]);
+        assert!(bad.validate_for_creation().is_err());
+        assert!("merge".parse::<ChoiceDisposition>().is_err());
+
         let answer = OperatorAnswer::MultipleChoice {
             value: "Ship now".into(),
         };
@@ -1601,9 +1839,10 @@ mod tests {
 
     #[test]
     fn answers_must_fit_the_question_type() {
-        let pick = OperatorAnswerType::MultipleChoice {
-            choices: choices(&["Ship now", "Wait a week"]),
-        };
+        let pick = OperatorAnswerType::multiple_choice(vec![
+            OperatorChoiceOption::resume("Ship now"),
+            OperatorChoiceOption::resume("Wait a week"),
+        ]);
         let choose = |value: &str| OperatorAnswer::MultipleChoice { value: value.into() };
         let yes = OperatorAnswer::YesNo { value: true };
         assert!(pick.check_answer(&choose("Wait a week")).is_ok());

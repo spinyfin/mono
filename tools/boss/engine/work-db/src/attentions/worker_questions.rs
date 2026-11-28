@@ -26,7 +26,9 @@ pub fn create_in_tx(
     );
     let (question_type, choices) = match &question.answer_type {
         OperatorAnswerType::YesNo => ("yes_no", None),
-        OperatorAnswerType::MultipleChoice { choices } => ("multiple_choice", Some(serde_json::to_string(choices)?)),
+        OperatorAnswerType::MultipleChoice { choices, .. } => {
+            ("multiple_choice", Some(serde_json::to_string(choices)?))
+        }
         OperatorAnswerType::CreatePrerequisiteTask { name, brief, .. } => {
             let (yes, no) = question
                 .answer_type
@@ -140,6 +142,111 @@ pub(super) fn stored_question(conn: &Connection, group: &AttentionGroup) -> Resu
     )
     .optional()
     .map_err(Into::into)
+}
+
+/// Optional per-option addendum stored on a `worker_question|` group's question.
+pub(super) fn choice_addendum(conn: &Connection, group: &AttentionGroup, choice: &str) -> Result<Option<String>> {
+    let Some(record) = stored_question(conn, group)? else {
+        return Ok(None);
+    };
+    Ok(record
+        .question
+        .answer_type
+        .choice_option(choice)
+        .and_then(|opt| opt.addendum.clone()))
+}
+
+/// When the repo owner actions a `worker_question|` group whose answered choice
+/// carries an `archive` or `park` disposition, execute it on the source item in
+/// `tx` instead of minting a follow-up revision or chore. Non-owner actors
+/// return `Ok(None)` so only the repo owner can archive or park.
+pub(super) fn apply_owner_disposition_in_tx(
+    db: &WorkDb,
+    pending: &mut PendingEvents,
+    tx: &rusqlite::Transaction<'_>,
+    group: &AttentionGroup,
+    members: &[Attention],
+    actor: &str,
+    provenance: Option<&str>,
+) -> Result<Option<(String, String, Vec<String>)>> {
+    if !group.grouping_key.starts_with("worker_question|") {
+        return Ok(None);
+    }
+    let Some(choice) = members
+        .iter()
+        .find(|m| m.answer_state == "answered")
+        .and_then(|m| m.answer.as_deref())
+    else {
+        return Ok(None);
+    };
+    let Some(record) = stored_question(tx, group)? else {
+        return Ok(None);
+    };
+    let Some(disposition) = crate::operator_disposition::owner_choice_disposition(actor, &record.question, choice)
+    else {
+        return Ok(None);
+    };
+    if disposition == boss_protocol::ChoiceDisposition::Resume {
+        return Ok(None);
+    }
+    let Some(source_id) = group.source_task_id.as_deref().filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(task) = query_task(tx, source_id)?.filter(|t| t.deleted_at.is_none()) else {
+        return Ok(None);
+    };
+    let reference = serde_json::json!({
+        "task_id": task.id,
+        "short_id": task.short_id,
+        "kind": task.kind,
+    })
+    .to_string();
+    match disposition {
+        boss_protocol::ChoiceDisposition::Archive => {
+            db.update_task_in_tx(
+                tx,
+                pending,
+                &task.id,
+                WorkItemPatch::builder()
+                    .status("archived")
+                    .archived_reason("the owner chose to archive this item in an operator question")
+                    .build(),
+                crate::task_status_audit::WriteAttribution {
+                    actor,
+                    provenance: Some(provenance.unwrap_or("operator_question_archive")),
+                },
+            )?;
+            Ok(Some(("archived".to_owned(), reference, vec![task.id])))
+        }
+        boss_protocol::ChoiceDisposition::Park => {
+            let now = now_string();
+            let answered_at = chrono::DateTime::from_timestamp(now.parse::<i64>()?, 0)
+                .context("answer timestamp is outside the supported range")?;
+            let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
+            let block = super::super::proposals::choice_block(&record.question, choice, &timestamp);
+            // Audited update path: a rejected description guard surfaces as an
+            // error instead of silently dropping the recorded answer.
+            db.update_task_in_tx(
+                tx,
+                pending,
+                &task.id,
+                WorkItemPatch::builder()
+                    .description(format!("{}{block}", task.description))
+                    .build(),
+                crate::task_status_audit::WriteAttribution {
+                    actor,
+                    provenance: Some(provenance.unwrap_or("operator_question_park")),
+                },
+            )?;
+            let touched = crate::operator_disposition::park_chain_root_in_tx(tx, pending, &task, actor, &now)?;
+            Ok(Some(("parked".to_owned(), reference, touched)))
+        }
+        // Engine-reserved dispositions only appear on engine-built cards
+        // answered through their own handler, never on a worker question.
+        boss_protocol::ChoiceDisposition::Resume
+        | boss_protocol::ChoiceDisposition::ForceMerge
+        | boss_protocol::ChoiceDisposition::RewriteOntoBase => Ok(None),
+    }
 }
 
 /// File-count bypass spec when this group was answered No on a split-vs-bypass

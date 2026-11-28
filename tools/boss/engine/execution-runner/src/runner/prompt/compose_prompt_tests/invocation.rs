@@ -236,7 +236,11 @@ fn run_done_seam_on_worker_signal_seam_off_teaches_summary_not_blocked_verb() {
             "Before asking, check the task description for recorded approval of the requested action or an `## Recorded answer` section."
         )
     );
-    assert!(prompt.contains("--answer-type multiple-choice --choices \"Gradual\" \"All at once\""));
+    assert!(
+        prompt.contains(
+            "--answer-type multiple-choice --choices \"Gradual\" \"All at once\" --dispositions resume resume"
+        )
+    );
     assert!(prompt.contains("your next run's task description ends with a `## Recorded answer` section"));
     assert!(prompt.contains("Follow the question-writing contract in the generated worker rules."));
     assert!(prompt.contains("Use the typed question flags on a blocked declaration"));

@@ -670,6 +670,7 @@ mod stuck_report_progress_tests;
 mod stuck_report_tests;
 
 mod conflict_mismatch_tests;
+mod operator_disposition_tests;
 mod stuck_snapshot_tests;
 
 mod upkeep_producer_tests;

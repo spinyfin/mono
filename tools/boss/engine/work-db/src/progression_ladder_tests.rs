@@ -436,9 +436,11 @@ fn run_one_acts_run_two_follows_on_the_unchanged_fingerprint_and_the_engine_asks
     assert_eq!(question.question.text, QUESTION_TEXT);
     assert_eq!(
         question.question.answer_type,
-        OperatorAnswerType::MultipleChoice {
-            choices: vec![PARK_IT.into(), ARCHIVE_IT.into(), KEEP_TRYING.into()]
-        }
+        OperatorAnswerType::multiple_choice(vec![
+            boss_protocol::OperatorChoiceOption::park(PARK_IT),
+            boss_protocol::OperatorChoiceOption::archive(ARCHIVE_IT),
+            boss_protocol::OperatorChoiceOption::resume(KEEP_TRYING),
+        ])
     );
     let explanation = &question.question.explanation;
     for expected in [
@@ -1353,6 +1355,130 @@ fn archive_it_archives_in_the_answer_transaction() {
     assert_eq!(fx.task(&id).status, TaskStatus::Archived);
     assert_eq!(fx.task(&id).last_status_actor, "human");
     assert!(fx.task(&id).operator_question.is_none());
+}
+
+/// Rename the stored buttons without touching their dispositions.
+fn relabel(fx: &Fx, question_id: &str, renames: &[(&str, &str)]) {
+    for (from, to) in renames {
+        fx.sql(&format!(
+            "UPDATE operator_questions SET question_json = REPLACE(question_json, '\"{from}\"', '\"{to}\"')
+             WHERE id = '{question_id}'"
+        ));
+    }
+}
+
+#[test]
+fn ladder_answers_follow_the_stored_dispositions_not_the_label_text() {
+    let fx = fx();
+    let id = fx.conflicted("Relabelled park");
+    let question = exhausted(&fx, &id, S5);
+    relabel(
+        &fx,
+        &question.question.id,
+        &[(PARK_IT, "Shelve"), (ARCHIVE_IT, "Bin"), (KEEP_TRYING, "Go again")],
+    );
+    let question = fx.open_question(&id).unwrap();
+    assert_eq!(
+        question.question.answer_type.choice_disposition("Shelve"),
+        Some(boss_protocol::ChoiceDisposition::Park)
+    );
+    assert!(
+        fx.db
+            .answer_operator_question_with(
+                &question.question.id,
+                OperatorAnswer::MultipleChoice { value: PARK_IT.into() },
+                &fx.checker,
+            )
+            .is_err(),
+        "the old wording is no longer an offered answer"
+    );
+
+    fx.answer(&question, "Shelve");
+
+    assert!(fx.db.is_parked(&id).unwrap());
+}
+
+#[test]
+fn a_relabelled_archive_and_keep_trying_keep_their_effects() {
+    let fx = fx();
+    let archived = fx.conflicted("Relabelled archive");
+    let question = exhausted(&fx, &archived, S5);
+    relabel(&fx, &question.question.id, &[(ARCHIVE_IT, "Bin")]);
+    fx.answer(&fx.open_question(&archived).unwrap(), "Bin");
+    assert_eq!(fx.task(&archived).status, TaskStatus::Archived);
+
+    let retried = fx.conflicted("Relabelled keep trying");
+    let question = exhausted(&fx, &retried, S5);
+    relabel(&fx, &question.question.id, &[(KEEP_TRYING, "Go again")]);
+    fx.answer(&fx.open_question(&retried).unwrap(), "Go again");
+    assert!(fx.ladder_row(&retried).0 > 0, "the reset is recorded");
+    assert!(!fx.db.is_parked(&retried).unwrap());
+}
+
+#[test]
+fn a_stored_ladder_card_without_options_is_repaired_before_it_can_be_answered() {
+    let fx = fx();
+    let id = fx.conflicted("Pre-upgrade card");
+    let question = exhausted(&fx, &id, S5);
+    let legacy = serde_json::json!({
+        "text": question.question.text,
+        "explanation": question.question.explanation,
+        "answer_type": {"kind": "multiple_choice", "choices": [PARK_IT, ARCHIVE_IT, KEEP_TRYING]},
+    });
+    fx.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE operator_questions SET question_json = ?2 WHERE id = ?1",
+            params![question.question.id, legacy.to_string()],
+        )
+        .unwrap();
+    assert!(
+        fx.db
+            .answer_operator_question_with(
+                &question.question.id,
+                OperatorAnswer::MultipleChoice { value: PARK_IT.into() },
+                &fx.checker,
+            )
+            .is_err(),
+        "an unrepaired card has no structured action to dispatch on"
+    );
+
+    crate::operator_disposition::migrate(&fx.db.connect().unwrap()).unwrap();
+    fx.answer(&fx.open_question(&id).unwrap(), PARK_IT);
+
+    assert!(fx.db.is_parked(&id).unwrap());
+}
+
+#[test]
+fn a_non_owner_answer_to_the_ladder_question_resets_the_ladder_and_never_parks() {
+    let fx = fx();
+    let id = fx.conflicted("Coordinator answers");
+    fx.sql(&format!("UPDATE tasks SET autostart = 1 WHERE id = '{id}'"));
+    let question = exhausted(&fx, &id, S5);
+    assert!(!fx.task(&id).autostart, "filing the question disables autostart");
+
+    fx.db
+        .answer_operator_question_from(
+            &question.question.id,
+            OperatorAnswer::MultipleChoice { value: PARK_IT.into() },
+            &fx.checker,
+            boss_protocol::LAST_STATUS_ACTOR_BOSS,
+            None,
+            false,
+        )
+        .unwrap();
+
+    assert!(!fx.db.is_parked(&id).unwrap(), "only the owner parks");
+    assert!(fx.open_question(&id).is_none());
+    assert!(fx.ladder_row(&id).0 > 0, "the ladder reset is recorded");
+    let task = fx.task(&id);
+    assert!(task.autostart, "the prior autostart is restored");
+    assert_eq!(
+        (task.status, task.blocked_reason.as_deref()),
+        (TaskStatus::Blocked, Some("merge_conflict")),
+        "the prior stuck state is restored"
+    );
 }
 
 // ── the cross-fingerprint worker_failed episode ──────────────────────────────

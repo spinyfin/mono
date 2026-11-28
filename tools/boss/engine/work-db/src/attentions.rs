@@ -920,7 +920,20 @@ fn action_question_group(
         );
     }
     let file_count_bypass_no = worker_questions::file_count_bypass_no_spec(conn, group, members)?.is_some();
+    let option_addendum = if group.grouping_key.starts_with("worker_question|") {
+        answered
+            .first()
+            .and_then(|m| m.answer.as_deref())
+            .map(|choice| worker_questions::choice_addendum(conn, group, choice))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
     let mut brief = build_qa_brief(group, &answered, file_count_bypass_no);
+    if let Some(addendum) = &option_addendum {
+        brief.push_str(&format!("\n**Option addendum:** {addendum}\n"));
+    }
     let source = group
         .source_task_id
         .as_deref()
@@ -985,6 +998,9 @@ fn action_question_group(
                     None => return Err(err),
                 };
                 brief = build_qa_brief(group, &answered, false);
+                if let Some(addendum) = &option_addendum {
+                    brief.push_str(&format!("\n**Option addendum:** {addendum}\n"));
+                }
                 if let Some(task) = &source {
                     brief.push_str(&format!("\n## Original work: {}\n\n{}\n", task.name, task.description));
                 }
@@ -1373,24 +1389,43 @@ impl WorkDb {
         }
 
         let mut pending = PendingEvents::new();
-        let (produced_kind, produced_ref, produced_work_item_ids, successor) = match group.kind.as_str() {
-            "question" => action_question_group(&mut pending, &tx, &group, &members, pr_checker, actor, provenance)?,
-            "followup" => {
-                let (kind, reference, ids) = action_followup_group(&tx, &group, &members, member_overrides)?;
-                (kind, reference, ids, worker_questions::QuestionSuccessor::NoPr)
-            }
-            other => bail!("cannot action attention group {} of kind {other:?}", group.id),
-        };
+        let (produced_kind, produced_ref, produced_work_item_ids, applied_owner_disposition, successor) =
+            match group.kind.as_str() {
+                "question" => {
+                    if let Some((kind, reference, ids)) = worker_questions::apply_owner_disposition_in_tx(
+                        self,
+                        &mut pending,
+                        &tx,
+                        &group,
+                        &members,
+                        actor,
+                        provenance,
+                    )? {
+                        (kind, reference, ids, true, worker_questions::QuestionSuccessor::NoPr)
+                    } else {
+                        let (kind, reference, ids, successor) =
+                            action_question_group(&mut pending, &tx, &group, &members, pr_checker, actor, provenance)?;
+                        (kind, reference, ids, false, successor)
+                    }
+                }
+                "followup" => {
+                    let (kind, reference, ids) = action_followup_group(&tx, &group, &members, member_overrides)?;
+                    (kind, reference, ids, false, worker_questions::QuestionSuccessor::NoPr)
+                }
+                other => bail!("cannot action attention group {} of kind {other:?}", group.id),
+            };
 
-        worker_questions::apply_typed_answer_in_tx(
-            &mut pending,
-            &tx,
-            &group,
-            &members,
-            &produced_work_item_ids,
-            successor,
-            crate::task_status_audit::WriteAttribution { actor, provenance },
-        )?;
+        if !applied_owner_disposition {
+            worker_questions::apply_typed_answer_in_tx(
+                &mut pending,
+                &tx,
+                &group,
+                &members,
+                &produced_work_item_ids,
+                successor,
+                crate::task_status_audit::WriteAttribution { actor, provenance },
+            )?;
+        }
 
         let now = now_string();
         tx.execute(
