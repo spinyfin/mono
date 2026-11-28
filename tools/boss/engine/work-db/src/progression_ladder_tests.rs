@@ -1454,7 +1454,9 @@ fn a_stored_ladder_card_without_options_is_repaired_before_it_can_be_answered() 
 fn a_non_owner_answer_to_the_ladder_question_resets_the_ladder_and_never_parks() {
     let fx = fx();
     let id = fx.conflicted("Coordinator answers");
+    fx.sql(&format!("UPDATE tasks SET autostart = 1 WHERE id = '{id}'"));
     let question = exhausted(&fx, &id, S5);
+    assert!(!fx.task(&id).autostart, "filing the question disables autostart");
 
     fx.db
         .answer_operator_question_from(
@@ -1471,6 +1473,7 @@ fn a_non_owner_answer_to_the_ladder_question_resets_the_ladder_and_never_parks()
     assert!(fx.open_question(&id).is_none());
     assert!(fx.ladder_row(&id).0 > 0, "the ladder reset is recorded");
     let task = fx.task(&id);
+    assert!(task.autostart, "the prior autostart is restored");
     assert_eq!(
         (task.status, task.blocked_reason.as_deref()),
         (TaskStatus::Blocked, Some("merge_conflict")),
