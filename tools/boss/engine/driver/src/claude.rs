@@ -13,10 +13,12 @@ use boss_engine_structured_output::StructuredOutputKind;
 use boss_engine_structured_output::fallback::FallbackCandidate;
 use boss_engine_transient_error::ErrorClass;
 use boss_protocol::{
-    EffortLevel, NormalizeError, PaneMonitorSpec, ReasoningMode, ReviewModelTier, WorkerEvent, normalize_hook_event,
+    DRIVER_SLUG_CLAUDE, EffortLevel, NormalizeError, PaneMonitorSpec, ReasoningMode, ReviewModelTier, WorkerEvent,
+    normalize_hook_event,
 };
 use boss_ssh_transport::shell_quote;
 
+pub use super::InvestigationRouting;
 use super::{
     AgentDriver, Capability, CapabilitySet, DriverDescriptor, EnvDirective, HookWiringDestination, InterruptDelivery,
     InterruptGesture, InterruptPlan, LaunchOptions, MidTurnPaneInput, ModelMenu, PermissionArtifacts, PermissionInput,
@@ -62,6 +64,32 @@ fn claude_model_for_reasoning(reasoning: ReasoningMode) -> &'static str {
     match reasoning {
         ReasoningMode::Standard => "sonnet",
         ReasoningMode::Investigation => "opus",
+    }
+}
+
+/// The routing the `investigation_routing` treatment applies at `level` on
+/// Claude: `large` effort at the `medium` level's value (`high`), and `small` or
+/// `medium` effort on the investigation reasoning model (Opus). `trivial`,
+/// `max` and a row with no level are not routed: the first two are the
+/// extremes the experiment does not test, and a row with no level launches
+/// without an effort flag.
+///
+/// Both values come from this driver's own tables, so the experiment cannot
+/// name a model or an effort the Claude CLI does not accept.
+pub fn investigation_routing_for_level(level: Option<EffortLevel>) -> InvestigationRouting {
+    match level {
+        Some(EffortLevel::Large) => InvestigationRouting {
+            model: None,
+            effort_value: claude_effort_value_for_level(EffortLevel::Medium),
+        },
+        Some(EffortLevel::Small | EffortLevel::Medium) => InvestigationRouting {
+            model: Some(claude_model_for_reasoning(ReasoningMode::Investigation)),
+            effort_value: None,
+        },
+        Some(EffortLevel::Trivial | EffortLevel::Max) | None => InvestigationRouting {
+            model: None,
+            effort_value: None,
+        },
     }
 }
 
@@ -139,7 +167,7 @@ fn claude_model_belongs_to_driver(model: &str) -> bool {
 }
 
 static CLAUDE_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
-    name: "claude",
+    name: DRIVER_SLUG_CLAUDE,
     label: "Claude Code",
     binary: "claude",
     config_dir: ".claude",
@@ -160,6 +188,7 @@ static CLAUDE_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
         model_for_reasoning: claude_model_for_reasoning,
         review_model_for_tier: claude_review_model_for_tier,
         design_investigation_model: Some(|| "fable"),
+        investigation_routing: Some(investigation_routing_for_level),
         prompt_addendum_for_level: claude_prompt_addendum_for_level,
         model_requires_auto_permissions: claude_model_requires_auto_permissions,
         model_belongs_to_driver: claude_model_belongs_to_driver,
@@ -1508,6 +1537,39 @@ mod tests {
             assert!(
                 !claude_model_belongs_to_driver(model),
                 "{model:?} should not be recognised as a Claude model"
+            );
+        }
+    }
+
+    #[test]
+    fn investigation_routing_steps_large_down_to_high_and_small_and_medium_to_opus() {
+        use boss_protocol::EffortLevel::{Large, Max, Medium, Small, Trivial};
+        let routed = |level| investigation_routing_for_level(level);
+        assert_eq!(
+            routed(Some(Large)),
+            InvestigationRouting {
+                model: None,
+                effort_value: Some("high")
+            }
+        );
+        for level in [Small, Medium] {
+            assert_eq!(
+                routed(Some(level)),
+                InvestigationRouting {
+                    model: Some("opus"),
+                    effort_value: None
+                },
+                "{level:?}"
+            );
+        }
+        for level in [Some(Trivial), Some(Max), None] {
+            assert_eq!(
+                routed(level),
+                InvestigationRouting {
+                    model: None,
+                    effort_value: None
+                },
+                "{level:?}"
             );
         }
     }

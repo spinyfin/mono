@@ -5,6 +5,8 @@
 use std::path::Path;
 
 #[cfg(test)]
+mod experiment_arm_tests;
+#[cfg(test)]
 #[path = "worker_spawn/tests.rs"]
 mod tests;
 #[cfg(test)]
@@ -20,7 +22,8 @@ use crate::work::{REASON_ALLOCATION, REASON_LEGACY_PERCENTAGE, WorkDb, WorkExecu
 use boss_execution_contracts::{REVIEW_GUIDE_DRIVER, pool_dispatch_policy_for_worker_id};
 use boss_protocol::{
     EffortLevel, ExecutionKind, ProposalKind, ProposalState, ReasoningMode, ReviewBatchMember, ReviewBatchMemberRole,
-    ReviewBatchMemberStatus, ReviewBatchPhase, ReviewBatchStatus, ReviewReportProposalPayload, TaskKind,
+    ReviewBatchMemberStatus, ReviewBatchPhase, ReviewBatchStatus, ReviewModelTier, ReviewReportProposalPayload,
+    TaskKind,
 };
 
 use super::answer_agent_prompt::compose_answer_agent_prompt;
@@ -486,10 +489,20 @@ fn load_batch_leaf_reports(
 /// Batch members carry the exact policy chosen when the immutable target was
 /// created. This intentionally bypasses review-pool Claude/strong defaults so
 /// a leaf remains on its assigned provider even if task settings change later.
+///
+/// `supervisor_standard_tier` is the `supervisor_standard_tier` treatment, read
+/// from the arm this launch recorded: a supervisor then runs on the driver's
+/// Balanced review tier whatever the tier its member row was created with. It is
+/// applied here, where the launch's arm is drawn, so the model a supervisor ran
+/// on is a function of the arm recorded for that same launch (a flag flipped
+/// between the member's creation and the launch cannot split the two). The
+/// member row keeps the profile's model; the launch record carries the one that
+/// ran. Leaf reviewers are never changed.
 fn resolve_batch_reviewer_spawn(
     registry: &crate::driver::DriverRegistry,
     member: &ReviewBatchMember,
     work_item_kind: Option<&TaskKind>,
+    supervisor_standard_tier: bool,
 ) -> anyhow::Result<SpawnConfig> {
     let effort = member.provider_effort.parse::<EffortLevel>().map_err(|error| {
         anyhow::anyhow!(
@@ -497,9 +510,15 @@ fn resolve_batch_reviewer_spawn(
             member.provider_effort
         )
     })?;
+    let model = match registry.get(member.requested_driver.as_str()) {
+        Some(driver) if supervisor_standard_tier && member.role == ReviewBatchMemberRole::Supervisor => {
+            (driver.descriptor().model_menu.review_model_for_tier)(ReviewModelTier::Balanced)
+        }
+        _ => member.resolved_model.as_str(),
+    };
     let input = SpawnResolutionInput::builder()
         .effort_level(effort)
-        .model_override(member.resolved_model.as_str())
+        .model_override(model)
         .task_driver(member.requested_driver.as_str())
         .maybe_kind(work_item_kind)
         .build();
@@ -656,6 +675,10 @@ pub async fn compose_worker_spawn(
     } = editorial_opts;
     // Experiments reach the composer as plain options, never as keys.
     let batched_search = experiment_arms.is_treated(crate::feature_flags::BATCHED_SEARCH_EXPERIMENT);
+    let ci_fix_standard_tier = experiment_arms.is_treated(crate::feature_flags::CI_FIX_STANDARD_TIER_EXPERIMENT);
+    let investigation_routing = experiment_arms.is_treated(crate::feature_flags::INVESTIGATION_ROUTING_EXPERIMENT);
+    let supervisor_standard_tier =
+        experiment_arms.is_treated(crate::feature_flags::SUPERVISOR_STANDARD_TIER_EXPERIMENT);
     // For any project-scoped task (the synthetic `kind = 'design'`
     // task and ordinary `project_task` rows alike), the richer
     // brief — what the project is for, what its goal is — lives
@@ -1276,12 +1299,28 @@ pub async fn compose_worker_spawn(
         .is_none()
         .then(|| pool_dispatch_policy_for_worker_id(worker_id))
         .flatten();
+    // The `ci_fix_standard_tier` treatment: a no-evidence CI-fix revision is
+    // minted with `ReasoningMode::Investigation` (whereas a CI-fix revision
+    // with attached failure evidence is minted with `ReasoningMode::Standard`).
+    // Applying the step-down here, from the arm this same launch records, keeps
+    // the launch record and the executed tier in lockstep across flag flips and
+    // kill-switch stops on retry — the same invariant `supervisor_standard_tier`
+    // upholds.
+    let (effective_reasoning, effective_effort) = if ci_fix_standard_tier
+        && execution.kind == ExecutionKind::RevisionImplementation
+        && work_item_created_via(work_item).is_some_and(|cv| cv.starts_with(boss_protocol::CREATED_VIA_CI_FIX_PREFIX))
+        && row_reasoning == Some(ReasoningMode::Investigation)
+    {
+        (Some(ReasoningMode::Standard), Some(EffortLevel::Medium))
+    } else {
+        (row_reasoning, row_effort)
+    };
     let model_inputs = model_selection_inputs(
         &execution.kind,
         pool_policy.map(|p| p.model_tier),
         row_model_override.as_deref(),
         work_item_kind,
-        row_reasoning,
+        effective_reasoning,
     );
     // Main-pool only: a live pin that the capability gate will refuse for
     // this execution kind yields to allocation / the engine default rather
@@ -1319,7 +1358,7 @@ pub async fn compose_worker_spawn(
         config
     } else {
         match batch_member.as_ref() {
-            Some(member) => resolve_batch_reviewer_spawn(&registry, member, work_item_kind)?,
+            Some(member) => resolve_batch_reviewer_spawn(&registry, member, work_item_kind, supervisor_standard_tier)?,
             None => {
                 let spawn_input = SpawnResolutionInput::builder()
                     .execution_kind(&execution.kind)
@@ -1334,7 +1373,7 @@ pub async fn compose_worker_spawn(
                     // For PR reviews this is only a size proxy, not a claim that small
                     // diffs are low risk: the rubric applies the same correctness bar at
                     // every level.
-                    .maybe_effort_level(row_effort)
+                    .maybe_effort_level(effective_effort)
                     .maybe_model_override(model_inputs.model_override)
                     .maybe_pool_model_override(model_inputs.pool_model_tier)
                     .maybe_product_default_model(product_default_model.as_deref())
@@ -1345,6 +1384,7 @@ pub async fn compose_worker_spawn(
                     .maybe_kind(model_inputs.kind)
                     .maybe_reasoning(model_inputs.reasoning)
                     .design_reasoning_effort_xhigh(row_design_reasoning_effort_xhigh)
+                    .investigation_routing(investigation_routing)
                     .build();
                 resolve_spawn_config_in(&registry, &spawn_input)
                     .map_err(|error| anyhow::anyhow!("effort/model resolution: {error}"))?

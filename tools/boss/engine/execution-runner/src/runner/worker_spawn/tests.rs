@@ -291,7 +291,7 @@ mod reviewer_pool_policy_tests {
             .execution_id("execution")
             .build();
 
-        let config = super::resolve_batch_reviewer_spawn(&registry, &member, None).unwrap();
+        let config = super::resolve_batch_reviewer_spawn(&registry, &member, None, false).unwrap();
         assert_eq!(config.driver, "codex");
         assert_eq!(config.model, "gpt-5.6-terra");
         assert_eq!(config.effort_level, Some(boss_protocol::EffortLevel::Medium));
@@ -308,6 +308,67 @@ mod reviewer_pool_policy_tests {
             super::prompt_addendum_to_prepend(&boss_protocol::ExecutionKind::PrReview, config.prompt_addendum),
             None,
         );
+    }
+}
+
+#[cfg(test)]
+mod supervisor_tier_tests {
+    //! The `supervisor_standard_tier` treatment moves only a review supervisor,
+    //! only onto the driver's Balanced review tier, and only when treated.
+
+    use boss_protocol::{ReviewBatchMember, ReviewBatchMemberRole, ReviewBatchMemberStatus};
+
+    fn member(role: ReviewBatchMemberRole, driver: &str, model: &str) -> ReviewBatchMember {
+        ReviewBatchMember::builder()
+            .id("member")
+            .batch_id("batch")
+            .attempt(1)
+            .created_at("1")
+            .provider_effort("medium")
+            .requested_driver(driver)
+            .resolved_model(model)
+            .role(role)
+            .status(ReviewBatchMemberStatus::Pending)
+            .updated_at("1")
+            .execution_id("execution")
+            .build()
+    }
+
+    fn resolve(member: &ReviewBatchMember, treated: bool) -> crate::effort::SpawnConfig {
+        let registry = crate::driver::DriverRegistry::default();
+        super::super::resolve_batch_reviewer_spawn(&registry, member, None, treated).unwrap()
+    }
+
+    #[test]
+    fn a_treated_supervisor_created_on_the_strong_tier_runs_on_sonnet() {
+        let supervisor = member(ReviewBatchMemberRole::Supervisor, "claude", "opus");
+        let treated = resolve(&supervisor, true);
+        assert_eq!(treated.model, "sonnet");
+        assert_eq!(treated.driver, "claude");
+        assert_eq!(treated.effort_value, resolve(&supervisor, false).effort_value);
+    }
+
+    #[test]
+    fn control_and_inert_supervisors_keep_the_model_their_profile_chose() {
+        let strong = member(ReviewBatchMemberRole::Supervisor, "claude", "opus");
+        assert_eq!(resolve(&strong, false).model, "opus");
+        let light = member(ReviewBatchMemberRole::Supervisor, "claude", "sonnet");
+        assert_eq!(resolve(&light, false).model, "sonnet");
+        assert_eq!(resolve(&light, true).model, "sonnet", "already on the Balanced tier");
+    }
+
+    #[test]
+    fn leaf_and_post_merge_reviewers_are_never_moved() {
+        for role in [
+            ReviewBatchMemberRole::ClaudeReviewer,
+            ReviewBatchMemberRole::PostMergeReviewer,
+        ] {
+            let reviewer = member(role, "claude", "opus");
+            assert_eq!(resolve(&reviewer, true), resolve(&reviewer, false), "{role:?}");
+            assert_eq!(resolve(&reviewer, true).model, "opus", "{role:?}");
+        }
+        let codex = member(ReviewBatchMemberRole::CodexReviewer, "codex", "gpt-5.6-terra");
+        assert_eq!(resolve(&codex, true), resolve(&codex, false));
     }
 }
 
@@ -2292,99 +2353,5 @@ mod progression_model_policy_tests {
             .pool_model_tier,
             Some(PoolModelTier::Strong)
         );
-    }
-}
-
-mod experiment_arm_tests {
-    //! The experiment arms a caller hands `compose_worker_spawn` reach both the
-    //! prompt (as a plain option) and `SpawnConfig` (as the set the dispatch
-    //! site records), and the default is "nothing was running".
-
-    use super::*;
-    use crate::feature_flags::{BATCHED_SEARCH_EXPERIMENT, ExperimentArm, ExperimentArmSet};
-
-    const RULE: &str = "**Batch independent tool calls.**";
-
-    async fn compose_with(arms: Option<ExperimentArmSet>, workspace: &Path) -> ComposedWorkerSpawn {
-        let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
-        let execution = WorkExecution::builder()
-            .id("exec_arms_01")
-            .work_item_id("task-arms")
-            .kind(ExecutionKind::ChoreImplementation)
-            .status(ExecutionStatus::Running)
-            .repo_remote_url("git@github.com:org/repo.git")
-            .workspace_path(workspace.to_string_lossy())
-            .created_at("2026-05-15T00:00:00Z")
-            .build();
-        let task = Task::builder()
-            .id("task-arms")
-            .product_id("prod-arms")
-            .kind(TaskKind::Chore)
-            .name("Widget import")
-            .description("Implement widget import.")
-            .status(TaskStatus::Todo)
-            .created_at("2026-05-15T00:00:00Z")
-            .updated_at("2026-05-15T00:00:00Z")
-            .build();
-        let opts = WorkerSpawnOpts::builder().review_signal_checks(|_| &[]);
-        let opts = match arms {
-            Some(arms) => opts.experiment_arms(arms).build(),
-            None => opts.build(),
-        };
-        compose_worker_spawn(
-            &db,
-            "worker-arms",
-            &execution,
-            &WorkItem::Chore(task),
-            workspace,
-            None,
-            opts,
-        )
-        .await
-        .unwrap()
-    }
-
-    fn set(arm: ExperimentArm) -> ExperimentArmSet {
-        let mut arms = ExperimentArmSet::new();
-        arms.insert(BATCHED_SEARCH_EXPERIMENT, arm);
-        arms
-    }
-
-    #[tokio::test]
-    async fn a_caller_that_resolves_no_arms_records_an_empty_set_and_is_never_treated() {
-        // The remote spawn path builds its options without arms.
-        let workspace = tempfile::tempdir().unwrap();
-        let composed = compose_with(None, workspace.path()).await;
-        assert_eq!(composed.spawn_config.experiment_arms.as_deref(), Some("{}"));
-        assert!(!composed.prompt_text.contains(RULE));
-    }
-
-    #[tokio::test]
-    async fn treatment_changes_the_brief_and_is_recorded() {
-        let workspace = tempfile::tempdir().unwrap();
-        let composed = compose_with(Some(set(ExperimentArm::Treatment)), workspace.path()).await;
-        assert_eq!(composed.prompt_text.matches(RULE).count(), 1);
-        assert_eq!(
-            composed.spawn_config.experiment_arms.as_deref(),
-            Some(r#"{"batched_search":"treatment"}"#)
-        );
-    }
-
-    #[tokio::test]
-    async fn control_and_stopped_keep_todays_brief_and_are_recorded() {
-        let workspace = tempfile::tempdir().unwrap();
-        let untreated = compose_with(None, workspace.path()).await;
-        for (arm, recorded) in [
-            (ExperimentArm::Control, r#"{"batched_search":"control"}"#),
-            (ExperimentArm::Stopped, r#"{"batched_search":"stopped"}"#),
-        ] {
-            let composed = compose_with(Some(set(arm)), workspace.path()).await;
-            assert_eq!(composed.prompt_text, untreated.prompt_text, "{arm:?}");
-            assert_eq!(
-                composed.spawn_config.experiment_arms.as_deref(),
-                Some(recorded),
-                "{arm:?}"
-            );
-        }
     }
 }

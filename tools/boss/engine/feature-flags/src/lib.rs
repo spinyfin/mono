@@ -53,10 +53,12 @@ use serde::{Deserialize, Serialize};
 
 mod experiments;
 pub use experiments::{
-    BATCHED_SEARCH_AB_SPLIT_FLAG, BATCHED_SEARCH_EXPERIMENT, EXPERIMENT_FLAG_CATEGORY, EXPERIMENTS, ExperimentArm,
-    ExperimentArmSet, ExperimentLane, ExperimentSpec, ExperimentState, TOKEN_EXPERIMENTS_FLAG, TREATMENT_BUCKET_LIMIT,
-    WORKER_AUTOCOMPACT_AB_SPLIT_FLAG, WORKER_AUTOCOMPACT_EXPERIMENT, ab_split_flag_name, assign_arm, experiment_state,
-    resolve_arms,
+    BATCHED_SEARCH_AB_SPLIT_FLAG, BATCHED_SEARCH_EXPERIMENT, CI_FIX_STANDARD_TIER_AB_SPLIT_FLAG,
+    CI_FIX_STANDARD_TIER_EXPERIMENT, EXPERIMENT_FLAG_CATEGORY, EXPERIMENTS, ExperimentArm, ExperimentArmSet,
+    ExperimentLane, ExperimentSpec, ExperimentState, INVESTIGATION_ROUTING_AB_SPLIT_FLAG,
+    INVESTIGATION_ROUTING_EXPERIMENT, SUPERVISOR_STANDARD_TIER_AB_SPLIT_FLAG, SUPERVISOR_STANDARD_TIER_EXPERIMENT,
+    TOKEN_EXPERIMENTS_FLAG, TREATMENT_BUCKET_LIMIT, WORKER_AUTOCOMPACT_AB_SPLIT_FLAG, WORKER_AUTOCOMPACT_EXPERIMENT,
+    ab_split_flag_name, assign_arm, experiment_state, resolve_arms,
 };
 
 /// One feature flag entry in the registry. The registry is the source
@@ -552,6 +554,48 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
              share one arm. On: half of families are treated and the rest are control. Off: every family is \
              treated. Has no effect while `worker_autocompact` is off. DEFAULT ON, so switching \
              `worker_autocompact` on starts the split; turn this off to treat every family.",
+        category: EXPERIMENT_FLAG_CATEGORY,
+        default_enabled: true,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
+        name: SUPERVISOR_STANDARD_TIER_EXPERIMENT,
+        description: "Experiment `supervisor_standard_tier` (token-consumption investigation R9; no lane). The consolidating review supervisor of a treated PR family runs on the Balanced model tier (Sonnet on Claude) whatever the batch's review profile; control supervisors keep the profile's tier. First-round reviewers are never changed. Which families are treated is decided by `supervisor_standard_tier_ab_split`, and every launch records its family's arm so the arms can be compared in the Token Usage window by model. Has no effect while `token_experiments` is off. DEFAULT OFF: ships inert. Kill switch: set false and the next supervisor launch gets the profile's tier; a supervisor already running keeps its model.",
+        category: EXPERIMENT_FLAG_CATEGORY,
+        default_enabled: false,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
+        name: SUPERVISOR_STANDARD_TIER_AB_SPLIT_FLAG,
+        description: "Run `supervisor_standard_tier` as an A/B experiment on half of PR families, chosen by a stable hash of the PR family and the experiment key. A work item and all of its revisions, reviews and guides share one arm. On: half of families are treated and the rest are control. Off: every family is treated. Has no effect while `supervisor_standard_tier` is off. DEFAULT ON, so switching `supervisor_standard_tier` on starts the split; turn this off to treat every family.",
+        category: EXPERIMENT_FLAG_CATEGORY,
+        default_enabled: true,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
+        name: CI_FIX_STANDARD_TIER_EXPERIMENT,
+        description: "Experiment `ci_fix_standard_tier` (token-consumption investigation R9; no lane). A CI-fix revision minted with no failure evidence (a queue rejection with no failing check attached, pinned to investigation reasoning on the row) launches with standard reasoning at `medium` effort for a treated PR family instead of the investigation tier. A CI-fix revision with a failed check attached is already standard and is not changed. Which families are treated is decided by `ci_fix_standard_tier_ab_split`, and every launch records its family's arm so the arms can be compared in the Token Usage window. Has no effect while `token_experiments` is off. DEFAULT OFF: ships inert. Kill switch: set false and the next launch (including a retry) gets the revision's investigation tier; a worker already running keeps the model and effort it started with.",
+        category: EXPERIMENT_FLAG_CATEGORY,
+        default_enabled: false,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
+        name: CI_FIX_STANDARD_TIER_AB_SPLIT_FLAG,
+        description: "Run `ci_fix_standard_tier` as an A/B experiment on half of PR families, chosen by a stable hash of the PR family and the experiment key. A work item and all of its revisions, reviews and guides share one arm. On: half of families are treated and the rest are control. Off: every family is treated. Has no effect while `ci_fix_standard_tier` is off. DEFAULT ON, so switching `ci_fix_standard_tier` on starts the split; turn this off to treat every family.",
+        category: EXPERIMENT_FLAG_CATEGORY,
+        default_enabled: true,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
+        name: INVESTIGATION_ROUTING_EXPERIMENT,
+        description: "Experiment `investigation_routing` (token-consumption investigation R9; no lane). For a treated PR family on the Claude driver, a design or investigation run at `large` effort launches at Claude `high` instead of `xhigh`, and one at `small` or `medium` effort launches on the investigation model (Opus) instead of the design model (Fable). An explicit design `xhigh` setting, a model pin and every other effort level are unchanged, and first-round Deep reviewers stay on Opus. Which families are treated is decided by `investigation_routing_ab_split`, and every launch records its family's arm so the arms can be compared in the Token Usage window by effort and model. Has no effect while `token_experiments` is off. DEFAULT OFF: ships inert. Kill switch: set false and the next launch gets today's routing; a worker already running keeps the model and effort it started with.",
+        category: EXPERIMENT_FLAG_CATEGORY,
+        default_enabled: false,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
+        name: INVESTIGATION_ROUTING_AB_SPLIT_FLAG,
+        description: "Run `investigation_routing` as an A/B experiment on half of PR families, chosen by a stable hash of the PR family and the experiment key. A work item and all of its revisions, reviews and guides share one arm. On: half of families are treated and the rest are control. Off: every family is treated. Has no effect while `investigation_routing` is off. DEFAULT ON, so switching `investigation_routing` on starts the split; turn this off to treat every family.",
         category: EXPERIMENT_FLAG_CATEGORY,
         default_enabled: true,
         capability_id: None,

@@ -199,6 +199,9 @@ pub enum ModelResolutionSource {
     ExecutionKind,
     TaskOverride,
     DesignInvestigationTier,
+    /// The `investigation_routing` treatment moved a design or investigation
+    /// run off the design model onto the investigation model.
+    InvestigationRouting,
     PoolStrongTier,
     /// The cheap standard tier requested by [`PoolModelTier::Standard`].
     PoolStandardTier,
@@ -218,6 +221,7 @@ impl ModelResolutionSource {
             Self::ExecutionKind => "execution_kind",
             Self::TaskOverride => "task_override",
             Self::DesignInvestigationTier => "design_investigation_tier",
+            Self::InvestigationRouting => "investigation_routing",
             Self::PoolStrongTier => "pool_strong_tier",
             Self::PoolStandardTier => "pool_standard_tier",
             Self::Reasoning => "reasoning",
@@ -585,6 +589,16 @@ pub struct SpawnResolutionInput<'a> {
     pub reasoning: Option<ReasoningMode>,
     #[builder(default)]
     pub design_reasoning_effort_xhigh: bool,
+    /// The `investigation_routing` treatment: a design or investigation run on
+    /// a driver whose [`boss_engine_driver::ModelMenu::investigation_routing`]
+    /// supplies a step-down goes one step down. Applies only where the
+    /// design/investigation tier itself chose the model, and never to CI-fix
+    /// revisions (which belong to `ci_fix_standard_tier`), so a model pin, a
+    /// pool tier, a CI-fix revision and every other driver resolve as they
+    /// always did. The explicit design `xhigh` setting still wins over the
+    /// effort step.
+    #[builder(default)]
+    pub investigation_routing: bool,
 }
 
 /// [`resolve_spawn_config`], resolved against a caller-supplied registry
@@ -680,6 +694,24 @@ pub fn resolve_spawn_config_in(
         (menu.engine_default.to_owned(), ModelResolutionSource::DriverDefault)
     };
 
+    // The `investigation_routing` treatment. Gated on the model having come
+    // from the design/investigation tier (so every pin and pool tier that
+    // outranks it is untouched), on not being a CI-fix revision (so no-evidence
+    // CI-fix revisions stay exclusively in `ci_fix_standard_tier`'s population),
+    // and on the driver's `ModelMenu` supplying a routing function.
+    let is_ci_fix = input
+        .created_via
+        .is_some_and(|cv| cv.starts_with(boss_protocol::CREATED_VIA_CI_FIX_PREFIX));
+    let routing =
+        (input.investigation_routing && !is_ci_fix && model_source == ModelResolutionSource::DesignInvestigationTier)
+            .then_some(menu.investigation_routing)
+            .flatten()
+            .map(|route| route(effort_level));
+    if let Some(routed_model) = routing.and_then(|routing| routing.model) {
+        model = routed_model.to_owned();
+        model_source = ModelResolutionSource::InvestigationRouting;
+    }
+
     // A product model is a default, not a row-level pin. When traffic
     // allocation or a live driver pin selects a driver with a different
     // model vocabulary, the driver takes precedence and supplies its own
@@ -726,6 +758,8 @@ pub fn resolve_spawn_config_in(
         && input.pool_model_override.is_none()
     {
         Some("xhigh")
+    } else if let Some(routed) = routing.and_then(|routing| routing.effort_value) {
+        Some(routed)
     } else {
         effort_level.and_then(|l| (menu.effort_value_for_level)(l))
     };
@@ -1125,6 +1159,7 @@ mod tests {
                 model_for_reasoning: stub_model_for_reasoning,
                 review_model_for_tier: |_| "stub-model",
                 design_investigation_model: Some(|| "stub-tier"),
+                investigation_routing: None,
                 prompt_addendum_for_level: stub_prompt_addendum_for_level,
                 model_requires_auto_permissions: stub_model_requires_auto_permissions,
                 model_belongs_to_driver: stub_model_belongs_to_driver,
@@ -2571,3 +2606,6 @@ mod tests {
 
 #[cfg(test)]
 mod work_type_tests;
+
+#[cfg(test)]
+mod investigation_routing_tests;
