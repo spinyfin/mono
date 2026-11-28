@@ -2519,6 +2519,40 @@ mod restart_and_snapshot_tests {
     }
 
     #[test]
+    fn withdrawn_record_after_the_echo_matches_full_replay_mid_turn() {
+        let intents = [
+            queued(1, 1, PromptOrigin::Engine, "stale reset prompt"),
+            intent_record(
+                2,
+                IntentRecordKind::Sent {
+                    intent_id: 1,
+                    request_id: RequestId::Number(1),
+                },
+            ),
+            intent_record(
+                3,
+                IntentRecordKind::Withdrawn {
+                    intent_id: 1,
+                    reason: WithdrawReason::StaleOnRestart,
+                },
+            ),
+        ];
+        let echo = prompt_wire(1, 1);
+
+        // Live ordering: the echo binds before the Withdrawn record is applied.
+        let mut live = ConversationReducer::new(CredentialRedactor::none());
+        live.apply_intent_record(&intents[0]);
+        live.apply_intent_record(&intents[1]);
+        live.apply_record(&echo);
+        live.apply_intent_record(&intents[2]);
+        assert!(!live.queue().in_flight().unwrap().withdrawn);
+
+        let replayed = replay_with_intent_log(&[echo], &intents, CredentialRedactor::none(), DEFAULT_TOOL_TEXT_LIMIT);
+        assert!(!replayed.queue().in_flight().unwrap().withdrawn);
+        assert_eq!(replayed.queue(), live.queue());
+    }
+
+    #[test]
     fn requeued_then_withdrawn_prompt_leaves_the_queue_idle() {
         let mut reducer = ConversationReducer::new(CredentialRedactor::none());
         for intent in [
