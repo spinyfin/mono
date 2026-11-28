@@ -871,8 +871,14 @@ async fn retained_remote_worker_release(completed: bool) {
             server_state.completion_handler.force_release(&execution.id).await,
             ForceReleaseOutcome::HeldForRemoteWorker
         );
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = std::collections::HashMap::new();
+        // Confirmation is elapsed-time based, so the second pass must run at
+        // least this long after the first observed the candidate.
+        let confirm_delay = std::time::Duration::from_millis(50);
         for pass in 0..2 {
+            if pass == 1 {
+                tokio::time::sleep(confirm_delay * 2).await;
+            }
             let outcome = boss_engine_runtime::terminal_work_sweep::run_one_pass(
                 db,
                 &server_state.live_worker_states,
@@ -880,7 +886,10 @@ async fn retained_remote_worker_release(completed: bool) {
                 server_state.cube_client.as_ref(),
                 server_state.dispatch_events.as_ref(),
                 &server_state.teardown_registry,
-                &mut seen,
+                boss_engine_runtime::terminal_work_sweep::Confirmation {
+                    seen: &mut seen,
+                    min_delay: confirm_delay,
+                },
             )
             .await;
             assert_eq!(outcome.pending_confirmation, usize::from(pass == 0));
