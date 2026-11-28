@@ -1,0 +1,47 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+config_setting(
+    name = "linux_arm64",
+    constraint_values = [
+        "@platforms//os:linux",
+        "@platforms//cpu:aarch64",
+    ],
+)
+
+config_setting(
+    name = "linux_amd64",
+    constraint_values = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+)
+
+alias(
+    name = "promtool",
+    actual = select({
+        "@platforms//os:macos": "@promtool_darwin_arm64//:promtool",
+        ":linux_arm64": "@promtool_linux_arm64//:promtool",
+        ":linux_amd64": "@promtool_linux_amd64//:promtool",
+    }),
+)
+
+sh_test(
+    name = "prometheus_test",
+    size = "small",
+    srcs = ["test.sh"],
+    data = [
+        "install.py",
+        "prometheus.yml",
+        "test_prometheus.py",
+        "validate.py",
+        ":promtool",
+        "//tools/remote-execution:root_fs.py",
+        "//tools/remote-execution/node_exporter:com.brianduff.node_exporter.plist",
+        "//tools/remote-execution/node_exporter:run-macos.sh",
+        "//tools/remote-execution/node_exporter:setup-macos.sh",
+        "//tools/remote-execution/node_exporter:setup-ubuntu.sh",
+    ],
+    env = {
+        "PROMTOOL": "$(rootpath :promtool)",
+    },
+)

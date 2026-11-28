@@ -20,6 +20,24 @@
 # a frozen hub is worse.
 
 steps:
+  # Evaluate changes against the main commit's first parent, not origin/main
+  # (which already contains this commit). Explicitly enable agent filtering.
+  # Set NATIVELINK_GRAFANA_PUBLISH=1 on a main build to force a catch-up publish.
+  - label: ":grafana: select NativeLink publication"
+    if: build.branch == "main" && build.pull_request.id == null
+    command: |
+      if [[ "${NATIVELINK_GRAFANA_PUBLISH:-}" == "1" ]]; then
+        buildkite-agent pipeline upload tools/remote-execution/grafana/pipeline-force.yml
+      else
+        buildkite-agent pipeline upload --apply-if-changed --git-diff-base=HEAD^ tools/remote-execution/grafana/pipeline.yml
+      fi
+    depends_on:
+      - "bazel-build-test"
+      - "mac-app-build"
+      - "checks"
+    agents:
+      queue: "${BUILDKITE_ANY_QUEUE:-bazel-any}"
+
   # Both jobs rendezvous while running, guaranteeing distinct agents; the
   # second waits for the first to populate the cache before invoking Bazel.
   - label: "Boss tag cache: %n"

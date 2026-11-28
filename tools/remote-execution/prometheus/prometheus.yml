@@ -1,0 +1,68 @@
+# Prometheus for the NativeLink hub on this host. The hub pushes its metrics
+# over OTLP to the collector on this host; the scrape jobs below read that
+# collector, the worker-slots exporter and each worker host's node_exporter.
+# Listens on loopback only.
+#
+# This runs the upstream binary in /usr/local/bin, not Ubuntu's: the Ubuntu
+# package has the OTLP ingestion endpoint compiled out (Debian bug 1080354).
+global:
+  scrape_interval: 15s
+  evaluation_interval: 30s
+otlp:
+  # As in NativeLink's deployment-examples/metrics/prometheus-config.yaml.
+  promote_resource_attributes:
+    - service.instance.id
+    - service.name
+    - service.namespace
+    - service.version
+    - deployment.environment
+    - deployment.environment.name
+    - nativelink.instance_name
+    - nativelink.worker_id
+    - nativelink.scheduler_name
+  translation_strategy: NoUTF8EscapingWithSuffixes
+storage:
+  tsdb:
+    out_of_order_time_window: 30m
+rule_files:
+  - /etc/prometheus/rules/*.yml
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["127.0.0.1:9090"]
+  # The NativeLink hub's metrics, as the collector on this host exposes them.
+  - job_name: nativelink
+    static_configs:
+      - targets: ["127.0.0.1:8889"]
+  # Slots offered and in use per worker, from the hub admin API.
+  - job_name: nativelink-pool
+    static_configs:
+      - targets: ["127.0.0.1:9108"]
+  # Host CPU, memory, load and swap per RBE worker host, from node_exporter.
+  # Every worker of the one hub, macOS and Linux. The macOS workers run
+  # Homebrew's node_exporter bound to their Tailscale address. This host runs
+  # Ubuntu's package on loopback. The other Linux workers run a copy of that
+  # binary as a user unit (node-exporter.service) on their Tailscale address.
+  # worker_id is the prefix of the worker's id on the hub.
+  - job_name: node
+    static_configs:
+      - targets: ["127.0.0.1:9100"]
+        labels: { instance: headcrash, platform: linux, worker_id: headcrash, pool: linux }
+      - targets: ["100.66.247.57:9100"]
+        labels: { instance: empiricist, platform: linux, worker_id: empiricist, pool: linux }
+      - targets: ["100.71.137.100:9100"]
+        labels: { instance: diziet, platform: linux, worker_id: diziet, pool: linux }
+      - targets: ["100.126.104.100:9100"]
+        labels: { instance: zoologist, platform: linux, worker_id: zoologist, pool: linux }
+      - targets: ["100.96.159.44:9100"]
+        labels: { instance: anaplian, platform: macos, worker_id: anaplian, pool: macos }
+      - targets: ["100.116.216.85:9100"]
+        labels: { instance: arbitrary, platform: macos, worker_id: arbitrary, pool: macos }
+      - targets: ["100.88.42.77:9100"]
+        labels: { instance: determinist, platform: macos, worker_id: determinist, pool: macos }
+      - targets: ["100.92.8.18:9100"]
+        labels: { instance: rascal, platform: macos, worker_id: rascal, pool: macos }
+      - targets: ["100.88.131.33:9100"]
+        labels: { instance: skaffen, platform: macos, worker_id: skaffen, pool: macos }
+      - targets: ["100.97.39.14:9100"]
+        labels: { instance: zakalwe, platform: macos, worker_id: zakalwe, pool: macos }
