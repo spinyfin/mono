@@ -89,6 +89,10 @@ pub struct CoordinatorUsageCollection {
     /// unchanged since the last poll), so any prior unmeasured `spawn:<token>`
     /// placeholder can be retired.
     pub covered_spawn_tokens: Vec<String>,
+    /// Session ids currently present in the projects directory when the
+    /// directory listing succeeded. `None` when the source does not list a
+    /// directory or the listing failed, so stale-fact pruning is skipped.
+    pub listed_session_ids: Option<Vec<String>>,
 }
 
 /// Small source interface for coordinator token usage.
@@ -109,12 +113,20 @@ pub trait CoordinatorUsageSource: Send + Sync {
     async fn acknowledge(&self, _persisted_session_ids: &[String]) {}
 }
 
+#[derive(Default)]
+struct RecorderBookkeeping {
+    last_active_sessions: Option<Vec<String>>,
+    cleared_spawn_tokens: HashSet<String>,
+    last_pruned_listed_sessions: Option<Vec<String>>,
+}
+
 /// Coordinates polling a [`CoordinatorUsageSource`] (or accepting pushed
 /// snapshots) and persisting them into [`WorkDb`] without overlapping passes.
 pub struct CoordinatorUsageRecorder {
     source: Arc<dyn CoordinatorUsageSource>,
     sync_lock: Mutex<()>,
     last_sync: StdMutex<Option<Instant>>,
+    bookkeeping: StdMutex<RecorderBookkeeping>,
 }
 
 impl CoordinatorUsageRecorder {
@@ -123,6 +135,7 @@ impl CoordinatorUsageRecorder {
             source,
             sync_lock: Mutex::new(()),
             last_sync: StdMutex::new(None),
+            bookkeeping: StdMutex::new(RecorderBookkeeping::default()),
         }
     }
 
@@ -144,36 +157,95 @@ impl CoordinatorUsageRecorder {
 
     async fn sync_locked(&self, work_db: &WorkDb, context: &CoordinatorUsageContext) -> Result<usize> {
         let collection = self.source.collect(context).await;
-        let mut slices_written = 0usize;
-        let mut persisted = Vec::with_capacity(collection.snapshots.len());
-        let mut first_error = None;
-        // One failing write must not strand the snapshots after it: keep going,
-        // and acknowledge only what actually committed.
-        for snapshot in &collection.snapshots {
-            match work_db.upsert_coordinator_session_usage(snapshot) {
-                Ok(written) => {
-                    slices_written += written;
-                    persisted.push(snapshot.session_id.clone());
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        session_id = %snapshot.session_id,
-                        error = %format!("{error:#}"),
-                        "coordinator usage snapshot not persisted; will retry on the next sync"
-                    );
-                    first_error.get_or_insert(error);
+
+        let mut active_sorted = collection.active_session_ids.clone();
+        active_sorted.sort();
+        active_sorted.dedup();
+        let listed_sorted = collection.listed_session_ids.clone().map(|mut ids| {
+            ids.sort();
+            ids.dedup();
+            ids
+        });
+
+        let (tokens_to_clear, run_mark_inactive, run_prune) = {
+            let guard = self.bookkeeping.lock().expect("recorder bookkeeping poisoned");
+            let tokens: Vec<String> = collection
+                .covered_spawn_tokens
+                .iter()
+                .filter(|t| !guard.cleared_spawn_tokens.contains(*t))
+                .cloned()
+                .collect();
+            let mark_inactive = guard.last_active_sessions.as_ref() != Some(&active_sorted);
+            let prune = listed_sorted.is_some() && guard.last_pruned_listed_sessions != listed_sorted;
+            (tokens, mark_inactive, prune)
+        };
+
+        let db = work_db.clone();
+        let snapshots = collection.snapshots;
+        let active_for_db = active_sorted.clone();
+        let listed_for_db = listed_sorted.clone();
+        let tokens_for_db = tokens_to_clear.clone();
+        let outcome = crate::work::db_diagnostics::spawn_blocking(move || {
+            let mut slices_written = 0usize;
+            let mut persisted = Vec::with_capacity(snapshots.len());
+            let mut first_error = None;
+            // One failing write must not strand the snapshots after it: keep going,
+            // and acknowledge only what actually committed.
+            for snapshot in &snapshots {
+                match db.upsert_coordinator_session_usage(snapshot) {
+                    Ok(written) => {
+                        slices_written += written;
+                        persisted.push(snapshot.session_id.clone());
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            session_id = %snapshot.session_id,
+                            error = %format!("{error:#}"),
+                            "coordinator usage snapshot not persisted; will retry on the next sync"
+                        );
+                        first_error.get_or_insert(error);
+                    }
                 }
             }
-        }
+            if let Some(error) = first_error {
+                return (persisted, Err(error));
+            }
+            for token in &tokens_for_db {
+                if let Err(error) = db.clear_coordinator_spawn_placeholder(token) {
+                    return (persisted, Err(error));
+                }
+            }
+            if run_mark_inactive {
+                let active_refs: Vec<&str> = active_for_db.iter().map(String::as_str).collect();
+                if let Err(error) = db.mark_inactive_coordinator_sessions_completed(&active_refs) {
+                    return (persisted, Err(error));
+                }
+            }
+            if run_prune && let Some(listed) = listed_for_db.as_ref() {
+                let listed_refs: Vec<&str> = listed.iter().map(String::as_str).collect();
+                if let Err(error) = db.prune_stale_coordinator_usage_facts(&listed_refs) {
+                    return (persisted, Err(error));
+                }
+            }
+            (persisted, Ok(slices_written))
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!("coordinator usage sync task failed: {err}"))?;
+
+        let (persisted, result) = outcome;
         self.source.acknowledge(&persisted).await;
-        if let Some(error) = first_error {
-            return Err(error);
+        let slices_written = result?;
+        if let Ok(mut guard) = self.bookkeeping.lock() {
+            for token in tokens_to_clear {
+                guard.cleared_spawn_tokens.insert(token);
+            }
+            if run_mark_inactive {
+                guard.last_active_sessions = Some(active_sorted);
+            }
+            if run_prune {
+                guard.last_pruned_listed_sessions = listed_sorted;
+            }
         }
-        for token in &collection.covered_spawn_tokens {
-            work_db.clear_coordinator_spawn_placeholder(token)?;
-        }
-        let active_refs: Vec<&str> = collection.active_session_ids.iter().map(String::as_str).collect();
-        work_db.mark_inactive_coordinator_sessions_completed(&active_refs)?;
         if let Ok(mut last) = self.last_sync.lock() {
             *last = Some(Instant::now());
         }
@@ -253,10 +325,14 @@ impl TrackedTail {
 
 /// Everything known about one coordinator session, kept across polls so each
 /// pass reads only the bytes appended since the previous one.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 struct SessionCapture {
     parent: TrackedTail,
     subagents: BTreeMap<PathBuf, TrackedTail>,
     acc: SessionTranscriptAccumulator,
+    dirty_messages: HashSet<String>,
+    dirty_durations: HashSet<String>,
     progress: u64,
     acknowledged: Option<EmitKey>,
 }
@@ -275,6 +351,8 @@ impl SessionCapture {
             parent: TrackedTail::new(parent_path),
             subagents: BTreeMap::new(),
             acc: SessionTranscriptAccumulator::default(),
+            dirty_messages: HashSet::new(),
+            dirty_durations: HashSet::new(),
             progress: 0,
             acknowledged: None,
         }
@@ -292,14 +370,30 @@ impl SessionCapture {
         for path in paths {
             if let Some(tracked) = self.subagents.get_mut(&path)
                 && matches!(
-                    poll_tracked(tracked, &mut self.acc, &mut self.progress, fallback_ts).await,
+                    poll_tracked(
+                        tracked,
+                        &mut self.acc,
+                        &mut self.dirty_messages,
+                        &mut self.dirty_durations,
+                        &mut self.progress,
+                        fallback_ts,
+                    )
+                    .await,
                     PollOutcome::Rebuild
                 )
             {
                 return PollOutcome::Rebuild;
             }
         }
-        poll_tracked(&mut self.parent, &mut self.acc, &mut self.progress, fallback_ts).await
+        poll_tracked(
+            &mut self.parent,
+            &mut self.acc,
+            &mut self.dirty_messages,
+            &mut self.dirty_durations,
+            &mut self.progress,
+            fallback_ts,
+        )
+        .await
     }
 
     fn skipped_lines(&self) -> usize {
@@ -352,6 +446,8 @@ fn lower_first(text: &str) -> String {
 async fn poll_tracked(
     tracked: &mut TrackedTail,
     acc: &mut SessionTranscriptAccumulator,
+    dirty_messages: &mut HashSet<String>,
+    dirty_durations: &mut HashSet<String>,
     progress: &mut u64,
     fallback_ts: i64,
 ) -> PollOutcome {
@@ -372,9 +468,19 @@ async fn poll_tracked(
             *progress += poll.skipped_lines as u64;
             let file_key = tracked.path.to_string_lossy().into_owned();
             for value in &poll.values {
-                acc.ingest_value(&file_key, tracked.next_value_index, value, fallback_ts, tracked);
+                if let Some(dirty) = acc.ingest_value(&file_key, tracked.next_value_index, value, fallback_ts, tracked)
+                {
+                    match dirty {
+                        DirtyFact::Message(id) => {
+                            dirty_messages.insert(id);
+                        }
+                        DirtyFact::Duration(id) => {
+                            dirty_durations.insert(id);
+                        }
+                    }
+                    *progress += 1;
+                }
                 tracked.next_value_index += 1;
-                *progress += 1;
             }
         }
         Err(error) => {
@@ -419,6 +525,8 @@ impl CoordinatorUsageSource for ClaudeTranscriptCoordinatorUsageSource {
                 && let Some(capture) = state.sessions.get_mut(session_id)
             {
                 capture.acknowledged = Some(key);
+                capture.dirty_messages.clear();
+                capture.dirty_durations.clear();
             }
         }
         state.pending.clear();
@@ -500,6 +608,7 @@ impl CoordinatorUsageSource for ClaudeTranscriptCoordinatorUsageSource {
             .iter()
             .filter_map(|entry| entry.path.file_stem().and_then(|s| s.to_str()).map(str::to_owned))
             .collect();
+        collection.listed_session_ids = Some(present.iter().cloned().collect());
         state.sessions.retain(|session_id, _| present.contains(session_id));
         let mut live_covered = false;
 
@@ -548,6 +657,7 @@ impl CoordinatorUsageSource for ClaudeTranscriptCoordinatorUsageSource {
                 gap: gap.clone(),
             };
             if capture.acknowledged.as_ref() != Some(&key) {
+                let facts_complete = capture.acknowledged.is_none();
                 let snapshot = build_snapshot(
                     SnapshotInput::builder()
                         .session_id(session_id)
@@ -558,6 +668,9 @@ impl CoordinatorUsageSource for ClaudeTranscriptCoordinatorUsageSource {
                         .maybe_gap(gap.as_deref())
                         .build(),
                     &capture.acc,
+                    facts_complete,
+                    &capture.dirty_messages,
+                    &capture.dirty_durations,
                 );
                 collection.snapshots.push(snapshot);
                 state.pending.insert(session_id.to_owned(), key);
@@ -709,6 +822,11 @@ struct DurationRecord {
     duration_ms: i64,
 }
 
+enum DirtyFact {
+    Message(String),
+    Duration(String),
+}
+
 #[derive(Default)]
 struct SessionTranscriptAccumulator {
     messages: HashMap<String, MessageUsageRecord>,
@@ -723,7 +841,7 @@ impl SessionTranscriptAccumulator {
         value: &Value,
         fallback_ts: i64,
         tracked: &mut TrackedTail,
-    ) {
+    ) -> Option<DirtyFact> {
         match decode_claude_record(value) {
             Some(ClaudeRecord::Assistant {
                 message_id,
@@ -745,9 +863,10 @@ impl SessionTranscriptAccumulator {
                 if let Some(model) = model {
                     existing.model = Some(model);
                 }
-                tracked.last_assistant_id = Some(message_id);
+                tracked.last_assistant_id = Some(message_id.clone());
                 tracked.last_model = existing.model.clone();
                 tracked.last_assistant_ts = Some(existing.timestamp_epoch_s);
+                Some(DirtyFact::Message(message_id))
             }
             Some(ClaudeRecord::TurnDuration {
                 key,
@@ -758,7 +877,7 @@ impl SessionTranscriptAccumulator {
                     .map(|key| format!("uuid:{key}"))
                     .unwrap_or_else(|| format!("anon:{file_key}:{value_idx}"));
                 self.durations.insert(
-                    key,
+                    key.clone(),
                     DurationRecord {
                         assistant_message_id: tracked.last_assistant_id.clone(),
                         timestamp_epoch_s: tracked.last_assistant_ts.or(timestamp).unwrap_or(fallback_ts),
@@ -766,188 +885,134 @@ impl SessionTranscriptAccumulator {
                         duration_ms,
                     },
                 );
+                Some(DirtyFact::Duration(key))
             }
-            None => {}
+            None => None,
         }
-    }
-}
-
-#[derive(Default, bon::Builder)]
-struct BucketSliceAcc {
-    first_event_at: Option<i64>,
-    last_event_at: Option<i64>,
-    saw_usage: bool,
-    input_tokens: i64,
-    output_tokens: i64,
-    cache_creation_tokens: i64,
-    cache_read_tokens: i64,
-    cache_creation_5m_tokens: i64,
-    cache_creation_1h_tokens: i64,
-    all_ttl_splits_known: bool,
-    rounds: i64,
-    saw_duration: bool,
-    agent_active_ms: i64,
-}
-
-impl BucketSliceAcc {
-    fn observe_ts(&mut self, ts: i64) {
-        self.first_event_at = Some(self.first_event_at.map_or(ts, |prev| prev.min(ts)));
-        self.last_event_at = Some(self.last_event_at.map_or(ts, |prev| prev.max(ts)));
     }
 }
 
 /// An unmeasured stand-in slice for a session whose read produced no usage.
-fn unmeasured_snapshot(input: &SnapshotInput<'_>, reason: String) -> CoordinatorSessionSnapshot {
-    CoordinatorSessionSnapshot::builder()
+fn unmeasured_slice(input: &SnapshotInput<'_>, reason: String) -> CoordinatorUsageSlice {
+    CoordinatorUsageSlice::builder()
         .session_id(input.session_id)
         .maybe_spawn_token(input.spawn_token.map(str::to_owned))
-        .slices(vec![
-            CoordinatorUsageSlice::builder()
-                .session_id(input.session_id)
-                .maybe_spawn_token(input.spawn_token.map(str::to_owned))
-                .source(CLAUDE_TRANSCRIPT_SOURCE)
-                .driver(DRIVER_SLUG_CLAUDE)
-                .maybe_launched_model(input.launched_model.map(str::to_owned))
-                .status(input.status)
-                .bucket_start_epoch_s(hour_bucket(input.fallback_ts))
-                .first_event_at(input.fallback_ts)
-                .last_event_at(input.fallback_ts)
-                .usage_unavailable(reason)
-                .build(),
-        ])
-        .full_replacement(true)
-        .maybe_capture_gap(input.gap.map(str::to_owned))
+        .source(CLAUDE_TRANSCRIPT_SOURCE)
+        .driver(DRIVER_SLUG_CLAUDE)
+        .maybe_launched_model(input.launched_model.map(str::to_owned))
+        .status(input.status)
+        .bucket_start_epoch_s(hour_bucket(input.fallback_ts))
+        .first_event_at(input.fallback_ts)
+        .last_event_at(input.fallback_ts)
+        .usage_unavailable(reason)
         .build()
 }
 
-fn build_snapshot(input: SnapshotInput<'_>, acc: &SessionTranscriptAccumulator) -> CoordinatorSessionSnapshot {
-    let mut facts = BTreeMap::new();
-    for (key, message) in &acc.messages {
-        let single = SessionTranscriptAccumulator {
-            messages: HashMap::from([(key.clone(), message.clone())]),
-            durations: HashMap::new(),
-        };
-        let snapshot = build_slices_snapshot(SnapshotInput { ..input }, &single);
-        if let Some(slice) = snapshot.slices.into_iter().next() {
-            facts.insert(format!("message:{key}"), slice);
-        }
-    }
-    for (key, duration) in &acc.durations {
-        let single = SessionTranscriptAccumulator {
-            messages: HashMap::new(),
-            durations: HashMap::from([(key.clone(), duration.clone())]),
-        };
-        let snapshot = build_slices_snapshot(SnapshotInput { ..input }, &single);
-        if let Some(mut slice) = snapshot.slices.into_iter().next() {
-            slice.usage_unavailable = None;
-            slice.assistant_message_id = duration.assistant_message_id.clone();
-            facts.insert(format!("duration:{key}"), slice);
-        }
-    }
-    let mut snapshot = build_slices_snapshot(input, acc);
-    snapshot.facts = Some(facts);
-    snapshot
+fn message_fact_slice(input: &SnapshotInput<'_>, msg: &MessageUsageRecord) -> CoordinatorUsageSlice {
+    let bucket_start = hour_bucket(msg.timestamp_epoch_s);
+    let usage = msg.usage.as_ref();
+    let slice_unavailable = if usage.is_some() {
+        None
+    } else {
+        Some(
+            input
+                .gap
+                .map(str::to_owned)
+                .unwrap_or_else(|| "Coordinator transcript contains no token usage records".to_owned()),
+        )
+    };
+    CoordinatorUsageSlice::builder()
+        .session_id(input.session_id)
+        .maybe_spawn_token(input.spawn_token.map(str::to_owned))
+        .source(CLAUDE_TRANSCRIPT_SOURCE)
+        .driver(DRIVER_SLUG_CLAUDE)
+        .maybe_launched_model(input.launched_model.map(str::to_owned))
+        .status(input.status)
+        .bucket_start_epoch_s(bucket_start)
+        .first_event_at(msg.timestamp_epoch_s)
+        .last_event_at(msg.timestamp_epoch_s)
+        .maybe_model(msg.model.clone())
+        .maybe_input_tokens(usage.map(|u| u.input_tokens))
+        .maybe_output_tokens(usage.map(|u| u.output_tokens))
+        .maybe_cache_creation_tokens(usage.map(|u| u.cache_creation_tokens))
+        .maybe_cache_creation_5m_tokens(
+            usage.and_then(|u| u.cache_creation_ttl_split_known.then_some(u.cache_creation_5m_tokens)),
+        )
+        .maybe_cache_creation_1h_tokens(
+            usage.and_then(|u| u.cache_creation_ttl_split_known.then_some(u.cache_creation_1h_tokens)),
+        )
+        .maybe_cache_read_tokens(usage.map(|u| u.cache_read_tokens))
+        .rounds(1)
+        .maybe_usage_unavailable(slice_unavailable)
+        .build()
 }
 
-fn build_slices_snapshot(input: SnapshotInput<'_>, acc: &SessionTranscriptAccumulator) -> CoordinatorSessionSnapshot {
-    // Group deduplicated messages and durations into (hour_bucket, model) slices.
-    let mut buckets: BTreeMap<(i64, Option<String>), BucketSliceAcc> = BTreeMap::new();
-    for msg in acc.messages.values() {
-        let bucket = hour_bucket(msg.timestamp_epoch_s);
-        let entry = buckets
-            .entry((bucket, msg.model.clone()))
-            .or_insert_with(|| BucketSliceAcc {
-                all_ttl_splits_known: true,
-                ..Default::default()
-            });
-        entry.observe_ts(msg.timestamp_epoch_s);
-        entry.rounds = entry.rounds.saturating_add(1);
-        if let Some(usage) = &msg.usage {
-            entry.saw_usage = true;
-            entry.input_tokens = entry.input_tokens.saturating_add(usage.input_tokens);
-            entry.output_tokens = entry.output_tokens.saturating_add(usage.output_tokens);
-            entry.cache_creation_tokens = entry.cache_creation_tokens.saturating_add(usage.cache_creation_tokens);
-            entry.cache_read_tokens = entry.cache_read_tokens.saturating_add(usage.cache_read_tokens);
-            entry.cache_creation_5m_tokens = entry
-                .cache_creation_5m_tokens
-                .saturating_add(usage.cache_creation_5m_tokens);
-            entry.cache_creation_1h_tokens = entry
-                .cache_creation_1h_tokens
-                .saturating_add(usage.cache_creation_1h_tokens);
-            entry.all_ttl_splits_known &= usage.cache_creation_ttl_split_known;
+fn duration_fact_slice(input: &SnapshotInput<'_>, dur: &DurationRecord) -> CoordinatorUsageSlice {
+    let bucket_start = hour_bucket(dur.timestamp_epoch_s);
+    CoordinatorUsageSlice::builder()
+        .maybe_assistant_message_id(dur.assistant_message_id.clone())
+        .session_id(input.session_id)
+        .maybe_spawn_token(input.spawn_token.map(str::to_owned))
+        .source(CLAUDE_TRANSCRIPT_SOURCE)
+        .driver(DRIVER_SLUG_CLAUDE)
+        .maybe_launched_model(input.launched_model.map(str::to_owned))
+        .status(input.status)
+        .bucket_start_epoch_s(bucket_start)
+        .first_event_at(dur.timestamp_epoch_s)
+        .last_event_at(dur.timestamp_epoch_s)
+        .maybe_model(dur.model.clone())
+        .agent_active_ms(dur.duration_ms)
+        .build()
+}
+
+fn build_snapshot(
+    input: SnapshotInput<'_>,
+    acc: &SessionTranscriptAccumulator,
+    facts_complete: bool,
+    dirty_messages: &HashSet<String>,
+    dirty_durations: &HashSet<String>,
+) -> CoordinatorSessionSnapshot {
+    let mut facts = BTreeMap::new();
+    if facts_complete {
+        for (key, message) in &acc.messages {
+            facts.insert(format!("message:{key}"), message_fact_slice(&input, message));
+        }
+        for (key, duration) in &acc.durations {
+            facts.insert(format!("duration:{key}"), duration_fact_slice(&input, duration));
+        }
+    } else {
+        for key in dirty_messages {
+            if let Some(message) = acc.messages.get(key) {
+                facts.insert(format!("message:{key}"), message_fact_slice(&input, message));
+            }
+        }
+        for key in dirty_durations {
+            if let Some(duration) = acc.durations.get(key) {
+                facts.insert(format!("duration:{key}"), duration_fact_slice(&input, duration));
+            }
         }
     }
-    for dur in acc.durations.values() {
-        let bucket = hour_bucket(dur.timestamp_epoch_s);
-        let entry = buckets
-            .entry((bucket, dur.model.clone()))
-            .or_insert_with(|| BucketSliceAcc {
-                all_ttl_splits_known: true,
-                ..Default::default()
-            });
-        entry.observe_ts(dur.timestamp_epoch_s);
-        entry.saw_duration = true;
-        entry.agent_active_ms = entry.agent_active_ms.saturating_add(dur.duration_ms);
-    }
 
-    if buckets.is_empty() {
+    let slices = if acc.messages.is_empty() && acc.durations.is_empty() {
         let reason = input
             .gap
             .map(str::to_owned)
             .unwrap_or_else(|| "Coordinator transcript contains no token usage records".to_owned());
-        return unmeasured_snapshot(&input, reason);
-    }
-
-    let no_usage_reason = || {
-        input
-            .gap
-            .map(str::to_owned)
-            .unwrap_or_else(|| "Coordinator transcript contains no token usage records".to_owned())
+        vec![unmeasured_slice(&input, reason)]
+    } else {
+        Vec::new()
     };
-    let slices: Vec<CoordinatorUsageSlice> = buckets
-        .into_iter()
-        .map(|((bucket_start, model), b)| {
-            let first_event_at = b.first_event_at.unwrap_or(bucket_start);
-            let last_event_at = b.last_event_at.unwrap_or(bucket_start);
-            let slice_unavailable = if b.saw_usage {
-                input.gap.map(str::to_owned)
-            } else {
-                Some(no_usage_reason())
-            };
-            CoordinatorUsageSlice::builder()
-                .session_id(input.session_id)
-                .maybe_spawn_token(input.spawn_token.map(str::to_owned))
-                .source(CLAUDE_TRANSCRIPT_SOURCE)
-                .driver(DRIVER_SLUG_CLAUDE)
-                .maybe_launched_model(input.launched_model.map(str::to_owned))
-                .status(input.status)
-                .bucket_start_epoch_s(bucket_start)
-                .first_event_at(first_event_at)
-                .last_event_at(last_event_at)
-                .maybe_model(model)
-                .maybe_input_tokens(b.saw_usage.then_some(b.input_tokens))
-                .maybe_output_tokens(b.saw_usage.then_some(b.output_tokens))
-                .maybe_cache_creation_tokens(b.saw_usage.then_some(b.cache_creation_tokens))
-                .maybe_cache_creation_5m_tokens(
-                    (b.saw_usage && b.all_ttl_splits_known).then_some(b.cache_creation_5m_tokens),
-                )
-                .maybe_cache_creation_1h_tokens(
-                    (b.saw_usage && b.all_ttl_splits_known).then_some(b.cache_creation_1h_tokens),
-                )
-                .maybe_cache_read_tokens(b.saw_usage.then_some(b.cache_read_tokens))
-                .maybe_rounds((b.rounds > 0).then_some(b.rounds))
-                .maybe_agent_active_ms(b.saw_duration.then_some(b.agent_active_ms))
-                .maybe_usage_unavailable(slice_unavailable)
-                .build()
-        })
-        .collect();
 
     CoordinatorSessionSnapshot::builder()
         .session_id(input.session_id)
         .maybe_spawn_token(input.spawn_token.map(str::to_owned))
+        .maybe_launched_model(input.launched_model.map(str::to_owned))
+        .status(input.status)
         .slices(slices)
-        .full_replacement(true)
+        .full_replacement(false)
         .maybe_capture_gap(input.gap.map(str::to_owned))
+        .facts(facts)
+        .facts_complete(facts_complete)
         .build()
 }
 
@@ -1443,6 +1508,7 @@ mod tests {
                 ],
                 active_session_ids: vec!["acp-sess-1".to_owned()],
                 covered_spawn_tokens: Vec::new(),
+                listed_session_ids: None,
             }
         }
     }
@@ -1523,7 +1589,206 @@ mod persistence_regressions {
         let records = db.cost_records_for_window(0, i64::MAX).unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(records.iter().filter_map(|r| r.input_tokens).sum::<i64>(), 1300);
-        assert!(records.iter().all(|r| r.usage_unavailable.is_some()));
+        // Only the hour containing the missing subagent carries the gap; the
+        // later hour whose capture is complete has no gap.
+        assert!(records[0].usage_unavailable.is_some());
+        assert_eq!(records[1].usage_unavailable, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_parent_then_readable_again_keeps_counts_and_clears_gap() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_db_dir, db) = crate::test_support::open_db();
+        let dir = tempfile::TempDir::new().unwrap();
+        let (working, config, projects) = setup_projects_dir(&dir);
+        let parent = projects.join("sess-transient.jsonl");
+        append(&parent, "m1", "2026-11-25T10:05:00Z", 150);
+        let context = CoordinatorUsageContext::builder()
+            .working_directory(working)
+            .claude_config_dir(config)
+            .now_epoch_s(1795608000)
+            .build();
+        let recorder = CoordinatorUsageRecorder::for_claude_transcripts();
+        recorder.sync(&db, &context).await.unwrap();
+        let records = db.cost_records_for_window(0, i64::MAX).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].input_tokens, Some(150));
+        assert_eq!(records[0].usage_unavailable, None);
+
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&parent).is_ok() {
+            return; // running with privileges that ignore file modes
+        }
+        recorder.sync(&db, &context).await.unwrap();
+        let records = db.cost_records_for_window(0, i64::MAX).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].input_tokens, Some(150));
+        assert!(
+            records[0]
+                .usage_unavailable
+                .as_deref()
+                .is_some_and(|r| r.contains("unreadable"))
+        );
+
+        // Once readable again, the transient gap clears and counts are kept.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o600)).unwrap();
+        recorder.sync(&db, &context).await.unwrap();
+        let records = db.cost_records_for_window(0, i64::MAX).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].input_tokens, Some(150));
+        assert_eq!(records[0].usage_unavailable, None);
+    }
+
+    #[tokio::test]
+    async fn handoff_preserves_outgoing_session_launched_model_and_spawn_token() {
+        let (_db_dir, db) = crate::test_support::open_db();
+        let dir = tempfile::TempDir::new().unwrap();
+        let (working, config, projects) = setup_projects_dir(&dir);
+        let outgoing = projects.join("sess-old.jsonl");
+        append(&outgoing, "m1", "2026-11-25T10:05:00Z", 200);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let recorder = CoordinatorUsageRecorder::for_claude_transcripts();
+        let ctx1 = CoordinatorUsageContext::builder()
+            .working_directory(working.clone())
+            .claude_config_dir(config.clone())
+            .live_record(CoordinatorTmuxRecord {
+                session_name: "boss-coordinator".to_owned(),
+                spawn_token: "tok-old".to_owned(),
+                spawn_state: "created".to_owned(),
+                model: "opus".to_owned(),
+                launched_claude_version: None,
+                spawned_at: Some(now - 600),
+                pane_id: None,
+                liveness_passed_at: None,
+            })
+            .now_epoch_s(now)
+            .build();
+        recorder.sync(&db, &ctx1).await.unwrap();
+
+        // Handoff to a new coordinator session while the outgoing transcript remains on disk.
+        let ctx2 = CoordinatorUsageContext::builder()
+            .working_directory(working)
+            .claude_config_dir(config)
+            .live_record(CoordinatorTmuxRecord {
+                session_name: "boss-coordinator".to_owned(),
+                spawn_token: "tok-new".to_owned(),
+                spawn_state: "created".to_owned(),
+                model: "sonnet".to_owned(),
+                launched_claude_version: None,
+                spawned_at: Some(now + 600),
+                pane_id: None,
+                liveness_passed_at: None,
+            })
+            .now_epoch_s(now + 605)
+            .build();
+        recorder.sync(&db, &ctx2).await.unwrap();
+
+        let usage = db.usage_records_for_window(0, i64::MAX).unwrap();
+        let old_run = usage
+            .runs
+            .iter()
+            .find(|r| r.execution_id.ends_with("sess-old"))
+            .expect("outgoing session slice");
+        assert_eq!(old_run.execution_status, "completed");
+        assert_eq!(old_run.execution_model.as_deref(), Some("opus"));
+
+        let spawn_token: Option<String> = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT spawn_token FROM coordinator_usage_slices WHERE session_id = 'sess-old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(spawn_token.as_deref(), Some("tok-old"));
+    }
+
+    #[tokio::test]
+    async fn prunes_facts_and_capture_state_for_completed_unlisted_sessions_while_keeping_slices() {
+        let (_db_dir, db) = crate::test_support::open_db();
+        let dir = tempfile::TempDir::new().unwrap();
+        let (working, config, projects) = setup_projects_dir(&dir);
+        let old_path = projects.join("sess-pruned.jsonl");
+        append(&old_path, "m1", "2026-11-25T10:05:00Z", 300);
+        let context = CoordinatorUsageContext::builder()
+            .working_directory(working)
+            .claude_config_dir(config)
+            .now_epoch_s(1795608000)
+            .build();
+        let recorder = CoordinatorUsageRecorder::for_claude_transcripts();
+        recorder.sync(&db, &context).await.unwrap();
+
+        let facts_before: i64 = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM coordinator_usage_facts WHERE session_id = 'sess-pruned'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(facts_before, 1);
+
+        // Claude Code cleans up the old transcript file.
+        std::fs::remove_file(&old_path).unwrap();
+        recorder.sync(&db, &context).await.unwrap();
+
+        let conn = db.connect().unwrap();
+        let facts_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM coordinator_usage_facts WHERE session_id = 'sess-pruned'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let state_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM coordinator_usage_capture_state WHERE session_id = 'sess-pruned'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!(facts_after, 0, "facts for unlisted completed session must be pruned");
+        assert_eq!(
+            state_after, 0,
+            "capture state for unlisted completed session must be pruned"
+        );
+
+        let slices = db.cost_records_for_window(0, i64::MAX).unwrap();
+        assert_eq!(slices.len(), 1, "durable coordinator_usage_slices must survive pruning");
+        assert_eq!(slices[0].input_tokens, Some(300));
+    }
+
+    #[tokio::test]
+    async fn non_usage_transcript_lines_do_not_trigger_db_writes() {
+        let (_db_dir, db) = crate::test_support::open_db();
+        let dir = tempfile::TempDir::new().unwrap();
+        let (working, config, projects) = setup_projects_dir(&dir);
+        let parent = projects.join("sess-quiet.jsonl");
+        append(&parent, "m1", "2026-11-25T10:05:00Z", 100);
+        let context = CoordinatorUsageContext::builder()
+            .working_directory(working)
+            .claude_config_dir(config)
+            .now_epoch_s(1795608000)
+            .build();
+        let recorder = CoordinatorUsageRecorder::for_claude_transcripts();
+        assert_eq!(recorder.sync(&db, &context).await.unwrap(), 1);
+
+        // Appending user and tool_result lines must not trigger a slice write.
+        let mut file = std::fs::OpenOptions::new().append(true).open(&parent).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","timestamp":"2026-11-25T10:06:00Z","message":{{"role":"user","content":"hi"}}}}"#
+        )
+        .unwrap();
+        writeln!(file, r#"{{"type":"progress","timestamp":"2026-11-25T10:06:01Z"}}"#).unwrap();
+        drop(file);
+
+        assert_eq!(recorder.sync(&db, &context).await.unwrap(), 0);
     }
 
     #[tokio::test]

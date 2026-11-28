@@ -349,20 +349,20 @@ pub fn build_usage_series_report(
                     let worker_runs_measured = measurement
                         .runs_measured
                         .saturating_sub(derived.coordinator_slices_measured);
-                    let tokens_per_run = (worker_runs_measured > 0).then(|| {
-                        (measurement.total_tokens - derived.coordinator_slice_tokens) as f64
-                            / worker_runs_measured as f64
-                    });
-                    let tokens_per_completed_execution = (measurement.runs_measured > 0
-                        && derived.executions_completed > 0)
-                        .then(|| measurement.total_tokens as f64 / derived.executions_completed as f64);
+                    let worker_tokens = measurement
+                        .total_tokens
+                        .saturating_sub(derived.coordinator_slice_tokens);
+                    let tokens_per_run =
+                        (worker_runs_measured > 0).then(|| worker_tokens as f64 / worker_runs_measured as f64);
+                    let tokens_per_completed_execution = (worker_runs_measured > 0 && derived.executions_completed > 0)
+                        .then(|| worker_tokens as f64 / derived.executions_completed as f64);
                     let tokens_per_active_hour = (derived.active_measured_runs > 0 && derived.active_ms > 0)
                         .then(|| derived.active_tokens as f64 / (derived.active_ms as f64 / MS_PER_HOUR));
                     let tokens_per_completed_task = (derived.tasks_completed > 0
                         && derived.tasks_completed_cost.runs_measured > 0)
                         .then(|| derived.tasks_completed_cost.total_tokens as f64 / derived.tasks_completed as f64);
-                    let tokens_per_pr = (measurement.runs_measured > 0 && derived.distinct_prs > 0)
-                        .then(|| measurement.total_tokens as f64 / derived.distinct_prs as f64);
+                    let tokens_per_pr = (worker_runs_measured > 0 && derived.distinct_prs > 0)
+                        .then(|| worker_tokens as f64 / derived.distinct_prs as f64);
 
                     UsageCell::builder()
                         .distinct_prs(derived.distinct_prs)
@@ -857,8 +857,9 @@ fn build_coverage(
         .any(|facts| facts.rec.execution_kind == COORDINATOR_USAGE_KIND)
     {
         notes.push(UsageSeriesNote {
-            code: "coordinator_hour_slices".into(), epoch_s: None,
-            detail: "Coordinator usage is recorded in UTC hourly/model slices whose hour starts fall within the window (whole slices at partial-hour edges), included in work volume as slices and excluded from both tokens and run counts for tokens per run; that ratio describes worker runs only.".into(),
+            code: note::COORDINATOR_HOUR_SLICES.to_owned(),
+            epoch_s: None,
+            detail: "Coordinator usage is recorded in UTC hourly/model slices whose hour starts fall within the window (whole slices at partial-hour edges), included in work volume and tokens per active hour, and excluded from tokens per run, tokens per completed execution, and tokens per PR; those ratios describe worker work only.".to_owned(),
         });
     }
     if query.since_epoch_s < query.capture_start_epoch_s {

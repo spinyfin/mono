@@ -1247,6 +1247,10 @@ mod floor_tests {
             "20261127_2305_coordinator_usage_capture_state",
             Box::new(|c| super::super::coordinator_usage::migrate_capture_state(c).unwrap()),
         ));
+        steps.push((
+            super::super::coordinator_usage::FACTS_TYPED_AND_INDEXES_MIGRATION_ID,
+            Box::new(|c| super::super::coordinator_usage::migrate_facts_typed_and_indexes(c).unwrap()),
+        ));
         steps.sort_by_key(|(id, _)| *id);
         for (_, apply) in steps {
             apply(&expected);
