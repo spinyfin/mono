@@ -187,6 +187,24 @@ pub fn write_hooks(
     write_executable(&adapter_path, GROK_HOOK_ADAPTER_SCRIPT)?;
 
     let mut guards = guard_commands(interception);
+    let mut artifacts = vec![adapter_path.clone()];
+    if interception.is_reviewer {
+        let reviewer_path = hooks_dir.join("boss-grok-reviewer-guard.py");
+        write_executable(
+            &reviewer_path,
+            &super::reviewer::script(&obs_config.workspace_path, &obs_config.run_id)?,
+        )?;
+        guards.insert(
+            0,
+            crate::hook_guards::Guard {
+                command: format!("python3 {}", shell_quote(&reviewer_path.display().to_string())),
+                matcher: "*",
+                timeout_sec: None,
+                run_once: false,
+            },
+        );
+        artifacts.push(reviewer_path);
+    }
     if guards.is_empty() {
         bail!("GrokDriver refuses to arm zero PreToolUse guards (ToolUseInterception declared)");
     }
@@ -234,7 +252,8 @@ pub fn write_hooks(
     fs::write(&hooks_path, serde_json::to_string_pretty(&hooks_value)?)
         .with_context(|| format!("writing {}", hooks_path.display()))?;
 
-    Ok(vec![hooks_path, adapter_path])
+    artifacts.insert(0, hooks_path);
+    Ok(artifacts)
 }
 
 /// The driver-owned canonicalisation adapter (design T-09 / A-2).

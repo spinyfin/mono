@@ -38,7 +38,7 @@ def guide_read_tool(payload):
         return guide_path(data.get('path') or '.', cwd)
     return False
 
-def guide_shell_read(payload):
+def guide_shell_read(payload, read_stage=None):
     command = payload.get('tool_input', {}).get('command')
     if not isinstance(command, str):
         return False
@@ -49,10 +49,14 @@ def guide_shell_read(payload):
     atom = '(?:[A-Za-z0-9_./:@+,-]+|\\||'+literal+')'
     if not re.fullmatch(atom+'(?:[ \t]+'+atom+')*[ \t]*', command):
         return False
-    values = []
+    values = {}
+    marker = 'GUIDE_LITERAL_'
+    while marker in command:
+        marker = '_' + marker
     def mask(match):
-        values.append(match.group(0)[1:-1])
-        return 'GUIDE_LITERAL_'+str(len(values)-1)
+        key = marker + str(len(values))
+        values[key] = match.group(0)[1:-1]
+        return key
     masked = re.sub(literal, mask, command)
     # Pipelines joined only by '|'; every stage is itself a single allowed read.
     stages = masked.split('|')
@@ -60,8 +64,8 @@ def guide_shell_read(payload):
         groups = command_groups(stage)
         if len(groups) != 1:
             return False
-        tokens = [values[int(t[14:])] if t.startswith('GUIDE_LITERAL_') and t[14:].isdigit() and int(t[14:]) < len(values) else t for t in groups[0]]
-        if not guide_read_stage(tokens, payload, index > 0):
+        tokens = [values.get(t, t) for t in groups[0]]
+        if not (read_stage or guide_read_stage)(tokens, payload, index > 0):
             return False
     return True
 

@@ -18,6 +18,32 @@ pub use process_runner::output_blocking_timeout;
 #[cfg(unix)]
 pub use process_runner::{kill_process_group, output_blocking_timeout_in_group};
 
+/// How many times [`retry_on_etxtbsy`] runs the operation before giving up.
+#[cfg(unix)]
+const ETXTBSY_SPAWN_ATTEMPTS: u32 = 50;
+#[cfg(unix)]
+const ETXTBSY_SPAWN_RETRY_SLEEP: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Run `spawn`, retrying briefly while it fails with `ETXTBSY`.
+///
+/// Linux fails `execve` with `ETXTBSY` while any fd still has the executable
+/// open for write, including a write fd briefly inherited by a child forked on
+/// another thread. The writer closes shortly, so retry the spawn. A failed
+/// spawn has no side effects, so `spawn` is safe to call repeatedly. Any other
+/// result, and `ETXTBSY` after the last attempt, is returned unchanged.
+pub fn retry_on_etxtbsy<T>(mut spawn: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    #[cfg(unix)]
+    {
+        for _ in 1..ETXTBSY_SPAWN_ATTEMPTS {
+            match spawn() {
+                Err(err) if err.raw_os_error() == Some(libc::ETXTBSY) => std::thread::sleep(ETXTBSY_SPAWN_RETRY_SLEEP),
+                result => return result,
+            }
+        }
+    }
+    spawn()
+}
+
 /// Process-spawning seam for components that construct commands.
 #[async_trait]
 pub trait CommandRunner: Send + Sync {
