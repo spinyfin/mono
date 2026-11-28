@@ -58,6 +58,11 @@ pub mod note {
     /// One or more measured runs lacked `agent_active_ms` (e.g. Grok) and were
     /// excluded from both numerator and denominator of `tokens_per_active_hour`.
     pub const ACTIVE_TIME_MISSING: &str = "active_time_missing";
+    /// Coordinator usage is included as UTC hourly/model slices in work volume
+    /// and `tokens_per_active_hour`, and excluded from worker unit-of-work
+    /// normalizers (`tokens_per_run`, `tokens_per_completed_execution`,
+    /// `tokens_per_pr`).
+    pub const COORDINATOR_HOUR_SLICES: &str = "coordinator_hour_slices";
 }
 
 /// What a rows request asks for, plus the engine constants the report

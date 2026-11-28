@@ -304,6 +304,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: coordinator_usage::migrate_facts,
         },
         Migration {
+            id: coordinator_usage::FACTS_TYPED_AND_INDEXES_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: coordinator_usage::migrate_facts_typed_and_indexes,
+        },
+        Migration {
             id: coordinator_usage::MIGRATION_ID.into(),
             legacy_version: None,
             apply: coordinator_usage::migrate,

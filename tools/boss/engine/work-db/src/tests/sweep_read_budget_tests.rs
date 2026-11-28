@@ -79,6 +79,58 @@ SELECT printf('gver_%04d', n), printf('gser_%04d', n), printf('gcmp_%04d', n), p
 WITH RECURSIVE g(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM g WHERE n < 499)
 INSERT INTO pr_review_guide_updates(attempt_id, previous_version_id)
 SELECT printf('gatt_%04d', n), printf('gver_%04d', n - 1) FROM g;
+-- Production-size coordinator session: 10,000 facts across 50 hours (200/hr)
+-- plus 200 completed historical slices to verify partial-index and
+-- bucket-scoped incremental sync stay well within the read budget.
+INSERT INTO coordinator_usage_capture_state(
+    session_id, gap, legacy_slices, spawn_token, launched_model, source, driver, host_id
+) VALUES (
+    'coord_sess_live', NULL, NULL, 'tok_live', 'opus', 'claude_transcript', 'claude', 'local'
+);
+WITH RECURSIVE f(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM f WHERE n < 9999)
+INSERT INTO coordinator_usage_facts(
+    session_id, fact_id, bucket_start_epoch_s, model_key, model,
+    assistant_message_id, first_event_at, last_event_at,
+    input_tokens, output_tokens, cache_creation_tokens,
+    cache_creation_5m_tokens, cache_creation_1h_tokens,
+    cache_read_tokens, rounds, agent_active_ms, usage_unavailable, source_missing
+)
+SELECT 'coord_sess_live',
+       printf('message:m_%05d', n),
+       1795600800 + (n / 200) * 3600,
+       'claude-opus-4-6',
+       'claude-opus-4-6',
+       NULL,
+       1795600800 + (n / 200) * 3600 + (n % 200),
+       1795600800 + (n / 200) * 3600 + (n % 200),
+       100, 20, 10, 10, 0, 500, 1, NULL, NULL, 0
+FROM f;
+WITH RECURSIVE h(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM h WHERE n < 49)
+INSERT INTO coordinator_usage_slices(
+    id, session_id, spawn_token, source, driver, launched_model, host_id, status,
+    bucket_start_epoch_s, first_event_at, last_event_at, model_key, model,
+    input_tokens, output_tokens, cache_creation_tokens, cache_creation_5m_tokens,
+    cache_creation_1h_tokens, cache_read_tokens, rounds, agent_active_ms,
+    usage_unavailable, updated_at
+)
+SELECT printf('coord_live_h_%02d', n), 'coord_sess_live', 'tok_live', 'claude_transcript', 'claude',
+       'opus', 'local', 'active', 1795600800 + n * 3600, 1795600800 + n * 3600,
+       1795600800 + n * 3600 + 199, 'claude-opus-4-6', 'claude-opus-4-6',
+       20000, 4000, 2000, 2000, 0, 100000, 200, NULL, NULL, 1795800000
+FROM h;
+WITH RECURSIVE c(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM c WHERE n < 199)
+INSERT INTO coordinator_usage_slices(
+    id, session_id, spawn_token, source, driver, launched_model, host_id, status,
+    bucket_start_epoch_s, first_event_at, last_event_at, model_key, model,
+    input_tokens, output_tokens, cache_creation_tokens, cache_creation_5m_tokens,
+    cache_creation_1h_tokens, cache_read_tokens, rounds, agent_active_ms,
+    usage_unavailable, updated_at
+)
+SELECT printf('coord_hist_%03d', n), printf('coord_sess_hist_%02d', n / 10), 'tok_old',
+       'claude_transcript', 'claude', 'opus', 'local', 'completed',
+       1790000000 + n * 3600, 1790000000 + n * 3600, 1790000000 + n * 3600 + 100,
+       'claude-opus-4-6', 'claude-opus-4-6', 1000, 100, 0, 0, 0, 5000, 5, NULL, NULL, 1790000000
+FROM c;
 DROP TABLE fill;
 "#;
 
@@ -349,6 +401,62 @@ fn recurring_reads() -> Vec<Read> {
         ),
         ("startup: stranded executions", "start", READ_BUDGET_PAGES, |db| {
             db.abandon_stranded_executions_on_closed_work_items().unwrap();
+        }),
+        (
+            "coordinator sync: incremental 1-fact upsert (10k-fact session)",
+            "10 s",
+            READ_BUDGET_PAGES,
+            |db| {
+                let fact = CoordinatorUsageSlice::builder()
+                    .session_id("coord_sess_live")
+                    .spawn_token("tok_live")
+                    .source("claude_transcript")
+                    .driver("claude")
+                    .launched_model("opus")
+                    .status("active")
+                    .bucket_start_epoch_s(1_795_600_800 + 49 * 3_600)
+                    .first_event_at(1_795_600_800 + 49 * 3_600 + 500)
+                    .last_event_at(1_795_600_800 + 49 * 3_600 + 500)
+                    .model("claude-opus-4-6")
+                    .input_tokens(120)
+                    .output_tokens(25)
+                    .cache_creation_tokens(10)
+                    .cache_creation_5m_tokens(10)
+                    .cache_creation_1h_tokens(0)
+                    .cache_read_tokens(600)
+                    .rounds(1)
+                    .build();
+                let snapshot = CoordinatorSessionSnapshot::builder()
+                    .session_id("coord_sess_live")
+                    .spawn_token("tok_live")
+                    .launched_model("opus")
+                    .status("active")
+                    .full_replacement(false)
+                    .facts(std::collections::BTreeMap::from([("message:m_10000".into(), fact)]))
+                    .facts_complete(false)
+                    .build();
+                db.upsert_coordinator_session_usage(&snapshot).unwrap();
+            },
+        ),
+        (
+            "coordinator sync: mark inactive sessions completed",
+            "10 s",
+            READ_BUDGET_PAGES,
+            |db| {
+                db.mark_inactive_coordinator_sessions_completed(&["coord_sess_live"])
+                    .unwrap();
+            },
+        ),
+        (
+            "coordinator sync: clear spawn placeholder",
+            "10 s",
+            READ_BUDGET_PAGES,
+            |db| {
+                db.clear_coordinator_spawn_placeholder("tok_live").unwrap();
+            },
+        ),
+        ("coordinator sync: prune stale facts", "10 s", READ_BUDGET_PAGES, |db| {
+            db.prune_stale_coordinator_usage_facts(&["coord_sess_live"]).unwrap();
         }),
     ]
 }

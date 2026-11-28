@@ -1142,11 +1142,13 @@ fn coordinator_hour_slices_stay_out_of_the_tokens_per_run_normalizer() {
     }
     let mut runs = vec![worker];
     runs.extend(coords);
+    let mut finished_exec = exec("e_worker", "t1", "completed", DAY0 + 500);
+    finished_exec.execution_pr_url = Some("https://github.com/spinyfin/mono/pull/9999".to_owned());
     let report = build_usage_series_report(
         &q,
         &UsageSeriesRecords {
             runs,
-            finished_executions: Vec::new(),
+            finished_executions: vec![finished_exec],
             tasks: vec![task("t1", "t1", None)],
         },
         None,
@@ -1161,5 +1163,23 @@ fn coordinator_hour_slices_stay_out_of_the_tokens_per_run_normalizer() {
         cell.ratios.tokens_per_run,
         Some(150.0),
         "per-run is over worker runs only"
+    );
+    assert_eq!(
+        cell.ratios.tokens_per_completed_execution,
+        Some(150.0),
+        "per-completed-execution excludes coordinator slice tokens"
+    );
+    assert_eq!(
+        cell.ratios.tokens_per_pr,
+        Some(150.0),
+        "per-PR excludes coordinator slice tokens"
+    );
+    assert!(
+        report
+            .coverage
+            .notes
+            .iter()
+            .any(|n| n.code == note::COORDINATOR_HOUR_SLICES),
+        "coordinator slices emit the COORDINATOR_HOUR_SLICES coverage note"
     );
 }

@@ -39,7 +39,12 @@ impl ServerState {
         let Ok(working_directory) = self.resolved_coordinator_session_directory() else {
             return;
         };
-        let live_record = self.work_db.coordinator_tmux_record().ok().flatten();
+        let db = self.work_db.clone();
+        let live_record =
+            boss_work_db::db_diagnostics::spawn_blocking(move || db.coordinator_tmux_record().ok().flatten())
+                .await
+                .ok()
+                .flatten();
         if live_record.is_none() && !working_directory.is_dir() {
             return;
         }

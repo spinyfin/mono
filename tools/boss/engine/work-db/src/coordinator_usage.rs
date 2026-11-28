@@ -37,12 +37,20 @@ use boss_engine_storage_values::CostRunRecord;
 use boss_protocol::{COORDINATOR_USAGE_KIND, coordinator_session_label};
 use boss_usage_report::{RecordedDriver, UsageRunRecord};
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::WorkDb;
+use crate::schema_init::table_has_column;
 
 /// Unique migration id for [`migrate`].
 pub(super) const MIGRATION_ID: &str = "20261127_2035_coordinator_usage_slices";
+
+/// Unique migration id for [`migrate_facts_typed_and_indexes`].
+pub(super) const FACTS_TYPED_AND_INDEXES_MIGRATION_ID: &str = "20261128_0235_coordinator_usage_facts_typed_and_indexes";
+
+const MISSING_FACTS_GAP: &str = "Previously captured transcript contributions are missing; retained known usage";
+const LEGACY_FLOOR_GAP: &str =
+    "Legacy aggregate usage lacks message identities; totals retain a known floor and may omit missing-source usage";
 
 pub use boss_protocol::{COORDINATOR_EXECUTION_ID_PREFIX, COORDINATOR_UNREADABLE_SPAWN_PREFIX};
 
@@ -96,6 +104,147 @@ pub(super) fn migrate_capture_state(conn: &Connection) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS coordinator_usage_capture_state (
         session_id TEXT PRIMARY KEY, gap TEXT, legacy_slices TEXT);",
     )?;
+    Ok(())
+}
+
+/// Replaces the JSON-blob `coordinator_usage_facts` table with typed columns
+/// indexed by `(session_id, bucket_start_epoch_s, model_key)`, adds session
+/// metadata columns to `coordinator_usage_capture_state`, and adds a partial
+/// index on active `coordinator_usage_slices`.
+pub(super) fn migrate_facts_typed_and_indexes(conn: &Connection) -> Result<()> {
+    let mut session_meta: HashMap<String, SessionMeta> = HashMap::new();
+    if table_has_column(conn, "coordinator_usage_facts", "payload")? {
+        conn.execute_batch(
+            "CREATE TABLE coordinator_usage_facts_v2 (
+                 session_id TEXT NOT NULL,
+                 fact_id TEXT NOT NULL,
+                 bucket_start_epoch_s INTEGER NOT NULL,
+                 model_key TEXT NOT NULL,
+                 model TEXT,
+                 assistant_message_id TEXT,
+                 first_event_at INTEGER NOT NULL,
+                 last_event_at INTEGER NOT NULL,
+                 input_tokens INTEGER,
+                 output_tokens INTEGER,
+                 cache_creation_tokens INTEGER,
+                 cache_creation_5m_tokens INTEGER,
+                 cache_creation_1h_tokens INTEGER,
+                 cache_read_tokens INTEGER,
+                 rounds INTEGER,
+                 agent_active_ms INTEGER,
+                 usage_unavailable TEXT,
+                 source_missing INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (session_id, fact_id)
+             );",
+        )?;
+        let mut select_old = conn.prepare("SELECT session_id, fact_id, payload FROM coordinator_usage_facts")?;
+        let mut insert_new = conn.prepare(
+            "INSERT INTO coordinator_usage_facts_v2 (
+                 session_id, fact_id, bucket_start_epoch_s, model_key, model,
+                 assistant_message_id, first_event_at, last_event_at,
+                 input_tokens, output_tokens, cache_creation_tokens,
+                 cache_creation_5m_tokens, cache_creation_1h_tokens,
+                 cache_read_tokens, rounds, agent_active_ms, usage_unavailable,
+                 source_missing
+             ) VALUES (
+                 ?1, ?2, ?3, ?4, ?5,
+                 ?6, ?7, ?8,
+                 ?9, ?10, ?11,
+                 ?12, ?13,
+                 ?14, ?15, ?16, ?17,
+                 0
+             )",
+        )?;
+        let rows = select_old.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (session_id, fact_id, payload) = row?;
+            let slice: CoordinatorUsageSlice = serde_json::from_str(&payload)?;
+            let model_key = slice.model.as_deref().unwrap_or("");
+            insert_new.execute(params![
+                session_id,
+                fact_id,
+                slice.bucket_start_epoch_s,
+                model_key,
+                slice.model,
+                slice.assistant_message_id,
+                slice.first_event_at,
+                slice.last_event_at,
+                slice.input_tokens,
+                slice.output_tokens,
+                slice.cache_creation_tokens,
+                slice.cache_creation_5m_tokens,
+                slice.cache_creation_1h_tokens,
+                slice.cache_read_tokens,
+                slice.rounds,
+                slice.agent_active_ms,
+                slice.usage_unavailable,
+            ])?;
+            let entry = session_meta.entry(session_id).or_insert_with(|| SessionMeta {
+                spawn_token: slice.spawn_token.clone(),
+                launched_model: slice.launched_model.clone(),
+                source: slice.source.clone(),
+                driver: slice.driver.clone(),
+                host_id: slice.host_id.clone(),
+            });
+            if entry.spawn_token.is_none() {
+                entry.spawn_token = slice.spawn_token;
+            }
+            if entry.launched_model.is_none() {
+                entry.launched_model = slice.launched_model;
+            }
+        }
+        drop(select_old);
+        drop(insert_new);
+        conn.execute_batch(
+            "DROP TABLE coordinator_usage_facts;
+             ALTER TABLE coordinator_usage_facts_v2 RENAME TO coordinator_usage_facts;",
+        )?;
+    }
+
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS coordinator_usage_facts_session_bucket_idx
+             ON coordinator_usage_facts(session_id, bucket_start_epoch_s, model_key);
+         CREATE INDEX IF NOT EXISTS coordinator_usage_slices_active_idx
+             ON coordinator_usage_slices(session_id) WHERE status = 'active';",
+    )?;
+
+    for column in ["spawn_token", "launched_model", "source", "driver", "host_id"] {
+        if !table_has_column(conn, "coordinator_usage_capture_state", column)? {
+            conn.execute_batch(&format!(
+                "ALTER TABLE coordinator_usage_capture_state ADD COLUMN {column} TEXT;"
+            ))?;
+        }
+    }
+
+    if !session_meta.is_empty() {
+        let mut update_meta = conn.prepare(
+            "INSERT INTO coordinator_usage_capture_state (
+                 session_id, spawn_token, launched_model, source, driver, host_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(session_id) DO UPDATE SET
+                 spawn_token = COALESCE(coordinator_usage_capture_state.spawn_token, excluded.spawn_token),
+                 launched_model = COALESCE(coordinator_usage_capture_state.launched_model, excluded.launched_model),
+                 source = COALESCE(coordinator_usage_capture_state.source, excluded.source),
+                 driver = COALESCE(coordinator_usage_capture_state.driver, excluded.driver),
+                 host_id = COALESCE(coordinator_usage_capture_state.host_id, excluded.host_id)",
+        )?;
+        for (session_id, meta) in session_meta {
+            update_meta.execute(params![
+                session_id,
+                meta.spawn_token,
+                meta.launched_model,
+                meta.source,
+                meta.driver,
+                meta.host_id
+            ])?;
+        }
+    }
     Ok(())
 }
 
@@ -156,6 +305,18 @@ pub struct CoordinatorSessionSnapshot {
     pub capture_gap: Option<String>,
     /// Individually identified contributions; absent facts are retained across rereads.
     pub facts: Option<BTreeMap<String, CoordinatorUsageSlice>>,
+    /// When `true` (default), `facts` contains every fact observed in the
+    /// session's current transcripts (first pass after startup or rebuild), so
+    /// any previously stored fact absent from `facts` is marked missing. When
+    /// `false`, `facts` contains only newly added or updated facts since the
+    /// last acknowledged pass.
+    #[builder(default = true)]
+    pub facts_complete: bool,
+    /// Session-level status (`"active"` or `"completed"`) for incremental fact
+    /// snapshots that omit pre-aggregated `slices`.
+    pub status: Option<String>,
+    /// Session-level launched model alias (preserved across completion).
+    pub launched_model: Option<String>,
 }
 
 impl CoordinatorUsageSlice {
@@ -205,10 +366,14 @@ impl WorkDb {
         let now = boss_engine_utils::epoch_time::now_epoch_secs();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let mut resolved = snapshot.clone();
         if let Some(facts) = &snapshot.facts {
-            resolve_facts(&tx, &mut resolved, facts)?;
-        } else if snapshot.full_replacement && snapshot.capture_gap.is_none() {
+            let written = upsert_facts_snapshot(&tx, snapshot, facts, now)?;
+            tx.commit()?;
+            return Ok(written);
+        }
+
+        let mut resolved = snapshot.clone();
+        if snapshot.full_replacement && snapshot.capture_gap.is_none() {
             let previous = load_slices(&tx, &snapshot.session_id)?;
             if previous.iter().any(|old| {
                 snapshot
@@ -223,7 +388,7 @@ impl WorkDb {
         }
         let snapshot = &resolved;
         let gap_reason = snapshot.capture_gap.clone();
-        let merge = gap_reason.is_some() && snapshot.facts.is_none();
+        let merge = gap_reason.is_some();
         let has_existing_slices: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM coordinator_usage_slices WHERE session_id = ?1)",
             params![snapshot.session_id],
@@ -257,33 +422,7 @@ impl WorkDb {
             if merge && has_existing_slices && !slice.has_measured_tokens() {
                 continue;
             }
-            let model_key = slice.model.as_deref().unwrap_or("");
-            let id = coordinator_slice_id(&slice.session_id, slice.bucket_start_epoch_s, model_key);
-            stmt.execute(params![
-                id,
-                slice.session_id,
-                slice.spawn_token,
-                slice.source,
-                slice.driver,
-                slice.launched_model,
-                slice.host_id,
-                slice.status,
-                slice.bucket_start_epoch_s,
-                slice.first_event_at,
-                slice.last_event_at,
-                model_key,
-                slice.model,
-                slice.input_tokens,
-                slice.output_tokens,
-                slice.cache_creation_tokens,
-                slice.cache_creation_5m_tokens,
-                slice.cache_creation_1h_tokens,
-                slice.cache_read_tokens,
-                slice.rounds,
-                slice.agent_active_ms,
-                slice.usage_unavailable,
-                now,
-            ])?;
+            execute_slice_upsert(&mut stmt, slice, now)?;
             written += 1;
         }
         drop(stmt);
@@ -307,12 +446,14 @@ impl WorkDb {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let updated = if active_session_ids.is_empty() {
             tx.execute(
-                "UPDATE coordinator_usage_slices SET status = 'completed' WHERE status = 'active'",
+                "UPDATE coordinator_usage_slices INDEXED BY coordinator_usage_slices_active_idx
+                 SET status = 'completed'
+                 WHERE status = 'active'",
                 [],
             )?
         } else {
             tx.execute(
-                "UPDATE coordinator_usage_slices
+                "UPDATE coordinator_usage_slices INDEXED BY coordinator_usage_slices_active_idx
                  SET status = 'completed'
                  WHERE status = 'active'
                    AND session_id NOT IN (SELECT value FROM json_each(?1))",
@@ -333,6 +474,55 @@ impl WorkDb {
             params![placeholder],
         )?;
         Ok(deleted)
+    }
+
+    /// Prune per-message facts and capture state for completed sessions whose
+    /// transcript is no longer listed in the projects directory. Durable
+    /// `coordinator_usage_slices` rows are kept.
+    pub fn prune_stale_coordinator_usage_facts(&self, listed_session_ids: &[&str]) -> Result<usize> {
+        let mut conn = self.connect()?;
+        let stale_sessions: Vec<String> = if listed_session_ids.is_empty() {
+            let mut stmt = conn.prepare(
+                "SELECT s.session_id
+                 FROM coordinator_usage_capture_state s
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM coordinator_usage_slices INDEXED BY coordinator_usage_slices_active_idx
+                     WHERE status = 'active' AND session_id = s.session_id
+                 )",
+            )?;
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT s.session_id
+                 FROM coordinator_usage_capture_state s
+                 WHERE s.session_id NOT IN (SELECT value FROM json_each(?1))
+                   AND NOT EXISTS (
+                       SELECT 1 FROM coordinator_usage_slices INDEXED BY coordinator_usage_slices_active_idx
+                       WHERE status = 'active' AND session_id = s.session_id
+                   )",
+            )?;
+            stmt.query_map([super::query_ensure::id_array(listed_session_ids)], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if stale_sessions.is_empty() {
+            return Ok(0);
+        }
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stale_refs: Vec<&str> = stale_sessions.iter().map(String::as_str).collect();
+        let id_json = super::query_ensure::id_array(&stale_refs);
+        let deleted_facts = tx.execute(
+            "DELETE FROM coordinator_usage_facts WHERE session_id IN (SELECT value FROM json_each(?1))",
+            [&id_json],
+        )?;
+        tx.execute(
+            "DELETE FROM coordinator_usage_capture_state WHERE session_id IN (SELECT value FROM json_each(?1))",
+            [&id_json],
+        )?;
+        tx.commit()?;
+        Ok(deleted_facts)
     }
 }
 
@@ -476,103 +666,693 @@ fn retain_counts(new: &mut CoordinatorUsageSlice, old: &CoordinatorUsageSlice) {
     new.agent_active_ms = kept[7];
 }
 
-fn resolve_facts(
+fn execute_slice_upsert(stmt: &mut rusqlite::Statement<'_>, slice: &CoordinatorUsageSlice, now: i64) -> Result<()> {
+    let model_key = slice.model.as_deref().unwrap_or("");
+    let id = coordinator_slice_id(&slice.session_id, slice.bucket_start_epoch_s, model_key);
+    stmt.execute(params![
+        id,
+        slice.session_id,
+        slice.spawn_token,
+        slice.source,
+        slice.driver,
+        slice.launched_model,
+        slice.host_id,
+        slice.status,
+        slice.bucket_start_epoch_s,
+        slice.first_event_at,
+        slice.last_event_at,
+        model_key,
+        slice.model,
+        slice.input_tokens,
+        slice.output_tokens,
+        slice.cache_creation_tokens,
+        slice.cache_creation_5m_tokens,
+        slice.cache_creation_1h_tokens,
+        slice.cache_read_tokens,
+        slice.rounds,
+        slice.agent_active_ms,
+        slice.usage_unavailable,
+        now,
+    ])?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+struct StoredFact {
+    bucket_start_epoch_s: i64,
+    model_key: String,
+    model: Option<String>,
+    assistant_message_id: Option<String>,
+    first_event_at: i64,
+    last_event_at: i64,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cache_creation_tokens: Option<i64>,
+    cache_creation_5m_tokens: Option<i64>,
+    cache_creation_1h_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
+    rounds: Option<i64>,
+    agent_active_ms: Option<i64>,
+    usage_unavailable: Option<String>,
+    source_missing: bool,
+}
+
+impl StoredFact {
+    fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            bucket_start_epoch_s: row.get(0)?,
+            model_key: row.get(1)?,
+            model: row.get(2)?,
+            assistant_message_id: row.get(3)?,
+            first_event_at: row.get(4)?,
+            last_event_at: row.get(5)?,
+            input_tokens: row.get(6)?,
+            output_tokens: row.get(7)?,
+            cache_creation_tokens: row.get(8)?,
+            cache_creation_5m_tokens: row.get(9)?,
+            cache_creation_1h_tokens: row.get(10)?,
+            cache_read_tokens: row.get(11)?,
+            rounds: row.get(12)?,
+            agent_active_ms: row.get(13)?,
+            usage_unavailable: row.get(14)?,
+            source_missing: row.get::<_, i64>(15)? != 0,
+        })
+    }
+
+    fn from_incoming(incoming: &CoordinatorUsageSlice) -> Self {
+        let model_key = incoming.model.as_deref().unwrap_or("").to_owned();
+        Self {
+            bucket_start_epoch_s: incoming.bucket_start_epoch_s,
+            model_key,
+            model: incoming.model.clone(),
+            assistant_message_id: incoming.assistant_message_id.clone(),
+            first_event_at: incoming.first_event_at,
+            last_event_at: incoming.last_event_at,
+            input_tokens: incoming.input_tokens,
+            output_tokens: incoming.output_tokens,
+            cache_creation_tokens: incoming.cache_creation_tokens,
+            cache_creation_5m_tokens: incoming.cache_creation_5m_tokens,
+            cache_creation_1h_tokens: incoming.cache_creation_1h_tokens,
+            cache_read_tokens: incoming.cache_read_tokens,
+            rounds: incoming.rounds,
+            agent_active_ms: incoming.agent_active_ms,
+            usage_unavailable: incoming.usage_unavailable.clone(),
+            source_missing: false,
+        }
+    }
+
+    fn merge_with_previous(&mut self, previous: &Self) {
+        self.bucket_start_epoch_s = previous.bucket_start_epoch_s;
+        self.first_event_at = previous.first_event_at;
+        self.last_event_at = self.last_event_at.max(previous.last_event_at);
+        if self.model.is_none() {
+            self.model = previous.model.clone();
+            self.model_key = previous.model_key.clone();
+        }
+        self.input_tokens = self.input_tokens.max(previous.input_tokens);
+        self.output_tokens = self.output_tokens.max(previous.output_tokens);
+        self.cache_creation_tokens = self.cache_creation_tokens.max(previous.cache_creation_tokens);
+        self.cache_creation_5m_tokens = self.cache_creation_5m_tokens.max(previous.cache_creation_5m_tokens);
+        self.cache_creation_1h_tokens = self.cache_creation_1h_tokens.max(previous.cache_creation_1h_tokens);
+        self.cache_read_tokens = self.cache_read_tokens.max(previous.cache_read_tokens);
+        self.rounds = self.rounds.max(previous.rounds);
+        self.agent_active_ms = self.agent_active_ms.max(previous.agent_active_ms);
+    }
+
+    fn into_slice(self, session_id: &str, meta: &SessionMeta, status: &str) -> CoordinatorUsageSlice {
+        CoordinatorUsageSlice {
+            assistant_message_id: self.assistant_message_id,
+            session_id: session_id.to_owned(),
+            spawn_token: meta.spawn_token.clone(),
+            source: meta.source.clone(),
+            driver: meta.driver.clone(),
+            launched_model: meta.launched_model.clone(),
+            host_id: meta.host_id.clone(),
+            status: status.to_owned(),
+            bucket_start_epoch_s: self.bucket_start_epoch_s,
+            first_event_at: self.first_event_at,
+            last_event_at: self.last_event_at,
+            model: self.model,
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_creation_tokens: self.cache_creation_tokens,
+            cache_creation_5m_tokens: self.cache_creation_5m_tokens,
+            cache_creation_1h_tokens: self.cache_creation_1h_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            rounds: self.rounds,
+            agent_active_ms: self.agent_active_ms,
+            usage_unavailable: self.usage_unavailable,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionMeta {
+    spawn_token: Option<String>,
+    launched_model: Option<String>,
+    source: String,
+    driver: Option<String>,
+    host_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+struct CaptureStateRow {
+    read_gap: Option<String>,
+    legacy_json: Option<String>,
+    spawn_token: Option<String>,
+    launched_model: Option<String>,
+    source: Option<String>,
+    driver: Option<String>,
+    host_id: Option<String>,
+}
+
+const SELECT_FACT_SQL: &str = "
+    SELECT bucket_start_epoch_s, model_key, model, assistant_message_id,
+           first_event_at, last_event_at, input_tokens, output_tokens,
+           cache_creation_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens,
+           cache_read_tokens, rounds, agent_active_ms, usage_unavailable, source_missing
+    FROM coordinator_usage_facts
+    WHERE session_id = ?1 AND fact_id = ?2";
+
+const UPSERT_FACT_SQL: &str = "
+    INSERT INTO coordinator_usage_facts (
+        session_id, fact_id, bucket_start_epoch_s, model_key, model,
+        assistant_message_id, first_event_at, last_event_at,
+        input_tokens, output_tokens, cache_creation_tokens,
+        cache_creation_5m_tokens, cache_creation_1h_tokens,
+        cache_read_tokens, rounds, agent_active_ms, usage_unavailable,
+        source_missing
+    ) VALUES (
+        ?1, ?2, ?3, ?4, ?5,
+        ?6, ?7, ?8,
+        ?9, ?10, ?11,
+        ?12, ?13,
+        ?14, ?15, ?16, ?17,
+        0
+    )
+    ON CONFLICT(session_id, fact_id) DO UPDATE SET
+        bucket_start_epoch_s = excluded.bucket_start_epoch_s,
+        model_key = excluded.model_key,
+        model = excluded.model,
+        assistant_message_id = excluded.assistant_message_id,
+        first_event_at = excluded.first_event_at,
+        last_event_at = excluded.last_event_at,
+        input_tokens = excluded.input_tokens,
+        output_tokens = excluded.output_tokens,
+        cache_creation_tokens = excluded.cache_creation_tokens,
+        cache_creation_5m_tokens = excluded.cache_creation_5m_tokens,
+        cache_creation_1h_tokens = excluded.cache_creation_1h_tokens,
+        cache_read_tokens = excluded.cache_read_tokens,
+        rounds = excluded.rounds,
+        agent_active_ms = excluded.agent_active_ms,
+        usage_unavailable = excluded.usage_unavailable,
+        source_missing = 0";
+
+const SELECT_BUCKET_FACTS_SQL: &str = "
+    SELECT bucket_start_epoch_s, model_key, model, assistant_message_id,
+           first_event_at, last_event_at, input_tokens, output_tokens,
+           cache_creation_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens,
+           cache_read_tokens, rounds, agent_active_ms, usage_unavailable, source_missing
+    FROM coordinator_usage_facts
+    WHERE session_id = ?1 AND bucket_start_epoch_s = ?2 AND model_key = ?3";
+
+fn upsert_facts_snapshot(
     conn: &Connection,
-    snapshot: &mut CoordinatorSessionSnapshot,
-    facts: &BTreeMap<String, CoordinatorUsageSlice>,
-) -> Result<()> {
-    let state: Option<(Option<String>, Option<String>)> = conn
+    snapshot: &CoordinatorSessionSnapshot,
+    incoming_facts: &BTreeMap<String, CoordinatorUsageSlice>,
+    now: i64,
+) -> Result<usize> {
+    let state_row: Option<CaptureStateRow> = conn
         .query_row(
-            "SELECT gap, legacy_slices FROM coordinator_usage_capture_state WHERE session_id = ?1",
+            "SELECT gap, legacy_slices, spawn_token, launched_model, source, driver, host_id
+             FROM coordinator_usage_capture_state
+             WHERE session_id = ?1",
             [&snapshot.session_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                Ok(CaptureStateRow {
+                    read_gap: row.get(0)?,
+                    legacy_json: row.get(1)?,
+                    spawn_token: row.get(2)?,
+                    launched_model: row.get(3)?,
+                    source: row.get(4)?,
+                    driver: row.get(5)?,
+                    host_id: row.get(6)?,
+                })
+            },
         )
         .optional()?;
-    let (old_gap, legacy) = match state {
-        Some((gap, legacy)) => (
-            gap,
-            legacy
-                .map(|s| serde_json::from_str::<Vec<CoordinatorUsageSlice>>(&s))
-                .transpose()?
-                .unwrap_or_default(),
-        ),
-        None => (None, load_slices(conn, &snapshot.session_id)?),
+    let state_existed = state_row.is_some();
+    let stored_read_gap = state_row.as_ref().and_then(|s| s.read_gap.clone());
+    let legacy: Vec<CoordinatorUsageSlice> = match &state_row {
+        Some(row) => match row.legacy_json.as_deref() {
+            None | Some("") | Some("[]") => Vec::new(),
+            Some(json) => serde_json::from_str(json)?,
+        },
+        None => load_slices(conn, &snapshot.session_id)?,
     };
-    let mut stored = BTreeMap::<String, CoordinatorUsageSlice>::new();
-    let mut stmt = conn.prepare("SELECT fact_id, payload FROM coordinator_usage_facts WHERE session_id = ?1")?;
-    for row in stmt.query_map([&snapshot.session_id], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })? {
-        let (key, payload) = row?;
-        stored.insert(key, serde_json::from_str(&payload)?);
-    }
-    snapshot.capture_gap = snapshot.capture_gap.clone().or(old_gap);
-    if snapshot.capture_gap.is_none() && stored.keys().any(|key| !facts.contains_key(key)) {
-        snapshot.capture_gap =
-            Some("Previously captured transcript contributions are missing; retained known usage".into());
-    }
-    if legacy.iter().any(CoordinatorUsageSlice::has_measured_tokens) {
-        snapshot.capture_gap = Some("Legacy aggregate usage lacks message identities; totals retain a known floor and may omit missing-source usage".into());
-    }
-    for (key, incoming) in facts {
-        let mut fact = incoming.clone();
-        if let Some(previous) = stored.get(key) {
-            fact.bucket_start_epoch_s = previous.bucket_start_epoch_s;
-            fact.first_event_at = previous.first_event_at;
-            fact.model = fact.model.or_else(|| previous.model.clone());
-            retain_counts(&mut fact, previous);
+
+    let sample = incoming_facts.values().next().or_else(|| snapshot.slices.first());
+    let legacy_sample = legacy.first();
+    let meta = SessionMeta {
+        spawn_token: snapshot
+            .spawn_token
+            .clone()
+            .or_else(|| sample.and_then(|s| s.spawn_token.clone()))
+            .or_else(|| state_row.as_ref().and_then(|s| s.spawn_token.clone()))
+            .or_else(|| legacy_sample.and_then(|s| s.spawn_token.clone())),
+        launched_model: snapshot
+            .launched_model
+            .clone()
+            .or_else(|| sample.and_then(|s| s.launched_model.clone()))
+            .or_else(|| state_row.as_ref().and_then(|s| s.launched_model.clone()))
+            .or_else(|| legacy_sample.and_then(|s| s.launched_model.clone())),
+        source: sample
+            .map(|s| s.source.clone())
+            .or_else(|| state_row.as_ref().and_then(|s| s.source.clone()))
+            .or_else(|| legacy_sample.map(|s| s.source.clone()))
+            .unwrap_or_else(|| "claude_transcript".to_owned()),
+        driver: sample
+            .and_then(|s| s.driver.clone())
+            .or_else(|| state_row.as_ref().and_then(|s| s.driver.clone()))
+            .or_else(|| legacy_sample.and_then(|s| s.driver.clone())),
+        host_id: sample
+            .map(|s| s.host_id.clone())
+            .or_else(|| state_row.as_ref().and_then(|s| s.host_id.clone()))
+            .or_else(|| legacy_sample.map(|s| s.host_id.clone()))
+            .unwrap_or_else(|| "local".to_owned()),
+    };
+    let effective_status = snapshot
+        .status
+        .clone()
+        .or_else(|| snapshot.slices.first().map(|s| s.status.clone()))
+        .or_else(|| incoming_facts.values().next().map(|s| s.status.clone()))
+        .unwrap_or_else(|| "active".to_owned());
+
+    let mut select_fact_stmt = conn.prepare(SELECT_FACT_SQL)?;
+    let mut upsert_fact_stmt = conn.prepare(UPSERT_FACT_SQL)?;
+    let mut touched_buckets: BTreeSet<(i64, String)> = BTreeSet::new();
+
+    // Process message facts before duration facts so duration re-bucketing
+    // sees any newly inserted or updated parent message fact in the same pass.
+    let mut message_facts = Vec::new();
+    let mut duration_facts = Vec::new();
+    for (key, incoming) in incoming_facts {
+        if incoming.assistant_message_id.is_some() || key.starts_with("duration:") {
+            duration_facts.push((key, incoming));
+        } else {
+            message_facts.push((key, incoming));
         }
-        conn.execute("INSERT INTO coordinator_usage_facts VALUES (?1, ?2, ?3) ON CONFLICT(session_id, fact_id) DO UPDATE SET payload = excluded.payload",
-            params![snapshot.session_id, key, serde_json::to_string(&fact)?])?;
-        stored.insert(key.clone(), fact);
     }
-    let mut buckets = BTreeMap::<(i64, Option<String>), CoordinatorUsageSlice>::new();
-    for fact in stored.values() {
-        let mut fact = fact.clone();
-        if let Some(message) = fact
-            .assistant_message_id
-            .as_ref()
-            .and_then(|id| stored.get(&format!("message:{id}")))
+
+    for (key, incoming) in message_facts {
+        let previous = select_fact_stmt
+            .query_row(params![snapshot.session_id, key], StoredFact::from_row)
+            .optional()?;
+        let mut fact = StoredFact::from_incoming(incoming);
+        if let Some(prev) = &previous {
+            fact.merge_with_previous(prev);
+        }
+        if previous.as_ref() != Some(&fact) {
+            upsert_fact_stmt.execute(params![
+                snapshot.session_id,
+                key,
+                fact.bucket_start_epoch_s,
+                fact.model_key,
+                fact.model,
+                fact.assistant_message_id,
+                fact.first_event_at,
+                fact.last_event_at,
+                fact.input_tokens,
+                fact.output_tokens,
+                fact.cache_creation_tokens,
+                fact.cache_creation_5m_tokens,
+                fact.cache_creation_1h_tokens,
+                fact.cache_read_tokens,
+                fact.rounds,
+                fact.agent_active_ms,
+                fact.usage_unavailable,
+            ])?;
+            touched_buckets.insert((fact.bucket_start_epoch_s, fact.model_key.clone()));
+            if let Some(prev) = &previous
+                && (prev.bucket_start_epoch_s, &prev.model_key) != (fact.bucket_start_epoch_s, &fact.model_key)
+            {
+                touched_buckets.insert((prev.bucket_start_epoch_s, prev.model_key.clone()));
+                if let Some(msg_id) = key.strip_prefix("message:") {
+                    conn.execute(
+                        "UPDATE coordinator_usage_facts
+                         SET bucket_start_epoch_s = ?4, model_key = ?5, model = ?6
+                         WHERE session_id = ?1 AND bucket_start_epoch_s = ?2 AND model_key = ?3
+                           AND assistant_message_id = ?7",
+                        params![
+                            snapshot.session_id,
+                            prev.bucket_start_epoch_s,
+                            prev.model_key,
+                            fact.bucket_start_epoch_s,
+                            fact.model_key,
+                            fact.model,
+                            msg_id,
+                        ],
+                    )?;
+                }
+            }
+        }
+    }
+
+    for (key, incoming) in duration_facts {
+        let previous = select_fact_stmt
+            .query_row(params![snapshot.session_id, key], StoredFact::from_row)
+            .optional()?;
+        let mut fact = StoredFact::from_incoming(incoming);
+        if let Some(prev) = &previous {
+            fact.merge_with_previous(prev);
+        }
+        if let Some(msg_id) = fact.assistant_message_id.as_deref()
+            && let Some(msg) = select_fact_stmt
+                .query_row(
+                    params![snapshot.session_id, format!("message:{msg_id}")],
+                    StoredFact::from_row,
+                )
+                .optional()?
         {
-            fact.bucket_start_epoch_s = message.bucket_start_epoch_s;
-            fact.first_event_at = message.first_event_at;
-            fact.last_event_at = message.first_event_at;
-            fact.model = message.model.clone();
+            fact.bucket_start_epoch_s = msg.bucket_start_epoch_s;
+            fact.first_event_at = msg.first_event_at;
+            fact.last_event_at = msg.first_event_at;
+            fact.model = msg.model;
+            fact.model_key = msg.model_key;
         }
-        let key = (fact.bucket_start_epoch_s, fact.model.clone());
-        if let Some(total) = buckets.get_mut(&key) {
-            sum_fact(total, &fact);
-        } else {
-            buckets.insert(key, fact);
+        if previous.as_ref() != Some(&fact) {
+            upsert_fact_stmt.execute(params![
+                snapshot.session_id,
+                key,
+                fact.bucket_start_epoch_s,
+                fact.model_key,
+                fact.model,
+                fact.assistant_message_id,
+                fact.first_event_at,
+                fact.last_event_at,
+                fact.input_tokens,
+                fact.output_tokens,
+                fact.cache_creation_tokens,
+                fact.cache_creation_5m_tokens,
+                fact.cache_creation_1h_tokens,
+                fact.cache_read_tokens,
+                fact.rounds,
+                fact.agent_active_ms,
+                fact.usage_unavailable,
+            ])?;
+            touched_buckets.insert((fact.bucket_start_epoch_s, fact.model_key.clone()));
+            if let Some(prev) = &previous
+                && (prev.bucket_start_epoch_s, &prev.model_key) != (fact.bucket_start_epoch_s, &fact.model_key)
+            {
+                touched_buckets.insert((prev.bucket_start_epoch_s, prev.model_key.clone()));
+            }
         }
     }
-    for old in &legacy {
-        if !old.has_measured_tokens() {
-            continue;
-        }
-        let key = (old.bucket_start_epoch_s, old.model.clone());
-        if let Some(total) = buckets.get_mut(&key) {
-            retain_counts(total, old);
-        } else {
-            buckets.insert(key, old.clone());
-        }
-    }
-    if !buckets.is_empty() {
-        snapshot.slices = buckets
-            .into_values()
-            .map(|mut slice| {
-                slice.status = snapshot
-                    .slices
-                    .first()
-                    .map_or_else(|| slice.status.clone(), |s| s.status.clone());
-                slice.usage_unavailable = snapshot.capture_gap.clone().or(slice.usage_unavailable);
-                slice
-            })
+    drop(select_fact_stmt);
+    drop(upsert_fact_stmt);
+
+    // On a complete read (startup/restart or transcript rebuild), detect any
+    // stored fact missing from the current transcripts and mark only its
+    // (bucket, model) slice as having missing source contributions.
+    if snapshot.facts_complete {
+        let mut existing_ids_stmt = conn.prepare(
+            "SELECT fact_id, bucket_start_epoch_s, model_key, source_missing
+             FROM coordinator_usage_facts
+             WHERE session_id = ?1",
+        )?;
+        let missing: Vec<(String, i64, String, bool)> = existing_ids_stmt
+            .query_map([&snapshot.session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|(fact_id, _, _, _)| !incoming_facts.contains_key(fact_id))
             .collect();
+        drop(existing_ids_stmt);
+
+        if !missing.is_empty() {
+            let mut mark_missing_stmt = conn.prepare(
+                "UPDATE coordinator_usage_facts SET source_missing = 1
+                 WHERE session_id = ?1 AND fact_id = ?2",
+            )?;
+            for (fact_id, bucket, model_key, already_missing) in missing {
+                if !already_missing {
+                    mark_missing_stmt.execute(params![snapshot.session_id, fact_id])?;
+                    touched_buckets.insert((bucket, model_key));
+                } else if !state_existed {
+                    touched_buckets.insert((bucket, model_key));
+                }
+            }
+        }
+        if !state_existed {
+            for old in &legacy {
+                if old.has_measured_tokens() {
+                    touched_buckets.insert((old.bucket_start_epoch_s, old.model.as_deref().unwrap_or("").to_owned()));
+                }
+            }
+        }
     }
-    conn.execute("INSERT INTO coordinator_usage_capture_state VALUES (?1, ?2, ?3) ON CONFLICT(session_id) DO UPDATE SET gap = excluded.gap, legacy_slices = excluded.legacy_slices",
-        params![snapshot.session_id, snapshot.capture_gap, serde_json::to_string(&legacy)?])?;
-    Ok(())
+
+    if let Some(spawn_token) = meta.spawn_token.as_deref().filter(|t| !t.is_empty())
+        && !snapshot.session_id.starts_with(COORDINATOR_UNREADABLE_SPAWN_PREFIX)
+        && (!state_existed || state_row.as_ref().and_then(|s| s.spawn_token.as_deref()) != Some(spawn_token))
+    {
+        let placeholder = format!("{COORDINATOR_UNREADABLE_SPAWN_PREFIX}{spawn_token}");
+        conn.execute(
+            "DELETE FROM coordinator_usage_slices WHERE session_id = ?1",
+            params![placeholder],
+        )?;
+    }
+
+    let legacy_by_bucket: BTreeMap<(i64, String), &CoordinatorUsageSlice> = legacy
+        .iter()
+        .filter(|old| old.has_measured_tokens())
+        .map(|old| {
+            (
+                (old.bucket_start_epoch_s, old.model.as_deref().unwrap_or("").to_owned()),
+                old,
+            )
+        })
+        .collect();
+
+    let mut written = 0usize;
+    if !touched_buckets.is_empty() {
+        let mut bucket_facts_stmt = conn.prepare(SELECT_BUCKET_FACTS_SQL)?;
+        let mut upsert_slice_stmt = conn.prepare(&upsert_sql(false))?;
+        let mut delete_slice_stmt = conn.prepare(
+            "DELETE FROM coordinator_usage_slices
+             WHERE session_id = ?1 AND bucket_start_epoch_s = ?2 AND model_key = ?3",
+        )?;
+
+        for (bucket_start_epoch_s, model_key) in &touched_buckets {
+            let bucket_facts: Vec<StoredFact> = bucket_facts_stmt
+                .query_map(
+                    params![snapshot.session_id, bucket_start_epoch_s, model_key],
+                    StoredFact::from_row,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let has_missing_fact = bucket_facts.iter().any(|f| f.source_missing);
+            let mut summed: Option<CoordinatorUsageSlice> = None;
+            for fact in bucket_facts {
+                let slice = fact.into_slice(&snapshot.session_id, &meta, &effective_status);
+                if let Some(total) = summed.as_mut() {
+                    sum_fact(total, &slice);
+                } else {
+                    summed = Some(slice);
+                }
+            }
+            let legacy_floor = legacy_by_bucket
+                .get(&(*bucket_start_epoch_s, model_key.clone()))
+                .copied();
+            let has_legacy_floor = legacy_floor.is_some();
+            if let Some(old) = legacy_floor {
+                if let Some(total) = summed.as_mut() {
+                    retain_counts(total, old);
+                } else {
+                    let mut slice = old.clone();
+                    slice.status = effective_status.clone();
+                    slice.spawn_token = meta.spawn_token.clone().or(slice.spawn_token);
+                    slice.launched_model = meta.launched_model.clone().or(slice.launched_model);
+                    summed = Some(slice);
+                }
+            }
+            if let Some(mut slice) = summed {
+                slice.usage_unavailable = if has_legacy_floor {
+                    Some(LEGACY_FLOOR_GAP.to_owned())
+                } else if let Some(gap) = &snapshot.capture_gap {
+                    Some(gap.clone())
+                } else if has_missing_fact {
+                    Some(MISSING_FACTS_GAP.to_owned())
+                } else if slice.has_measured_tokens() {
+                    None
+                } else {
+                    slice.usage_unavailable
+                };
+                execute_slice_upsert(&mut upsert_slice_stmt, &slice, now)?;
+                written += 1;
+            } else {
+                delete_slice_stmt.execute(params![snapshot.session_id, bucket_start_epoch_s, model_key])?;
+            }
+        }
+    }
+
+    // Retire the initial unknown stand-in once facts exist. Fact-backed
+    // unmeasured slices (including duration-only buckets) remain meaningful.
+    if !incoming_facts.is_empty() {
+        conn.execute(
+            "DELETE FROM coordinator_usage_slices AS s
+             WHERE s.session_id = ?1
+               AND s.input_tokens IS NULL AND s.output_tokens IS NULL
+               AND s.cache_creation_tokens IS NULL AND s.cache_read_tokens IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM coordinator_usage_facts AS f
+                   WHERE f.session_id = s.session_id
+                     AND f.bucket_start_epoch_s = s.bucket_start_epoch_s
+                     AND f.model_key = s.model_key
+               )",
+            params![snapshot.session_id],
+        )?;
+    }
+
+    let has_existing_slices: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM coordinator_usage_slices WHERE session_id = ?1)",
+        params![snapshot.session_id],
+        |row| row.get(0),
+    )?;
+    if !has_existing_slices && !snapshot.slices.is_empty() {
+        let mut upsert_slice_stmt = conn.prepare(&upsert_sql(false))?;
+        for slice in &snapshot.slices {
+            execute_slice_upsert(&mut upsert_slice_stmt, slice, now)?;
+            written += 1;
+        }
+    } else if has_existing_slices {
+        if snapshot.capture_gap != stored_read_gap {
+            if let Some(reason) = snapshot.capture_gap.as_deref() {
+                conn.execute(
+                    "UPDATE coordinator_usage_slices
+                     SET usage_unavailable = ?2, updated_at = ?3
+                     WHERE session_id = ?1 AND COALESCE(usage_unavailable, '') != ?4",
+                    params![snapshot.session_id, reason, now, LEGACY_FLOOR_GAP],
+                )?;
+            } else {
+                // Transient read error cleared: restore each slice's gap purely
+                // from its own legacy floor or missing stored facts.
+                let mut existing_stmt = conn.prepare(
+                    "SELECT bucket_start_epoch_s, model_key,
+                            (input_tokens IS NOT NULL OR output_tokens IS NOT NULL
+                             OR cache_creation_tokens IS NOT NULL OR cache_read_tokens IS NOT NULL)
+                     FROM coordinator_usage_slices
+                     WHERE session_id = ?1",
+                )?;
+                let slices: Vec<(i64, String, bool)> = existing_stmt
+                    .query_map([&snapshot.session_id], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                drop(existing_stmt);
+
+                let mut has_missing_stmt = conn.prepare(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM coordinator_usage_facts
+                         WHERE session_id = ?1 AND bucket_start_epoch_s = ?2 AND model_key = ?3
+                           AND source_missing = 1
+                     )",
+                )?;
+                let mut update_gap_stmt = conn.prepare(
+                    "UPDATE coordinator_usage_slices
+                     SET usage_unavailable = ?4, updated_at = ?5
+                     WHERE session_id = ?1 AND bucket_start_epoch_s = ?2 AND model_key = ?3",
+                )?;
+                for (bucket, model_key, has_measured) in slices {
+                    if touched_buckets.contains(&(bucket, model_key.clone())) {
+                        continue;
+                    }
+                    let has_legacy = legacy_by_bucket.contains_key(&(bucket, model_key.clone()));
+                    let has_missing: bool = has_missing_stmt
+                        .query_row(params![snapshot.session_id, bucket, model_key], |row| row.get(0))?;
+                    let new_gap: Option<&str> = if has_legacy {
+                        Some(LEGACY_FLOOR_GAP)
+                    } else if has_missing {
+                        Some(MISSING_FACTS_GAP)
+                    } else if has_measured {
+                        None
+                    } else {
+                        continue;
+                    };
+                    update_gap_stmt.execute(params![snapshot.session_id, bucket, model_key, new_gap, now])?;
+                }
+            }
+        }
+        // Propagate status changes (e.g. active -> completed) and newly
+        // discovered launch metadata without erasing stored launch metadata.
+        conn.execute(
+            "UPDATE coordinator_usage_slices
+             SET status = ?2,
+                 spawn_token = COALESCE(?3, spawn_token),
+                 launched_model = COALESCE(?4, launched_model),
+                 updated_at = ?5
+             WHERE session_id = ?1
+               AND (status != ?2
+                    OR (?3 IS NOT NULL AND spawn_token IS NULL)
+                    OR (?4 IS NOT NULL AND launched_model IS NULL))",
+            params![
+                snapshot.session_id,
+                effective_status,
+                meta.spawn_token,
+                meta.launched_model,
+                now,
+            ],
+        )?;
+    }
+
+    let legacy_json = if legacy.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&legacy)?)
+    };
+    let next_state = CaptureStateRow {
+        read_gap: snapshot.capture_gap.clone(),
+        legacy_json,
+        spawn_token: meta.spawn_token,
+        launched_model: meta.launched_model,
+        source: Some(meta.source),
+        driver: meta.driver,
+        host_id: Some(meta.host_id),
+    };
+    if state_row.as_ref() != Some(&next_state) {
+        conn.execute(
+            "INSERT INTO coordinator_usage_capture_state (
+                 session_id, gap, legacy_slices, spawn_token, launched_model, source, driver, host_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(session_id) DO UPDATE SET
+                 gap = excluded.gap,
+                 legacy_slices = excluded.legacy_slices,
+                 spawn_token = excluded.spawn_token,
+                 launched_model = excluded.launched_model,
+                 source = excluded.source,
+                 driver = excluded.driver,
+                 host_id = excluded.host_id",
+            params![
+                snapshot.session_id,
+                next_state.read_gap,
+                next_state.legacy_json,
+                next_state.spawn_token,
+                next_state.launched_model,
+                next_state.source,
+                next_state.driver,
+                next_state.host_id,
+            ],
+        )?;
+    }
+
+    Ok(written)
 }
 
 fn sum_fact(total: &mut CoordinatorUsageSlice, fact: &CoordinatorUsageSlice) {
@@ -851,11 +1631,15 @@ mod tests {
         .unwrap();
         {
             let conn = db.connect().unwrap();
-            conn.execute_batch(
+            conn.execute_batch(&format!(
                 "DROP TABLE coordinator_usage_facts;
                 DROP TABLE coordinator_usage_capture_state;
-                DELETE FROM schema_migrations WHERE id IN ('20261127_2215_coordinator_usage_facts', '20261127_2305_coordinator_usage_capture_state');",
-            )
+                DELETE FROM schema_migrations WHERE id IN (
+                    '20261127_2215_coordinator_usage_facts',
+                    '20261127_2305_coordinator_usage_capture_state',
+                    '{FACTS_TYPED_AND_INDEXES_MIGRATION_ID}'
+                );"
+            ))
             .unwrap();
         }
         drop(db);
@@ -887,10 +1671,13 @@ mod tests {
         db.upsert_coordinator_session_usage(&snapshot).unwrap();
         db.connect()
             .unwrap()
-            .execute_batch(
+            .execute_batch(&format!(
                 "DROP TABLE coordinator_usage_capture_state;
-            DELETE FROM schema_migrations WHERE id = '20261127_2305_coordinator_usage_capture_state';",
-            )
+                DELETE FROM schema_migrations WHERE id IN (
+                    '20261127_2305_coordinator_usage_capture_state',
+                    '{FACTS_TYPED_AND_INDEXES_MIGRATION_ID}'
+                );"
+            ))
             .unwrap();
         drop(db);
         let db = WorkDb::open(path).unwrap();
