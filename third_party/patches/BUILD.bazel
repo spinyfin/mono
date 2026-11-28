@@ -17,3 +17,21 @@ sh_test(
     args = ["$(rootpath @rustix_probe//:build_script_build)"],
     data = ["@rustix_probe//:build_script_build"],
 )
+
+# Runs under both channels: `bazel test` checks that an ordinary build still
+# resolves the pinned stable compiler, and `bazel test --config=cranelift`
+# checks that the nightly one loads the backend the codegen-backends patch
+# downloads.
+sh_test(
+    name = "rust_toolchain_channel_test",
+    size = "small",
+    srcs = ["rust_toolchain_channel_test.sh"],
+    args = select({
+        "@rules_rust//rust/toolchain/channel:nightly": ["nightly"],
+        "//conditions:default": ["stable"],
+    }) + ["$(rootpath @rules_rust//rust/toolchain:current_rustc_files)"],
+    data = [
+        "@rules_rust//rust/toolchain:current_rust_toolchain",
+        "@rules_rust//rust/toolchain:current_rustc_files",
+    ],
+)

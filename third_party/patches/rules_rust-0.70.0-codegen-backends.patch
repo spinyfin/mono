@@ -1,0 +1,232 @@
+diff --git a/rust/extensions.bzl b/rust/extensions.bzl
+--- a/rust/extensions.bzl
++++ b/rust/extensions.bzl
+@@ -57,6 +57,7 @@
+                 "allocator_library": str(repository_set.allocator_library) if repository_set.allocator_library else None,
+                 "auth": repository_set.auth if repository_set.auth else None,
+                 "auth_patterns": repository_set.auth_patterns if repository_set.auth_patterns else None,
++                "codegen_backends": repository_set.codegen_backends if repository_set.codegen_backends else None,
+                 "dev_components": repository_set.dev_components,
+                 "edition": repository_set.edition,
+                 "exec_compatible_with": [str(v) for v in repository_set.exec_compatible_with] if repository_set.exec_compatible_with else None,
+@@ -122,6 +123,7 @@
+             rust_register_toolchains(
+                 hub_name = "rust_toolchains",
+                 dev_components = toolchain.dev_components,
++                codegen_backends = toolchain.codegen_backends if toolchain.codegen_backends else None,
+                 edition = toolchain.edition,
+                 extra_rustc_flags = extra_rustc_flags,
+                 extra_exec_rustc_flags = toolchain.extra_exec_rustc_flags,
+@@ -156,6 +158,13 @@
+     "allocator_library": attr.label(
+         doc = "Target that provides allocator functions when rust_library targets are embedded in a cc_binary.",
+     ),
++    "codegen_backends": attr.string_list(
++        doc = (
++            "Alternative rustc codegen backends to download into the compiler's sysroot, e.g. `[\"cranelift\"]` " +
++            "for the `rustc-codegen-cranelift-preview` component. Requires version to be \"nightly\". " +
++            "Select a downloaded backend with `-Zcodegen-backend=<name>`, for example through `extra_rustc_flags`."
++        ),
++    ),
+     "dev_components": attr.bool(
+         doc = "Whether to download the rustc-dev components (defaults to False). Requires version to be \"nightly\".",
+         default = False,
+diff --git a/rust/private/repository_utils.bzl b/rust/private/repository_utils.bzl
+--- a/rust/private/repository_utils.bzl
++++ b/rust/private/repository_utils.bzl
+@@ -801,7 +801,35 @@
+     )
+ 
+     return sha256
++
++def load_rustc_codegen_backend(ctx, backend, target_triple, version, iso_date = None):
++    """Loads an alternative rustc codegen backend into the compiler's sysroot
++
++    Backends are distributed as `rustc-codegen-<backend>-preview` rustup components
++    (e.g. `rustc-codegen-cranelift-preview`). Each one installs a dynamic library under
++    `lib/rustlib/<host>/codegen-backends`, which the `rustc_lib` filegroup already globs,
++    so the backend becomes an input of every compile action and rustc can load it with
++    `-Zcodegen-backend=<backend>`.
++
++    Args:
++        ctx (repository_ctx): A repository_ctx.
++        backend (str): The name of the backend, e.g. `cranelift`.
++        target_triple (struct): The Rust-style triple of the host the compiler runs on.
++        version (str): The version of the tool among \"nightly\", \"beta\", or an exact version.
++        iso_date (str): The iso_date to use with \"nightly\" or \"beta\" versions.
+ 
++    Returns:
++        Dict[str, str]: The sha256 value of the codegen backend artifact.
++    """
++    return load_arbitrary_tool(
++        ctx,
++        iso_date = iso_date,
++        target_triple = target_triple,
++        tool_name = "rustc-codegen-{}".format(backend),
++        tool_subdirectories = ["rustc-codegen-{}-preview".format(backend)],
++        version = version,
++    )
++
+ def load_llvm_tools(ctx, target_triple, version, iso_date = None):
+     """Loads the llvm tools
+ 
+diff --git a/rust/repositories.bzl b/rust/repositories.bzl
+--- a/rust/repositories.bzl
++++ b/rust/repositories.bzl
+@@ -30,6 +30,7 @@
+     "load_rust_compiler",
+     "load_rust_src",
+     "load_rust_stdlib",
++    "load_rustc_codegen_backend",
+     "load_rustc_dev_nightly",
+     "load_rustfmt",
+     "select_rust_version",
+@@ -145,6 +146,7 @@
+ def rust_register_toolchains(
+         *,
+         dev_components = False,
++        codegen_backends = None,
+         edition = None,
+         allocator_library = None,
+         global_allocator_library = None,
+@@ -185,6 +187,7 @@
+ 
+     Args:
+         dev_components (bool, optional): Whether to download the rustc-dev components (defaults to False). Requires version to be "nightly".
++        codegen_backends (list, optional): Alternative rustc codegen backends (e.g. `["cranelift"]`) to download into the sysroot of the "nightly" toolchains. Requires a "nightly" version.
+         edition (str, optional): The rust edition to be used by default (2015, 2018, or 2021). If absent, every target is required to specify its `edition` attribute.
+         allocator_library (str, optional): Target that provides allocator functions when rust_library targets are embedded in a cc_binary.
+         global_allocator_library (str, optional): Target that provides allocator functions when global allocator is used with cc_common.link.
+@@ -223,6 +226,8 @@
+         if not has_nightly:
+             fail("rustc-dev components were requested but no \"nightly\" is being registered. Please update `versions` to include a nightly version.")
+ 
++    _check_codegen_backends(codegen_backends, versions)
++
+     if not rust_analyzer_version:
+         rust_analyzer_version = select_rust_version(versions)
+ 
+@@ -265,6 +270,7 @@
+             rust_repository_set,
+             name = name,
+             dev_components = dev_components,
++            codegen_backends = codegen_backends,
+             edition = edition,
+             exec_triple = exec_triple,
+             extra_target_triples = extra_target_triples,
+@@ -369,6 +375,13 @@
+     ),
+     "auth_patterns": attr.string_list(
+         doc = "A list of patterns to match against urls for which the auth object should be used.",
++    ),
++    "codegen_backends": attr.string_list(
++        doc = (
++            "Alternative rustc codegen backends to download into the compiler's sysroot, e.g. `[\"cranelift\"]` " +
++            "for the `rustc-codegen-cranelift-preview` component. Requires version to be \"nightly\". " +
++            "Select a downloaded backend with `-Zcodegen-backend=<name>`."
++        ),
+     ),
+     "dev_components": attr.bool(
+         doc = "Whether to download the rustc-dev components (defaults to False). Requires version to be \"nightly\".",
+@@ -531,6 +544,24 @@
+         cargo_content,
+     ]
+     sha256s.update(rustc_sha256 | clippy_sha256 | cargo_sha256)
++
++    # Codegen backends are plugins of the compiler itself, so they follow the
++    # exec triple. They land in `lib/rustlib/<exec_triple>/codegen-backends`,
++    # which the `rustc_lib` filegroup emitted by `load_rust_compiler` globs.
++    if ctx.attr.codegen_backends and channel != "nightly":
++        fail("`codegen_backends` are only distributed for \"nightly\" toolchains but {} requested {} for version {}".format(
++            ctx.name,
++            ctx.attr.codegen_backends,
++            ctx.attr.version,
++        ))
++    for backend in ctx.attr.codegen_backends:
++        sha256s.update(load_rustc_codegen_backend(
++            ctx = ctx,
++            backend = backend,
++            target_triple = exec_triple,
++            version = version,
++            iso_date = iso_date,
++        ))
+ 
+     if ctx.attr.rustfmt_version:
+         rustfmt_version = ctx.attr.rustfmt_version
+@@ -705,6 +736,7 @@
+         rustfmt_version = None,
+         edition = None,
+         dev_components = False,
++        codegen_backends = None,
+         extra_rustc_flags = None,
+         extra_exec_rustc_flags = None,
+         opt_level = None,
+@@ -733,6 +765,8 @@
+         edition (str, optional): The rust edition to be used by default (2015, 2018, or 2021). If absent, every rule is required to specify its `edition` attribute.
+         dev_components (bool, optional): Whether to download the rustc-dev components.
+             Requires version to be "nightly". Defaults to False.
++        codegen_backends (list, optional): Alternative rustc codegen backends (e.g. `["cranelift"]`)
++            to download into the compiler's sysroot. Requires version to be "nightly".
+         extra_rustc_flags (list, optional): Extra flags to pass to rustc in non-exec configuration.
+             Subject to Make variable expansion with respect to RUST_SYSROOT,
+             RUST_SYSROOT_SHORT, RUSTC, etc.
+@@ -770,6 +804,7 @@
+         rustfmt_version = rustfmt_version,
+         edition = edition,
+         dev_components = dev_components,
++        codegen_backends = codegen_backends,
+         extra_rustc_flags = extra_rustc_flags,
+         extra_exec_rustc_flags = extra_exec_rustc_flags,
+         opt_level = opt_level,
+@@ -1247,6 +1282,15 @@
+     else:
+         fail(name + " should be a list or a dict")
+ 
++def _check_codegen_backends(codegen_backends, versions):
++    """Fail if codegen backends are requested without a toolchain that can provide them."""
++    if not codegen_backends:
++        return
++    for ver in versions:
++        if ver.startswith("nightly"):
++            return
++    fail("Codegen backends {} were requested but no \"nightly\" is being registered. Please update `versions` to include a nightly version.".format(codegen_backends))
++
+ def rust_repository_set(
+         *,
+         name,
+@@ -1259,6 +1303,7 @@
+         rustfmt_version = None,
+         edition = None,
+         dev_components = False,
++        codegen_backends = None,
+         extra_rustc_flags = None,
+         extra_exec_rustc_flags = None,
+         opt_level = None,
+@@ -1293,6 +1338,8 @@
+             required to specify its `edition` attribute.
+         dev_components (bool, optional): Whether to download the rustc-dev components.
+             Requires version to be "nightly".
++        codegen_backends (list, optional): Alternative rustc codegen backends (e.g. `["cranelift"]`)
++            to download into the sysroot of the "nightly" toolchains in this set. Requires a "nightly" version.
+         extra_rustc_flags (dict, list, optional): Dictionary of target triples to list of extra flags to pass to rustc in non-exec configuration.
+         extra_exec_rustc_flags (dict, list, optional): Dictionary of target triples to list of extra flags to pass to rustc in exec configuration.
+         opt_level (dict, dict, optional): Dictionary of target triples to optimization config.
+@@ -1317,6 +1364,8 @@
+         dict[str, dict]: A dict of information about all generated toolchains.
+     """
+ 
++    _check_codegen_backends(codegen_backends, versions)
++
+     all_toolchain_details = {}
+     toolchain_labels = []
+     for toolchain in _get_toolchain_repositories(
+@@ -1348,6 +1397,9 @@
+             auth_patterns = auth_patterns,
+             channel = toolchain.channel.name,
+             dev_components = dev_components,
++            # Only nightly distributes codegen backends, so a set that also
++            # carries a stable or beta version keeps those toolchains as is.
++            codegen_backends = codegen_backends if toolchain.channel.name == "nightly" else None,
+             edition = edition,
+             exec_triple = exec_triple,
+             extra_exec_rustc_flags = toolchain_extra_exec_rustc_flags,
