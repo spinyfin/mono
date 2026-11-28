@@ -168,7 +168,14 @@ impl CoordinatorUsageRecorder {
         });
 
         let (tokens_to_clear, run_mark_inactive, run_prune) = {
-            let guard = self.bookkeeping.lock().expect("recorder bookkeeping poisoned");
+            let mut guard = self.bookkeeping.lock().expect("recorder bookkeeping poisoned");
+            // A transient listing failure can recreate a previously cleared
+            // placeholder; allow the next covered pass to clear it again.
+            for snapshot in &collection.snapshots {
+                if let Some(token) = snapshot.session_id.strip_prefix(COORDINATOR_UNREADABLE_SPAWN_PREFIX) {
+                    guard.cleared_spawn_tokens.remove(token);
+                }
+            }
             let tokens: Vec<String> = collection
                 .covered_spawn_tokens
                 .iter()
@@ -359,6 +366,12 @@ impl SessionCapture {
     }
 
     async fn poll(&mut self, subagent_paths: &[PathBuf], fallback_ts: i64) -> PollOutcome {
+        // Re-read the remaining sources once when a tracked subagent disappears.
+        // The complete fact inventory lets storage mark only its old buckets as
+        // missing, just as it does after a recorder restart.
+        if self.subagents.keys().any(|path| !path.exists()) {
+            return PollOutcome::Rebuild;
+        }
         // Subagents first, parent last, so a shared message.id keeps the
         // parent's record if timestamps tie.
         for path in subagent_paths {
@@ -1022,7 +1035,7 @@ mod tests {
     use boss_protocol::COORDINATOR_USAGE_KIND;
     use tempfile::TempDir;
 
-    fn live_record(token: &str, model: &str, spawned_at: i64) -> CoordinatorTmuxRecord {
+    pub(super) fn live_record(token: &str, model: &str, spawned_at: i64) -> CoordinatorTmuxRecord {
         CoordinatorTmuxRecord {
             session_name: "boss-coordinator".to_owned(),
             spawn_token: token.to_owned(),
@@ -1555,6 +1568,15 @@ mod persistence_regressions {
 
     #[tokio::test]
     async fn missing_subagent_then_restart_and_same_and_later_hour_appends() {
+        missing_subagent_appends(true).await;
+    }
+
+    #[tokio::test]
+    async fn missing_subagent_same_recorder_and_later_hour_appends() {
+        missing_subagent_appends(false).await;
+    }
+
+    async fn missing_subagent_appends(restart: bool) {
         let (_db_dir, db) = crate::test_support::open_db();
         let dir = tempfile::TempDir::new().unwrap();
         let (working, config, projects) = setup_projects_dir(&dir);
@@ -1576,8 +1598,11 @@ mod persistence_regressions {
         let records = db.cost_records_for_window(0, i64::MAX).unwrap();
         assert_eq!(records.iter().filter_map(|r| r.input_tokens).sum::<i64>(), 800);
         assert!(records.iter().all(|r| r.usage_unavailable.is_some()));
-        drop(recorder);
-        let recorder = CoordinatorUsageRecorder::for_claude_transcripts();
+        let recorder = if restart {
+            CoordinatorUsageRecorder::for_claude_transcripts()
+        } else {
+            recorder
+        };
         append(&parent, "new-same-hour", "2026-11-25T10:30:00Z", 200);
         recorder.sync(&db, &context).await.unwrap();
         let records = db.cost_records_for_window(0, i64::MAX).unwrap();
@@ -1593,6 +1618,64 @@ mod persistence_regressions {
         // later hour whose capture is complete has no gap.
         assert!(records[0].usage_unavailable.is_some());
         assert_eq!(records[1].usage_unavailable, None);
+    }
+
+    #[tokio::test]
+    async fn user_only_fallback_retires_when_usage_arrives() {
+        for later_hour in [false, true] {
+            let (_db_dir, db) = crate::test_support::open_db();
+            let dir = tempfile::TempDir::new().unwrap();
+            let (working, config, projects) = setup_projects_dir(&dir);
+            let parent = projects.join("session.jsonl");
+            std::fs::write(&parent, "{\"type\":\"user\"}\n").unwrap();
+            let context = CoordinatorUsageContext::builder()
+                .working_directory(working)
+                .claude_config_dir(config)
+                .now_epoch_s(1795608000)
+                .build();
+            let recorder = CoordinatorUsageRecorder::for_claude_transcripts();
+            recorder.sync(&db, &context).await.unwrap();
+            let records = db.cost_records_for_window(0, i64::MAX).unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].input_tokens, None);
+            let ts = system_time_epoch_s(std::fs::metadata(&parent).unwrap().modified().unwrap()).unwrap();
+            let ts = ts + if later_hour { HOUR_SECS } else { 0 };
+            let timestamp = chrono::DateTime::from_timestamp(ts, 0).unwrap().to_rfc3339();
+            append(&parent, "first-usage", &timestamp, 100);
+            recorder.sync(&db, &context).await.unwrap();
+            let records = db.cost_records_for_window(0, i64::MAX).unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].input_tokens, Some(100));
+            assert_eq!(records[0].usage_unavailable, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn recreated_spawn_placeholder_retires_without_transcript_append() {
+        let (_db_dir, db) = crate::test_support::open_db();
+        let dir = tempfile::TempDir::new().unwrap();
+        let (working, config, projects) = setup_projects_dir(&dir);
+        let parent = projects.join("session.jsonl");
+        append(&parent, "first", "2026-11-25T10:05:00Z", 100);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let context = CoordinatorUsageContext::builder()
+            .working_directory(working)
+            .claude_config_dir(config)
+            .live_record(super::tests::live_record("recover-token", "opus", now - 60))
+            .now_epoch_s(now)
+            .build();
+        let recorder = CoordinatorUsageRecorder::for_claude_transcripts();
+        recorder.sync(&db, &context).await.unwrap();
+        let hidden = projects.with_extension("hidden");
+        std::fs::rename(&projects, &hidden).unwrap();
+        recorder.sync(&db, &context).await.unwrap();
+        assert_eq!(db.cost_records_for_window(0, i64::MAX).unwrap().len(), 2);
+        std::fs::rename(&hidden, &projects).unwrap();
+        recorder.sync(&db, &context).await.unwrap();
+        let records = db.cost_records_for_window(0, i64::MAX).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].input_tokens, Some(100));
+        assert_eq!(records[0].usage_unavailable, None);
     }
 
     #[cfg(unix)]

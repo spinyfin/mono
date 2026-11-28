@@ -40,6 +40,7 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::WorkDb;
+use crate::schema_init::table_has_column;
 
 /// Unique migration id for [`migrate`].
 pub(super) const MIGRATION_ID: &str = "20261127_2035_coordinator_usage_slices";
@@ -104,17 +105,6 @@ pub(super) fn migrate_capture_state(conn: &Connection) -> Result<()> {
         session_id TEXT PRIMARY KEY, gap TEXT, legacy_slices TEXT);",
     )?;
     Ok(())
-}
-
-fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        if row.get::<_, String>(1)? == column {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 /// Replaces the JSON-blob `coordinator_usage_facts` table with typed columns
@@ -1211,6 +1201,24 @@ fn upsert_facts_snapshot(
                 delete_slice_stmt.execute(params![snapshot.session_id, bucket_start_epoch_s, model_key])?;
             }
         }
+    }
+
+    // Retire the initial unknown stand-in once facts exist. Fact-backed
+    // unmeasured slices (including duration-only buckets) remain meaningful.
+    if !incoming_facts.is_empty() {
+        conn.execute(
+            "DELETE FROM coordinator_usage_slices AS s
+             WHERE s.session_id = ?1
+               AND s.input_tokens IS NULL AND s.output_tokens IS NULL
+               AND s.cache_creation_tokens IS NULL AND s.cache_read_tokens IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM coordinator_usage_facts AS f
+                   WHERE f.session_id = s.session_id
+                     AND f.bucket_start_epoch_s = s.bucket_start_epoch_s
+                     AND f.model_key = s.model_key
+               )",
+            params![snapshot.session_id],
+        )?;
     }
 
     let has_existing_slices: bool = conn.query_row(
