@@ -41,7 +41,7 @@
 //! # Guarantees
 //!
 //! - **Every step leaves a trace.** A `[parking]` line is appended to the
-//!   item's description (`reconcile_audit::append_parking_audit`) and an `unpark_reconcile`
+//!   item's audit ledger (`reconcile_audit::append_parking_audit`) and an `unpark_reconcile`
 //!   dispatch event is emitted, with the step name and outcome
 //!   (`ok` / `skipped` / `error`).
 //! - **A failing step does not stop the sequence.** The error is recorded, the

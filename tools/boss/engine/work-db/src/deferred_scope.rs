@@ -98,8 +98,8 @@ fn validate_deferred_scope_fields(rest: &str) -> Option<String> {
 /// prefix is stripped before formatting so the resulting line carries the
 /// tag exactly once (e.g.
 /// `[deferred-scope] epoch 1700000000: summary="…" reason="…"`), matching
-/// the grep-able `[engine-reconcile] epoch …: …` convention already used for
-/// audit lines on work item descriptions.
+/// the grep-able `[engine-reconcile] epoch …: …` convention used by
+/// reconciliation ledger entries (and legacy description audit lines).
 /// Extract `(summary, reason)` from a `[deferred-scope]` marker line's
 /// quoted fields, e.g. for prefilling the followup task created by
 /// `boss_engine::app::attentions::handle_create_task_from_deferred_scope_attention`.

@@ -207,7 +207,7 @@ impl WorkDb {
 
     /// Append `line` verbatim to the work item's description.
     ///
-    /// The engine's audit trail (`[engine-reconcile]`, `[deferred-scope]`,
+    /// The engine's audit trail (`[deferred-scope]`,
     /// `[doc-detector]`, …) is written into the description so the reason the engine acted
     /// stays visible on the card. Services format the line and own the
     /// marker vocabulary. A single SQL update appends to the current value
@@ -1721,8 +1721,8 @@ mod tests {
         );
     }
 
-    /// Storage owns the description append that every audit-line writer
-    /// shares: it adds the line verbatim after the existing text.
+    /// Storage owns description-trail appends:
+    /// it adds the line verbatim after the existing text.
     #[test]
     fn append_work_item_description_line_adds_the_line_verbatim_to_the_description() {
         let (_dir, db) = open_db();
@@ -1733,14 +1733,14 @@ mod tests {
         };
         let before = description(&db);
 
-        db.append_work_item_description_line(&chore_id, "\n[engine-reconcile] epoch 1: a reason.")
+        db.append_work_item_description_line(&chore_id, "\n[doc-detector] first line")
             .unwrap();
         db.append_work_item_description_line(&chore_id, "\n[doc-detector] second line")
             .unwrap();
 
         assert_eq!(
             description(&db),
-            format!("{before}\n[engine-reconcile] epoch 1: a reason.\n[doc-detector] second line")
+            format!("{before}\n[doc-detector] first line\n[doc-detector] second line")
         );
         assert!(
             db.append_work_item_description_line("task_that_does_not_exist", "\nx")

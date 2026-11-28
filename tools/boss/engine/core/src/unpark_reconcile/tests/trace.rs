@@ -1,4 +1,4 @@
-//! What every step leaves behind: a `[parking]` line on the item and an
+//! What every step leaves behind: a `[parking]` line in the ledger and an
 //! `unpark_reconcile` dispatch event, with the step name and outcome. And the
 //! sequence's two promises: a failing step does not stop the ones after it, and
 //! running it again is harmless.
@@ -170,11 +170,8 @@ async fn the_trail_does_not_leak_into_the_brief_a_worker_reads() {
     f.unpark_and_reconcile(&chore).await;
 
     let description = f.description(&chore);
-    assert!(description.contains("[parking]"), "{description}");
-    assert_eq!(
-        boss_engine_storage_values::audit_text::strip_engine_audit_lines(&description),
-        "Do the thing."
-    );
+    assert_eq!(description, "Do the thing.");
+    assert!(!f.parking_lines(&chore).is_empty());
 }
 
 #[tokio::test]

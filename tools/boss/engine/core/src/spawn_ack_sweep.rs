@@ -644,7 +644,7 @@ pub(crate) enum ReapOutcome {
 
 /// The operator-facing narrative for one never-started reap: the orphan
 /// reason recorded on the run, the `[engine-reconcile]` audit line appended
-/// to the work item's description, and the dispatch stage emitted.
+/// to the work-item audit ledger, and the dispatch stage emitted.
 ///
 /// `liveness` is the transcript probe's summary — what the reap checked on
 /// disk before it proceeded — and is appended to both texts so the record
@@ -988,7 +988,7 @@ pub(crate) async fn finish_reap(
     )
     .await;
 
-    // Append an [engine-reconcile] audit line to the work item's description
+    // Append an [engine-reconcile] audit line to the work-item audit ledger
     // so a human inspecting the chore can see why it was reset.
     if let Err(err) =
         crate::reconcile_audit::append_reconcile_audit(ctx.work_db, work_item_id, now_epoch_secs, &audit_note)
@@ -996,7 +996,7 @@ pub(crate) async fn finish_reap(
         tracing::warn!(
             work_item_id,
             ?err,
-            "reap-never-started-spawn: failed to append audit line to description (non-fatal)",
+            "reap-never-started-spawn: failed to append audit line to ledger (non-fatal)",
         );
     }
 

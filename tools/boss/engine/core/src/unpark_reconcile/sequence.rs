@@ -21,9 +21,9 @@ use crate::worker_readoption::LiveWorkerConvergence;
 /// `updated_at` age the orphan sweep requires before it will treat an `active`
 /// item with no live execution as an orphan. The race that guard exists for — a
 /// fresh `todo → active` flip whose worker is still spinning up — cannot apply
-/// to an item the owner un-parked, which was already `active`; and the
-/// reconciliation's own audit lines stamp `updated_at` in the current second,
-/// which a zero age would still read as too fresh. `-1` makes the cutoff one
+/// to an item the owner un-parked, which was already `active`. The un-park
+/// itself can stamp `updated_at` in the current second, which a zero age
+/// would still read as too fresh. `-1` makes the cutoff one
 /// second in the future, so the item is a candidate immediately.
 const UNPARK_ORPHAN_MIN_AGE_SECS: i64 = -1;
 

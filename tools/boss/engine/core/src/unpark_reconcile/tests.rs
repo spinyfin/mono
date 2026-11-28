@@ -236,12 +236,14 @@ impl Fixture {
         self.task(id).description
     }
 
-    /// The `[parking]` lines on an item's description, in order.
+    /// The `[parking]` lines in an item's audit ledger, in order.
     pub(super) fn parking_lines(&self, id: &str) -> Vec<String> {
-        self.description(id)
-            .lines()
+        self.db
+            .list_task_field_audit(id)
+            .unwrap()
+            .into_iter()
+            .filter_map(|row| row.detail)
             .filter(|line| line.starts_with("[parking]"))
-            .map(str::to_owned)
             .collect()
     }
 
