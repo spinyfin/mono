@@ -52,7 +52,11 @@ impl Fixture {
     }
 
     fn sql(&self, sql: &str) {
-        self.db.connect().unwrap().execute_batch(sql).unwrap();
+        let conn = self.db.connect().unwrap();
+        conn.execute_batch(sql).unwrap();
+        if sql.contains("work_item_dependencies") {
+            crate::work_dependencies::cycle::rebuild_members(&conn).unwrap();
+        }
     }
 
     /// A stuck chore: `blocked: merge_conflict`, stuck for three hours (past the

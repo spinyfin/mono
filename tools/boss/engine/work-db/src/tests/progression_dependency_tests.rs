@@ -574,3 +574,164 @@ fn clause_4_a_same_family_finished_prerequisite_does_not_hide_the_dependent_run(
     f.db.mint_progression_executions().unwrap();
     assert_eq!(bucket(&f.db, &dependent), Some(StuckBucket::ProgressionInFlight));
 }
+
+#[test]
+fn revision_waiting_on_its_own_pr_is_a_named_cycle_even_with_archived_prerequisites() {
+    let f = fixture();
+    let root = f.chore("Open PR root");
+    let revision = f.revision_of(&root, "Review revision");
+    let prerequisite = f.chore("Split-out work");
+    let archived = f.chore("Archived prerequisite");
+    f.sql(&format!(
+        "UPDATE tasks SET status = 'in_review' WHERE id = '{root}';
+         UPDATE tasks SET status = 'archived' WHERE id = '{archived}';
+         INSERT INTO work_item_dependencies (dependent_id, prerequisite_id, relation, created_at)
+         VALUES ('{revision}', '{prerequisite}', 'blocks', '1'),
+                ('{prerequisite}', '{root}', 'blocks', '1'),
+                ('{revision}', '{archived}', 'blocks', '1')"
+    ));
+    for id in [&revision, &prerequisite] {
+        f.stick(id, "status = 'blocked', blocked_reason = 'dependency'", 3);
+    }
+    f.execution(
+        &revision,
+        ExecutionKind::RevisionImplementation,
+        ExecutionStatus::WaitingDependency,
+    );
+    let later = f.revision_of(&root, "Later revision queued on the same PR");
+    f.sql(&format!(
+        "INSERT INTO work_item_dependencies (dependent_id, prerequisite_id, relation, created_at)
+         VALUES ('{later}', '{revision}', 'blocks', '1')"
+    ));
+    f.execution(
+        &later,
+        ExecutionKind::RevisionImplementation,
+        ExecutionStatus::WaitingDependency,
+    );
+    let report = f.db.stuck_report(0, now(), &observed_live_pid).unwrap();
+    for id in [&revision, &prerequisite] {
+        assert_eq!(
+            report
+                .rows
+                .iter()
+                .find(|row| &row.work_item_id == id)
+                .unwrap()
+                .classification,
+            "S4_dependency_cycle"
+        );
+        assert_eq!(f.clauses(id).stuck_kind.as_deref(), Some("S4_dependency_cycle"));
+        f.assert_candidate(id, true);
+        assert_eq!(bucket(&f.db, id), Some(StuckBucket::EngineStuck));
+    }
+    assert!(f.db.gating_prereqs_for(&revision).unwrap().contains(&prerequisite));
+    assert!(f.db.gating_prereqs_for(&root).unwrap().contains(&prerequisite));
+    // Archiving a member cannot silently satisfy a structural cycle.
+    f.sql(&format!(
+        "UPDATE tasks SET status = 'archived' WHERE id = '{prerequisite}'"
+    ));
+    assert!(f.db.gating_prereqs_for(&revision).unwrap().contains(&prerequisite));
+    assert_eq!(f.clauses(&revision).stuck_kind.as_deref(), Some("S4_dependency_cycle"));
+    f.execution(&revision, ExecutionKind::Progression, ExecutionStatus::Ready);
+    assert_eq!(bucket(&f.db, &revision), Some(StuckBucket::ProgressionInFlight));
+    f.assert_candidate(&revision, false);
+    // Diagnosis must not repair the graph by dropping edges or archiving work.
+    assert_eq!(
+        query_task(&f.db.connect().unwrap(), &revision).unwrap().unwrap().status,
+        TaskStatus::Blocked
+    );
+}
+
+#[test]
+fn graph_repairs_clear_cycle_membership_without_reopening() {
+    for convert in [false, true] {
+        let f = fixture();
+        let root = f.chore("PR root");
+        let revision = f.revision_of(&root, "Review findings");
+        let prerequisite = f.chore("Split-out prerequisite");
+        // The root's edge closes a loop through the revision-parent edge.
+        f.sql(&format!(
+            "INSERT INTO work_item_dependencies (dependent_id, prerequisite_id, relation, created_at)
+             VALUES ('{root}', '{prerequisite}', 'blocks', '1'),
+                    ('{prerequisite}', '{revision}', 'blocks', '1')"
+        ));
+        f.stick(&revision, "status = 'blocked', blocked_reason = 'dependency'", 3);
+        assert_eq!(f.clauses(&revision).stuck_kind.as_deref(), Some("S4_dependency_cycle"));
+        assert!(f.db.gating_prereqs_for(&revision).unwrap().contains(&root));
+        if convert {
+            let mut conn = f.db.connect().unwrap();
+            let tx = conn.transaction().unwrap();
+            let rev = query_task(&tx, &revision).unwrap().unwrap();
+            let (changed, _) = crate::review_findings_followup::convert_revision_to_review_findings_followup(
+                &tx,
+                &rev,
+                &root,
+                &now_string(),
+                true,
+            )
+            .unwrap();
+            assert_eq!(changed, 1);
+            tx.commit().unwrap();
+        } else {
+            f.db.delete_work_item(&prerequisite).unwrap();
+        }
+        let conn = f.db.connect().unwrap();
+        assert!(!crate::work_dependencies::cycle::any_member(&conn, &[&root, &revision, &prerequisite]).unwrap());
+        drop(conn);
+        assert!(f.db.gating_prereqs_for(&revision).unwrap().is_empty());
+        assert_ne!(f.clauses(&revision).stuck_kind.as_deref(), Some("S4_dependency_cycle"));
+        let report = f.db.stuck_report(0, now(), &observed_live_pid).unwrap();
+        assert!(
+            report
+                .rows
+                .iter()
+                .all(|row| row.classification != "S4_dependency_cycle")
+        );
+    }
+}
+
+#[test]
+fn converting_nonmember_revision_does_not_scan_tasks() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let f = fixture();
+    let root = f.chore("PR root");
+    let revision = f.revision_of(&root, "Review findings");
+    let mut conn = f.db.connect().unwrap();
+    conn.execute_batch(
+        "WITH RECURSIVE s(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM s WHERE n < 9999)
+         INSERT INTO tasks(id, name, product_id, kind, status, created_at, updated_at)
+         SELECT printf('unrelated%d', n), 'Unrelated', (SELECT product_id FROM tasks LIMIT 1),
+                'chore', 'done', '1760000000', '1760000000' FROM s",
+    )
+    .unwrap();
+    assert!(!crate::work_dependencies::cycle::any_member(&conn, &[&revision]).unwrap());
+    let rev = query_task(&conn, &revision).unwrap().unwrap();
+    let steps = Arc::new(AtomicUsize::new(0));
+    let count = steps.clone();
+    conn.progress_handler(
+        100,
+        Some(move || {
+            count.fetch_add(100, Ordering::Relaxed);
+            false
+        }),
+    );
+    let tx = conn.transaction().unwrap();
+    let (changed, _) = crate::review_findings_followup::convert_revision_to_review_findings_followup(
+        &tx,
+        &rev,
+        &root,
+        &now_string(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(changed, 1);
+    tx.commit().unwrap();
+    let steps = steps.load(Ordering::Relaxed);
+    assert!(
+        steps < 3000,
+        "nonmember conversion used {steps} VM steps; must not scan 10000 tasks"
+    );
+    assert!(query_task(&conn, &revision).unwrap().unwrap().parent_task_id.is_none());
+}

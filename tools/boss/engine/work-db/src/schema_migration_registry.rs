@@ -319,6 +319,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: critical_requests::migrate,
         },
         Migration {
+            id: crate::work_dependencies::cycle::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: crate::work_dependencies::cycle::migrate,
+        },
+        Migration {
             id: "20261113_0633_dispatch_failure_history".into(),
             legacy_version: None,
             apply: pre_start_failure::migrate_dispatch_failure_history,
