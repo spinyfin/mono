@@ -5,6 +5,9 @@
 set -euo pipefail
 
 RELEASE_LOG_PREFIX="release-release"
+# Match `bazel build -c opt` below. Override ci-env.sh's default fastbuild so
+# tool-install does not discard the analysis cache when the product build starts.
+CI_BAZEL_STEP_FLAGS="--compilation_mode=opt"
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
 CONFIG="tools/release/release.toml"
@@ -16,6 +19,10 @@ TARGET="//tools/release:release"
 
 phase_prepare() {
   echo "[release-release] agent: $(uname -a)"
+  # Deliberately runs in opt (inherited from CI_BAZEL_STEP_FLAGS) so this
+  # gate shares the analysis cache and compiled crates with tool-install's
+  # bin/release build; release_lib_test does not rely on debug_assert!-only
+  # checks.
   bazel test //tools/release:release_lib_test
   local tag
   tag="$(bin/release prepare --config "${CONFIG}")"

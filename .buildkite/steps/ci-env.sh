@@ -75,8 +75,24 @@ fi
 # config and replace none of it: the disk cache stays on in front of the remote
 # cache (see build:ci-remote in .ci.bazelrc for why). The bazel() wrapper below
 # and repobin (via REPOBIN_BAZEL_FLAGS) both read from here.
+#
+# Analysis-affecting flags this step's main bazel command uses (--config,
+# -c / --compilation_mode, --define) are appended so the bootstrap
+# `bazel build //tools/repobin:repobin` and `repobin install` keep the same
+# analysis cache as the command that follows. A step may set
+# CI_BAZEL_STEP_FLAGS before sourcing; otherwise bazel-step-flags.sh fills
+# them in from CI_BAZEL_VERIFY_ONLY (see that file). They are appended here
+# rather than baked into the assignment below so CI_BAZEL_FLAGS never
+# hard-codes --config=ci-strip: release builds share this variable and must
+# keep their symbols.
 export CI_BAZEL_FLAGS="--config=ci-${OS_TYPE} --experimental_disk_cache_gc_max_size=${CI_DISK_CACHE_GC_MAX_SIZE}${CI_REMOTE_BAZEL_FLAGS:+ ${CI_REMOTE_BAZEL_FLAGS}}"
+# shellcheck source=bazel-step-flags.sh
+source "$(dirname "${BASH_SOURCE[0]}")/bazel-step-flags.sh"
+CI_BAZEL_STEP_FLAGS="$(ci_resolve_bazel_step_flags)"
+export CI_BAZEL_STEP_FLAGS
+export CI_BAZEL_FLAGS="$CI_BAZEL_FLAGS${CI_BAZEL_STEP_FLAGS:+ ${CI_BAZEL_STEP_FLAGS}}"
 export REPOBIN_BAZEL_FLAGS="$CI_BAZEL_FLAGS"
+echo "--- [ci-env] bazel step flags: ${CI_BAZEL_STEP_FLAGS}"
 
 # CI_BAZEL_VERIFY_ONLY_FLAGS (set by ci_remote_execution_decide) is for a build
 # or test command that is run only for its result: nothing afterwards reads its
@@ -387,15 +403,27 @@ bazel() {
 # flags. Do not use it for a build whose output is then executed, uploaded or
 # inspected -- on a remotely executing step that file will not be on the agent.
 #
-# It also selects --config=ci-strip (see .ci.bazelrc): nothing run through here
+# It also relies on --config=ci-strip (see .ci.bazelrc): nothing run through here
 # ships or is debugged from its binaries, so Rust executables and test binaries
 # are linked without symbol tables, which roughly halves what each one adds to
 # the remote cache. Release builds do not go through this function and keep
 # their symbols.
+#
+# The step must set CI_BAZEL_VERIFY_ONLY=1 before sourcing this file so
+# CI_BAZEL_FLAGS (and therefore tool-install and this command) already carries
+# --config=ci-strip and --compilation_mode=fastbuild. Do not pass --config=ci-strip
+# again here: extra_rustc_flag is a repeatable string_list setting, so selecting
+# ci-strip twice produces a different configuration than tool-install's single
+# selection and discards the analysis cache.
 bazel_verify_only() {
+  if [[ "${CI_BAZEL_VERIFY_ONLY:-}" != "1" ]]; then
+    echo "^^^ +++"
+    echo "[ci-env] error: bazel_verify_only requires CI_BAZEL_VERIFY_ONLY=1 before sourcing ci-env.sh so tool-install shares --config=ci-strip and --compilation_mode=fastbuild with this step's main build." >&2
+    return 1
+  fi
   local subcommand="$1"
   shift
-  bazel "$subcommand" --config=ci-strip $CI_BAZEL_VERIFY_ONLY_FLAGS "$@"
+  bazel "$subcommand" $CI_BAZEL_VERIFY_ONLY_FLAGS "$@"
 }
 
 # Shared by the release step scripts (checkleft-release.sh, release-release.sh)
@@ -434,6 +462,11 @@ binary_path() {
 # tools/repobin/shim/install-workspace-shims.sh (symlinks that build repobin
 # on first use, since a lease cannot afford a bazel build). Keep the two in
 # step: bin/checkleft must mean the same binary there as it does here.
+#
+# Both invocations go through CI_BAZEL_FLAGS / REPOBIN_BAZEL_FLAGS (including
+# CI_BAZEL_STEP_FLAGS) so they share the analysis cache with the step's main
+# build. repobin's hardcoded --compilation_mode=opt is overridden by the
+# trailing --compilation_mode from those flags.
 echo "+++ installing repobin tools into bin/"
 bazel build //tools/repobin:repobin
 ./bazel-bin/tools/repobin/repobin install --bin-dir bin/ --no-defaults

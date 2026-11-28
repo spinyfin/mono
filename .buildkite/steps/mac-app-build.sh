@@ -10,6 +10,7 @@ set -euo pipefail
 # nothing it passes to bazel is a credential and its build and
 # test commands are run only for their result.
 CI_REMOTE_EXECUTION_ALLOWED=1
+CI_BAZEL_VERIFY_ONLY=1
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
 echo "--- [mac-app-build] building"

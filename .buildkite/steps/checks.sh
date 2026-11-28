@@ -14,6 +14,15 @@ set -euo pipefail
 # decides whether it does (see remote-execution.sh). It qualifies because
 # nothing it passes to bazel is a credential. checkleft and
 # repobin build the tools they then run, which downloads those outputs as usual.
+#
+# Build bin/checkleft in opt rather than fastbuild: a fastbuild checkleft is
+# much slower because its embedded wasmtime/Cranelift JIT runs unoptimized
+# (~17x slower per docs/investigations/checkleft-lib-test-wasm-compile-timeout.md),
+# which costs more than the re-analysis a shared fastbuild config would save.
+# checkleft's own bazel invocations read CI_BAZEL_FLAGS, so the analysis cache
+# stays shared.
+# Do not set CI_BAZEL_VERIFY_ONLY: ci-strip is not used here.
+CI_BAZEL_STEP_FLAGS="--compilation_mode=opt"
 CI_REMOTE_EXECUTION_ALLOWED=1
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 

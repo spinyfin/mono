@@ -51,7 +51,34 @@ sh_test(
     srcs = ["ci_strip_config_test.sh"],
     data = [
         "//:.ci.bazelrc",
+        "//.buildkite/steps:bazel-step-flags.sh",
         "//.buildkite/steps:ci-env.sh",
+    ],
+)
+
+# Script-level test for the per-step analysis flags ci-env.sh appends to
+# CI_BAZEL_FLAGS / REPOBIN_BAZEL_FLAGS so tool-install keeps the analysis
+# cache. Also greps each CI step that sources ci-env.sh for the matching
+# CI_BAZEL_VERIFY_ONLY / CI_BAZEL_STEP_FLAGS opt-in.
+sh_test(
+    name = "bazel_step_flags_test",
+    size = "small",
+    srcs = ["bazel_step_flags_test.sh"],
+    data = [
+        "//.buildkite/steps:bazel-build-test.sh",
+        "//.buildkite/steps:bazel-step-flags.sh",
+        "//.buildkite/steps:boss-release.sh",
+        "//.buildkite/steps:changelog-release.sh",
+        "//.buildkite/steps:checkleft-release.sh",
+        "//.buildkite/steps:checks.sh",
+        "//.buildkite/steps:ci-env.sh",
+        "//.buildkite/steps:integrity-bazel.sh",
+        "//.buildkite/steps:integrity-checkleft.sh",
+        "//.buildkite/steps:mac-app-build.sh",
+        "//.buildkite/steps:release-release.sh",
+        "//.buildkite/steps:repobin-release.sh",
+        "//.buildkite/steps:spoke-release.sh",
+        "//.buildkite/steps:verify-boss-tag-cache.sh",
     ],
 )
 

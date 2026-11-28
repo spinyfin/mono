@@ -13,6 +13,12 @@ set -euo pipefail
 # decides whether it does (see remote-execution.sh). It qualifies because
 # nothing it passes to bazel is a credential. checkleft and
 # repobin build the tools they then run, which downloads those outputs as usual.
+#
+# Build bin/checkleft in opt rather than fastbuild: same rationale as checks.sh
+# (embedded wasmtime/Cranelift JIT penalty on unoptimized builds, amplified
+# across --all). checkleft's own bazel invocations read CI_BAZEL_FLAGS, so the
+# analysis cache stays shared. Do not set CI_BAZEL_VERIFY_ONLY.
+CI_BAZEL_STEP_FLAGS="--compilation_mode=opt"
 CI_REMOTE_EXECUTION_ALLOWED=1
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 

@@ -72,6 +72,12 @@ fi
 # this step publishes, so the cache holds nothing the release does not. A step
 # whose secrets must stay on the agent must not copy this line.
 CI_REMOTE_EXECUTION_ALLOWED=1
+# Tool-install builds opt to match the other release steps. The Boss.app
+# compile below adds --config=release and the shake credential --defines (to
+# stamp the binary and embed secrets without re-keying every tool build), so
+# it discards the analysis cache once when those flags appear -- that command
+# is the documented exception.
+CI_BAZEL_STEP_FLAGS="--compilation_mode=opt"
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
