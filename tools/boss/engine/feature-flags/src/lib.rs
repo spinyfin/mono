@@ -53,8 +53,9 @@ use serde::{Deserialize, Serialize};
 
 mod experiments;
 pub use experiments::{
-    BATCHED_SEARCH_AB_SPLIT_FLAG, BATCHED_SEARCH_EXPERIMENT, EXPERIMENT_FLAG_CATEGORY, EXPERIMENTS, ExperimentArm,
-    ExperimentArmSet, ExperimentLane, ExperimentSpec, ExperimentState, TOKEN_EXPERIMENTS_FLAG, TREATMENT_BUCKET_LIMIT,
+    BATCHED_SEARCH_AB_SPLIT_FLAG, BATCHED_SEARCH_EXPERIMENT, CLAUDE_LEAN_ENVIRONMENT_AB_SPLIT_FLAG,
+    CLAUDE_LEAN_ENVIRONMENT_EXPERIMENT, EXPERIMENT_FLAG_CATEGORY, EXPERIMENTS, ExperimentArm, ExperimentArmSet,
+    ExperimentLane, ExperimentSpec, ExperimentState, TOKEN_EXPERIMENTS_FLAG, TREATMENT_BUCKET_LIMIT,
     WORKER_AUTOCOMPACT_AB_SPLIT_FLAG, WORKER_AUTOCOMPACT_EXPERIMENT, ab_split_flag_name, assign_arm, experiment_state,
     resolve_arms,
 };
@@ -552,6 +553,34 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
              share one arm. On: half of families are treated and the rest are control. Off: every family is \
              treated. Has no effect while `worker_autocompact` is off. DEFAULT ON, so switching \
              `worker_autocompact` on starts the split; turn this off to treat every family.",
+        category: EXPERIMENT_FLAG_CATEGORY,
+        default_enabled: true,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
+        name: CLAUDE_LEAN_ENVIRONMENT_EXPERIMENT,
+        description: "Experiment `claude_lean_environment` (token-consumption investigation R3 step 1; no lane). \
+             Treated Claude workers of every kind launch with skills and slash commands disabled \
+             (`--disable-slash-commands`), no inherited MCP servers (`--strict-mcp-config`), setting sources \
+             restricted to `project,local` (excluding the user-level `CLAUDE.md` while keeping project rules and \
+             `--settings` hooks), and unused built-in tools (`Artifact`, `Workflow`, `ScheduleWakeup`, \
+             `SendFeedback`, `ReportFindings`) removed alongside `AskUserQuestion`. Control launches are unchanged. \
+             Which PR families are treated is decided by `claude_lean_environment_ab_split`, and every launch \
+             records its family's arm in the execution's launch record so the arms can be compared in the Token \
+             Usage window. Has no effect while `token_experiments` is off. DEFAULT OFF: ships inert. Kill switch: \
+             set false and the next launch gets today's launch line; a worker already running keeps the one it \
+             started with.",
+        category: EXPERIMENT_FLAG_CATEGORY,
+        default_enabled: false,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
+        name: CLAUDE_LEAN_ENVIRONMENT_AB_SPLIT_FLAG,
+        description: "Run `claude_lean_environment` as an A/B experiment on half of PR families, chosen by a stable \
+             hash of the PR family and the experiment key. A work item and all of its revisions, reviews and guides \
+             share one arm. On: half of families are treated and the rest are control. Off: every family is \
+             treated. Has no effect while `claude_lean_environment` is off. DEFAULT ON, so switching \
+             `claude_lean_environment` on starts the split; turn this off to treat every family.",
         category: EXPERIMENT_FLAG_CATEGORY,
         default_enabled: true,
         capability_id: None,

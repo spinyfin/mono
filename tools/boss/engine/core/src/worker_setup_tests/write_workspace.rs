@@ -103,6 +103,7 @@ fn write_workspace_files_with_autocompact_adds_compact_instructions() {
     };
     let options = crate::driver::LaunchOptions {
         auto_compact_window: Some(crate::driver::CLAUDE_WORKER_AUTO_COMPACT_WINDOW),
+        ..crate::driver::LaunchOptions::default()
     };
 
     let untreated = write_workspace_files(&input, &ClaudeDriver).unwrap();
@@ -112,6 +113,51 @@ fn write_workspace_files_with_autocompact_adds_compact_instructions() {
     assert!(!untreated_rules.contains(COMPACT_INSTRUCTIONS_HEADING));
     assert!(treated_rules.contains(COMPACT_INSTRUCTIONS_HEADING));
     assert_eq!(treated_rules, with_compact_instructions(untreated_rules));
+}
+
+#[test]
+fn write_workspace_files_with_lean_environment_writes_permission_acknowledgements() {
+    let _shared = lock_shared_settings_dir();
+    let _home = ClaudeConfigGuard::new();
+    let dir = TempDir::new().unwrap();
+    let input = WorkerSetupInput {
+        run_id: "run-lean-acks".into(),
+        lease_id: "lease-lean-acks".into(),
+        workspace_path: dir.path().to_path_buf(),
+        events_socket_path: PathBuf::from("/tmp/events.sock"),
+        boss_event_path: PathBuf::from("/tmp/boss-event"),
+        ..sample_input()
+    };
+    let untreated = write_workspace_files(&input, &ClaudeDriver).unwrap();
+    let untreated_settings: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&untreated.settings_path).unwrap()).unwrap();
+    assert!(untreated_settings.get("skipDangerousModePermissionPrompt").is_none());
+    assert!(untreated_settings.get("skipAutoPermissionPrompt").is_none());
+
+    let treated = write_workspace_files_with_options(
+        &input,
+        &ClaudeDriver,
+        &crate::driver::LaunchOptions {
+            lean_environment: true,
+            ..crate::driver::LaunchOptions::default()
+        },
+    )
+    .unwrap();
+    let treated_settings: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&treated.settings_path).unwrap()).unwrap();
+    for (key, enabled) in crate::driver::claude::CLAUDE_LEAN_PERMISSION_ACKNOWLEDGEMENTS {
+        assert_eq!(
+            treated_settings[*key],
+            serde_json::Value::Bool(*enabled),
+            "lean --settings must carry {key}"
+        );
+    }
+    assert!(
+        treated_settings["hooks"]
+            .as_object()
+            .is_some_and(|h| h.contains_key("SessionStart")),
+        "lean --settings must still carry hooks"
+    );
 }
 
 #[test]

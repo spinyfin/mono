@@ -1912,6 +1912,15 @@ pub struct LaunchOptions {
     /// Claude `--autocompact` window (for example `"200k"`). `None` keeps
     /// today's launch line.
     pub auto_compact_window: Option<&'static str>,
+    /// Launch Claude without the personal environment: disable skills and
+    /// slash commands, ignore inherited MCP servers, exclude the user-level
+    /// `CLAUDE.md` and `~/.claude/settings.json` via `--setting-sources
+    /// project,local` (user `permissions` / `autoMode` settings are dropped;
+    /// the worker `--settings` file supplies the bypass/auto acknowledgement
+    /// keys so treated interactive launches do not stop on "Yes, I accept"),
+    /// and remove unused built-in tools by name. `false` keeps today's launch
+    /// line.
+    pub lean_environment: bool,
 }
 
 /// Driver-neutral inputs for the [`Capability::Spawn`] capability. Every
@@ -2052,7 +2061,8 @@ pub trait AgentDriver: Send + Sync {
     /// [`Self::spawn_invocation`] with the launch knobs the runner resolved
     /// from the arm set. The default ignores `options` and returns today's
     /// launch line, so the many `SpawnRequest` struct-literal sites stay
-    /// on the control path. Claude applies [`LaunchOptions::auto_compact_window`].
+    /// on the control path. Claude applies [`LaunchOptions::auto_compact_window`]
+    /// and [`LaunchOptions::lean_environment`].
     fn spawn_invocation_with_options(&self, request: SpawnRequest<'_>, options: &LaunchOptions) -> SpawnPlan {
         let _ = options;
         self.spawn_invocation(request)

@@ -17,7 +17,9 @@ use std::path::PathBuf;
 use crate::driver::{
     AgentDriver, CLAUDE_WORKER_AUTO_COMPACT_WINDOW, ClaudeDriver, EnvDirective, LaunchOptions, SpawnRequest,
 };
-use crate::worker_setup::{WorkerKind, WorkerSetupInput, render_claude_md, render_settings_json};
+use crate::worker_setup::{
+    WorkerKind, WorkerSetupInput, render_claude_md, render_settings_json, render_settings_json_with_options,
+};
 
 /// Deterministic fixture input — absolute paths, no host temp dir, so the
 /// CLAUDE.md / deny-rule goldens are portable across machines and CI.
@@ -210,6 +212,7 @@ fn golden_spawn_line_opus_with_autocompact() {
         },
         &LaunchOptions {
             auto_compact_window: Some(CLAUDE_WORKER_AUTO_COMPACT_WINDOW),
+            ..LaunchOptions::default()
         },
     );
     assert_eq!(
@@ -217,6 +220,121 @@ fn golden_spawn_line_opus_with_autocompact() {
         "python3 -I .claude/initial-prompt.py claude --model opus --disallowedTools=AskUserQuestion --permission-mode auto --settings '/tmp/boss-worker-settings/mono-agent-007.json' --autocompact 200k\n",
         "treated Claude spawn line must pass --autocompact 200k",
     );
+}
+
+#[test]
+fn golden_spawn_line_opus_with_lean_environment() {
+    let settings = PathBuf::from("/tmp/boss-worker-settings/mono-agent-007.json");
+    let plan = ClaudeDriver.spawn_invocation_with_options(
+        SpawnRequest {
+            model: "opus",
+            effort: None,
+            settings_path: Some(settings.as_path()),
+            non_opus_auto_mode: false,
+            permission_mode_override: None,
+            run_id: None,
+        },
+        &LaunchOptions {
+            lean_environment: true,
+            ..LaunchOptions::default()
+        },
+    );
+    assert_eq!(
+        plan.env,
+        vec![EnvDirective::Unset("ANTHROPIC_API_KEY".to_owned())],
+        "lean Claude spawn must still unset ANTHROPIC_API_KEY",
+    );
+    assert_eq!(
+        plan.command,
+        "python3 -I .claude/initial-prompt.py claude --model opus --disallowedTools=AskUserQuestion,Artifact,Workflow,ScheduleWakeup,SendFeedback,ReportFindings --permission-mode auto --settings '/tmp/boss-worker-settings/mono-agent-007.json' --disable-slash-commands --strict-mcp-config --setting-sources project,local\n",
+        "treated lean Claude spawn line must pin the exact lean flags and preserve --settings",
+    );
+    assert!(!plan.command.contains("--bare"));
+    assert!(!plan.command.contains("--safe-mode"));
+}
+
+#[test]
+fn golden_spawn_line_opus_with_lean_environment_and_autocompact() {
+    let settings = PathBuf::from("/tmp/boss-worker-settings/mono-agent-007.json");
+    let plan = ClaudeDriver.spawn_invocation_with_options(
+        SpawnRequest {
+            model: "opus",
+            effort: None,
+            settings_path: Some(settings.as_path()),
+            non_opus_auto_mode: false,
+            permission_mode_override: None,
+            run_id: None,
+        },
+        &LaunchOptions {
+            auto_compact_window: Some(CLAUDE_WORKER_AUTO_COMPACT_WINDOW),
+            lean_environment: true,
+        },
+    );
+    assert_eq!(
+        plan.command,
+        "python3 -I .claude/initial-prompt.py claude --model opus --disallowedTools=AskUserQuestion,Artifact,Workflow,ScheduleWakeup,SendFeedback,ReportFindings --permission-mode auto --settings '/tmp/boss-worker-settings/mono-agent-007.json' --disable-slash-commands --strict-mcp-config --setting-sources project,local --autocompact 200k\n",
+        "lean_environment and worker_autocompact must compose cleanly on the treated launch line",
+    );
+}
+
+#[test]
+fn golden_lean_environment_still_passes_hook_settings_file() {
+    let input = golden_input();
+    let rendered = render_settings_json_with_options(
+        &input,
+        &ClaudeDriver as &dyn AgentDriver,
+        &LaunchOptions {
+            lean_environment: true,
+            ..LaunchOptions::default()
+        },
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    let hooks = parsed["hooks"].as_object().expect("rendered settings must carry hooks");
+    for event in [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "Stop",
+        "Notification",
+        "SessionEnd",
+    ] {
+        assert!(hooks.contains_key(event), "hook settings file must wire {event}");
+    }
+
+    let settings = PathBuf::from("/tmp/boss-worker-settings/mono-agent-007.json");
+    let plan = ClaudeDriver.spawn_invocation_with_options(
+        SpawnRequest {
+            model: "sonnet",
+            effort: Some("high"),
+            settings_path: Some(settings.as_path()),
+            non_opus_auto_mode: false,
+            permission_mode_override: None,
+            run_id: None,
+        },
+        &LaunchOptions {
+            lean_environment: true,
+            ..LaunchOptions::default()
+        },
+    );
+    assert!(
+        plan.command
+            .contains("--settings '/tmp/boss-worker-settings/mono-agent-007.json'"),
+        "treated lean launch must still pass the rendered hook settings file via --settings; got: {}",
+        plan.command,
+    );
+    assert!(
+        !plan.command.contains("--bare") && !plan.command.contains("--safe-mode"),
+        "treated lean launch must never pass --bare or --safe-mode (both skip hooks); got: {}",
+        plan.command,
+    );
+    for (key, enabled) in crate::driver::claude::CLAUDE_LEAN_PERMISSION_ACKNOWLEDGEMENTS {
+        assert_eq!(
+            parsed[*key],
+            serde_json::Value::Bool(*enabled),
+            "lean --settings must carry {key} so excluding the user source does not reintroduce the accept dialog"
+        );
+    }
 }
 
 // ── Deny rules ──────────────────────────────────────────────────────────────

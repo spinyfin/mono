@@ -392,44 +392,55 @@ mod apply_permission_extra_args_tests {
 mod pty_initial_input_tests;
 
 /// Launch knobs for this spawn: only a treated Claude worker gets the
-/// auto-compact window. Other drivers, and control/stopped/unrecorded
-/// Claude launches, stay on today's line.
+/// auto-compact window or the lean environment. Other drivers, and
+/// control/stopped/unrecorded Claude launches, stay on today's line.
 fn worker_launch_options(driver: &str, arms: &crate::feature_flags::ExperimentArmSet) -> crate::driver::LaunchOptions {
+    let is_claude = driver == "claude";
     crate::driver::LaunchOptions {
-        auto_compact_window: (driver == "claude"
-            && arms.is_treated(crate::feature_flags::WORKER_AUTOCOMPACT_EXPERIMENT))
-        .then_some(crate::driver::CLAUDE_WORKER_AUTO_COMPACT_WINDOW),
+        auto_compact_window: (is_claude && arms.is_treated(crate::feature_flags::WORKER_AUTOCOMPACT_EXPERIMENT))
+            .then_some(crate::driver::CLAUDE_WORKER_AUTO_COMPACT_WINDOW),
+        lean_environment: is_claude && arms.is_treated(crate::feature_flags::CLAUDE_LEAN_ENVIRONMENT_EXPERIMENT),
     }
 }
 
 #[cfg(test)]
 mod launch_options_tests {
     use super::worker_launch_options;
-    use crate::feature_flags::{ExperimentArm, ExperimentArmSet, WORKER_AUTOCOMPACT_EXPERIMENT};
+    use crate::feature_flags::{
+        CLAUDE_LEAN_ENVIRONMENT_EXPERIMENT, ExperimentArm, ExperimentArmSet, WORKER_AUTOCOMPACT_EXPERIMENT,
+    };
 
-    fn arms(arm: ExperimentArm) -> ExperimentArmSet {
+    fn arms_for(key: &str, arm: ExperimentArm) -> ExperimentArmSet {
         let mut set = ExperimentArmSet::new();
-        set.insert(WORKER_AUTOCOMPACT_EXPERIMENT, arm);
+        set.insert(key, arm);
         set
     }
 
     #[test]
     fn only_a_treated_claude_worker_gets_the_window() {
-        let treated = worker_launch_options("claude", &arms(ExperimentArm::Treatment));
+        let treated = worker_launch_options(
+            "claude",
+            &arms_for(WORKER_AUTOCOMPACT_EXPERIMENT, ExperimentArm::Treatment),
+        );
         assert_eq!(
             treated.auto_compact_window,
             Some(crate::driver::CLAUDE_WORKER_AUTO_COMPACT_WINDOW)
         );
+        assert!(!treated.lean_environment);
         for driver in ["grok", "codex", "agy"] {
             assert_eq!(
-                worker_launch_options(driver, &arms(ExperimentArm::Treatment)).auto_compact_window,
+                worker_launch_options(
+                    driver,
+                    &arms_for(WORKER_AUTOCOMPACT_EXPERIMENT, ExperimentArm::Treatment)
+                )
+                .auto_compact_window,
                 None,
                 "{driver}"
             );
         }
         for arm in [ExperimentArm::Control, ExperimentArm::Stopped] {
             assert_eq!(
-                worker_launch_options("claude", &arms(arm)).auto_compact_window,
+                worker_launch_options("claude", &arms_for(WORKER_AUTOCOMPACT_EXPERIMENT, arm)).auto_compact_window,
                 None,
                 "{arm:?}"
             );
@@ -438,6 +449,46 @@ mod launch_options_tests {
             worker_launch_options("claude", &ExperimentArmSet::new()).auto_compact_window,
             None
         );
+    }
+
+    #[test]
+    fn only_a_treated_claude_worker_gets_the_lean_environment() {
+        let treated = worker_launch_options(
+            "claude",
+            &arms_for(CLAUDE_LEAN_ENVIRONMENT_EXPERIMENT, ExperimentArm::Treatment),
+        );
+        assert!(treated.lean_environment);
+        assert_eq!(treated.auto_compact_window, None);
+        for driver in ["grok", "codex", "agy"] {
+            assert!(
+                !worker_launch_options(
+                    driver,
+                    &arms_for(CLAUDE_LEAN_ENVIRONMENT_EXPERIMENT, ExperimentArm::Treatment)
+                )
+                .lean_environment,
+                "{driver}"
+            );
+        }
+        for arm in [ExperimentArm::Control, ExperimentArm::Stopped] {
+            assert!(
+                !worker_launch_options("claude", &arms_for(CLAUDE_LEAN_ENVIRONMENT_EXPERIMENT, arm)).lean_environment,
+                "{arm:?}"
+            );
+        }
+        assert!(!worker_launch_options("claude", &ExperimentArmSet::new()).lean_environment);
+    }
+
+    #[test]
+    fn lean_environment_and_autocompact_compose_on_claude() {
+        let mut set = ExperimentArmSet::new();
+        set.insert(WORKER_AUTOCOMPACT_EXPERIMENT, ExperimentArm::Treatment);
+        set.insert(CLAUDE_LEAN_ENVIRONMENT_EXPERIMENT, ExperimentArm::Treatment);
+        let options = worker_launch_options("claude", &set);
+        assert_eq!(
+            options.auto_compact_window,
+            Some(crate::driver::CLAUDE_WORKER_AUTO_COMPACT_WINDOW)
+        );
+        assert!(options.lean_environment);
     }
 }
 

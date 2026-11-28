@@ -1256,12 +1256,14 @@ fn prepare_session_start_brief(
 
 /// Parse `claude --version` stdout, e.g. `"2.1.237 (Claude Code)\n"` — the
 /// first whitespace-separated token, when it is a dotted run of digits.
+/// An optional leading `v` is stripped (`"v2.1.332"` parses as `"2.1.332"`).
 /// Mirrors the soft-parse shape `conformance::version_pin::parse_codex_version`
 /// uses for `codex` (which instead takes the *last* token; the two CLIs put
 /// the version in different positions).
-fn parse_claude_version(stdout: &str) -> Option<String> {
+pub(crate) fn parse_claude_version(stdout: &str) -> Option<String> {
     let line = stdout.lines().next()?.trim();
-    let version = line.split_whitespace().next()?;
+    let token = line.split_whitespace().next()?;
+    let version = token.strip_prefix('v').unwrap_or(token);
     let looks_like_semver = !version.is_empty()
         && version
             .split('.')
@@ -1492,8 +1494,8 @@ mod tests {
         assert_eq!(parse_claude_version("command not found\n"), None);
         assert_eq!(
             parse_claude_version("v2.1.237\n"),
-            None,
-            "leading 'v' is not a bare digit run"
+            Some("2.1.237".to_owned()),
+            "optional leading 'v' is stripped"
         );
     }
 

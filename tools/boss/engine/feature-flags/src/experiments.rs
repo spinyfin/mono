@@ -58,6 +58,14 @@ pub const WORKER_AUTOCOMPACT_EXPERIMENT: &str = "worker_autocompact";
 /// Splits [`WORKER_AUTOCOMPACT_EXPERIMENT`] between half of families and all.
 pub const WORKER_AUTOCOMPACT_AB_SPLIT_FLAG: &str = "worker_autocompact_ab_split";
 
+/// Key of the Claude lean-environment experiment: launch Claude workers without
+/// personal skills/slash commands, inherited MCP servers, unused built-in tools,
+/// or the user-level `CLAUDE.md`. No lane; it may overlap any other experiment.
+pub const CLAUDE_LEAN_ENVIRONMENT_EXPERIMENT: &str = "claude_lean_environment";
+
+/// Splits [`CLAUDE_LEAN_ENVIRONMENT_EXPERIMENT`] between half of families and all.
+pub const CLAUDE_LEAN_ENVIRONMENT_AB_SPLIT_FLAG: &str = "claude_lean_environment_ab_split";
+
 /// A surface on which at most one experiment may be assigned at a time.
 ///
 /// Two experiments that rewrite the same instructions, or reshape the same
@@ -125,6 +133,12 @@ pub const EXPERIMENTS: &[ExperimentSpec] = &[
     },
     ExperimentSpec {
         key: WORKER_AUTOCOMPACT_EXPERIMENT,
+        lane: None,
+        requires: &[],
+        splits: true,
+    },
+    ExperimentSpec {
+        key: CLAUDE_LEAN_ENVIRONMENT_EXPERIMENT,
         lane: None,
         requires: &[],
         splits: true,
@@ -851,6 +865,40 @@ mod tests {
         let resolved = resolve_arms(EXPERIMENTS, &flag, &|_| 0);
         assert!(resolved.is_treated(BATCHED_SEARCH_EXPERIMENT));
         assert!(resolved.is_treated(WORKER_AUTOCOMPACT_EXPERIMENT));
+    }
+
+    #[test]
+    fn claude_lean_environment_is_a_laneless_split() {
+        let spec = EXPERIMENTS
+            .iter()
+            .find(|spec| spec.key == CLAUDE_LEAN_ENVIRONMENT_EXPERIMENT)
+            .expect("claude_lean_environment is registered");
+        assert_eq!(spec.lane, None);
+        assert!(spec.splits);
+        assert!(spec.requires.is_empty());
+        assert_eq!(ab_split_flag_name(spec.key), CLAUDE_LEAN_ENVIRONMENT_AB_SPLIT_FLAG);
+    }
+
+    #[test]
+    fn claude_lean_environment_runs_alongside_other_experiments() {
+        let on = [
+            TOKEN_EXPERIMENTS_FLAG,
+            BATCHED_SEARCH_EXPERIMENT,
+            WORKER_AUTOCOMPACT_EXPERIMENT,
+            CLAUDE_LEAN_ENVIRONMENT_EXPERIMENT,
+        ];
+        let flag = |name: &str| on.contains(&name);
+        for key in [
+            BATCHED_SEARCH_EXPERIMENT,
+            WORKER_AUTOCOMPACT_EXPERIMENT,
+            CLAUDE_LEAN_ENVIRONMENT_EXPERIMENT,
+        ] {
+            assert_eq!(experiment_state(EXPERIMENTS, key, &flag), ExperimentState::All, "{key}");
+        }
+        let resolved = resolve_arms(EXPERIMENTS, &flag, &|_| 0);
+        assert!(resolved.is_treated(BATCHED_SEARCH_EXPERIMENT));
+        assert!(resolved.is_treated(WORKER_AUTOCOMPACT_EXPERIMENT));
+        assert!(resolved.is_treated(CLAUDE_LEAN_ENVIRONMENT_EXPERIMENT));
     }
 
     fn store() -> (tempfile::TempDir, FeatureFlagsStore) {
