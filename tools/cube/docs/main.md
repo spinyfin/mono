@@ -587,6 +587,16 @@ fails, and names the survivors and inspection errors. Removal refuses to unlink
 the directory if any owned process survives or if the process table, an individual
 process, or its working directory cannot be inspected.
 
+The same sweeps also cover the workspace's Claude Code scratch tree,
+`/tmp/claude-<uid>/<slug>/` (`/private/tmp/…` on macOS), where `<slug>` is the
+workspace path with every character outside `[A-Za-z0-9]` replaced by `-`. A
+session started in the workspace keeps its scratchpad and background-task files
+there, and a job it starts from that directory (a `nohup` script, a private tmux
+server) has no working directory in the workspace at all. The tree is keyed by
+the workspace path, not by lease, so it is only swept where the workspace is:
+on release and removal. The read-only expiry and claim checks below do not look
+at it, because a process there is not writing the checkout.
+
 Lease expiry does not prove that a holder has finished. Expiry and claim-time
 checks scan without sending signals. Occupied or uninspectable workspaces are
 durably quarantined with a process audit; ordinary lease selection continues to

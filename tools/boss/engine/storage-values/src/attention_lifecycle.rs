@@ -268,6 +268,13 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
         "The lease was returned although processes owned by no live run were still in the workspace after \
          the bounded wait. The item names the PIDs; a human decides whether they are stale.",
     ),
+    entry(
+        RUN_PROCESSES_SURVIVED_ATTENTION_KIND,
+        ClearedBy::HumanDecision,
+        "A run with no workspace lease was reaped as dead and processes carrying its run identity \
+         survived SIGTERM and SIGKILL, or the cleanup could not run. No lease sweep revisits such a \
+         run, so the item names the PIDs or the failure and a human stops what is left.",
+    ),
     // ── Cleared by work resuming ────────────────────────────────────────
     entry(
         LOCKFILE_REGENERATION_FAILED_ATTENTION_KIND,

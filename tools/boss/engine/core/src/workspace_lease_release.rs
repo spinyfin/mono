@@ -20,7 +20,9 @@ use crate::work::WorkDb;
 use boss_execution_contracts::CubeClient;
 
 pub use boss_engine_completion::workspace_lease_release::*;
-use boss_engine_storage_values::attention_kinds::UNOWNED_OCCUPANTS_RELEASED_ATTENTION_KIND;
+use boss_engine_storage_values::attention_kinds::{
+    RUN_PROCESSES_SURVIVED_ATTENTION_KIND, UNOWNED_OCCUPANTS_RELEASED_ATTENTION_KIND,
+};
 
 /// Cadence for the leftover-lease sweep. Fires on boot so leases left by a
 /// previous engine process return to the pool without waiting a day.
@@ -97,6 +99,50 @@ impl WorkspaceOccupancy for HostOccupancy {
 
     fn occupancy(&self, workspace_path: &Path) -> Occupancy {
         occupancy_of(workspace_path)
+    }
+}
+
+/// Stop what a local run that holds no workspace lease left running.
+///
+/// A run's detached processes are normally stopped where its lease is
+/// released ([`HostOccupancy::cleanup`]), and a failure there keeps the lease
+/// for the leftover-lease sweep to retry. A run with no lease (a
+/// `progression` run, or a row whose lease columns are already clear) never
+/// reaches that gate, so the inferred-death reapers call this instead. Only
+/// processes carrying this run's exact `BOSS_RUN_ID` are signalled. Nothing
+/// retries a run with no lease, so a survivor, or a cleanup that could not
+/// run, is reported once in an attention item naming what is known.
+pub async fn reap_leaseless_run_processes(work_db: &WorkDb, execution: &WorkExecution) {
+    if execution.cube_lease_id.is_some() {
+        return;
+    }
+    let local = matches!(work_db.execution_host_id(&execution.id), Ok(None))
+        || matches!(work_db.execution_host_id(&execution.id), Ok(Some(host)) if host == "local");
+    if !local {
+        return;
+    }
+    let cleanup = boss_worker_processes::cleanup("BOSS_RUN_ID", &execution.id, "").await;
+    report_leaseless_cleanup(work_db, execution, cleanup.map(|_| ()));
+}
+
+fn report_leaseless_cleanup(work_db: &WorkDb, execution: &WorkExecution, cleanup: Result<()>) {
+    if let Err(err) = cleanup {
+        tracing::error!(
+            execution_id = %execution.id,
+            error = %format!("{err:#}"),
+            "run without a workspace lease left processes that could not be stopped",
+        );
+        raise_attention(
+            work_db,
+            execution,
+            RUN_PROCESSES_SURVIVED_ATTENTION_KIND,
+            "Run left processes that could not be stopped",
+            &format!(
+                "This run ended without a workspace lease, so no lease sweep will retry its process cleanup. \
+                 Stopping the processes that carry its run identity failed: {err:#}. Inspect them on the \
+                 engine host and stop them by hand."
+            ),
+        );
     }
 }
 

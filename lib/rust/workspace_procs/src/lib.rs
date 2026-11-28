@@ -6,6 +6,7 @@ pub mod bazel;
 pub mod darwin;
 pub mod process_args;
 pub mod process_table;
+pub mod scratchpad;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -13,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 pub use process_table::{LiveProcess, Signal, SystemWorkspaceProcessTable, WorkspaceProcessTable};
+pub use scratchpad::{claude_scratchpad_roots, claude_scratchpad_roots_in};
 
 /// Bound on an ancestry walk; the launcher chain between a pane shell and a
 /// tool's own subprocesses is a dozen deep at most.
@@ -58,6 +60,26 @@ impl Scope {
 
     pub fn with_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.paths.push(path.into());
+        self
+    }
+
+    /// Also own occupants of the Claude Code scratch trees of the paths
+    /// already in scope (see [`scratchpad`]). A tool a session backgrounds
+    /// from its scratchpad has no working directory in the workspace, so
+    /// without this a re-parented one is invisible to a workspace sweep.
+    /// For kill sweeps of a workspace whose holder is finished only: the
+    /// tree is shared by every session started in that workspace.
+    pub fn with_claude_scratchpads(mut self) -> Self {
+        let roots: Vec<PathBuf> = self
+            .paths
+            .iter()
+            .flat_map(|path| scratchpad::claude_scratchpad_roots(path))
+            .collect();
+        for root in roots {
+            if !self.paths.contains(&root) {
+                self.paths.push(root);
+            }
+        }
         self
     }
 }

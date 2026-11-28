@@ -348,6 +348,11 @@ pub const LEASE_RELEASE_FAILED_ATTENTION_KIND: &str = "workspace_lease_release_f
 /// no live run were still running in the workspace after the bounded wait.
 pub const UNOWNED_OCCUPANTS_RELEASED_ATTENTION_KIND: &str = "workspace_unowned_occupants_released";
 
+/// Attention kind filed when a run that holds no workspace lease ended by
+/// inferred death and processes carrying its run identity could not be
+/// stopped, or the cleanup that would stop them could not run.
+pub const RUN_PROCESSES_SURVIVED_ATTENTION_KIND: &str = "run_processes_survived_cleanup";
+
 /// `work_attention_items.kind` filed once a candidate's auto-create attempts
 /// have failed `ESCALATE_AFTER_CONSECUTIVE_FAILURES` times in a row.
 pub const ATTENTION_KIND_ABANDONED_BRANCH_NO_PR: &str = "abandoned_branch_no_pr";

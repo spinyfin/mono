@@ -109,6 +109,116 @@ pub fn spawn_setsid_sleeper(
     ProcessGroupChild::from_leader(child)
 }
 
+/// How a job left the shell that started it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Escape {
+    /// `nohup <job> &`, after which the shell exits.
+    Nohup,
+    /// The job is started in a new session and its launcher exits.
+    Setsid,
+}
+
+/// Waits until its launcher is gone, so that it has been re-parented before
+/// anything inspects it, then publishes its pid and idles. It ends on its own
+/// after two minutes so a failed test cannot leave it running for long.
+const ESCAPED_JOB: &str = "import os,sys,time\nparent=int(sys.argv[2])\nwhile os.getppid()==parent: time.sleep(0.01)\nopen(sys.argv[1]+'.tmp','w').write(str(os.getpid()))\nos.rename(sys.argv[1]+'.tmp',sys.argv[1])\ntime.sleep(120)";
+/// `nohup <job> &`, then the shell exits. The test runtime's `PATH` holds
+/// only audited tools, so `nohup` is taken from its standard location, and
+/// where there is none the shell does what `nohup` does: ignore `SIGHUP`,
+/// then exec the job. `$0` is the job source and `$1` its pid file.
+const NOHUP_LAUNCHER: &str = "if [ -x /usr/bin/nohup ]; then /usr/bin/nohup python3 -c \"$0\" \"$1\" $$ >/dev/null 2>&1 </dev/null & \
+     else ( trap '' HUP; exec python3 -c \"$0\" \"$1\" $$ >/dev/null 2>&1 </dev/null ) & fi";
+const SETSID_LAUNCHER: &str = "import os,subprocess,sys; subprocess.Popen([sys.executable,'-c',sys.argv[1],sys.argv[2],str(os.getpid())], start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)";
+
+/// A job that outlived the shell that started it, as a worker's background
+/// tool does: re-parented away from this test, sharing no pipe with it, and
+/// with a working directory of the caller's choosing. Dropping it kills it.
+pub struct EscapedProcess {
+    pid: i32,
+}
+
+impl EscapedProcess {
+    pub fn pid(&self) -> i32 {
+        self.pid
+    }
+
+    pub fn is_alive(&self) -> bool {
+        // SAFETY: signal 0 only checks existence.
+        unsafe { libc::kill(self.pid, 0) == 0 }
+    }
+
+    /// Whether the job is gone within `limit`.
+    pub fn exited_within(&self, limit: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        while self.is_alive() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        !self.is_alive()
+    }
+}
+
+impl Drop for EscapedProcess {
+    fn drop(&mut self) {
+        // SAFETY: the pid of a job this helper started; a no-op once it has exited.
+        unsafe {
+            libc::kill(self.pid, libc::SIGKILL);
+        }
+    }
+}
+
+/// Start a job in `dir` that escapes as `escape` describes and return once
+/// it has been re-parented. `run_id` is the `BOSS_RUN_ID` it inherits, as a
+/// worker's tool shell would pass on; `None` starts it with no run identity.
+pub fn spawn_escaped(escape: Escape, dir: impl AsRef<std::path::Path>, run_id: Option<&str>) -> EscapedProcess {
+    use std::process::{Command, Stdio};
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let dir = dir.as_ref();
+    let pid_file = dir.join(format!(
+        ".escaped-{}-{}.pid",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut command = match escape {
+        Escape::Nohup => {
+            let mut command = Command::new("sh");
+            command.args(["-c", NOHUP_LAUNCHER, ESCAPED_JOB]);
+            command
+        }
+        Escape::Setsid => {
+            let mut command = Command::new("python3");
+            command.args(["-c", SETSID_LAUNCHER, ESCAPED_JOB]);
+            command
+        }
+    };
+    command
+        .arg(&pid_file)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .env_remove("BOSS_RUN_ID")
+        .env_remove("BOSS_SPAWN_TOKEN");
+    if let Some(run_id) = run_id {
+        command.env("BOSS_RUN_ID", run_id);
+    }
+    let status = command.status().expect("start escaped job launcher");
+    assert!(status.success(), "escaped job launcher exited {status:?}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+            let _ = std::fs::remove_file(&pid_file);
+            return EscapedProcess {
+                pid: pid.trim().parse().expect("escaped job pid"),
+            };
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{escape:?} job never reported that it was re-parented"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 #[cfg(test)]
 mod process_group_child_tests {
     use super::{spawn_group_leader_sleeper, spawn_setsid_sleeper};
@@ -141,6 +251,23 @@ mod process_group_child_tests {
             pid
         };
         assert!(!pid_is_alive(pid), "unwind must kill the process group");
+    }
+
+    #[test]
+    fn escaped_jobs_are_reparented_into_the_given_directory_and_die_with_their_guard() {
+        for escape in [super::Escape::Nohup, super::Escape::Setsid] {
+            let dir = tempfile::tempdir().unwrap();
+            let job = super::spawn_escaped(escape, dir.path(), Some("run-under-test"));
+            assert!(job.is_alive(), "{escape:?} job must be running");
+            assert_ne!(job.pid(), std::process::id() as i32);
+            let pid = job.pid() as u32;
+            drop(job);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while pid_is_alive(pid) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(!pid_is_alive(pid), "dropping the guard must kill the {escape:?} job");
+        }
     }
 
     #[test]

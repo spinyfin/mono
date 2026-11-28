@@ -51,9 +51,10 @@ pub fn open_db_arc() -> (TempDir, Arc<WorkDb>) {
 }
 
 pub use boss_engine_completion::test_support::{
-    ProcessGroupChild, confirm_remote_test_recovery, counting_source_collector, declare_no_changes_needed,
-    preserve_test_workspace, record_remote_test_recovery, seed_empty_execution_bookmark, seed_published_guide_comment,
-    source_capture_packet, spawn_group_leader_sleeper, spawn_setsid_sleeper, wait_for_source_capture,
+    Escape, EscapedProcess, ProcessGroupChild, confirm_remote_test_recovery, counting_source_collector,
+    declare_no_changes_needed, preserve_test_workspace, record_remote_test_recovery, seed_empty_execution_bookmark,
+    seed_published_guide_comment, source_capture_packet, spawn_escaped, spawn_group_leader_sleeper,
+    spawn_setsid_sleeper, wait_for_source_capture,
 };
 pub use boss_execution_contracts::test_doubles::{NoopCube, RecordingPublisher};
 
