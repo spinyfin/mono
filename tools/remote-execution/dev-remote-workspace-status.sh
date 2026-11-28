@@ -146,9 +146,24 @@ watchdog_tick() {
   return 0
 }
 
+watchdog_sweep_stale_pidfiles() {
+  local dir="${TMPDIR:-/tmp}" f pid
+  for f in "${dir}"/dev-remote-watchdog-*.pid; do
+    [[ -f "$f" ]] || continue
+    pid="$(cat "$f" 2> /dev/null || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2> /dev/null; then
+      continue
+    fi
+    rm -f "$f"
+  done
+}
+
 watchdog_loop() {
   local target="${DEV_REMOTE_WATCHDOG_TARGET_PID:-}" reason
   [[ -n "$target" ]] || target="$(watchdog_in_flight_pid "$PPID")"
+  _watchdog_pidfile="$(watchdog_pidfile "$target")"
+  trap 'rm -f "$_watchdog_pidfile"' EXIT
+  trap 'rm -f "$_watchdog_pidfile"; exit 0' TERM INT
   while kill -0 "$target" 2> /dev/null; do
     sleep "$interval_s"
     kill -0 "$target" 2> /dev/null || return 0
@@ -180,6 +195,7 @@ start_watchdog() {
     cat "$leftover" >&2
     rm -f "$leftover"
   fi
+  watchdog_sweep_stale_pidfiles
   pidfile="$(watchdog_pidfile "$target")"
   if [[ -f "$pidfile" ]] && kill -0 "$(cat "$pidfile" 2> /dev/null)" 2> /dev/null; then
     return 0
