@@ -275,6 +275,176 @@ mod reviewer_pool_policy_tests {
     }
 
     #[test]
+    fn slim_effort_changes_only_the_post_merge_reviewer() {
+        use boss_protocol::{EffortLevel, ReviewBatchMemberRole};
+        let registry = crate::driver::DriverRegistry::default();
+        for role in [
+            ReviewBatchMemberRole::PostMergeReviewer,
+            ReviewBatchMemberRole::ClaudeReviewer,
+            ReviewBatchMemberRole::Supervisor,
+        ] {
+            let member = boss_protocol::ReviewBatchMember::builder()
+                .id("member")
+                .batch_id("batch")
+                .attempt(1)
+                .created_at("1")
+                .provider_effort("large")
+                .requested_driver("claude")
+                .resolved_model("opus")
+                .role(role)
+                .status(boss_protocol::ReviewBatchMemberStatus::Pending)
+                .updated_at("1")
+                .execution_id("execution")
+                .build();
+            for treated in [false, true] {
+                let config = super::resolve_batch_reviewer_spawn(&registry, &member, None, treated).unwrap();
+                let slim = treated && role == ReviewBatchMemberRole::PostMergeReviewer;
+                assert_eq!(
+                    config.effort_level,
+                    Some(if slim { EffortLevel::Medium } else { EffortLevel::Large })
+                );
+                assert_eq!(config.effort_value, Some(if slim { "high" } else { "xhigh" }));
+                assert_eq!(config.model, "opus");
+            }
+        }
+    }
+
+    #[test]
+    fn review_diff_fetch_plan_enables_lockfile_filter_and_embed_only_for_treated_post_merge() {
+        use boss_protocol::ReviewBatchMemberRole;
+        let pr_url = "https://github.com/org/repo/pull/99";
+        for role in [
+            None,
+            Some(ReviewBatchMemberRole::ClaudeReviewer),
+            Some(ReviewBatchMemberRole::CodexReviewer),
+            Some(ReviewBatchMemberRole::Supervisor),
+            Some(ReviewBatchMemberRole::PostMergeReviewer),
+        ] {
+            for treated in [false, true] {
+                let plan = super::review_diff_fetch_plan(pr_url, role, treated);
+                let expected_treated_post_merge = treated && role == Some(ReviewBatchMemberRole::PostMergeReviewer);
+                assert_eq!(
+                    plan.gh_args,
+                    vec!["pr", "diff", pr_url],
+                    "role={role:?}, treated={treated}"
+                );
+                assert_eq!(
+                    plan.exclude_lockfiles, expected_treated_post_merge,
+                    "role={role:?}, treated={treated}"
+                );
+                assert_eq!(
+                    plan.embed_in_post_merge_prompt, expected_treated_post_merge,
+                    "role={role:?}, treated={treated}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn treated_post_merge_diff_embedding_covers_rebase_squash_and_merge_commit_pr_diffs() {
+        use boss_protocol::{ReviewBatchMemberRole, ReviewBatchPhase};
+        let pr_url = "https://github.com/org/repo/pull/101";
+        let destination = crate::pr_review::ReviewerReportDestination::builder()
+            .batch_id("rvb_pm")
+            .pr_url(pr_url)
+            .target_sha("merge-sha-final")
+            .phase(ReviewBatchPhase::PostMerge)
+            .body_path("/tmp/boss-worker-output/exec_pm.verdict.json")
+            .build();
+        let brief = crate::pr_review::ReviewBriefPacket::builder()
+            .task_name("Ship feature")
+            .work_item_brief("Implement feature across modules.")
+            .build();
+        let lock = "diff --git a/Cargo.lock b/Cargo.lock\n-old\n+new\n";
+
+        let treated_plan = super::review_diff_fetch_plan(pr_url, Some(ReviewBatchMemberRole::PostMergeReviewer), true);
+        let control_plan = super::review_diff_fetch_plan(pr_url, Some(ReviewBatchMemberRole::PostMergeReviewer), false);
+        assert_eq!(treated_plan.gh_args, vec!["pr", "diff", pr_url]);
+        assert!(treated_plan.exclude_lockfiles);
+        assert!(treated_plan.embed_in_post_merge_prompt);
+        assert!(!control_plan.exclude_lockfiles);
+        assert!(!control_plan.embed_in_post_merge_prompt);
+
+        // Two-commit rebase merge touching different files: `gh pr diff`
+        // returns both commits' files, unlike `repos/{repo}/commits/{sha}`
+        // which would only return commit 2.
+        let commit_1_diff = "diff --git a/src/first.rs b/src/first.rs\n+pub fn first() {}\n";
+        let commit_2_diff = "diff --git a/src/second.rs b/src/second.rs\n+pub fn second() {}\n";
+        let two_commit_rebase_diff = format!("{commit_1_diff}{commit_2_diff}{lock}");
+
+        // Under the cap: both files are embedded and the lockfile is stripped.
+        let embedded_rebase =
+            crate::pr_review::bounded_review_diff(&two_commit_rebase_diff, 4, treated_plan.exclude_lockfiles)
+                .expect("combined two-commit rebase diff without lockfile fits cap of 4 lines");
+        assert!(embedded_rebase.contains("src/first.rs"));
+        assert!(embedded_rebase.contains("src/second.rs"));
+        assert!(!embedded_rebase.contains("Cargo.lock"));
+        let treated_prompt = crate::pr_review::render_post_merge_reviewer_initial_prompt(
+            &brief,
+            &destination,
+            crate::pr_review::ReviewScope::Code,
+            "org/repo",
+            treated_plan
+                .embed_in_post_merge_prompt
+                .then_some(embedded_rebase.as_str()),
+        );
+        assert!(treated_prompt.contains("## Embedded diff"));
+        assert!(treated_prompt.contains("src/first.rs"));
+        assert!(treated_prompt.contains("src/second.rs"));
+
+        // Over the cap (cap=2 would fit commit 2 alone, but NOT the full
+        // two-commit rebase PR): must fall back to reviewer fetch instead of
+        // embedding an incomplete diff.
+        assert!(
+            crate::pr_review::bounded_review_diff(&two_commit_rebase_diff, 2, treated_plan.exclude_lockfiles).is_none()
+        );
+        let fallback_prompt = crate::pr_review::render_post_merge_reviewer_initial_prompt(
+            &brief,
+            &destination,
+            crate::pr_review::ReviewScope::Code,
+            "org/repo",
+            None,
+        );
+        assert!(fallback_prompt.contains("1. Get the PR description and diff"));
+        assert!(!fallback_prompt.contains("## Embedded diff"));
+
+        // Squash merge and merge-commit merge diffs embed completely with lockfiles excluded.
+        let squash_diff = format!("diff --git a/src/squashed.rs b/src/squashed.rs\n+pub fn squashed() {{}}\n{lock}");
+        let merge_commit_diff = format!(
+            "diff --git a/src/left.rs b/src/left.rs\n+pub fn left() {{}}\n\
+             diff --git a/src/right.rs b/src/right.rs\n+pub fn right() {{}}\n{lock}"
+        );
+        for (label, diff, expected_files) in [
+            ("squash", squash_diff.as_str(), vec!["src/squashed.rs"]),
+            (
+                "merge-commit",
+                merge_commit_diff.as_str(),
+                vec!["src/left.rs", "src/right.rs"],
+            ),
+        ] {
+            let embedded = crate::pr_review::bounded_review_diff(diff, 10, treated_plan.exclude_lockfiles)
+                .unwrap_or_else(|| panic!("{label} diff should embed"));
+            for file in expected_files {
+                assert!(embedded.contains(file), "{label}: missing {file}");
+            }
+            assert!(!embedded.contains("Cargo.lock"), "{label}: lockfile must be excluded");
+        }
+
+        // Control post-merge never embeds into the post-merge prompt.
+        let control_prompt = crate::pr_review::render_post_merge_reviewer_initial_prompt(
+            &brief,
+            &destination,
+            crate::pr_review::ReviewScope::Code,
+            "org/repo",
+            control_plan
+                .embed_in_post_merge_prompt
+                .then_some(embedded_rebase.as_str()),
+        );
+        assert!(control_prompt.contains("1. Get the PR description and diff"));
+        assert!(!control_prompt.contains("## Embedded diff"));
+    }
+
+    #[test]
     fn persisted_batch_member_overrides_the_legacy_claude_review_pool() {
         let registry = crate::driver::DriverRegistry::default();
         let member = boss_protocol::ReviewBatchMember::builder()
@@ -291,7 +461,7 @@ mod reviewer_pool_policy_tests {
             .execution_id("execution")
             .build();
 
-        let config = super::resolve_batch_reviewer_spawn(&registry, &member, None).unwrap();
+        let config = super::resolve_batch_reviewer_spawn(&registry, &member, None, false).unwrap();
         assert_eq!(config.driver, "codex");
         assert_eq!(config.model, "gpt-5.6-terra");
         assert_eq!(config.effort_level, Some(boss_protocol::EffortLevel::Medium));

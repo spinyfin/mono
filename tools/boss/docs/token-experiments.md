@@ -6,7 +6,7 @@ Every experiment ships **inert**: its flag is off, and a build that contains it 
 
 ## What is on and what is not yet
 
-The mechanism and its first experiment are in the engine. The things that make an experiment readable are not:
+The mechanism and the experiments listed below are in the engine. The things that make an experiment readable are not:
 
 - **Landed:** the experiment registry and flags, the arm assigned to every launch, the `experiment_arms` column in the launch record, and the `pane_spawned` dispatch event carrying the arm set.
 - **Not landed:** the usage-rows dimension `experiment_arm` (so `boss cost rows --experiment <key> --group-by experiment_arm` does not exist yet), the per-family outcomes report, and the Token Usage window picker.
@@ -117,6 +117,22 @@ To run it: switch `batched_search` on (a half-and-half split starts), switch `ba
 | Stop early when       | A compacted run loses its task or its done declaration, or the undeclared rate is twice control. Also the general rule below.                                                                                                                                         |
 
 To run it: switch `worker_autocompact` on (a half-and-half split starts), switch `worker_autocompact_ab_split` off to treat every family, switch `worker_autocompact` off to stop. To read it, once the usage dimension lands: `boss cost rows --experiment worker_autocompact --group-by experiment_arm --filter driver=claude`.
+
+### `post_merge_review_slim`
+
+| Property        | Value                                                                                                                                                                                                                                                                    |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Source          | R1 steps 1–2 of the token-consumption investigation.                                                                                                                                                                                                                     |
+| Lane            | `post_merge_review`                                                                                                                                                                                                                                                      |
+| Requires        | `token_experiments` and `review_batch_fanout`.                                                                                                                                                                                                                           |
+| Runs it changes | Post-merge reviewers and admission of reviews for their follow-up PR families.                                                                                                                                                                                           |
+| Treatment       | Boss `medium` effort (provider `high`) instead of `large` (provider `xhigh`); embeds the merged PR diff with lockfiles excluded when it fits `BOSS_MAX_EMBED_DIFF_LINES`; skips post-merge reviews of families minted by a post-merge review, including their revisions. |
+| Control         | Existing effort, prompt and Deep eligibility, including recursive reviews.                                                                                                                                                                                               |
+| Effect          | Post-merge review runs and tokens per run, grouped by experiment arm.                                                                                                                                                                                                    |
+| Guardrail       | Critical and high findings per post-merge review, and the share of follow-ups that merge.                                                                                                                                                                                |
+| Stop early when | Treated reviews find fewer than half the critical and high findings of control, after at least 40 reviews per arm; any hard failure stops immediately.                                                                                                                   |
+
+**Ships inert.** The operator enables `post_merge_review_slim` in Debug → Feature Flags after the reporting prerequisites above land. `post_merge_review_slim_ab_split` defaults on for a half-and-half split; turn it off to treat every family. Turn the experiment off to restore ordinary admission and subsequent launches. Pre-merge diff embedding keeps lockfiles. A zero cap, oversized filtered diff or failed fetch keeps the reviewer-fetch fallback; no diff is truncated.
 
 ## Rules for every experiment
 

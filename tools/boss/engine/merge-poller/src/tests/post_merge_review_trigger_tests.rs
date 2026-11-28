@@ -86,7 +86,7 @@ async fn no_post_merge_review_without_a_pre_merge_batch_on_record() {
     let candidate = candidate(product_id, work_item_id.clone(), pr);
     let probe = merged_probe(pr, Some("merge-sha-1"), Some("head-sha-1"));
 
-    maybe_trigger_post_merge_review(&db, &publisher, &candidate, &probe).await;
+    maybe_trigger_post_merge_review(&db, &publisher, &candidate, &probe, |_| false).await;
 
     assert_eq!(
         db.review_batches_for_cycle_root(&work_item_id).unwrap().len(),
@@ -108,7 +108,7 @@ async fn no_post_merge_review_when_pre_merge_profile_is_not_deep() {
     let candidate = candidate(product_id, work_item_id.clone(), pr);
     let probe = merged_probe(pr, Some("merge-sha-1"), Some("head-sha-1"));
 
-    maybe_trigger_post_merge_review(&db, &publisher, &candidate, &probe).await;
+    maybe_trigger_post_merge_review(&db, &publisher, &candidate, &probe, |_| false).await;
 
     assert!(
         db.review_batch_for_target(&work_item_id, ReviewBatchPhase::PostMerge, "merge-sha-1")
@@ -132,7 +132,7 @@ async fn deep_pr_gets_a_post_merge_batch_keyed_on_the_merge_commit_and_is_idempo
     let candidate = candidate(product_id, work_item_id.clone(), pr);
     let probe = merged_probe(pr, Some("merge-sha-1"), Some("head-sha-1"));
 
-    maybe_trigger_post_merge_review(&db, &publisher, &candidate, &probe).await;
+    maybe_trigger_post_merge_review(&db, &publisher, &candidate, &probe, |_| false).await;
 
     let batch = db
         .review_batch_for_target(&work_item_id, ReviewBatchPhase::PostMerge, "merge-sha-1")
@@ -148,7 +148,7 @@ async fn deep_pr_gets_a_post_merge_batch_keyed_on_the_merge_commit_and_is_idempo
 
     // Idempotent: a redundant trigger call for the same merge must not mint
     // a second batch.
-    maybe_trigger_post_merge_review(&db, &publisher, &candidate, &probe).await;
+    maybe_trigger_post_merge_review(&db, &publisher, &candidate, &probe, |_| false).await;
     assert_eq!(
         db.review_batches_for_cycle_root(&work_item_id)
             .unwrap()
@@ -176,7 +176,7 @@ async fn skips_when_only_head_ref_oid_is_available() {
     let candidate = candidate(product_id, work_item_id.clone(), pr);
     let probe = merged_probe(pr, None, Some("head-sha-1"));
 
-    maybe_trigger_post_merge_review(&db, &publisher, &candidate, &probe).await;
+    maybe_trigger_post_merge_review(&db, &publisher, &candidate, &probe, |_| false).await;
 
     assert_eq!(
         db.review_batches_for_cycle_root(&work_item_id)
@@ -202,7 +202,7 @@ async fn skips_when_neither_merge_commit_nor_head_sha_is_available() {
     let candidate = candidate(product_id, work_item_id.clone(), pr);
     let probe = merged_probe(pr, None, None);
 
-    maybe_trigger_post_merge_review(&db, &publisher, &candidate, &probe).await;
+    maybe_trigger_post_merge_review(&db, &publisher, &candidate, &probe, |_| false).await;
 
     assert_eq!(
         db.review_batches_for_cycle_root(&work_item_id)
@@ -212,4 +212,124 @@ async fn skips_when_neither_merge_commit_nor_head_sha_is_available() {
             .count(),
         0
     );
+}
+
+/// The guard belongs to the whole PR family, including a revision that merges it.
+#[tokio::test]
+async fn review_minted_families_are_skipped_only_in_treatment() {
+    for treated in [false, true] {
+        for minted in [false, true] {
+            for revision in [false, true] {
+                let dir = tempdir().unwrap();
+                let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+                let pr = "https://github.com/foo/bar/pull/506";
+                let (product_id, root) = make_chore_in_review(&db, "follow-up", pr);
+                if minted {
+                    db.connect()
+                        .unwrap()
+                        .execute(
+                            "UPDATE tasks SET created_via = 'pr_review:post_merge:verdict' WHERE id = ?1",
+                            [&root],
+                        )
+                        .unwrap();
+                }
+                seed_pre_merge_batch(&db, &root, "head", ReviewProfile::Deep);
+                let item = if revision {
+                    let (_, child) = make_chore_in_review(&db, "revision", pr);
+                    db.connect()
+                        .unwrap()
+                        .execute(
+                            "UPDATE tasks SET kind = 'revision', parent_task_id = ?1 WHERE id = ?2",
+                            [&root, &child],
+                        )
+                        .unwrap();
+                    child
+                } else {
+                    root.clone()
+                };
+                let publisher = RecordingPublisher::default();
+                maybe_trigger_post_merge_review(
+                    &db,
+                    &publisher,
+                    &candidate(product_id, item, pr),
+                    &merged_probe(pr, Some("merged"), Some("head")),
+                    |cycle_root_id| {
+                        assert_eq!(cycle_root_id, root);
+                        treated
+                    },
+                )
+                .await;
+                assert_eq!(
+                    db.review_batch_for_target(&root, ReviewBatchPhase::PostMerge, "merged")
+                        .unwrap()
+                        .is_some(),
+                    !(treated && minted),
+                    "treated={treated}, minted={minted}, revision={revision}",
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn legacy_review_provenance_is_resolved_through_the_verdict_batch() {
+    for treated in [false, true] {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/507";
+        let (product, origin) = make_chore_in_review(&db, "origin", pr);
+        let source = db
+            .create_post_merge_review_batch(
+                ReviewBatchCreateInput::builder()
+                    .cycle_root_id(&origin)
+                    .base_sha("base")
+                    .classification(classification(ReviewProfile::Deep))
+                    .phase(ReviewBatchPhase::PostMerge)
+                    .pr_number(507)
+                    .pr_url(pr)
+                    .target_sha("origin-merge")
+                    .merge_sha("origin-merge")
+                    .build(),
+                "https://github.com/foo/bar.git",
+            )
+            .unwrap();
+        let crate::work::ReviewBatchDispatch::Created { executions, .. } = source else {
+            panic!("source post-merge review must be created");
+        };
+        db.connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO worker_proposals
+             (id, execution_id, kind, payload_json, idempotency_key, state, created_at)
+             VALUES ('legacy-verdict', ?1, 'review_verdict', '{}', 'legacy-verdict', 'applied', '1')",
+                [&executions[0].id],
+            )
+            .unwrap();
+        let (_, followup) = make_chore_in_review(&db, "legacy follow-up", pr);
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET created_via = 'pr_review:legacy-verdict' WHERE id = ?1",
+                [&followup],
+            )
+            .unwrap();
+        seed_pre_merge_batch(&db, &followup, "followup-head", ReviewProfile::Deep);
+        maybe_trigger_post_merge_review(
+            &db,
+            &RecordingPublisher::default(),
+            &candidate(product, followup.clone(), pr),
+            &merged_probe(pr, Some("followup-merge"), Some("followup-head")),
+            |cycle_root_id| {
+                assert_eq!(cycle_root_id, followup);
+                treated
+            },
+        )
+        .await;
+        assert_eq!(
+            db.review_batch_for_target(&followup, ReviewBatchPhase::PostMerge, "followup-merge")
+                .unwrap()
+                .is_some(),
+            !treated,
+        );
+    }
 }

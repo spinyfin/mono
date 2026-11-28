@@ -153,6 +153,8 @@ impl SweepPasses for NoPasses {
     }
 }
 
+impl crate::host::SweepHost for RecordingHost {}
+
 impl LoopPasses for RecordingHost {
     fn start_passes(&self) -> Box<dyn SweepPasses> {
         Box::new(NoPasses)

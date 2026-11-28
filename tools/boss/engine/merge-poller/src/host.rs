@@ -199,6 +199,9 @@ impl ActiveProducts for EveryProductActive {
 /// Everything the sweep needs from the engine host: conflict handling, design-doc
 /// pointer maintenance (the same [`DesignDetection`] contract the completion
 /// service consumes), project population and the loop's optional passes.
-pub trait SweepHost: ConflictHandling + DesignDetection + PopulationRequests + LoopPasses {}
-
-impl<T: ConflictHandling + DesignDetection + PopulationRequests + LoopPasses + ?Sized> SweepHost for T {}
+pub trait SweepHost: ConflictHandling + DesignDetection + PopulationRequests + LoopPasses {
+    /// Resolve the family's current treatment for post-merge admission.
+    fn slim_post_merge_review(&self, _cycle_root_id: &str) -> bool {
+        false
+    }
+}

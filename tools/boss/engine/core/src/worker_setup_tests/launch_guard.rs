@@ -524,7 +524,7 @@ fn pr_review_prompts_render_guard_approved_submission_commands() {
             &[SupervisorSourceRole::Claude, SupervisorSourceRole::Codex],
             "org/repo",
         ),
-        render_post_merge_reviewer_initial_prompt(&brief, &destination, ReviewScope::Code, "org/repo"),
+        render_post_merge_reviewer_initial_prompt(&brief, &destination, ReviewScope::Code, "org/repo", None),
     ];
 
     let env = [("BOSS_BIN", "/usr/bin/true")];

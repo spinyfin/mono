@@ -89,7 +89,15 @@ pub fn render_post_merge_reviewer_initial_prompt(
     destination: &ReviewerReportDestination,
     scope: ReviewScope,
     repo_slug: &str,
+    embedded_diff: Option<&str>,
 ) -> String {
+    let embedded_diff_section = embedded_diff
+        .map(|diff| {
+            format!(
+                "## Embedded diff\n\nDiff of the merged PR below, with lockfiles excluded.\n\n```diff\n{diff}\n```\n\n"
+            )
+        })
+        .unwrap_or_default();
     let rubric = render_rubric_section(&scope);
     let brief_block = crate::brief::render_brief_packet_block(brief);
     let brief_conformance = crate::brief::render_brief_conformance_rubric();
@@ -100,6 +108,10 @@ pub fn render_post_merge_reviewer_initial_prompt(
         .next()
         .filter(|s| !s.is_empty())
         .unwrap_or(destination.pr_url.as_str());
+    let diff_step = match embedded_diff {
+        Some(_) => "1. Read the merged diff in **Embedded diff** below (lockfiles excluded). Fetch additional context only when needed.".to_owned(),
+        None => format!("1. Get the PR description and diff: `gh pr view {pr_ref} --repo {repo_slug}` and `gh pr diff {pr_ref} --repo {repo_slug}`."),
+    };
     let verdict_submission_block =
         crate::blocks::render_verdict_submission_block(&destination.batch_id, &destination.body_path);
 
@@ -143,8 +155,7 @@ pub fn render_post_merge_reviewer_initial_prompt(
          \n\
          ## Review steps\n\
          \n\
-         1. Get the PR description and diff: `gh pr view {pr_ref} --repo {repo_slug}` and \
-            `gh pr diff {pr_ref} --repo {repo_slug}`.\n\
+         {diff_step}\n\
          2. Read the changed files at the merge commit (see **Verifying the landed tree** \
             above) and their surrounding context.\n\
          3. Apply the rubric below to what actually landed — not to the PR's stated intent, \
@@ -153,6 +164,7 @@ pub fn render_post_merge_reviewer_initial_prompt(
             against the real landed state.\n\
          4. Produce the `SupervisorVerdict` JSON (schema below).\n\
          \n\
+         {embedded_diff_section}\
          {brief_conformance}\
          {rubric}\n\
          ## `revision_warranted`\n\
@@ -226,7 +238,32 @@ mod tests {
             destination,
             scope,
             repo_slug,
+            None,
         )
+    }
+
+    #[test]
+    fn embedded_landed_diff_replaces_the_fetch_step() {
+        let prompt = super::render_post_merge_reviewer_initial_prompt(
+            &ReviewBriefPacket::from_task("Fix", "Fix the bug"),
+            &destination(),
+            ReviewScope::Code,
+            "org/repo",
+            Some("+landed change"),
+        );
+        assert!(prompt.contains("## Embedded diff"));
+        assert!(prompt.contains("+landed change"));
+        assert!(prompt.contains("lockfiles excluded"));
+        assert!(!prompt.contains("1. Get the PR description and diff"));
+        let control = super::render_post_merge_reviewer_initial_prompt(
+            &ReviewBriefPacket::from_task("Fix", "Fix the bug"),
+            &destination(),
+            ReviewScope::Code,
+            "org/repo",
+            None,
+        );
+        assert!(control.contains("1. Get the PR description and diff"));
+        assert!(!control.contains("## Embedded diff"));
     }
 
     fn destination() -> ReviewerReportDestination {

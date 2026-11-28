@@ -54,7 +54,8 @@ use serde::{Deserialize, Serialize};
 mod experiments;
 pub use experiments::{
     BATCHED_SEARCH_AB_SPLIT_FLAG, BATCHED_SEARCH_EXPERIMENT, EXPERIMENT_FLAG_CATEGORY, EXPERIMENTS, ExperimentArm,
-    ExperimentArmSet, ExperimentLane, ExperimentSpec, ExperimentState, TOKEN_EXPERIMENTS_FLAG, TREATMENT_BUCKET_LIMIT,
+    ExperimentArmSet, ExperimentLane, ExperimentSpec, ExperimentState, POST_MERGE_REVIEW_SLIM_AB_SPLIT_FLAG,
+    POST_MERGE_REVIEW_SLIM_EXPERIMENT, TOKEN_EXPERIMENTS_FLAG, TREATMENT_BUCKET_LIMIT,
     WORKER_AUTOCOMPACT_AB_SPLIT_FLAG, WORKER_AUTOCOMPACT_EXPERIMENT, ab_split_flag_name, assign_arm, experiment_state,
     resolve_arms,
 };
@@ -503,6 +504,20 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
              the experiments existed and nothing is recorded for them. A worker that is already running keeps the \
              brief and launch options it started with. DEFAULT ON, which changes nothing by itself because every \
              experiment ships off; set false to stop all of them with one click.",
+        category: EXPERIMENT_FLAG_CATEGORY,
+        default_enabled: true,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
+        name: POST_MERGE_REVIEW_SLIM_EXPERIMENT,
+        description: "Slim post-merge reviews: medium effort, embedded landed diff without lockfiles, and no recursive post-merge review of review-minted follow-ups. Requires review_batch_fanout. Ships inert; turn off to stop the treatment on subsequent launches and admission decisions.",
+        category: EXPERIMENT_FLAG_CATEGORY,
+        default_enabled: false,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
+        name: POST_MERGE_REVIEW_SLIM_AB_SPLIT_FLAG,
+        description: "Split post_merge_review_slim across half of PR families. Turn off to treat every family while the experiment is enabled.",
         category: EXPERIMENT_FLAG_CATEGORY,
         default_enabled: true,
         capability_id: None,

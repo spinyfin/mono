@@ -36,7 +36,9 @@
 
 mod blocks;
 mod brief;
+mod diff_embed;
 mod parsing;
+pub use diff_embed::bounded_review_diff;
 mod post_merge_render;
 mod render;
 mod supervisor_render;
