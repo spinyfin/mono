@@ -29,6 +29,8 @@ patches_dir="${dir}/nativelink/patches"
 readme="${dir}/README.md"
 dev_watchdog="${dir}/dev-remote-workspace-status.sh"
 remote_status="${dir}/remote-status.sh"
+grafana_overview="${dir}/grafana/dashboards/nativelink-overview.json"
+grafana_alerts="${dir}/grafana/alerting/nativelink-hub.yaml"
 
 failures=0
 fail() {
@@ -322,6 +324,13 @@ grep -q -F '/proc/{pid}/environ' "$slots_exporter" ||
 if grep -v -E '^[[:space:]]*(#|")' "$slots_exporter" | grep -q -E 'systemctl.*restart|systemctl.*stop'; then
   fail "worker-slots-exporter.py must only read: it must not restart or stop the hub"
 fi
+grep -q -F 'journalctl --unit nativelink-macos-hub.service --output json --all --lines=1' "$readme" ||
+  fail "README.md must describe the JSON journal access check with --all"
+grep -q -F -e '--follow --no-tail --after-cursor <cursor>' "$readme" ||
+  fail "README.md must describe cursor-based journal follow, not --output cat --lines=0"
+if grep -q -F 'journalctl --quiet --unit nativelink-macos-hub.service --output cat --follow --lines=0' "$readme"; then
+  fail "README.md must not describe the old cat --lines=0 journal follower"
+fi
 grep -q -x '## Hub metrics' "$readme" ||
   fail "README.md must keep its \"Hub metrics\" section"
 grep -q -F 'copy_if_changed' "$readme" && grep -q -F 'cmp -s' "$readme" ||
@@ -393,7 +402,7 @@ if [[ -e "${dir}/nativelink/hub.env" ]]; then
   fail "hub.env names listen addresses and must not be in the repository"
 fi
 
-for file in "$hub" "$worker" "$plist" "$hub_unit" "$health_unit" "$health_timer" "$textfile" "$textfile_unit" "$textfile_timer" "$slots_exporter" "$slots_unit" "$readme"; do
+for file in "$hub" "$worker" "$plist" "$hub_unit" "$health_unit" "$health_timer" "$textfile" "$textfile_unit" "$textfile_timer" "$slots_exporter" "$slots_unit" "$readme" "$grafana_overview" "$grafana_alerts" "${dir}/grafana/dashboards/nativelink-workers.json" "${dir}/grafana/dashboards/buildkite-pipelines.json" "${dir}/grafana/provisioning/nativelink.yaml"; do
   # Loopback is the one address that is the same on every host.
   if grep -o -E '([0-9]{1,3}\.){3}[0-9]{1,3}' "$file" | grep -v -x -q '127\.0\.0\.1'; then
     fail "$(basename "$file") contains an IP address; addresses are host configuration"
@@ -402,6 +411,82 @@ for file in "$hub" "$worker" "$plist" "$hub_unit" "$health_unit" "$health_timer"
     fail "$(basename "$file") names a remote endpoint"
   fi
 done
+
+# ---------------------------------------------------------------------------
+# Grafana dashboard and alerting rules.
+# ---------------------------------------------------------------------------
+
+if ! python3 -c '
+import ast
+import json
+import re
+import sys
+
+dash_path, alert_path = sys.argv[1], sys.argv[2]
+with open(dash_path) as f:
+    dash = json.load(f)
+
+from pathlib import Path
+ast.parse((Path(dash_path).parent.parent / "preview-alerts.py").read_text())
+for path in Path(dash_path).parent.glob("*.json"):
+    other = json.loads(path.read_text())
+    assert other["uid"] and other["panels"], path
+
+uid = dash.get("uid")
+assert uid == "nativelink-overview", f"unexpected uid: {uid}"
+panels = dash.get("panels", [])
+ids = [p.get("id") for p in panels]
+assert len(ids) == len(set(ids)), "duplicate panel ids in nativelink-overview.json"
+assert len(panels) >= 50, f"expected >= 50 panels (37 original + new monitoring panels), got {len(panels)}"
+for orig_id in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138):
+    assert orig_id in ids, f"original panel id {orig_id} missing"
+
+all_exprs = "\n".join(
+    t.get("expr", "")
+    for p in panels
+    for t in p.get("targets", [])
+)
+for metric in (
+    "nativelink_hub_status_up",
+    "nativelink_hub_status_duration_seconds",
+    "nativelink_hub_connected_workers",
+    "nativelink_hub_store_health_timeouts_total",
+    "nativelink_hub_worker_kill_ack_evictions_total",
+    "nativelink_hub_scheduler_action_timeouts_total",
+    "nativelink_hub_action_kills_total",
+    "nativelink_hub_command_timeouts_total",
+    "nativelink_hub_compressed_upload_decoded_size_errors_total",
+    "nativelink_hub_cache_used_bytes",
+    "node_disk_io_time_seconds_total",
+    "node_disk_write_time_seconds_total",
+    "node_pressure_io_stalled_seconds_total",
+    "node_memory_SwapFree_bytes",
+    "nativelink_hub_memory_current_bytes",
+):
+    assert metric in all_exprs, f"dashboard missing metric {metric}"
+
+with open(alert_path) as f:
+    alert_text = f.read()
+
+assert "apiVersion: 1" in alert_text
+assert "PBFA97CFB590B2093" in alert_text
+for uid in (
+    "nl-hub-store-health-timeout",
+    "nl-hub-status-probe-failed",
+    "nl-hub-workers-below-normal",
+    "nl-hub-kills-timeouts-burst",
+    "nl-hub-sched-timeouts-evictions",
+    "nl-hub-decoded-size-error",
+    "nl-hub-cache-disk-full",
+    "nl-hub-monitoring-unavailable",
+):
+    assert f"uid: {uid}" in alert_text, f"missing alert rule uid {uid}"
+for m in re.finditer(r"panelId:\s*(\d+)", alert_text):
+    pid = int(m.group(1))
+    assert pid in ids, f"alert rule references nonexistent panelId {pid}"
+' "$grafana_overview" "$grafana_alerts"; then
+  fail "Grafana dashboard or alerting validation failed"
+fi
 
 # The developer-side bound on a silent hub is this script, and it must still
 # produce the same workspace-status keys every other build uses.

@@ -21,6 +21,8 @@
 #   nativelink_hub_last_result{result} systemd Result of the unit (oom-kill,
 #                                      success, exit-code, ...)
 #   nativelink_hub_main_exit_status    ExecMainStatus of the last main process
+#   nativelink_hub_memory_current_bytes current cgroup memory of the hub unit
+#   nativelink_hub_memory_peak_bytes   peak cgroup memory of the hub unit
 # The check only reads; it never restarts or stops anything.
 set -euo pipefail
 
@@ -31,7 +33,7 @@ OUT="$OUT_DIR/nativelink_hub.prom"
 declare -A P
 while IFS='=' read -r k v; do P[$k]=$v; done < <(
   systemctl show "$UNIT" --timestamp=unix \
-    -p NRestarts,ExecMainStartTimestamp,ActiveState,Result,ExecMainStatus
+    -p NRestarts,ExecMainStartTimestamp,ActiveState,Result,ExecMainStatus,MemoryCurrent,MemoryPeak
 )
 
 restarts=${P[NRestarts]:-0}
@@ -43,6 +45,8 @@ result=${P[Result]:-unknown}
 result=${result//[^a-zA-Z0-9_-]/_}
 status=${P[ExecMainStatus]:-0}
 [[ $status =~ ^[0-9]+$ ]] || status=0
+mem_current=${P[MemoryCurrent]:-}
+mem_peak=${P[MemoryPeak]:-}
 
 tmp=$(mktemp "$OUT_DIR/.nativelink_hub.prom.XXXXXX")
 trap 'rm -f "$tmp"' EXIT
@@ -63,6 +67,20 @@ nativelink_hub_last_result{result="$result"} 1
 # TYPE nativelink_hub_main_exit_status gauge
 nativelink_hub_main_exit_status $status
 PROM
+if [[ $mem_current =~ ^[0-9]+$ ]]; then
+  cat >> "$tmp" <<PROM
+# HELP nativelink_hub_memory_current_bytes Current cgroup memory usage of the hub systemd unit.
+# TYPE nativelink_hub_memory_current_bytes gauge
+nativelink_hub_memory_current_bytes $mem_current
+PROM
+fi
+if [[ $mem_peak =~ ^[0-9]+$ ]]; then
+  cat >> "$tmp" <<PROM
+# HELP nativelink_hub_memory_peak_bytes Peak cgroup memory usage of the hub systemd unit since start.
+# TYPE nativelink_hub_memory_peak_bytes gauge
+nativelink_hub_memory_peak_bytes $mem_peak
+PROM
+fi
 chmod 0644 "$tmp"
 mv "$tmp" "$OUT"
 trap - EXIT

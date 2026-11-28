@@ -1,32 +1,45 @@
 #!/usr/bin/env python3
-"""Exposes each worker's slot count and slots in use to Prometheus.
+"""Exposes hub health, worker slots, CAS eviction, and journal counters to Prometheus.
 
-The NativeLink hub's own metrics do not say how many slots a worker offers or
-how many are busy; its admin API does. On every scrape this asks the hub's
-admin API (loopback, NL_HUB_ADMIN_LISTEN from hub.env) for the worker list and
-prints it in Prometheus text format on 127.0.0.1:9108/metrics.
-It also exports the hub's cache size and CAS eviction figures (see below).
+The NativeLink hub's own metrics omit per-worker slot counts, CAS eviction
+volume, and several scheduler/store journal fault events; this exporter exposes
+them on 127.0.0.1:9108/metrics:
+  * Per-worker slots, running actions, paused/draining flags, and connected
+    worker counts from the hub's loopback admin API (NL_HUB_ADMIN_LISTEN).
+  * Hub-side /status health probe result and latency (polled in a background
+    thread so a stalled /status never blocks Prometheus scrapes).
+  * Hub journal event counters (store health-probe stat timeouts, kill-ack and
+    silence evictions, scheduler Action.timeout events, worker command timeouts,
+    action kills, and compressed-upload decoded-size errors) tailed from
+    journalctl on nativelink-macos-hub.service.
+  * Store volume size and CAS insert/eviction figures via inotify and a
+    low-priority 15-minute scan.
 
 Started by the user unit nativelink-worker-slots-exporter.service (the hub it
-watches is a system unit). It only
-reads; it never changes anything on the hub.
+watches is a system unit). It only reads; it never changes anything on the hub.
 """
-import json, os, re, subprocess, urllib.request
+import json, os, re, socket, subprocess, urllib.error, urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ADMIN = os.environ.get("NL_HUB_ADMIN_LISTEN", "127.0.0.1:50071")
 URL = f"http://{ADMIN}/admin/scheduler/MAIN_SCHEDULER/workers"
+STATUS_URL = f"http://{ADMIN}/status"
+HUB_UNIT = os.environ.get("NL_HUB_UNIT", "nativelink-macos-hub.service")
+STATUS_PROBE_INTERVAL_S = max(1, int(os.environ.get("NL_STATUS_PROBE_INTERVAL_S", "15") or 15))
+STATUS_PROBE_TIMEOUT_S = max(1, int(os.environ.get("NL_STATUS_PROBE_TIMEOUT_S", "10") or 10))
 
-def render():
-    out = ["# HELP nativelink_pool_admin_up 1 if the hub's admin API answered.",
-           "# TYPE nativelink_pool_admin_up gauge"]
-    try:
-        with urllib.request.urlopen(URL, timeout=5) as r:
-            workers = json.load(r)
-    except Exception:
-        return "\n".join(out + ["nativelink_pool_admin_up 0", ""])
-    out.append("nativelink_pool_admin_up 1")
+def expected_workers():
+    raw = os.environ.get("NL_HEALTH_EXPECTED_WORKERS", "").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else None
+
+def render_workers(workers):
+    out = [
+        "# HELP nativelink_pool_admin_up 1 if the hub's admin API answered.",
+        "# TYPE nativelink_pool_admin_up gauge",
+        "nativelink_pool_admin_up 1",
+    ]
     rows = {"slots": [], "running": [], "paused": [], "draining": []}
+    by_os = {}
     for w in workers:
         m = re.match(r"^([a-z]+)-", w.get("id", ""))
         host = m.group(1) if m else "unknown"
@@ -35,11 +48,27 @@ def render():
         # separate pools as far as capacity goes.
         osf = (w.get("platform_properties") or {}).get("OSFamily") or "unknown"
         osf = osf if re.fullmatch(r"[a-z0-9_-]+", osf) else "unknown"
+        by_os[osf] = by_os.get(osf, 0) + 1
         key = (host, osf)
         rows["slots"].append((key, w.get("max_inflight_tasks", 0)))
         rows["running"].append((key, w.get("running_actions", 0)))
         rows["paused"].append((key, 1 if w.get("is_paused") else 0))
         rows["draining"].append((key, 1 if w.get("is_draining") else 0))
+    out += [
+        "# HELP nativelink_hub_connected_workers Total workers connected to the hub scheduler.",
+        "# TYPE nativelink_hub_connected_workers gauge",
+        f"nativelink_hub_connected_workers {len(workers)}",
+        "# HELP nativelink_hub_connected_workers_by_os Workers connected to the hub scheduler, by OSFamily.",
+        "# TYPE nativelink_hub_connected_workers_by_os gauge",
+    ]
+    out += [f'nativelink_hub_connected_workers_by_os{{os="{o}"}} {v}' for o, v in sorted(by_os.items())]
+    exp = expected_workers()
+    if exp is not None:
+        out += [
+            "# HELP nativelink_hub_expected_workers Expected total workers (NL_HEALTH_EXPECTED_WORKERS from hub.env).",
+            "# TYPE nativelink_hub_expected_workers gauge",
+            f"nativelink_hub_expected_workers {exp}",
+        ]
     for name, help_ in (("slots", "Slots the worker offers (max_inflight_tasks)."),
                         ("running", "Actions the worker is running now."),
                         ("paused", "1 if the worker is paused."),
@@ -52,6 +81,26 @@ def render():
             totals[key] = totals.get(key, 0) + v
         out += [f'{metric}{{host="{h}",os="{o}"}} {v}' for (h, o), v in sorted(totals.items())]
     return "\n".join(out) + "\n"
+
+def render():
+    try:
+        with urllib.request.urlopen(URL, timeout=5) as r:
+            workers = json.load(r)
+    except Exception:
+        out = [
+            "# HELP nativelink_pool_admin_up 1 if the hub's admin API answered.",
+            "# TYPE nativelink_pool_admin_up gauge",
+            "nativelink_pool_admin_up 0",
+        ]
+        exp = expected_workers()
+        if exp is not None:
+            out += [
+                "# HELP nativelink_hub_expected_workers Expected total workers (NL_HEALTH_EXPECTED_WORKERS from hub.env).",
+                "# TYPE nativelink_hub_expected_workers gauge",
+                f"nativelink_hub_expected_workers {exp}",
+            ]
+        return "\n".join(out) + "\n"
+    return render_workers(workers)
 
 def cache():
     """Size of the hub's store volume, from the filesystem: cheap, no directory walk."""
@@ -262,14 +311,256 @@ def eviction():
         out += [f"# HELP {metric} {help_}", f"# TYPE {metric} {typ}", f"{metric} {v}"]
     return out
 
-threading.Thread(target=_watch, name="cas-watch", daemon=True).start()
-threading.Thread(target=_scan_loop, name="cas-scan", daemon=True).start()
+# ---------------------------------------------------------------------------
+# Hub-side /status health probe.
+#
+# NativeLink's /status handler runs FilesystemStore::check_health (a 2 s stat
+# on cas-content) and returns 503 on timeout without logging the response code.
+# Running this probe on a background thread keeps /metrics fast even when
+# /status stalls, and records both the result and its wall latency.
+# ---------------------------------------------------------------------------
+_status_lock = threading.Lock()
+_status_st = {
+    "probed": False,
+    "up": 0,
+    "code": 0,
+    "duration_s": 0.0,
+    "last_ts": 0.0,
+    "counts": {"ok": 0, "503": 0, "timeout": 0, "error": 0},
+}
+
+def probe_status_once(url=None, timeout=None):
+    """Probe the hub's /status endpoint once. Returns (up, http_code, duration_s, outcome)."""
+    target = url or STATUS_URL
+    tmo = STATUS_PROBE_TIMEOUT_S if timeout is None else timeout
+    t0 = time.monotonic()
+    try:
+        with urllib.request.urlopen(target, timeout=tmo) as r:
+            code = getattr(r, "status", 200) or 200
+            r.read()
+        dur = time.monotonic() - t0
+        if code == 200:
+            return 1, 200, dur, "ok"
+        return 0, code, dur, "503" if code == 503 else "error"
+    except urllib.error.HTTPError as e:
+        dur = time.monotonic() - t0
+        try:
+            e.read()
+        except Exception:
+            pass
+        code = int(e.code)
+        return 0, code, dur, "503" if code == 503 else "error"
+    except (socket.timeout, TimeoutError):
+        return 0, 0, time.monotonic() - t0, "timeout"
+    except urllib.error.URLError as e:
+        dur = time.monotonic() - t0
+        reason = getattr(e, "reason", None)
+        if isinstance(reason, (socket.timeout, TimeoutError)) or "timed out" in str(reason).lower():
+            return 0, 0, dur, "timeout"
+        return 0, 0, dur, "error"
+    except Exception:
+        return 0, 0, time.monotonic() - t0, "error"
+
+def _record_status(up, code, dur, outcome, now=None):
+    ts = time.time() if now is None else now
+    with _status_lock:
+        _status_st["probed"] = True
+        _status_st["up"] = up
+        _status_st["code"] = code
+        _status_st["duration_s"] = dur
+        _status_st["last_ts"] = ts
+        _status_st["counts"][outcome] = _status_st["counts"].get(outcome, 0) + 1
+
+def _status_probe_loop():
+    while True:
+        up, code, dur, outcome = probe_status_once()
+        _record_status(up, code, dur, outcome)
+        time.sleep(STATUS_PROBE_INTERVAL_S)
+
+def status_metrics():
+    with _status_lock:
+        probed = _status_st["probed"]
+        up = _status_st["up"]
+        code = _status_st["code"]
+        dur = _status_st["duration_s"]
+        last_ts = _status_st["last_ts"]
+        counts = dict(_status_st["counts"])
+    out = []
+    if probed:
+        for metric, help_, v in (
+            ("nativelink_hub_status_up", "1 if the hub-side /status health probe returned HTTP 200.", up),
+            ("nativelink_hub_status_http_code", "HTTP status code from the last hub-side /status probe (0 on timeout or connection error).", code),
+            ("nativelink_hub_status_duration_seconds", "Wall latency of the last hub-side /status probe in seconds.", round(dur, 6)),
+            ("nativelink_hub_status_last_probe_timestamp_seconds", "Unix time of the last hub-side /status probe.", round(last_ts, 3)),
+        ):
+            out += [f"# HELP {metric} {help_}", f"# TYPE {metric} gauge", f"{metric} {v}"]
+    out += [
+        "# HELP nativelink_hub_status_probes_total Hub-side /status health probes by outcome since exporter start.",
+        "# TYPE nativelink_hub_status_probes_total counter",
+    ]
+    for outcome in ("ok", "503", "timeout", "error"):
+        out.append(f'nativelink_hub_status_probes_total{{outcome="{outcome}"}} {counts.get(outcome, 0)}')
+    return out
+
+# ---------------------------------------------------------------------------
+# Hub journal event counters.
+#
+# Tails the hub's JSON journal (NL_LOG=json on nativelink-macos-hub.service)
+# with cursor-based JSON journalctl output, resuming after reconnects. Every
+# counter starts at 0 at exporter start so Prometheus increase() observes even
+# the first occurrence of a rare fault without a cold-series blind spot.
+# ---------------------------------------------------------------------------
+JOURNAL_METRICS = (
+    (
+        "nativelink_hub_store_health_timeouts_total",
+        "FilesystemStore::check_health stat timeouts logged by the hub.",
+        re.compile(r"FilesystemStore::check_health: stat timed out"),
+    ),
+    (
+        "nativelink_hub_worker_kill_ack_evictions_total",
+        "Workers evicted by the hub for not acknowledging a kill in time.",
+        re.compile(r'"message":"Worker did not acknowledge a kill in time, removing from pool"'),
+    ),
+    (
+        "nativelink_hub_worker_silence_evictions_total",
+        "Workers evicted by the hub for timing out (silence).",
+        re.compile(r'"message":"Worker timed out, removing from pool"'),
+    ),
+    (
+        "nativelink_hub_scheduler_action_timeouts_total",
+        "Scheduler Action.timeout events ('Timing out operation') logged by the hub.",
+        re.compile(r'"message":"Timing out operation"'),
+    ),
+    (
+        "nativelink_hub_action_kills_total",
+        "'Action ended by a kill' events logged by the hub.",
+        re.compile(r'"message":"Action ended by a kill"'),
+    ),
+    (
+        "nativelink_hub_command_timeouts_total",
+        "'Command timed out on the worker' events logged by the hub.",
+        re.compile(r'"message":"Command timed out on the worker'),
+    ),
+    (
+        "nativelink_hub_compressed_upload_decoded_size_errors_total",
+        "Compressed-upload decoded-size-exceeds-digest-size errors logged by the hub.",
+        re.compile(r"Decoded compressed upload size [0-9]+ bytes exceeds digest size"),
+    ),
+)
+
+_journal_lock = threading.Lock()
+_journal_counts = {name: 0 for name, _, _ in JOURNAL_METRICS}
+_journal_watch_up = 0
+
+def classify_journal_line(line):
+    """Return the list of journal counter metric names matched by one log line."""
+    return [name for name, _, pat in JOURNAL_METRICS if pat.search(line)]
+
+def normalize_journal_message(value):
+    """Turn a journalctl JSON MESSAGE into text for classify_journal_line.
+
+    journalctl --output json encodes fields over 4096 bytes as null unless
+    --all is passed, and non-printable fields as arrays of byte values.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        try:
+            return bytes(value).decode("utf-8", "replace")
+        except (TypeError, ValueError):
+            return ""
+    return ""
+
+def record_journal_line(line):
+    matched = classify_journal_line(line)
+    if matched:
+        with _journal_lock:
+            for name in matched:
+                _journal_counts[name] += 1
+    return matched
+
+def _journal_follow_once(cursor):
+    """Confirm journal access and resume after the last counted entry."""
+    global _journal_watch_up
+    base = ["journalctl", "--unit", HUB_UNIT, "--output", "json", "--all", "--no-pager"]
+    proc = None
+    try:
+        # A running journalctl alone does not prove access (it can just print
+        # an access warning and wait forever). Require a readable unit entry.
+        check = subprocess.run(base + ["--lines=1"], capture_output=True, text=True, timeout=10)
+        if check.returncode or check.stderr.strip():
+            return cursor
+        try:
+            entry = json.loads(check.stdout.strip())
+        except json.JSONDecodeError:
+            return cursor
+        if not entry.get("__CURSOR") or "MESSAGE" not in entry:
+            return cursor
+        if cursor is None:
+            cursor = entry["__CURSOR"]
+        proc = subprocess.Popen(base + ["--follow", "--no-tail", "--after-cursor", cursor],
+                                stdout=subprocess.PIPE, text=True, bufsize=1)
+        with _journal_lock:
+            _journal_watch_up = 1
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            next_cursor = entry.get("__CURSOR")
+            if not next_cursor or next_cursor == cursor:
+                continue
+            try:
+                record_journal_line(normalize_journal_message(entry.get("MESSAGE", "")))
+            except Exception:
+                pass
+            cursor = next_cursor
+    except Exception:
+        pass
+    finally:
+        with _journal_lock:
+            _journal_watch_up = 0
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                proc.kill()
+                proc.wait()
+    return cursor
+
+
+def _journal_loop():
+    cursor = None
+    while True:
+        cursor = _journal_follow_once(cursor)
+        time.sleep(5)
+
+def journal_metrics():
+    with _journal_lock:
+        up = _journal_watch_up
+        counts = dict(_journal_counts)
+    out = [
+        "# HELP nativelink_hub_journal_watch_up 1 if the journalctl follower on the hub unit is running.",
+        "# TYPE nativelink_hub_journal_watch_up gauge",
+        f"nativelink_hub_journal_watch_up {up}",
+    ]
+    for name, help_, _ in JOURNAL_METRICS:
+        out += [f"# HELP {name} {help_}", f"# TYPE {name} counter", f"{name} {counts[name]}"]
+    return out
 
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
-        body = (render() + "\n".join(cache() + eviction()) + "\n").encode()
+        sections = cache() + eviction() + status_metrics() + journal_metrics()
+        body = (render() + "\n".join(sections) + "\n").encode()
         self.send_response(200); self.send_header("Content-Type", "text/plain; version=0.0.4")
         self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
     def log_message(self, *a): pass
 
-HTTPServer(("127.0.0.1", 9108), H).serve_forever()
+if __name__ == "__main__":
+    threading.Thread(target=_watch, name="cas-watch", daemon=True).start()
+    threading.Thread(target=_scan_loop, name="cas-scan", daemon=True).start()
+    threading.Thread(target=_status_probe_loop, name="status-probe", daemon=True).start()
+    threading.Thread(target=_journal_loop, name="journal-watch", daemon=True).start()
+    HTTPServer(("127.0.0.1", 9108), H).serve_forever()

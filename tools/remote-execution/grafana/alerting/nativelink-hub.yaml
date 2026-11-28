@@ -1,0 +1,532 @@
+# Grafana Unified Alerting rules for the NativeLink hub on headcrash.
+#
+# Installed at /etc/grafana/provisioning/alerting/nativelink-hub.yaml on
+# headcrash. Grafana loads provisioning files under
+# /etc/grafana/provisioning/alerting/ on startup (or via
+# `sudo systemctl restart grafana-server.service`).
+#
+# Thresholds are grounded in 8 days of measured hub behaviour (2026-11-20 to
+# 2026-11-27, UTC):
+#   - Store health-probe stat timeouts: 0/day on 11-20..11-26; 4 in 69 s on
+#     11-27 22:22-22:23 UTC -> fire on any timeout (>= 1 in 5m).
+#   - Hub /status probe failure: guard with uptime > 120s and `for: 1m` so a
+#     normal hub restart (10-20s) never pages.
+#   - Connected workers below normal: p50/p95/p99 = 10 (NL_HEALTH_EXPECTED_WORKERS
+#     = 10). Worker reconnect backoff caps at 30s; uptime > 180s and `for: 5m`
+#     keep normal hub restarts and worker reconnects silent while catching a
+#     dropped/evicted worker.
+#   - Burst of worker command timeouts or kills: quiet days (11-24..11-26) saw
+#     1-8/day; 8-day 15m distribution had p95=2.1 / p99=6.1 for KILLED_TIMEOUT
+#     and p95=3.05 / p99=11.19 for all kills; 11-23 burst peaked at 25 in 15m.
+#     Thresholds > 15 cmd-timeouts/15m or > 20 kills/15m sit well above p99.
+#   - Kill-ack evictions or scheduler Action.timeout burst: 0/day on 11-23..11-26;
+#     1 kill-ack eviction + 4 Action.timeouts on 11-27 22:19-22:20 UTC -> fire
+#     on >= 1 kill-ack eviction or >= 3 scheduler timeouts in 15m.
+#   - Decoded-size compressed-upload errors: 0/day on 11-23..11-26 after
+#     compressed-upload-restart.patch; 7-8 on 11-27 -> fire on any error (>= 1
+#     in 5m).
+#   - /mnt/cache fullness: steady-state p50=94.95%, p99=94.96%, max=95.01%
+#     because NL_HUB_CAS_MAX_BYTES is 95% of filesystem minus 5 GB (~94.87%).
+#     Threshold > 96% for 5m avoids permanent false firing under the current
+#     cap while alerting if the store overshoots its cap or cas-tmp leaks.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: nativelink_hub_health
+    folder: NativeLink
+    interval: 1m
+    rules:
+      - uid: nl-hub-store-health-timeout
+        title: NativeLink hub store health-probe timeout
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: >-
+                max(increase(nativelink_hub_store_health_timeouts_total[5m]))
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator:
+                    params:
+                      - 0.5
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: B
+              type: threshold
+        dashboardUid: nativelink-overview
+        panelId: 146
+        noDataState: OK
+        executionErrorState: Alerting
+        for: 0s
+        annotations:
+          summary: NativeLink hub CAS FilesystemStore::check_health stat timed out
+          description: >-
+            The hub logged at least one FilesystemStore::check_health stat
+            timeout (>2s) in the last 5m. Any single timeout makes /status
+            return 503 and causes client watchdogs to stop in-flight builds.
+            Check nvme1n1 busy/await, IO pressure, and /mnt/cache fullness.
+        labels:
+          severity: critical
+          service: nativelink-hub
+        isPaused: false
+
+      - uid: nl-hub-status-probe-failed
+        title: NativeLink hub /status health probe failing
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: >-
+                (1 - nativelink_hub_status_up)
+                and on() ((time() - nativelink_hub_start_time_seconds) > 120)
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator:
+                    params:
+                      - 0.5
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: B
+              type: threshold
+        dashboardUid: nativelink-overview
+        panelId: 141
+        noDataState: OK
+        executionErrorState: Alerting
+        for: 1m
+        annotations:
+          summary: NativeLink hub loopback /status probe is failing (non-200 or timeout)
+          description: >-
+            The hub-side /status probe failed for at least 1m while the hub
+            has been up >2m (suppresses normal restarts). Inspect
+            nativelink_hub_status_http_code, latency, and the hub journal.
+        labels:
+          severity: critical
+          service: nativelink-hub
+        isPaused: false
+
+      - uid: nl-hub-workers-below-normal
+        title: NativeLink hub connected workers below expected count
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: >-
+                (nativelink_hub_expected_workers - nativelink_hub_connected_workers)
+                and on() (nativelink_hub_expected_workers > 0)
+                and on() (nativelink_pool_admin_up == 1)
+                and on() ((time() - nativelink_hub_start_time_seconds) > 180)
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator:
+                    params:
+                      - 0.5
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: B
+              type: threshold
+        dashboardUid: nativelink-overview
+        panelId: 145
+        noDataState: OK
+        executionErrorState: Alerting
+        for: 5m
+        annotations:
+          summary: Fewer NativeLink workers connected than expected for >5m
+          description: >-
+            Connected worker count has been below NL_HEALTH_EXPECTED_WORKERS
+            (10) for 5m while the hub has been up >3m (normal hub restarts and
+            worker reconnects settle within ~30s). Check which worker dropped
+            in NativeLink Workers or via the hub admin API.
+        labels:
+          severity: warning
+          service: nativelink-hub
+        isPaused: false
+
+      - uid: nl-hub-kills-timeouts-burst
+        title: NativeLink hub burst of worker command timeouts or action kills
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1200
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: >-
+                (increase(nativelink_hub_command_timeouts_total[15m]) > bool 15)
+                + (increase(nativelink_hub_action_kills_total[15m]) > bool 20)
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 1200
+              to: 0
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator:
+                    params:
+                      - 0.5
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - C
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: C
+              type: threshold
+        dashboardUid: nativelink-overview
+        panelId: 147
+        noDataState: OK
+        executionErrorState: Alerting
+        for: 0s
+        annotations:
+          summary: Burst of worker command timeouts (>15/15m) or action kills (>20/15m)
+          description: >-
+            Command timeouts or killed actions exceeded the 15-minute burst
+            threshold (measured 8-day p99 is 6.1 KILLED_TIMEOUT and 11.2 total
+            kills per 15m). Check worker load, memory pressure, and hub logs.
+        labels:
+          severity: warning
+          service: nativelink-hub
+        isPaused: false
+
+      - uid: nl-hub-sched-timeouts-evictions
+        title: NativeLink hub kill-ack eviction or scheduler Action.timeout burst
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1200
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: >-
+                (increase(nativelink_hub_worker_kill_ack_evictions_total[15m]) >= bool 1)
+                + (increase(nativelink_hub_scheduler_action_timeouts_total[15m]) >= bool 3)
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 1200
+              to: 0
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator:
+                    params:
+                      - 0.5
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: B
+              type: threshold
+        dashboardUid: nativelink-overview
+        panelId: 146
+        noDataState: OK
+        executionErrorState: Alerting
+        for: 0s
+        annotations:
+          summary: NativeLink hub kill-ack worker eviction or >=3 scheduler Action.timeouts in 15m
+          description: >-
+            Either a worker failed to acknowledge a kill within 60s and was
+            evicted (which often leaves the worker unable to reconnect until
+            restarted) or the scheduler timed out >=3 operations in 15m.
+        labels:
+          severity: warning
+          service: nativelink-hub
+        isPaused: false
+
+      - uid: nl-hub-decoded-size-error
+        title: NativeLink hub compressed-upload decoded-size error
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: >-
+                max(increase(nativelink_hub_compressed_upload_decoded_size_errors_total[5m]))
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator:
+                    params:
+                      - 0.5
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: B
+              type: threshold
+        dashboardUid: nativelink-overview
+        panelId: 146
+        noDataState: OK
+        executionErrorState: Alerting
+        for: 0s
+        annotations:
+          summary: NativeLink hub logged a compressed-upload decoded-size error
+          description: >-
+            ByteStreamServer::write_compressed rejected a compressed upload
+            whose decoded size exceeded the digest size (baseline 0/day on
+            2026-11-23..11-26). Check the hub journal for client and blob details.
+        labels:
+          severity: warning
+          service: nativelink-hub
+        isPaused: false
+
+      - uid: nl-hub-cache-disk-full
+        title: NativeLink hub /mnt/cache disk usage above 96%
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: >-
+                100 * nativelink_hub_cache_used_bytes / nativelink_hub_cache_filesystem_bytes
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator:
+                    params:
+                      - 96
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: B
+              type: threshold
+        dashboardUid: nativelink-overview
+        panelId: 149
+        noDataState: OK
+        executionErrorState: Alerting
+        for: 5m
+        annotations:
+          summary: /mnt/cache is above 96% full for 5m
+          description: >-
+            NL_HUB_CAS_MAX_BYTES holds /mnt/cache at ~94.95% steady state
+            (measured 8-day max 95.01%). Exceeding 96% indicates CAS cap
+            overshoot, leaked cas-tmp files, or another writer filling the
+            volume toward ENOSPC.
+        labels:
+          severity: warning
+          service: nativelink-hub
+        isPaused: false
+
+      - uid: nl-hub-monitoring-unavailable
+        title: NativeLink hub monitoring unavailable
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: >-
+                max(up{job="nativelink-pool"} == 0) + 1
+                or (1 - min(nativelink_hub_journal_watch_up == 0))
+                or ((time() - min(nativelink_hub_status_last_probe_timestamp_seconds)) > 90)
+                or max(absent(up{job="nativelink-pool"}))
+                or absent(nativelink_hub_journal_watch_up)
+                or absent(nativelink_hub_status_last_probe_timestamp_seconds)
+                or vector(0)
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator:
+                    params:
+                      - 0.5
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: B
+              type: threshold
+        dashboardUid: nativelink-overview
+        panelId: 141
+        noDataState: Alerting
+        executionErrorState: Alerting
+        for: 3m
+        annotations:
+          summary: NativeLink hub monitoring has been unavailable for 3m
+          description: >-
+            Prometheus cannot scrape the pool exporter, the hub journal is
+            unreadable or its follower stopped, or the last /status probe is
+            older than 90s. Hub event alerts cannot be trusted until restored.
+        labels:
+          severity: warning
+          service: nativelink-hub
+        isPaused: false
