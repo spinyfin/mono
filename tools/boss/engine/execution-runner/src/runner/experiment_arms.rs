@@ -16,13 +16,23 @@
 //!   column existed). Nothing is treated and nothing is added: a run that cannot
 //!   be recorded must not be changed.
 //!
-//! - **Review-batch members.** The `delta_rereview` arm is decided once, at
-//!   admission, and is persisted as the batch's shape. A member's first launch
-//!   records the arm that shape implies, whatever the flags say by then: a
-//!   one-reviewer delta batch is always `treatment` (including after the
-//!   experiment was switched off while it queued), and a member of a
-//!   multi-reviewer batch reuses the arm a sibling already launched under, so a
-//!   supervisor never disagrees with its leaves.
+//! - **Pre-merge review-batch members.** The `delta_rereview` arm is decided
+//!   once, at batch admission, and persisted atomically on
+//!   `pr_review_batches.delta_rereview_arm` (`treatment`, `control`, or `NULL`
+//!   when not enrolled). Every leaf, supervisor, member retry and restarted
+//!   execution of a pre-merge batch resolves `delta_rereview` from that stored
+//!   value, ignoring live flags for that key — so a supervisor never disagrees
+//!   with its leaves, a control-admitted batch never flips to treatment or
+//!   unrecorded while queued, and a not-enrolled batch never picks up the key
+//!   mid-batch if the flags turn on.
+//! - **Kill-switch policy for `delta_rereview`.** Switching `delta_rereview`
+//!   (or `token_experiments`) off stops new pre-merge batches from enrolling.
+//!   An already-admitted batch cannot change its shape mid-batch (its member
+//!   rows and solo/full mode are immutable), so every member — including a
+//!   restarted execution — completes under the batch's admitted behaviour and
+//!   keeps its admission-time `delta_rereview` attribution rather than being
+//!   rewritten to `stopped`. Other experiments on the same execution still
+//!   follow `stop_experiments_not_running` as usual.
 //!
 //! Every failure to read resolves to the empty set, which is untreated and, at
 //! worst, records "nothing was running". An experiment never changes a worker on
@@ -58,6 +68,7 @@ pub(crate) fn resolve_launch_experiment_arms(
         StoredExperimentArms::Recorded(text) => match ExperimentArmSet::decode(&text) {
             Ok(mut arms) => {
                 flags.stop_experiments_not_running(&mut arms);
+                align_delta_rereview_arm(work_db, execution, &mut arms);
                 arms
             }
             Err(error) => {
@@ -73,8 +84,9 @@ pub(crate) fn resolve_launch_experiment_arms(
     }
 }
 
-/// Make a review-batch member's `delta_rereview` arm agree with the batch it
-/// belongs to. See the module docs. Any read failure leaves the drawn set as is.
+/// Resolve a pre-merge review-batch member's `delta_rereview` arm from the
+/// batch's persisted admission-time assignment (`pr_review_batches.delta_rereview_arm`).
+/// See the module docs. Any read failure leaves `arms` unchanged.
 fn align_delta_rereview_arm(work_db: &WorkDb, execution: &WorkExecution, arms: &mut ExperimentArmSet) {
     let key = crate::feature_flags::DELTA_REREVIEW_EXPERIMENT;
     let Ok(Some(member)) = work_db.review_batch_member_for_execution(&execution.id) else {
@@ -83,24 +95,22 @@ fn align_delta_rereview_arm(work_db: &WorkDb, execution: &WorkExecution, arms: &
     let Ok(Some(batch)) = work_db.review_batch(&member.batch_id) else {
         return;
     };
-    if batch.single_reviewer {
-        arms.insert(key, ExperimentArm::Treatment);
+    if batch.phase != boss_protocol::ReviewBatchPhase::PreMerge {
         return;
     }
-    let Ok(members) = work_db.review_batch_members(&batch.id) else {
-        return;
-    };
-    let sibling_arm = members
-        .iter()
-        .filter_map(|m| m.execution_id.as_deref())
-        .filter(|id| *id != execution.id)
-        .filter_map(|id| match work_db.stored_experiment_arms(id) {
-            Ok(StoredExperimentArms::Recorded(text)) => ExperimentArmSet::decode(&text).ok(),
-            _ => None,
-        })
-        .find_map(|set| set.get(key));
-    if let Some(arm) = sibling_arm {
-        arms.insert(key, arm);
+    match batch.delta_rereview_arm {
+        Some(boss_protocol::DeltaRereviewBatchArm::Treatment) => {
+            arms.insert(key, ExperimentArm::Treatment);
+        }
+        Some(boss_protocol::DeltaRereviewBatchArm::Control) => {
+            arms.insert(key, ExperimentArm::Control);
+        }
+        None if batch.single_reviewer => {
+            arms.insert(key, ExperimentArm::Treatment);
+        }
+        None => {
+            arms.remove(key);
+        }
     }
 }
 
@@ -357,8 +367,12 @@ mod tests {
         assert!(resolve_launch_experiment_arms(&flags, &db, &execution).is_empty());
     }
 
-    /// Admit a pre-merge review batch for a fresh chore and return its executions.
-    fn review_batch(db: &WorkDb, solo: bool) -> Vec<WorkExecution> {
+    /// Admit a pre-merge review batch for a fresh chore and return its batch id and executions.
+    fn review_batch_with_arm(
+        db: &WorkDb,
+        solo: bool,
+        arm: Option<boss_protocol::DeltaRereviewBatchArm>,
+    ) -> (String, Vec<WorkExecution>) {
         use crate::work::{ReviewBatchCreateInput, ReviewBatchDispatch};
         let task = create_test_chore(db, create_product(db), "batch target");
         db.connect()
@@ -387,21 +401,49 @@ mod tests {
             .pr_url("https://github.com/o/r/pull/9")
             .target_sha("head")
             .single_reviewer_light(solo)
+            .maybe_delta_rereview_arm(arm)
             .build();
         match db
             .create_pre_merge_review_batch(input, "git@github.com:o/r.git")
             .unwrap()
         {
-            ReviewBatchDispatch::Created { executions, .. } => executions,
+            ReviewBatchDispatch::Created { batch, executions } => (batch.id, executions),
             other => panic!("expected a new batch, got {other:?}"),
         }
+    }
+
+    /// Attach a pending supervisor execution to `batch_id` so tests can check
+    /// supervisor arm resolution alongside leaf members.
+    fn attach_supervisor(db: &WorkDb, batch_id: &str) -> WorkExecution {
+        let batch = db.review_batch(batch_id).unwrap().expect("batch exists");
+        let exec = db
+            .create_execution(
+                boss_protocol::CreateExecutionInput::builder()
+                    .work_item_id(batch.cycle_root_id)
+                    .kind(boss_protocol::ExecutionKind::PrReview)
+                    .repo_remote_url("git@github.com:o/r.git")
+                    .build(),
+            )
+            .unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO pr_review_batch_members (
+                    id, batch_id, attempt, created_at, provider_effort,
+                    requested_driver, resolved_model, role, status, updated_at,
+                    execution_id, report_proposal_id, terminal_at
+                 ) VALUES ('rvm_sup', ?1, 1, '1', 'high', 'claude', 'opus', 'supervisor', 'pending', '1', ?2, NULL, NULL)",
+                rusqlite::params![batch_id, exec.id],
+            )
+            .unwrap();
+        exec
     }
 
     #[test]
     fn a_solo_delta_batch_launches_as_treatment_even_after_the_experiment_is_switched_off() {
         let (_db_dir, db) = open_db();
         let (_flags_dir, flags) = flags();
-        let executions = review_batch(&db, true);
+        let (_, executions) = review_batch_with_arm(&db, true, Some(boss_protocol::DeltaRereviewBatchArm::Treatment));
         assert_eq!(executions.len(), 1);
 
         // The flags changed between admission and launch: nothing is running now.
@@ -414,23 +456,108 @@ mod tests {
     }
 
     #[test]
-    fn a_member_of_a_full_batch_launches_under_the_arm_its_sibling_recorded() {
+    fn a_control_admitted_full_batch_stays_control_when_flags_flip_before_any_member_launches() {
+        let key = crate::feature_flags::DELTA_REREVIEW_EXPERIMENT;
         let (_db_dir, db) = open_db();
         let (_flags_dir, flags) = flags();
-        let executions = review_batch(&db, false);
-        let key = crate::feature_flags::DELTA_REREVIEW_EXPERIMENT;
-        let mut first = ExperimentArmSet::new();
-        first.insert(key, ExperimentArm::Control);
-        launch(&db, &executions[0], &first);
+        let (batch_id, executions) =
+            review_batch_with_arm(&db, false, Some(boss_protocol::DeltaRereviewBatchArm::Control));
+        let supervisor = attach_supervisor(&db, &batch_id);
 
-        // Everything is treated now, which would give the second leaf another arm.
+        // Flip 1: ab_split turns off before any member launches — live flags would draw Treatment.
+        flags.set("review_batch_fanout", true).unwrap();
         flags.set(TOKEN_EXPERIMENTS_FLAG, true).unwrap();
         flags.set(key, true).unwrap();
         flags
             .set(crate::feature_flags::DELTA_REREVIEW_AB_SPLIT_FLAG, false)
             .unwrap();
-        let arms = resolve_launch_experiment_arms(&flags, &db, &executions[1]);
+        for exec in [&executions[0], &executions[1], &supervisor] {
+            let arms = resolve_launch_experiment_arms(&flags, &db, exec);
+            assert_eq!(
+                arms.get(key),
+                Some(ExperimentArm::Control),
+                "ab_split off must not flip a control-admitted batch"
+            );
+        }
 
-        assert_eq!(arms.get(key), Some(ExperimentArm::Control));
+        // Flip 2: experiment turns off completely before any member launches — live flags would omit the key.
+        flags.set(key, false).unwrap();
+        for exec in [&executions[0], &executions[1], &supervisor] {
+            let arms = resolve_launch_experiment_arms(&flags, &db, exec);
+            assert_eq!(
+                arms.get(key),
+                Some(ExperimentArm::Control),
+                "turning the flag off must not erase a control-admitted batch's arm"
+            );
+        }
+    }
+
+    #[test]
+    fn a_not_enrolled_full_batch_records_no_arm_for_later_members_after_flags_turn_on() {
+        let key = crate::feature_flags::DELTA_REREVIEW_EXPERIMENT;
+        let (_db_dir, db) = open_db();
+        let (_flags_dir, flags) = flags();
+        let (batch_id, executions) = review_batch_with_arm(&db, false, None);
+        let supervisor = attach_supervisor(&db, &batch_id);
+
+        // Leaf 1 launches while the experiment is off and records no `delta_rereview` key.
+        let leaf1_arms = resolve_launch_experiment_arms(&flags, &db, &executions[0]);
+        assert_eq!(leaf1_arms.get(key), None);
+        launch(&db, &executions[0], &leaf1_arms);
+
+        // Now turn `delta_rereview` on with split off (live flags would draw Treatment).
+        flags.set("review_batch_fanout", true).unwrap();
+        flags.set(TOKEN_EXPERIMENTS_FLAG, true).unwrap();
+        flags.set(key, true).unwrap();
+        flags
+            .set(crate::feature_flags::DELTA_REREVIEW_AB_SPLIT_FLAG, false)
+            .unwrap();
+
+        // Leaf 2 and the supervisor must still record no `delta_rereview` key.
+        assert_eq!(
+            resolve_launch_experiment_arms(&flags, &db, &executions[1]).get(key),
+            None
+        );
+        assert_eq!(resolve_launch_experiment_arms(&flags, &db, &supervisor).get(key), None);
+    }
+
+    #[test]
+    fn a_recorded_solo_execution_that_restarts_keeps_treatment_while_other_experiments_stop() {
+        let delta_key = crate::feature_flags::DELTA_REREVIEW_EXPERIMENT;
+        let (_db_dir, db) = open_db();
+        let (_flags_dir, flags) = flags();
+        let (_, executions) = review_batch_with_arm(&db, true, Some(boss_protocol::DeltaRereviewBatchArm::Treatment));
+        let solo = &executions[0];
+
+        // First launch records both `delta_rereview` and an unrelated experiment.
+        let mut first = ExperimentArmSet::new();
+        first.insert(delta_key, ExperimentArm::Treatment);
+        first.insert(KEY, ExperimentArm::Treatment);
+        launch(&db, solo, &first);
+
+        // Both experiments are switched off before the solo execution restarts.
+        flags.set(delta_key, false).unwrap();
+        flags.set(KEY, false).unwrap();
+        let restarted = resolve_launch_experiment_arms(&flags, &db, solo);
+
+        // The solo batch still runs the delta treatment, so attribution stays `treatment`,
+        // while the unrelated experiment transitions to `stopped` as usual.
+        assert_eq!(restarted.get(delta_key), Some(ExperimentArm::Treatment));
+        assert_eq!(restarted.get(KEY), Some(ExperimentArm::Stopped));
+    }
+
+    #[test]
+    fn a_recorded_control_execution_that_restarts_after_kill_switch_keeps_control() {
+        let delta_key = crate::feature_flags::DELTA_REREVIEW_EXPERIMENT;
+        let (_db_dir, db) = open_db();
+        let (_flags_dir, flags) = flags();
+        let (_, executions) = review_batch_with_arm(&db, false, Some(boss_protocol::DeltaRereviewBatchArm::Control));
+        let mut first = ExperimentArmSet::new();
+        first.insert(delta_key, ExperimentArm::Control);
+        launch(&db, &executions[0], &first);
+
+        flags.set(TOKEN_EXPERIMENTS_FLAG, false).unwrap();
+        let restarted = resolve_launch_experiment_arms(&flags, &db, &executions[0]);
+        assert_eq!(restarted.get(delta_key), Some(ExperimentArm::Control));
     }
 }

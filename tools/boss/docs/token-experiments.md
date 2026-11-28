@@ -136,6 +136,8 @@ To run it: switch `worker_autocompact` on (a half-and-half split starts), switch
 
 To run it: ensure `review_batch_fanout` is on, switch `delta_rereview` on (a half-and-half split starts), switch `delta_rereview_ab_split` off to treat every family, switch `delta_rereview` off to stop. To read it, once the usage dimensions and outcomes report land: `boss cost rows --experiment delta_rereview --group-by experiment_arm,pipeline_stage` and `boss cost experiment delta_rereview`.
 
+**Batch-level arm persistence and kill-switch policy:** `delta_rereview` is decided once at pre-merge batch admission and stored on `pr_review_batches.delta_rereview_arm` (`treatment`, `control`, or `NULL` when not enrolled). Every leaf, supervisor, member retry, and restarted execution of that batch resolves `delta_rereview` from the batch's stored arm rather than live flags. Switching `delta_rereview` (or `token_experiments`) off stops new pre-merge batches from enrolling; an already-admitted batch cannot change its shape mid-batch, so its members finish under the admitted behaviour and keep their admission-time `delta_rereview` attribution (neither behaviour nor attribution is rewritten to `stopped` mid-batch, while other experiments on the same execution still stop as usual). If a fault is in an in-flight treated run itself, cancel it.
+
 ## Rules for every experiment
 
 - **A hard failure stops an experiment at once.** A treated run that cannot start, loses its hooks, or ends in a state the engine cannot classify is a reason to turn the key off without waiting for a count.

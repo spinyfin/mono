@@ -1229,8 +1229,11 @@ mod floor_tests {
         steps.push((
             "20261127_2200_review_batch_single_reviewer",
             Box::new(|c| {
-                c.execute_batch("ALTER TABLE pr_review_batches ADD COLUMN single_reviewer INTEGER NOT NULL DEFAULT 0")
-                    .unwrap();
+                c.execute_batch(
+                    "ALTER TABLE pr_review_batches ADD COLUMN single_reviewer INTEGER NOT NULL DEFAULT 0;
+                     ALTER TABLE pr_review_batches ADD COLUMN delta_rereview_arm TEXT;",
+                )
+                .unwrap();
             }),
         ));
         steps.push((

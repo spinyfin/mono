@@ -304,6 +304,11 @@ impl ExperimentArmSet {
         self.0.get(key).copied()
     }
 
+    /// Remove `key` from the arm set, returning its prior arm if present.
+    pub fn remove(&mut self, key: &str) -> Option<ExperimentArm> {
+        self.0.remove(key)
+    }
+
     /// Whether the execution runs `key`'s treatment. A stopped experiment is
     /// not treated: stopping withdraws the change for later runs.
     pub fn is_treated(&self, key: &str) -> bool {

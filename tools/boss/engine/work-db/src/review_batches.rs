@@ -12,8 +12,8 @@ use std::str::FromStr;
 
 use anyhow::{Result, bail};
 use boss_protocol::{
-    CreateAttentionItemInput, ExecutionKind, ExecutionStatus, ReviewBatch, ReviewBatchMember, ReviewBatchMemberRole,
-    ReviewBatchMemberStatus, ReviewBatchPhase, ReviewBatchStatus, ReviewClassification,
+    CreateAttentionItemInput, DeltaRereviewBatchArm, ExecutionKind, ExecutionStatus, ReviewBatch, ReviewBatchMember,
+    ReviewBatchMemberRole, ReviewBatchMemberStatus, ReviewBatchPhase, ReviewBatchStatus, ReviewClassification,
 };
 use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
@@ -54,6 +54,10 @@ pub struct ReviewBatchCreateInput {
     /// `classification` still stores the PR's whole-PR profile.
     #[builder(default)]
     pub single_reviewer_light: bool,
+    /// Admission-time `delta_rereview` experiment arm to persist on the batch
+    /// (`None` when not enrolled). When `single_reviewer_light` is true and
+    /// this is `None`, creation records `Some(DeltaRereviewBatchArm::Treatment)`.
+    pub delta_rereview_arm: Option<DeltaRereviewBatchArm>,
 }
 
 /// Inputs for one role-specific member attempt in a new review batch.
@@ -291,6 +295,20 @@ where
         .map_err(|error: String| conversion_error(index, std::io::Error::new(std::io::ErrorKind::InvalidData, error)))
 }
 
+fn parse_optional_discriminator<T>(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<T>>
+where
+    T: FromStr<Err = String>,
+{
+    let value: Option<String> = row.get(index)?;
+    value
+        .map(|raw| {
+            raw.parse().map_err(|error: String| {
+                conversion_error(index, std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+            })
+        })
+        .transpose()
+}
+
 fn parse_classification(row: &Row<'_>, index: usize) -> rusqlite::Result<ReviewClassification> {
     let value: String = row.get(index)?;
     serde_json::from_str(&value).map_err(|error| conversion_error(index, error))
@@ -316,6 +334,7 @@ fn map_review_batch(row: &Row<'_>) -> rusqlite::Result<ReviewBatch> {
         explicit: row.get(15)?,
         producing_work_item_id: row.get(16)?,
         single_reviewer: row.get(17)?,
+        delta_rereview_arm: parse_optional_discriminator(row, 18)?,
     })
 }
 
@@ -506,6 +525,9 @@ fn create_review_batch_in_tx(
 ) -> Result<(ReviewBatch, Vec<ReviewBatchMember>)> {
     validate_batch_input(&input, member_inputs)?;
     let classification_json = serde_json::to_string(&input.classification)?;
+    let delta_rereview_arm = input
+        .delta_rereview_arm
+        .or_else(|| input.single_reviewer_light.then_some(DeltaRereviewBatchArm::Treatment));
     let batch_id = next_id("rvb");
     let now = now_string();
     tx.execute(
@@ -513,8 +535,8 @@ fn create_review_batch_in_tx(
             id, cycle_root_id, base_sha, classification_json, created_at,
             phase, pr_number, pr_url, status, target_sha, updated_at,
             completed_at, final_verdict_proposal_id, merge_sha, generation, explicit,
-            producing_work_item_id, single_reviewer
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'collecting', ?9, ?5, NULL, NULL, ?10, ?11, ?12, ?13, ?14)",
+            producing_work_item_id, single_reviewer, delta_rereview_arm
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'collecting', ?9, ?5, NULL, NULL, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             batch_id,
             input.cycle_root_id,
@@ -530,6 +552,7 @@ fn create_review_batch_in_tx(
             explicit,
             input.legacy_task_id,
             input.single_reviewer_light,
+            delta_rereview_arm.map(DeltaRereviewBatchArm::as_str),
         ],
     )?;
 
@@ -544,6 +567,7 @@ fn create_review_batch_in_tx(
             .generation(generation)
             .explicit(explicit)
             .single_reviewer(input.single_reviewer_light)
+            .maybe_delta_rereview_arm(delta_rereview_arm)
             .cycle_root_id(input.cycle_root_id)
             .base_sha(input.base_sha)
             .classification(input.classification)
@@ -620,7 +644,7 @@ fn review_batch_for_target_in(
     conn.query_row(
         "SELECT id, cycle_root_id, base_sha, classification_json, created_at,
                 phase, pr_number, pr_url, status, target_sha, updated_at,
-                completed_at, final_verdict_proposal_id, merge_sha, generation, explicit, producing_work_item_id, single_reviewer
+                completed_at, final_verdict_proposal_id, merge_sha, generation, explicit, producing_work_item_id, single_reviewer, delta_rereview_arm
          FROM pr_review_batches WHERE cycle_root_id = ?1 AND phase = ?2 AND target_sha = ?3
          ORDER BY generation DESC LIMIT 1",
         params![cycle_root_id, phase.as_str(), target_sha],
@@ -655,7 +679,7 @@ fn review_batch_by_id_in(conn: &rusqlite::Connection, batch_id: &str) -> Result<
     conn.query_row(
         "SELECT id, cycle_root_id, base_sha, classification_json, created_at,
                 phase, pr_number, pr_url, status, target_sha, updated_at,
-                completed_at, final_verdict_proposal_id, merge_sha, generation, explicit, producing_work_item_id, single_reviewer
+                completed_at, final_verdict_proposal_id, merge_sha, generation, explicit, producing_work_item_id, single_reviewer, delta_rereview_arm
          FROM pr_review_batches WHERE id = ?1",
         params![batch_id],
         map_review_batch,
@@ -2235,7 +2259,7 @@ impl WorkDb {
         let mut statement = conn.prepare(
             "SELECT id, cycle_root_id, base_sha, classification_json, created_at,
                     phase, pr_number, pr_url, status, target_sha, updated_at,
-                    completed_at, final_verdict_proposal_id, merge_sha, generation, explicit, producing_work_item_id, single_reviewer
+                    completed_at, final_verdict_proposal_id, merge_sha, generation, explicit, producing_work_item_id, single_reviewer, delta_rereview_arm
              FROM pr_review_batches
              WHERE cycle_root_id = ?1
              ORDER BY created_at DESC, generation DESC, id DESC",
@@ -2257,7 +2281,7 @@ impl WorkDb {
         let mut statement = conn.prepare(
             "SELECT id, cycle_root_id, base_sha, classification_json, created_at,
                     phase, pr_number, pr_url, status, target_sha, updated_at,
-                    completed_at, final_verdict_proposal_id, merge_sha, generation, explicit, producing_work_item_id, single_reviewer
+                    completed_at, final_verdict_proposal_id, merge_sha, generation, explicit, producing_work_item_id, single_reviewer, delta_rereview_arm
              FROM pr_review_batches
              WHERE status NOT IN ('completed', 'failed')
              ORDER BY created_at ASC, id ASC

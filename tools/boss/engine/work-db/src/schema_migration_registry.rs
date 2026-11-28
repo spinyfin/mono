@@ -878,17 +878,24 @@ mod tests {
                 super::super::table_has_column(&conn, "pr_review_batches", "single_reviewer").unwrap(),
                 "fresh schema must include pr_review_batches.single_reviewer"
             );
+            assert!(
+                super::super::table_has_column(&conn, "pr_review_batches", "delta_rereview_arm").unwrap(),
+                "fresh schema must include pr_review_batches.delta_rereview_arm"
+            );
             conn.execute_batch(
                 "ALTER TABLE pr_review_batches DROP COLUMN single_reviewer;
+                 ALTER TABLE pr_review_batches DROP COLUMN delta_rereview_arm;
                  DELETE FROM schema_migrations WHERE id = '20261127_2200_review_batch_single_reviewer';",
             )
             .unwrap();
             assert!(!super::super::table_has_column(&conn, "pr_review_batches", "single_reviewer").unwrap());
+            assert!(!super::super::table_has_column(&conn, "pr_review_batches", "delta_rereview_arm").unwrap());
         }
         drop(db);
         let upgraded = crate::WorkDb::open(path).unwrap();
         let conn = upgraded.connect().unwrap();
         assert!(super::super::table_has_column(&conn, "pr_review_batches", "single_reviewer").unwrap());
+        assert!(super::super::table_has_column(&conn, "pr_review_batches", "delta_rereview_arm").unwrap());
         let applied: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM schema_migrations WHERE id = '20261127_2200_review_batch_single_reviewer'",

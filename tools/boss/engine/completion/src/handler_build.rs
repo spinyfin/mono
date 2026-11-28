@@ -553,10 +553,21 @@ impl WorkerCompletionHandler {
         self.review_batch_enqueuer.as_ref()
     }
 
+    /// Admission-time `delta_rereview` decision for an automatic pre-merge
+    /// review of `work_item_id`.
+    pub fn delta_rereview_decision(
+        &self,
+        work_db: &WorkDb,
+        work_item_id: &str,
+    ) -> boss_observation_contracts::DeltaRereviewDecision {
+        crate::delta_rereview_decision(&self.feature_flags, work_db, work_item_id)
+    }
+
     /// Whether an automatic pre-merge review for `work_item_id` should use the
     /// single-reviewer Light-tier delta re-review path.
     pub fn should_use_delta_rereview(&self, work_db: &WorkDb, work_item_id: &str) -> bool {
-        crate::should_use_delta_rereview(&self.feature_flags, work_db, work_item_id)
+        self.delta_rereview_decision(work_db, work_item_id)
+            .single_reviewer_light
     }
 
     /// Shrink the conflict stop gate's `mergeable=UNKNOWN` re-probe
@@ -662,6 +673,14 @@ impl CompletionRequests for WorkerCompletionHandler {
 
     fn review_batch_enqueuer(&self) -> &dyn ReviewBatchEnqueuer {
         WorkerCompletionHandler::review_batch_enqueuer(self)
+    }
+
+    fn delta_rereview_decision(
+        &self,
+        work_db: &WorkDb,
+        work_item_id: &str,
+    ) -> boss_observation_contracts::DeltaRereviewDecision {
+        WorkerCompletionHandler::delta_rereview_decision(self, work_db, work_item_id)
     }
 
     fn should_use_delta_rereview(&self, work_db: &WorkDb, work_item_id: &str) -> bool {

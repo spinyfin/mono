@@ -104,8 +104,15 @@ impl ReviewBatchEnqueuer for ModeAwareStubEnqueuer {
         pr_url: &str,
         review_pool_size: usize,
     ) -> anyhow::Result<ReviewBatchDispatch> {
-        self.enqueue_with_mode(work_db, work_item_id, repo_remote_url, pr_url, review_pool_size, false)
-            .await
+        self.enqueue_with_mode(
+            work_db,
+            work_item_id,
+            repo_remote_url,
+            pr_url,
+            review_pool_size,
+            boss_observation_contracts::DeltaRereviewDecision::default(),
+        )
+        .await
     }
 
     async fn enqueue_with_mode(
@@ -115,12 +122,14 @@ impl ReviewBatchEnqueuer for ModeAwareStubEnqueuer {
         repo_remote_url: &str,
         pr_url: &str,
         review_pool_size: usize,
-        single_reviewer_light: bool,
+        decision: boss_observation_contracts::DeltaRereviewDecision,
     ) -> anyhow::Result<ReviewBatchDispatch> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.last_single_reviewer.store(single_reviewer_light, Ordering::SeqCst);
+        self.last_single_reviewer
+            .store(decision.single_reviewer_light, Ordering::SeqCst);
         let mut input = crate::review_batch_input_from_metadata(work_db, work_item_id, pr_url, self.metadata_json())?;
-        input.single_reviewer_light = single_reviewer_light;
+        input.single_reviewer_light = decision.single_reviewer_light;
+        input.delta_rereview_arm = decision.arm;
         work_db.create_pre_merge_review_batch_for_pool(input, repo_remote_url, review_pool_size)
     }
 }
@@ -554,7 +563,7 @@ async fn all_trigger_sites_agree_on_round_1_full_batch_and_round_2_delta_routing
         &treated_root,
         Some(treated_pr),
         Some(16),
-        unpark_handler.should_use_delta_rereview(&db, &treated_root),
+        unpark_handler.delta_rereview_decision(&db, &treated_root),
         &FakePrStateChecker::always(PrOpenState::Open),
         |_| async {
             Ok(serde_json::json!({
@@ -1049,7 +1058,7 @@ async fn solo_delta_batch_persists_whole_pr_deep_classification_for_post_merge_e
             REPO,
             pr_url,
             16,
-            should_use_delta_rereview(&flags, &db, &root_id),
+            crate::delta_rereview_decision(&flags, &db, &root_id),
         )
         .await
         .unwrap();

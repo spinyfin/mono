@@ -1372,8 +1372,7 @@ pub(super) async fn maybe_enqueue_declared_delivery_reviewer(
     }
 
     if feature_flags.is_enabled("review_batch_fanout") {
-        let single_reviewer_light =
-            super::pr_transition::should_use_delta_rereview(feature_flags, work_db, work_item_id);
+        let decision = super::pr_transition::delta_rereview_decision(feature_flags, work_db, work_item_id);
         match review_batch_enqueuer
             .enqueue_with_mode(
                 work_db,
@@ -1381,7 +1380,7 @@ pub(super) async fn maybe_enqueue_declared_delivery_reviewer(
                 repo_remote_url,
                 pr_url,
                 review_pool_size,
-                single_reviewer_light,
+                decision,
             )
             .await
         {

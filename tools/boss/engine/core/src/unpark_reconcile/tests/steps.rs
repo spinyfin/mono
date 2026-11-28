@@ -989,6 +989,10 @@ async fn unpark_review_of_a_treated_repeat_round_admits_the_one_reviewer_batch()
     assert_eq!((record.kind, record.code), (StepKind::Ok, "scheduled"), "{record:?}");
     let batch = f.db.review_batches_for_cycle_root(&chore).unwrap().remove(0);
     assert!(batch.single_reviewer);
+    assert_eq!(
+        batch.delta_rereview_arm,
+        Some(boss_protocol::DeltaRereviewBatchArm::Treatment)
+    );
     assert_eq!(f.db.review_batch_members(&batch.id).unwrap().len(), 1);
 }
 
@@ -1003,6 +1007,10 @@ async fn unpark_review_of_a_control_repeat_round_admits_the_full_batch() {
     assert_eq!((record.kind, record.code), (StepKind::Ok, "scheduled"), "{record:?}");
     let batch = f.db.review_batches_for_cycle_root(&chore).unwrap().remove(0);
     assert!(!batch.single_reviewer);
+    assert_eq!(
+        batch.delta_rereview_arm,
+        Some(boss_protocol::DeltaRereviewBatchArm::Control)
+    );
     assert_eq!(f.db.review_batch_members(&batch.id).unwrap().len(), 2);
 }
 
@@ -1024,4 +1032,8 @@ async fn unpark_review_of_a_treated_first_round_admits_the_full_batch() {
     assert_eq!((record.kind, record.code), (StepKind::Ok, "scheduled"), "{record:?}");
     let batch = f.db.review_batches_for_cycle_root(&chore).unwrap().remove(0);
     assert!(!batch.single_reviewer, "round 1 is never a delta round");
+    assert_eq!(
+        batch.delta_rereview_arm,
+        Some(boss_protocol::DeltaRereviewBatchArm::Treatment)
+    );
 }

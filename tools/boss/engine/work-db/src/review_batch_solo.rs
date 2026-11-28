@@ -30,10 +30,14 @@ pub const SOLO_PRE_MERGE_BATCH_RESERVATION_UNITS: i64 = 1;
 
 pub(super) const REVIEW_BATCH_SINGLE_REVIEWER_MIGRATION_ID: &str = "20261127_2200_review_batch_single_reviewer";
 
-/// Add `pr_review_batches.single_reviewer` (default 0 for multi-leaf batches).
+/// Add `pr_review_batches.single_reviewer` (default 0 for multi-leaf batches)
+/// and `pr_review_batches.delta_rereview_arm` (NULL when not enrolled).
 pub(super) fn migrate_review_batch_single_reviewer(conn: &Connection) -> Result<()> {
     if !super::schema_init::table_has_column(conn, "pr_review_batches", "single_reviewer")? {
         conn.execute_batch("ALTER TABLE pr_review_batches ADD COLUMN single_reviewer INTEGER NOT NULL DEFAULT 0")?;
+    }
+    if !super::schema_init::table_has_column(conn, "pr_review_batches", "delta_rereview_arm")? {
+        conn.execute_batch("ALTER TABLE pr_review_batches ADD COLUMN delta_rereview_arm TEXT")?;
     }
     Ok(())
 }

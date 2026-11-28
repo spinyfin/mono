@@ -117,6 +117,20 @@ pub struct WorkerSpawnOpts {
     /// `{}` and is never treated.
     #[builder(default)]
     pub experiment_arms: crate::feature_flags::ExperimentArmSet,
+    /// Override for GitHub history and diff fetches on solo delta re-review
+    /// spawns. `None` uses the production `gh` helpers.
+    pub delta_diff_source: Option<std::sync::Arc<dyn DeltaDiffSource>>,
+}
+
+/// Injectable GitHub history and diff fetcher for solo delta re-review spawns.
+/// Production uses the `gh` helpers directly; tests inject a stub so
+/// [`compose_worker_spawn`] exercises linear vs rewritten diff selection,
+/// embedding caps, and `history_rewritten` wiring end to end.
+#[async_trait::async_trait]
+pub trait DeltaDiffSource: std::fmt::Debug + Send + Sync {
+    async fn fetch_delta_history(&self, repo_slug: &str, last_sha: &str, target_sha: &str) -> DeltaHistory;
+    async fn fetch_compare_diff(&self, repo_slug: &str, last_sha: &str, target_sha: &str) -> Option<String>;
+    async fn fetch_pr_diff(&self, pr_url: &str) -> Option<String>;
 }
 
 /// Fetch authoritative PR metadata for a reviewer worker's initial prompt.
@@ -318,7 +332,7 @@ async fn fetch_compare_diff(repo_slug: &str, base_sha: &str, head_sha: &str) -> 
 /// upstream changes. A merge commit in the range (main merged into the branch)
 /// also pulls base-branch changes into an otherwise `ahead` range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeltaHistory {
+pub enum DeltaHistory {
     Linear,
     Rewritten,
 }
@@ -740,6 +754,7 @@ pub async fn compose_worker_spawn(
         repo_guidance,
         remote_workspace,
         experiment_arms,
+        delta_diff_source,
     } = editorial_opts;
     // Experiments reach the composer as plain options, never as keys.
     let batched_search = experiment_arms.is_treated(crate::feature_flags::BATCHED_SEARCH_EXPERIMENT);
@@ -1122,14 +1137,23 @@ pub async fn compose_worker_spawn(
                 ) && !target_sha.is_empty()
                     && last_sha != target_sha
                 {
-                    delta_history_rewritten =
-                        fetch_delta_history(slug, last_sha, target_sha).await == DeltaHistory::Rewritten;
+                    let history = match delta_diff_source.as_deref() {
+                        Some(src) => src.fetch_delta_history(slug, last_sha, target_sha).await,
+                        None => fetch_delta_history(slug, last_sha, target_sha).await,
+                    };
+                    delta_history_rewritten = history == DeltaHistory::Rewritten;
                     // A rebased, amended or main-merged head makes the compare
                     // diff wrong, so review the full PR diff instead.
                     let diff = if delta_history_rewritten {
-                        fetch_pr_diff(pr_url).await
+                        match delta_diff_source.as_deref() {
+                            Some(src) => src.fetch_pr_diff(pr_url).await,
+                            None => fetch_pr_diff(pr_url).await,
+                        }
                     } else {
-                        fetch_compare_diff(slug, last_sha, target_sha).await
+                        match delta_diff_source.as_deref() {
+                            Some(src) => src.fetch_compare_diff(slug, last_sha, target_sha).await,
+                            None => fetch_compare_diff(slug, last_sha, target_sha).await,
+                        }
                     };
                     if let Some(diff) = diff {
                         if let Some(ref mut ctx) = pr_review_context {

@@ -311,7 +311,7 @@ pub async fn reconcile_batch(
             work_db,
             publisher,
             handler.review_batch_enqueuer(),
-            &|db, id| handler.should_use_delta_rereview(db, id),
+            &|db, id| handler.delta_rereview_decision(db, id),
             Some(&wanted),
             pool_size,
             &mut outcome,

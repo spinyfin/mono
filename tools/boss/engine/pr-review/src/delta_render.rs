@@ -102,7 +102,7 @@ pub fn render_delta_rereviewer_initial_prompt(
         .or_else(|| delta.last_reviewed_sha.as_deref().filter(|s| !s.is_empty()));
 
     let pr_metadata_block = render_pr_metadata_block(ctx, target_sha, last_reviewed_sha);
-    let prior_findings_block = render_prior_findings_block(delta.prior_round.as_ref());
+    let prior_findings_block = render_prior_findings_block(delta.prior_round.as_ref(), delta.history_rewritten);
     let (delta_diff_step, embedded_delta_diff_section) = render_delta_diff_sections(
         delta.delta_diff_content.as_deref(),
         delta.history_rewritten,
@@ -120,7 +120,7 @@ pub fn render_delta_rereviewer_initial_prompt(
     let boss_construct_sweep_block = ctx
         .map(|c| crate::blocks::render_boss_construct_sweep_block(&c.boss_construct_refs))
         .unwrap_or_default();
-    let rubric = render_delta_rubric_section(&scope);
+    let rubric = render_delta_rubric_section(&scope, delta.history_rewritten);
     let verdict_submission_block =
         crate::blocks::render_verdict_submission_block(&destination.batch_id, &destination.body_path);
 
@@ -128,15 +128,94 @@ pub fn render_delta_rereviewer_initial_prompt(
         .map(|sha| format!("`{sha}`"))
         .unwrap_or_else(|| "the last reviewed commit".to_owned());
 
+    let (title, intro, scope_section, verify_step, clean_subject, summary_placeholder) = if delta.history_rewritten {
+        (
+            "# PR re-review (history rewritten — full PR diff)",
+            format!(
+                "You are the sole reviewer for a repeat pre-merge review round. The PR's \
+                 history was rewritten since {last_sha_label} (rebase, amend, force-push, \
+                 or a base-branch merge), so a compare against the last reviewed commit \
+                 cannot be trusted. Your job is to verify the prior round's findings, \
+                 review the **full current PR diff**, run one explicit whole-PR \
+                 duplication check over the changed-file list, and submit a single \
+                 structured `SupervisorVerdict` JSON directly (there is no second \
+                 reviewer and no separate supervisor). {BASE_BRANCH_SCOPE_NOTE}"
+            ),
+            format!(
+                "## Full-PR re-review scope (history rewritten)\n\
+                 \n\
+                 1. **Verify every prior finding first.** For each item in **Prior round \
+                    findings** above, inspect the full PR diff and current workspace to \
+                    determine whether it is **resolved** or **unresolved**. In your \
+                    verdict's `summary`, state the disposition of each prior finding \
+                    explicitly (for example: `C1: resolved; C2: unresolved — ...`). Any \
+                    prior finding that is still unresolved MUST be included in your \
+                    `findings` list so it remains actionable.\n\
+                 2. **Review the full current PR diff.** Because history was rewritten \
+                    since {last_sha_label}, do not restrict your review to an old-head \
+                    compare. Apply the rubric below to the full current PR diff and the \
+                    revision ask. {BASE_BRANCH_SCOPE_NOTE}\n\
+                 3. **Whole-PR duplication check — REQUIRED (one explicit step).** Before \
+                    concluding the PR is clean, scan the full **Changed files** list above \
+                    for whole-PR duplication defects — specifically, whether a refactor, \
+                    move, or crate/module extraction left duplicate copies of the same \
+                    module, type, helper, or file tree in the PR (for example, an old copy \
+                    left behind alongside a newly extracted crate or module). Check any \
+                    suspicious file pairs in the workspace and raise a `category: \
+                    \"duplication\"` finding for any confirmed duplicate."
+            ),
+            "3. Check each prior finding against the full PR diff and workspace and record whether \
+             each one is resolved or unresolved.",
+            "the full PR diff is clean",
+            "<prior finding dispositions (resolved/unresolved) + concise full-PR assessment>",
+        )
+    } else {
+        (
+            "# Delta PR re-review",
+            format!(
+                "You are the sole reviewer for a repeat pre-merge review round. Earlier \
+                 round(s) already reviewed this PR up to {last_sha_label}. Your job is to \
+                 verify the prior round's findings, review **only the delta** since \
+                 {last_sha_label}, run one explicit whole-PR duplication check over the \
+                 changed-file list, and submit a single structured `SupervisorVerdict` \
+                 JSON directly (there is no second reviewer and no separate supervisor)."
+            ),
+            format!(
+                "## Delta-only review scope\n\
+                 \n\
+                 1. **Verify every prior finding first.** For each item in **Prior round \
+                    findings** above, inspect the delta and current workspace to determine \
+                    whether it is **resolved** or **unresolved**. In your verdict's \
+                    `summary`, state the disposition of each prior finding explicitly (for \
+                    example: `C1: resolved; C2: unresolved — ...`). Any prior finding that \
+                    is still unresolved MUST be included in your `findings` list so it \
+                    remains actionable.\n\
+                 2. **Review only the delta since {last_sha_label}.** Do not re-review \
+                    unchanged parts of the PR that earlier rounds already accepted unless \
+                    the new commits modify or break them. Apply the rubric below to the \
+                    new/changed hunks and the revision ask.\n\
+                 3. **Whole-PR duplication check — REQUIRED (one explicit step).** Before \
+                    concluding the PR is clean, scan the full **Changed files** list above \
+                    for whole-PR duplication defects that a delta-only diff cannot see — \
+                    specifically, whether a refactor, move, or crate/module extraction \
+                    left duplicate copies of the same module, type, helper, or file tree \
+                    in the PR (for example, an old copy left behind alongside a newly \
+                    extracted crate or module). Check any suspicious file pairs in the \
+                    workspace and raise a `category: \"duplication\"` finding for any \
+                    confirmed duplicate. Keep all other scrutiny scoped strictly to the \
+                    delta and the prior findings."
+            ),
+            "3. Check each prior finding against the delta and workspace and record whether \
+             each one is resolved or unresolved.",
+            "the delta is clean",
+            "<prior finding dispositions (resolved/unresolved) + concise delta assessment>",
+        )
+    };
+
     format!(
-        "# Delta PR re-review\n\
+        "{title}\n\
          \n\
-         You are the sole reviewer for a repeat pre-merge review round. Earlier round(s) \
-         already reviewed this PR up to {last_sha_label}. Your job is to verify the prior \
-         round's findings, review **only the delta** since {last_sha_label}, run one \
-         explicit whole-PR duplication check over the changed-file list, and submit a \
-         single structured `SupervisorVerdict` JSON directly (there is no second reviewer \
-         and no separate supervisor).\n\
+         {intro}\n\
          \n\
          You MUST NOT change the PR in any way: no commits, no pushes, no `gh` writes, no \
          edits to repo files or branches, no comments on GitHub. You operate **read-only** \
@@ -155,27 +234,7 @@ pub fn render_delta_rereviewer_initial_prompt(
          **PR:** {pr_url}\n\
          {pr_metadata_block}\n\
          {prior_findings_block}\
-         ## Delta-only review scope\n\
-         \n\
-         1. **Verify every prior finding first.** For each item in **Prior round findings** \
-            above, inspect the delta and current workspace to determine whether it is \
-            **resolved** or **unresolved**. In your verdict's `summary`, state the \
-            disposition of each prior finding explicitly (for example: `C1: resolved; \
-            C2: unresolved — ...`). Any prior finding that is still unresolved MUST be \
-            included in your `findings` list so it remains actionable.\n\
-         2. **Review only the delta since {last_sha_label}.** Do not re-review unchanged \
-            parts of the PR that earlier rounds already accepted unless the new commits \
-            modify or break them. Apply the rubric below to the new/changed hunks and the \
-            revision ask.\n\
-         3. **Whole-PR duplication check — REQUIRED (one explicit step).** Before \
-            concluding the PR is clean, scan the full **Changed files** list above for \
-            whole-PR duplication defects that a delta-only diff cannot see — specifically, \
-            whether a refactor, move, or crate/module extraction left duplicate copies of \
-            the same module, type, helper, or file tree in the PR (for example, an old \
-            copy left behind alongside a newly extracted crate or module). Check any \
-            suspicious file pairs in the workspace and raise a `category: \"duplication\"` \
-            finding for any confirmed duplicate. Keep all other scrutiny scoped strictly \
-            to the delta and the prior findings.\n\
+         {scope_section}\n\
          \n\
          {merged_parent_deletion_block}\
          {supersession_flag_block}\
@@ -185,8 +244,7 @@ pub fn render_delta_rereviewer_initial_prompt(
          1. Your workspace is already checked out to `{target_sha}` — read changed files \
             directly with `Read`, `cat`, `grep`, etc.\n\
          {delta_diff_step}\
-         3. Check each prior finding against the delta and workspace and record whether \
-            each one is resolved or unresolved.\n\
+         {verify_step}\n\
          4. Run the single **Whole-PR duplication check** over the full **Changed files** \
             list above.\n\
          5. Submit your `SupervisorVerdict` JSON using **Required output** below.\n\
@@ -198,7 +256,7 @@ pub fn render_delta_rereviewer_initial_prompt(
          Set to `true` when there is at least one finding at `critical`/`high` severity, \
          or any finding with `category: \"regression\"`, `\"duplication\"`, \
          `\"deferred_scope\"`, or `\"agent_isms\"`, regardless of severity. Set to `false` \
-         when every prior finding is resolved and the delta is clean (or has only \
+         when every prior finding is resolved and {clean_subject} (or has only \
          `medium`/`low` non-gating observations).\n\
          \n\
          {verdict_submission_block}\
@@ -214,7 +272,7 @@ pub fn render_delta_rereviewer_initial_prompt(
            \"pr_url\": \"{pr_url}\",\n\
            \"target_sha\": \"{target_sha}\",\n\
            \"phase\": \"pre_merge\",\n\
-           \"summary\": \"<prior finding dispositions (resolved/unresolved) + concise delta assessment>\",\n\
+           \"summary\": \"{summary_placeholder}\",\n\
            \"revision_warranted\": false,\n\
            \"findings\": [\n\
              {{\n\
@@ -233,24 +291,30 @@ pub fn render_delta_rereviewer_initial_prompt(
          }}\n\
          ```\n\
          \n\
-         `findings` may be empty when every prior finding is resolved and the delta is \
-         clean. `contradictions` is always `[]` here — there is no second reviewer to \
-         disagree with. Give every finding a unique `id` (`C1`, `C2`, ...); `sources` on \
-         every finding must be exactly `[\"claude\"]`; omit `location` when it does not \
-         apply. There are no separate leaf reports in a delta re-review, so omit `rejected`.\n",
-        last_sha_label = last_sha_label,
+         `findings` may be empty when every prior finding is resolved and {clean_subject}. \
+         `contradictions` is always `[]` here — there is no second reviewer to disagree \
+         with. Give every finding a unique `id` (`C1`, `C2`, ...); `sources` on every \
+         finding must be exactly `[\"claude\"]`; omit `location` when it does not apply. \
+         There are no separate leaf reports in a single-reviewer re-review, so omit \
+         `rejected`.\n",
+        title = title,
+        intro = intro,
         repo_slug = repo_slug,
         brief_block = brief_block,
         pr_url = pr_url,
         pr_metadata_block = pr_metadata_block,
         prior_findings_block = prior_findings_block,
+        scope_section = scope_section,
         merged_parent_deletion_block = merged_parent_deletion_block,
         supersession_flag_block = supersession_flag_block,
         boss_construct_sweep_block = boss_construct_sweep_block,
         target_sha = target_sha,
         delta_diff_step = delta_diff_step,
+        verify_step = verify_step,
         embedded_delta_diff_section = embedded_delta_diff_section,
         rubric = rubric,
+        clean_subject = clean_subject,
+        summary_placeholder = summary_placeholder,
         verdict_submission_block = verdict_submission_block,
         batch_id = destination.batch_id,
     )
@@ -284,13 +348,20 @@ fn render_pr_metadata_block(
     format!("{base_line}{last_line}{head_line}{files_block}")
 }
 
-fn render_prior_findings_block(prior_round: Option<&PriorReviewRound>) -> String {
+fn render_prior_findings_block(prior_round: Option<&PriorReviewRound>, history_rewritten: bool) -> String {
     let mut out = String::from("## Prior round findings\n\n");
     let Some(round) = prior_round else {
-        out.push_str(
-            "No prior-round findings are recorded in storage for this PR. Review the delta \
-             since the last reviewed commit and the revision ask above.\n\n",
-        );
+        if history_rewritten {
+            out.push_str(
+                "No prior-round findings are recorded in storage for this PR. Review the full \
+                 current PR diff and the revision ask above.\n\n",
+            );
+        } else {
+            out.push_str(
+                "No prior-round findings are recorded in storage for this PR. Review the delta \
+                 since the last reviewed commit and the revision ask above.\n\n",
+            );
+        }
         return out;
     };
     if let Some(sha) = round.head_sha.as_deref().filter(|s| !s.is_empty()) {
@@ -336,6 +407,11 @@ fn render_prior_findings_block(prior_round: Option<&PriorReviewRound>) -> String
         );
         out.push_str(instructions.trim());
         out.push_str("\n\n");
+    } else if history_rewritten {
+        out.push_str(
+            "The prior review round recorded no findings (clean pass). Review the full \
+             current PR diff and the single whole-PR duplication check.\n\n",
+        );
     } else {
         out.push_str(
             "The prior review round recorded no findings (clean pass). Focus on the delta \
@@ -416,9 +492,50 @@ fn render_delta_diff_sections(
     (step, String::new())
 }
 
-fn render_delta_rubric_section(scope: &ReviewScope) -> String {
-    match scope {
-        ReviewScope::Code => "## Delta review rubric — code PR\n\
+fn render_delta_rubric_section(scope: &ReviewScope, history_rewritten: bool) -> String {
+    match (scope, history_rewritten) {
+        (ReviewScope::Code, true) => format!(
+            "## Full-PR re-review rubric — code PR\n\
+             \n\
+             Apply a **high bar** on the full current PR diff and prior findings: push back \
+             only on real problems, not stylistic preferences. Every finding must name a \
+             file and state **concretely what to change**. {BASE_BRANCH_SCOPE_NOTE}\n\
+             \n\
+             Check the full PR diff for:\n\
+             \n\
+             - **Unresolved prior findings** — prior findings that were skipped, only \
+               partially fixed, or deferred with a TODO/follow-up instead of fixed.\n\
+             - **Correctness and edge cases** (`correctness`, `edgecase`) — bugs, broken \
+               invariants, mishandled errors, or races in the PR.\n\
+             - **Regressions and deletions** (`regression`) — functionality or merged-parent \
+               surfaces dropped by the PR without a verified design-doc citation.\n\
+             - **Whole-PR duplication** (`duplication`) — run the single explicit check over \
+               the **Changed files** list for left-behind duplicate copies/modules, plus any \
+               duplicated infrastructure introduced by the PR.\n\
+             - **Deferred-scope hygiene** (`deferred_scope`) — task or revision-ask items \
+               silently dropped or deferred only in prose without an engine-recorded \
+               `[deferred-scope]` declaration (manual/interactive verification a headless \
+               worker cannot perform is exempt with a plain prose note).\n\
+             - **Agent-isms** (`agent_isms`) — bare Boss work-item ids (`T<n>`/`P<n>`), \
+               \"the operator\"/actor references, or lineage-narrating code comments added by \
+               the PR.\n\
+             - **Tests** (`tests`) — missing or weakened tests for behaviour changed by the \
+               PR.\n"
+        ),
+        (ReviewScope::DocsOnly, true) => format!(
+            "## Full-PR re-review rubric — docs-only PR\n\
+             \n\
+             This PR contains only documentation files. Apply the **light rubric** to the \
+             full current PR diff and prior findings — skip code-review concerns. \
+             {BASE_BRANCH_SCOPE_NOTE}\n\
+             \n\
+             - Confirm each prior finding is resolved or carry it forward.\n\
+             - Check the full PR diff for structure, completeness, internal consistency, and \
+               required design-doc sections where applicable.\n\
+             - Run the single **Whole-PR duplication check** over the **Changed files** list \
+               to confirm no duplicate document copy was left behind.\n"
+        ),
+        (ReviewScope::Code, false) => "## Delta review rubric — code PR\n\
              \n\
              Apply a **high bar** on the delta and prior findings: push back only on real \
              problems, not stylistic preferences. Every finding must name a file and state \
@@ -445,7 +562,7 @@ fn render_delta_rubric_section(scope: &ReviewScope) -> String {
              - **Tests** (`tests`) — missing or weakened tests for behaviour changed by the \
                delta.\n"
             .to_owned(),
-        ReviewScope::DocsOnly => "## Delta review rubric — docs-only PR\n\
+        (ReviewScope::DocsOnly, false) => "## Delta review rubric — docs-only PR\n\
              \n\
              This PR contains only documentation files. Apply the **light rubric** to the \
              delta and prior findings only — skip code-review concerns.\n\
@@ -651,6 +768,26 @@ mod tests {
         )
     }
 
+    fn assert_no_delta_only_restrictions(prompt: &str) {
+        for forbidden in [
+            "# Delta PR re-review",
+            "review **only the delta**",
+            "## Delta-only review scope",
+            "Review only the delta",
+            "Do not re-review unchanged parts",
+            "scoped strictly to the delta",
+            "## Delta review rubric",
+            "Check the delta for:",
+            "Focus on the delta",
+            "Review the delta since",
+        ] {
+            assert!(
+                !prompt.contains(forbidden),
+                "rewritten-history prompt must not contain delta-only restriction {forbidden:?}:\n{prompt}"
+            );
+        }
+    }
+
     #[test]
     fn rebased_or_amended_history_reviews_the_full_pr_diff_instead_of_a_delta() {
         let prompt = render_with(
@@ -660,10 +797,21 @@ mod tests {
                 .history_rewritten(true)
                 .build(),
         );
+        assert!(
+            prompt.contains("# PR re-review (history rewritten — full PR diff)"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("## Full-PR re-review scope (history rewritten)"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("## Full-PR re-review rubric — code PR"), "{prompt}");
         assert!(prompt.contains("## Full PR diff (history rewritten)"), "{prompt}");
         assert!(prompt.contains("+whole_pr_change();"));
+        assert!(prompt.contains("Whole-PR duplication check — REQUIRED"));
         assert!(!prompt.contains("## Delta diff"));
         assert!(prompt.contains("out of scope: do not raise findings against upstream code"));
+        assert_no_delta_only_restrictions(&prompt);
     }
 
     #[test]
@@ -677,6 +825,19 @@ mod tests {
         assert!(prompt.contains("gh pr diff 42 --repo org/repo"), "{prompt}");
         assert!(!prompt.contains("compare/head-sha-1...head-sha-2"), "{prompt}");
         assert!(prompt.contains("do NOT diff against the last reviewed commit"));
+        assert_no_delta_only_restrictions(&prompt);
+
+        // Also check docs-only and missing-prior-round fallback text under rewritten history.
+        let docs_prompt = render_delta_rereviewer_initial_prompt(
+            &ReviewBriefPacket::from_task("Update docs", "Fix section 2."),
+            &sample_destination(),
+            ReviewScope::DocsOnly,
+            Some(&sample_ctx()),
+            &DeltaRereviewContext::builder().history_rewritten(true).build(),
+            "org/repo",
+        );
+        assert!(docs_prompt.contains("## Full-PR re-review rubric — docs-only PR"));
+        assert_no_delta_only_restrictions(&docs_prompt);
     }
 
     #[test]

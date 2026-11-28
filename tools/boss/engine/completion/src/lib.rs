@@ -177,7 +177,7 @@ use conflict_delivery_gate::ConflictDeliveryDecision;
 use contribution_gate::{RevisionContributionReason, RevisionReviewGate};
 use pr_binding_guard::PrUrlDeliverable;
 pub(crate) use pr_transition::GhReviewBatchEnqueuer;
-pub use pr_transition::{review_batch_input_from_metadata, should_use_delta_rereview};
+pub use pr_transition::{delta_rereview_decision, review_batch_input_from_metadata, should_use_delta_rereview};
 
 // Counter handles for the PR URL capture channels, in the order they are
 // consulted: the worker's structured-output artifact (the driver-agnostic file

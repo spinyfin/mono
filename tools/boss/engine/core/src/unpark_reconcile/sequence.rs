@@ -718,7 +718,11 @@ where
         .completion
         .review_batch_fanout_enabled()
         .then_some(env.completion.review_pool_size());
-    let single_reviewer_light = pool.is_some() && env.completion.should_use_delta_rereview(&env.work_db, &task.id);
+    let decision = if pool.is_some() {
+        env.completion.delta_rereview_decision(&env.work_db, &task.id)
+    } else {
+        boss_observation_contracts::DeltaRereviewDecision::default()
+    };
     // Parking does not stop a reviewer that was already running. The legacy
     // admission refuses to start a second execution on the item, which would
     // read as a failed step; batch admission reports this case itself.
@@ -734,7 +738,7 @@ where
         &task.id,
         Some(pr_url),
         pool,
-        single_reviewer_light,
+        decision,
         &StaticPrStateChecker(PrOpenState::Open),
         fetch_metadata,
     )
