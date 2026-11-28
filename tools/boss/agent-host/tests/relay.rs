@@ -7,13 +7,15 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use boss_agent_host::journal::{Direction, WireRecord, read_records};
-use boss_agent_host::{Config, Handshake, run};
+use boss_agent_host::{Config, Handshake, TestHooks, is_takeover_boundary_line, run, run_with_hooks};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(20);
@@ -54,6 +56,10 @@ struct Host {
 
 impl Host {
     async fn start(script: &[String], child_args: &[&str]) -> Self {
+        Self::start_with_hooks(script, child_args, TestHooks::default()).await
+    }
+
+    async fn start_with_hooks(script: &[String], child_args: &[&str], hooks: TestHooks) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let script_path = dir.path().join("script.jsonl");
         std::fs::write(&script_path, script.join("\n") + "\n").unwrap();
@@ -64,11 +70,14 @@ impl Host {
             script_path.into_os_string(),
         ];
         command.extend(child_args.iter().map(Into::into));
-        let task = tokio::spawn(run(Config {
-            socket_path: socket.clone(),
-            journal_path: journal.clone(),
-            command,
-        }));
+        let task = tokio::spawn(run_with_hooks(
+            Config {
+                socket_path: socket.clone(),
+                journal_path: journal.clone(),
+                command,
+            },
+            hooks,
+        ));
         wait_for_socket(&socket).await;
         Self {
             _dir: dir,
@@ -80,6 +89,14 @@ impl Host {
 
     async fn connect(&self, replay_from: u64) -> Client {
         Client::connect(&self.socket, replay_from).await
+    }
+
+    async fn connect_takeover(&self, replay_from: u64) -> Client {
+        Client::connect_with_handshake(&self.socket, Handshake::takeover(replay_from)).await
+    }
+
+    async fn connect_raw_handshake(&self, raw_handshake_line: &str) -> Client {
+        Client::connect_raw_handshake(&self.socket, raw_handshake_line).await
     }
 
     async fn finish(self) -> i32 {
@@ -115,6 +132,12 @@ async fn wait_for_socket(socket: &Path) {
     .expect("the host starts listening");
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ClientFrame {
+    Record(WireRecord),
+    TakeoverBoundary,
+}
+
 struct Client {
     read: tokio::io::Lines<BufReader<OwnedReadHalf>>,
     write: OwnedWriteHalf,
@@ -122,15 +145,39 @@ struct Client {
 
 impl Client {
     async fn connect(socket: &Path, replay_from: u64) -> Self {
+        Self::connect_with_handshake(socket, Handshake::new(replay_from)).await
+    }
+
+    async fn connect_with_handshake(socket: &Path, handshake: Handshake) -> Self {
+        Self::connect_raw_handshake(socket, &handshake.line()).await
+    }
+
+    async fn connect_raw_handshake(socket: &Path, raw_handshake_line: &str) -> Self {
         let stream = UnixStream::connect(socket).await.unwrap();
         let (read, mut write) = stream.into_split();
         write
-            .write_all(format!("{}\n", Handshake { replay_from }.line()).as_bytes())
+            .write_all(format!("{raw_handshake_line}\n").as_bytes())
             .await
             .unwrap();
         Self {
             read: BufReader::new(read).lines(),
             write,
+        }
+    }
+
+    /// The next line from the socket as either a takeover boundary or a
+    /// journal record, or `None` when the host closed the connection.
+    async fn next_frame(&mut self) -> Option<ClientFrame> {
+        let line = tokio::time::timeout(STEP_TIMEOUT, self.read.next_line())
+            .await
+            .expect("the host sends a frame or closes")
+            .ok()??;
+        if is_takeover_boundary_line(&line) {
+            Some(ClientFrame::TakeoverBoundary)
+        } else {
+            Some(ClientFrame::Record(
+                serde_json::from_str(&line).expect("the host sends journal records or takeover boundaries"),
+            ))
         }
     }
 
@@ -161,6 +208,14 @@ impl Client {
             records.push(record);
         }
         records
+    }
+
+    async fn collect_frames_until_closed(&mut self) -> Vec<ClientFrame> {
+        let mut frames = Vec::new();
+        while let Some(frame) = self.next_frame().await {
+            frames.push(frame);
+        }
+        frames
     }
 }
 
@@ -526,4 +581,327 @@ async fn the_binary_exits_with_the_childs_status_and_mirrors_its_stderr() {
     .unwrap();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].line, "hi");
+}
+
+/// Builds a [`TestHooks`] that pauses the client reader after reading `target`
+/// and before journalling it. Returns the hooks, a receiver that fires once
+/// the reader has reached the pause point, and a sender that releases it.
+fn hold_client_line_hook(target: &'static str) -> (TestHooks, oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let reached_tx = Arc::new(Mutex::new(Some(reached_tx)));
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+    let hooks = TestHooks {
+        before_journal_client_line: Some(Arc::new(move |line: &str| {
+            let should_hold = line == target;
+            let reached_tx = Arc::clone(&reached_tx);
+            let release_rx = Arc::clone(&release_rx);
+            Box::pin(async move {
+                if !should_hold {
+                    return;
+                }
+                let tx = reached_tx.lock().unwrap().take();
+                if let Some(tx) = tx {
+                    let _ = tx.send(());
+                }
+                let rx = release_rx.lock().unwrap().take();
+                if let Some(rx) = rx {
+                    let _ = rx.await;
+                }
+            })
+        })),
+    };
+    (hooks, reached_rx, release_tx)
+}
+
+#[tokio::test]
+async fn a_complete_prompt_in_the_old_reader_is_journalled_once_on_takeover() {
+    let (hooks, reached_rx, release_tx) = hold_client_line_hook("prompt-from-A");
+    let host = Host::start_with_hooks(
+        &[
+            from_agent("ready"),
+            to_agent("prompt-from-A"),
+            from_agent("reply"),
+            to_agent("done"),
+        ],
+        &[],
+        hooks,
+    )
+    .await;
+
+    let mut client_a = host.connect(1).await;
+    client_a.expect(1, Direction::FromAgent, "ready").await;
+
+    client_a.send("prompt-from-A").await;
+    tokio::time::timeout(STEP_TIMEOUT, reached_rx)
+        .await
+        .expect("client A reads the complete prompt and hits the hold hook")
+        .unwrap();
+
+    // Start client B's takeover while A is holding its complete prompt.
+    let mut client_b = host.connect_takeover(1).await;
+    // B kicks A's writer immediately, so A sees EOF while A's reader is still
+    // parked at the hold hook.
+    assert!(
+        client_a.next().await.is_none(),
+        "client A's socket is closed by takeover kick"
+    );
+    // B must still be waiting on A's fence before sending replay + boundary.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), client_b.read.next_line())
+            .await
+            .is_err(),
+        "client B must not receive records or takeover boundary before A finishes"
+    );
+
+    release_tx.send(()).unwrap();
+
+    // B must observe ready (seq 1), prompt-from-A (seq 2), and then the
+    // takeover boundary (never before prompt-from-A).
+    let mut saw_prompt_before_boundary = false;
+    let mut saw_boundary = false;
+    let mut saw_reply = false;
+    while !(saw_boundary && saw_reply) {
+        match client_b.next_frame().await.expect("client B stays open until done") {
+            ClientFrame::TakeoverBoundary => {
+                assert!(
+                    saw_prompt_before_boundary,
+                    "takeover boundary arrived before client A's prompt"
+                );
+                assert!(!saw_boundary, "takeover boundary must arrive once");
+                saw_boundary = true;
+            }
+            ClientFrame::Record(record) => match record.seq {
+                1 => assert_eq!((record.dir, record.line.as_str()), (Direction::FromAgent, "ready")),
+                2 => {
+                    assert_eq!(
+                        (record.dir, record.line.as_str()),
+                        (Direction::ToAgent, "prompt-from-A")
+                    );
+                    assert!(!saw_boundary, "prompt-from-A must precede the takeover boundary");
+                    saw_prompt_before_boundary = true;
+                }
+                3 => {
+                    assert_eq!((record.dir, record.line.as_str()), (Direction::FromAgent, "reply"));
+                    saw_reply = true;
+                }
+                other => panic!("unexpected record seq {other}: {record:?}"),
+            },
+        }
+    }
+
+    client_b.send("done").await;
+    let rest = client_b.collect_frames_until_closed().await;
+    assert_eq!(rest.len(), 1);
+    match &rest[0] {
+        ClientFrame::Record(record) => {
+            assert_eq!(
+                (record.seq, record.dir, record.line.as_str()),
+                (4, Direction::ToAgent, "done")
+            );
+        }
+        ClientFrame::TakeoverBoundary => panic!("unexpected second takeover boundary"),
+    }
+
+    let journal = host.journal_records();
+    assert_eq!(
+        journal
+            .iter()
+            .map(|r| (r.seq, r.dir, r.line.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (1, Direction::FromAgent, "ready"),
+            (2, Direction::ToAgent, "prompt-from-A"),
+            (3, Direction::FromAgent, "reply"),
+            (4, Direction::ToAgent, "done"),
+        ],
+        "prompt-from-A is journalled once and the takeover boundary is never journalled"
+    );
+    assert_eq!(host.finish().await, 0);
+}
+
+#[tokio::test]
+async fn three_client_takeover_serializes_fencing_and_journals_prompt_once() {
+    let (hooks, reached_rx, release_tx) = hold_client_line_hook("prompt-from-A");
+    let host = Host::start_with_hooks(
+        &[
+            from_agent("ready"),
+            to_agent("prompt-from-A"),
+            from_agent("reply"),
+            to_agent("done"),
+        ],
+        &[],
+        hooks,
+    )
+    .await;
+
+    let mut client_a = host.connect(1).await;
+    client_a.expect(1, Direction::FromAgent, "ready").await;
+
+    client_a.send("prompt-from-A").await;
+    tokio::time::timeout(STEP_TIMEOUT, reached_rx)
+        .await
+        .expect("client A reads the complete prompt and hits the hold hook")
+        .unwrap();
+
+    // Start B's takeover and wait until B has kicked A (proving B holds the
+    // attach serialization lock and is awaiting A's closure).
+    let mut client_b = host.connect_takeover(1).await;
+    assert!(client_a.next().await.is_none());
+
+    // Connect C before A is released; C must queue behind B's fence rather
+    // than registering unfenced or overwriting B without kicking it.
+    let mut client_c = host.connect_takeover(1).await;
+
+    // Neither B nor C may receive a takeover boundary while A is still held.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), client_b.read.next_line())
+            .await
+            .is_err(),
+        "B must wait for A to finish"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), client_c.read.next_line())
+            .await
+            .is_err(),
+        "C must wait behind B's fence"
+    );
+
+    release_tx.send(()).unwrap();
+
+    // C displaces B, so B must be kicked and close cleanly. If B received any
+    // takeover boundary before being kicked, prompt-from-A must have preceded it.
+    let b_frames = client_b.collect_frames_until_closed().await;
+    let mut b_saw_prompt = false;
+    for frame in &b_frames {
+        match frame {
+            ClientFrame::Record(r) if r.dir == Direction::ToAgent && r.line == "prompt-from-A" => {
+                b_saw_prompt = true;
+            }
+            ClientFrame::TakeoverBoundary => {
+                assert!(
+                    b_saw_prompt,
+                    "client B received a takeover boundary before prompt-from-A: {b_frames:?}"
+                );
+            }
+            ClientFrame::Record(_) => {}
+        }
+    }
+
+    // C is the surviving client: it must receive prompt-from-A before its
+    // takeover boundary, and the child must receive prompt-from-A once.
+    let mut c_saw_prompt = false;
+    let mut c_saw_boundary = false;
+    let mut c_saw_reply = false;
+    while !(c_saw_boundary && c_saw_reply) {
+        match client_c.next_frame().await.expect("client C stays open until done") {
+            ClientFrame::TakeoverBoundary => {
+                assert!(
+                    c_saw_prompt,
+                    "client C received a takeover boundary before prompt-from-A"
+                );
+                assert!(!c_saw_boundary, "client C received duplicate takeover boundaries");
+                c_saw_boundary = true;
+            }
+            ClientFrame::Record(record) => match record.seq {
+                1 => assert_eq!((record.dir, record.line.as_str()), (Direction::FromAgent, "ready")),
+                2 => {
+                    assert_eq!(
+                        (record.dir, record.line.as_str()),
+                        (Direction::ToAgent, "prompt-from-A")
+                    );
+                    assert!(!c_saw_boundary, "prompt-from-A must precede C's takeover boundary");
+                    c_saw_prompt = true;
+                }
+                3 => {
+                    assert_eq!((record.dir, record.line.as_str()), (Direction::FromAgent, "reply"));
+                    c_saw_reply = true;
+                }
+                other => panic!("unexpected record seq {other}: {record:?}"),
+            },
+        }
+    }
+
+    client_c.send("done").await;
+    let rest = client_c.collect_frames_until_closed().await;
+    assert_eq!(rest.len(), 1);
+    match &rest[0] {
+        ClientFrame::Record(record) => {
+            assert_eq!(
+                (record.seq, record.dir, record.line.as_str()),
+                (4, Direction::ToAgent, "done")
+            );
+        }
+        ClientFrame::TakeoverBoundary => panic!("unexpected second takeover boundary"),
+    }
+
+    let journal = host.journal_records();
+    assert_eq!(
+        journal
+            .iter()
+            .map(|r| (r.seq, r.dir, r.line.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (1, Direction::FromAgent, "ready"),
+            (2, Direction::ToAgent, "prompt-from-A"),
+            (3, Direction::FromAgent, "reply"),
+            (4, Direction::ToAgent, "done"),
+        ],
+    );
+    assert_eq!(
+        host.finish().await,
+        0,
+        "the scripted child received prompt-from-A exactly once"
+    );
+}
+
+#[tokio::test]
+async fn opt_in_takeover_and_legacy_handshakes_are_compatible() {
+    let host = Host::start(
+        &[
+            from_agent("one"),
+            to_agent("from-takeover"),
+            from_agent("two"),
+            to_agent("from-legacy"),
+            from_agent("three"),
+        ],
+        &[],
+    )
+    .await;
+    host.wait_for_journal_len(1).await;
+
+    // 1. Legacy client sends {"replay_from":1} (no `takeover` field): receives
+    // only journal WireRecords, never a takeover boundary.
+    let mut legacy_first = host.connect_raw_handshake(r#"{"replay_from":1}"#).await;
+    legacy_first.expect(1, Direction::FromAgent, "one").await;
+
+    // 2. Opt-in takeover client sends {"replay_from":1,"takeover":true}:
+    // displaces the legacy client, replays seq 1, receives the socket-only
+    // takeover boundary, then exchanges live records.
+    let mut takeover = host.connect_takeover(1).await;
+    assert!(legacy_first.next().await.is_none());
+    match takeover.next_frame().await.unwrap() {
+        ClientFrame::Record(r) => assert_eq!((r.seq, r.dir, r.line.as_str()), (1, Direction::FromAgent, "one")),
+        ClientFrame::TakeoverBoundary => panic!("boundary arrived before replayed record"),
+    }
+    assert_eq!(takeover.next_frame().await, Some(ClientFrame::TakeoverBoundary));
+    takeover.send("from-takeover").await;
+    takeover.expect(2, Direction::ToAgent, "from-takeover").await;
+    takeover.expect(3, Direction::FromAgent, "two").await;
+
+    // 3. Another legacy client sends {"replay_from":1}: displaces the takeover
+    // client and receives only journal WireRecords (no takeover boundary).
+    let mut legacy_second = host.connect_raw_handshake(r#"{"replay_from":1}"#).await;
+    assert!(takeover.next_frame().await.is_none());
+    legacy_second.expect(1, Direction::FromAgent, "one").await;
+    legacy_second.expect(2, Direction::ToAgent, "from-takeover").await;
+    legacy_second.expect(3, Direction::FromAgent, "two").await;
+    legacy_second.send("from-legacy").await;
+    legacy_second.expect(4, Direction::ToAgent, "from-legacy").await;
+    legacy_second.expect(5, Direction::FromAgent, "three").await;
+    assert!(legacy_second.next().await.is_none());
+
+    // The journal contains only the 5 wire records, never the takeover boundary.
+    assert_eq!(host.journal_records().len(), 5);
+    assert_eq!(host.finish().await, 0);
 }
