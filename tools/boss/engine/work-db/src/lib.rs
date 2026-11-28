@@ -908,6 +908,7 @@ mod execution_launch_config;
 mod execution_recovery_rearm;
 mod execution_retention;
 mod executions_runs;
+mod family_outcomes;
 mod feedback_target;
 mod github_api_usage_db;
 mod github_merge_intents;

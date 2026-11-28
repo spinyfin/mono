@@ -442,6 +442,7 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
         | R::GetConflictResolution { .. }
         // Cost and usage reports are operator/coordinator diagnostics, not work context.
         | R::GetCostWindowReport { .. }
+        | R::GetExperimentOutcomes { .. }
         // Ideas are human/coordinator drafts, deliberately not work items;
         // a worker's task does not depend on reading or editing those drafts.
         | R::GetIdea { .. }

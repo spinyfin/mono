@@ -273,3 +273,121 @@ pub struct SolComparisonReport {
     pub arms: Vec<SolArmReport>,
     pub notes: Vec<String>,
 }
+
+/// One registered experiment and where it stands, a line of the experiment
+/// listing `boss cost experiment` prints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+pub struct ExperimentListEntry {
+    pub key: String,
+    /// `off`, `waiting`, `held`, `split` or `all`.
+    ///
+    /// `waiting` means the experiment is switched on but a flag it requires is
+    /// not, so it resolves to off ([`Self::waiting_on`] names them). `held`
+    /// means another experiment in the same lane runs instead
+    /// ([`Self::held_by`] names it).
+    pub state: String,
+    /// The lane the experiment holds while it runs, if it has one.
+    pub lane: Option<String>,
+    /// Whether the experiment has a half-and-half split flag at all.
+    pub splits: bool,
+    /// Flags that must be on for the experiment to run.
+    #[serde(default)]
+    #[builder(default)]
+    pub requires: Vec<String>,
+    /// For `waiting`: the required flags that are off.
+    #[serde(default)]
+    #[builder(default)]
+    pub waiting_on: Vec<String>,
+    /// For `held`: the experiment that holds the lane.
+    pub held_by: Option<String>,
+}
+
+/// Outcome figures for one set of PR families: one arm, or one driver within
+/// an arm. Every ratio is `None` when its denominator is zero, never zero.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+pub struct FamilyOutcomeMetrics {
+    /// PR families in the set (an open PR counts).
+    pub families: u64,
+    /// Families whose PR has merged.
+    pub merged_families: u64,
+    /// Families whose first published head reached a terminal CI result.
+    pub ci_observed_families: u64,
+    /// Of those, the families whose first result was a pass.
+    pub first_attempt_ci_passes: u64,
+    /// Revision work items launched before the merge, over merged families.
+    pub revisions_before_merge: u64,
+    /// Pre-merge review batches started, over every family.
+    pub review_batches: u64,
+    /// Findings of the accepted automated review verdicts before the merge
+    /// (all verdicts for an open PR), over every family.
+    pub review_findings: u64,
+    /// Follow-up tasks minted by post-merge reviews, over merged families.
+    pub post_merge_followups: u64,
+    /// Every recorded run of the merged families up to their merge.
+    pub merged_cost: super::CostMeasurement,
+    pub first_attempt_ci_pass_rate: Option<f64>,
+    pub revisions_per_merged_pr: Option<f64>,
+    pub review_batches_per_pr: Option<f64>,
+    pub review_findings_per_pr: Option<f64>,
+    pub post_merge_followups_per_merged_pr: Option<f64>,
+    /// Mean tokens over merged families whose every run was measured; `None`
+    /// when no merged family is fully measured.
+    pub tokens_per_merged_family: Option<f64>,
+    /// Merged families left out of `tokens_per_merged_family` because at least
+    /// one of their runs has no token measurement.
+    #[serde(default)]
+    #[builder(default)]
+    pub merged_families_tokens_unmeasured: u64,
+}
+
+/// [`FamilyOutcomeMetrics`] for the families whose first launched execution
+/// ran on one driver.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DriverOutcomes {
+    /// The driver slug, or `unknown` when the launch recorded none.
+    pub driver: String,
+    pub outcomes: FamilyOutcomeMetrics,
+}
+
+/// One arm of an experiment, overall and by the driver of each family's first
+/// launched execution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArmOutcomes {
+    /// `treatment` or `control`; `all` when no experiment is selected.
+    pub arm: String,
+    pub outcomes: FamilyOutcomeMetrics,
+    /// Sorted by driver slug.
+    pub by_driver: Vec<DriverOutcomes>,
+}
+
+/// PR-family outcomes for one experiment, or for every family when none is
+/// selected.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExperimentOutcomes {
+    /// The experiment read, or `None` for the all-families figure.
+    pub experiment: Option<String>,
+    /// `treatment` then `control` for an experiment (both present even when
+    /// empty); a single `all` arm when none is selected.
+    pub arms: Vec<ArmOutcomes>,
+    /// Families that recorded the experiment but not one arm throughout: another
+    /// execution recorded the other arm, or recorded nothing for it. Left out of
+    /// `arms`.
+    pub mixed_families: u64,
+    /// Families in which any execution recorded `stopped`. Left out of `arms`.
+    pub stopped_families: u64,
+    pub notes: Vec<String>,
+}
+
+/// Reply to `boss cost experiment [<key>]`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExperimentOutcomesReport {
+    /// Whether `token_experiments` is on. Off resolves every experiment to
+    /// off, whatever the listing says about its own flag.
+    pub master_switch_on: bool,
+    /// Every registered experiment, in registration order.
+    pub experiments: Vec<ExperimentListEntry>,
+    /// The outcomes read: the named experiment's, or every family's.
+    pub outcomes: ExperimentOutcomes,
+}

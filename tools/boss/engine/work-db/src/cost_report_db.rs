@@ -18,11 +18,11 @@ use boss_usage_report::{
     RecordedDriver, UsageExecutionRecord, UsageRunRecord, UsageSeriesRecords, UsageTaskRecord, UsageWindowRecords,
 };
 
-const COST_RECORD_COLUMNS: &str = "
+pub(crate) const COST_RECORD_COLUMNS: &str = "
     wr.id,
     wr.execution_id,
     we.work_item_id,
-    t.name,
+    COALESCE(t.name, we.work_item_id),
     we.kind,
     we.status,
     wr.status,
@@ -43,7 +43,7 @@ const COST_RECORD_COLUMNS: &str = "
     wr.usage_unavailable
 ";
 
-fn map_cost_run_record(row: &Row) -> rusqlite::Result<CostRunRecord> {
+pub(crate) fn map_cost_run_record(row: &Row) -> rusqlite::Result<CostRunRecord> {
     Ok(CostRunRecord {
         run_id: row.get(0)?,
         execution_id: row.get(1)?,

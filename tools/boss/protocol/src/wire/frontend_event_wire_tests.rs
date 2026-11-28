@@ -2365,6 +2365,23 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "sol_comparison_report",
         },
         TagCase {
+            label: "ExperimentOutcomesReport",
+            event: FrontendEvent::ExperimentOutcomesReport {
+                report: crate::ExperimentOutcomesReport {
+                    master_switch_on: true,
+                    experiments: vec![],
+                    outcomes: crate::ExperimentOutcomes {
+                        experiment: None,
+                        arms: vec![],
+                        mixed_families: 0,
+                        stopped_families: 0,
+                        notes: vec![],
+                    },
+                },
+            },
+            expected_tag: "experiment_outcomes_report",
+        },
+        TagCase {
             label: "DispatchFocusResult",
             event: FrontendEvent::DispatchFocusResult {
                 focus: crate::DispatchFocusState {
@@ -2555,6 +2572,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::DriverTrafficSplitResult { .. }
         | FrontendEvent::CodexSolPercentage { .. }
         | FrontendEvent::SolComparisonReport { .. }
+        | FrontendEvent::ExperimentOutcomesReport { .. }
         | FrontendEvent::DriverQuotaUsageResult { .. }
         | FrontendEvent::DispatchStateResult { .. }
         | FrontendEvent::ExternalTrackerSyncStarted { .. }

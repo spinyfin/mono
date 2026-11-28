@@ -197,6 +197,44 @@ pub struct SolPrRecord {
     pub first_ci: Option<bool>,
 }
 
+/// Stored outcome facts for one PR family in the family outcome ledger,
+/// everything `boss cost experiment` folds into per-arm figures.
+///
+/// A family is the chain root work item and everything under it. The ledger
+/// opens at the family's first launch, so every figure here covers the family's
+/// whole life up to the merge (or to now, for an open PR).
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
+pub struct FamilyOutcomeRecord {
+    /// The chain root work item.
+    pub family_root: String,
+    /// Driver slug of the family's first launched execution, when it recorded
+    /// one.
+    pub first_driver: Option<String>,
+    /// For each launched execution of the family, in no particular order: the
+    /// arm it recorded for the experiment being read (`control`, `treatment` or
+    /// `stopped`), or `None` when it recorded nothing for it. Empty when no
+    /// experiment is being read.
+    #[builder(default)]
+    pub launch_arms: Vec<Option<String>>,
+    /// The PR has merged.
+    pub merged: bool,
+    /// The family's first published head passed (`true`) or failed (`false`)
+    /// CI; `None` while that has not been observed.
+    pub first_ci: Option<bool>,
+    /// Revision work items launched before the merge.
+    pub revisions: u64,
+    /// Pre-merge review batches started.
+    pub review_batches: u64,
+    /// Findings of accepted automated review verdicts before the merge.
+    pub findings: u64,
+    /// Follow-up tasks minted by post-merge reviews.
+    pub followups: u64,
+    /// Every recorded run of the family up to the merge. Empty for a family that
+    /// has not merged: its cost is not read.
+    pub runs: Vec<CostRunRecord>,
+}
+
 #[derive(Debug, Clone, bon::Builder)]
 #[builder(on(String, into))]
 pub struct Host {

@@ -831,6 +831,17 @@ pub enum FrontendRequest {
         id: String,
     },
 
+    /// PR-family outcomes per arm of one token experiment, or for every
+    /// family when `experiment` is omitted, plus the list of registered
+    /// experiments and where each stands. Read-only; backs
+    /// `boss cost experiment [<key>]`. Replies with
+    /// [`FrontendEvent::ExperimentOutcomesReport`].
+    GetExperimentOutcomes {
+        /// The experiment key to read. Omitted: every family, as one arm.
+        #[serde(default)]
+        experiment: Option<String>,
+    },
+
     /// Full details for one registered host, including all capabilities.
     /// Replies with [`FrontendEvent::HostResult`] or
     /// [`FrontendEvent::Error`] when the id is unknown.

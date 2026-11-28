@@ -8,6 +8,11 @@ use crate::*;
 pub(crate) enum CostCommand {
     /// Compare Sol-eligible PRs by Sol/Astra arm, including revisions and retries.
     Sol,
+    /// PR-family outcomes per arm of one token experiment, and every
+    /// registered experiment with where it stands: off, split, all, held by
+    /// its lane, or waiting on a required flag. Without a key, the outcomes of
+    /// every PR family as a single arm.
+    Experiment(CostExperimentArgs),
     /// Token cost for one work item, aggregated across every execution
     /// and run it has ever had. The natural companion to `boss task
     /// show` / `boss chore show`.
@@ -59,6 +64,16 @@ pub(crate) fn parse_usage_filter(input: &str) -> Result<boss_protocol::UsageFilt
         dimension: dimension.trim().parse()?,
         values,
     })
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct CostExperimentArgs {
+    /// The experiment to read, by key (for example `batched_search`). A key
+    /// that is no longer registered still reads, from what its executions
+    /// recorded. Omit it to list the experiments and read every PR family
+    /// as one arm.
+    #[arg(value_name = "EXPERIMENT")]
+    pub(crate) key: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -260,6 +275,24 @@ pub(crate) async fn run_cost_command(command: CostCommand, ctx: &RunContext) -> 
                 }
                 for note in &report.notes {
                     println!("{note}");
+                }
+            })
+        }
+        CostCommand::Experiment(args) => {
+            let response = client
+                .send_request(&FrontendRequest::GetExperimentOutcomes { experiment: args.key })
+                .await
+                .map_err(CliError::internal)?;
+            let report = match response {
+                FrontendEvent::ExperimentOutcomesReport { report } => report,
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    return Err(CliError::application(message));
+                }
+                other => return Err(unexpected_event("cost experiment", &other)),
+            };
+            print_entity(ctx, &serde_json::json!({ "report": report }), || {
+                for line in experiment_outcome_lines(&report) {
+                    println!("{line}");
                 }
             })
         }
@@ -1105,6 +1138,104 @@ fn format_optional_average(value: Option<f64>) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
+// ── `boss cost experiment` ────────────────────────────────────────────
+
+/// The experiment listing and the outcomes of one experiment (or of every
+/// family), as the lines `boss cost experiment` prints.
+fn experiment_outcome_lines(report: &boss_protocol::ExperimentOutcomesReport) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "Token experiments (master switch `token_experiments` is {})",
+        if report.master_switch_on {
+            "on"
+        } else {
+            "off: every experiment is off"
+        }
+    ));
+    if report.experiments.is_empty() {
+        lines.push("  No experiments are registered.".to_owned());
+    }
+    let key_width = report
+        .experiments
+        .iter()
+        .map(|entry| entry.key.len())
+        .max()
+        .unwrap_or(0);
+    for entry in &report.experiments {
+        let state = match entry.state.as_str() {
+            "waiting" => format!("waiting on {}", entry.waiting_on.join(", ")),
+            "held" => format!("held by {}", entry.held_by.as_deref().unwrap_or("another experiment")),
+            other => other.to_owned(),
+        };
+        let lane = entry
+            .lane
+            .as_deref()
+            .map(|lane| format!("lane {lane}"))
+            .unwrap_or_else(|| "no lane".to_owned());
+        let split = if entry.splits { "splits" } else { "no split" };
+        lines.push(format!("  {:<key_width$}  {state}  ({lane}, {split})", entry.key));
+    }
+
+    let outcomes = &report.outcomes;
+    lines.push(String::new());
+    match &outcomes.experiment {
+        Some(key) => lines.push(format!("Outcomes of {key}:")),
+        None => lines.push("Outcomes of every PR family:".to_owned()),
+    }
+    for arm in &outcomes.arms {
+        lines.push(format!("  {}", family_outcome_line(&arm.arm, &arm.outcomes)));
+        for driver in &arm.by_driver {
+            lines.push(format!(
+                "    first launch on {}",
+                family_outcome_line(&driver.driver, &driver.outcomes)
+            ));
+        }
+    }
+    if outcomes.experiment.is_some() {
+        lines.push(format!(
+            "  Left out: {} mixed {}, {} stopped {}.",
+            outcomes.mixed_families,
+            if outcomes.mixed_families == 1 {
+                "family"
+            } else {
+                "families"
+            },
+            outcomes.stopped_families,
+            if outcomes.stopped_families == 1 {
+                "family"
+            } else {
+                "families"
+            },
+        ));
+    }
+    lines.extend(outcomes.notes.iter().map(|note| format!("  {note}")));
+    lines
+}
+
+fn family_outcome_line(label: &str, metrics: &boss_protocol::FamilyOutcomeMetrics) -> String {
+    let tokens = metrics
+        .tokens_per_merged_family
+        .map(|tokens| format_tokens(tokens.round() as i64))
+        .unwrap_or_else(|| "unknown".to_owned());
+    let unmeasured = if metrics.merged_families_tokens_unmeasured == 0 {
+        String::new()
+    } else {
+        format!(" ({} merged unmeasured)", metrics.merged_families_tokens_unmeasured)
+    };
+    format!(
+        "{label}: {} families, {} merged; first CI passes {}/{} ({}); revisions/merged PR {}; review batches/PR {}; findings/PR {}; post-merge follow-ups/merged PR {}; tokens/merged family {tokens}{unmeasured}",
+        metrics.families,
+        metrics.merged_families,
+        metrics.first_attempt_ci_passes,
+        metrics.ci_observed_families,
+        format_optional_share(metrics.first_attempt_ci_pass_rate),
+        format_optional_average(metrics.revisions_per_merged_pr),
+        format_optional_average(metrics.review_batches_per_pr),
+        format_optional_average(metrics.review_findings_per_pr),
+        format_optional_average(metrics.post_merge_followups_per_merged_pr),
+    )
+}
+
 // ── `boss cost series` ────────────────────────────────────────────────
 
 fn format_bucket_width(width: boss_protocol::UsageBucketWidth) -> &'static str {
@@ -1704,6 +1835,120 @@ mod tests {
             !grok.contains("| 0.0%"),
             "unmeasured group never gets 0.0% share: {grok}"
         );
+    }
+
+    fn outcome_metrics(families: u64, merged: u64, tokens: Option<f64>) -> boss_protocol::FamilyOutcomeMetrics {
+        boss_protocol::FamilyOutcomeMetrics::builder()
+            .families(families)
+            .merged_families(merged)
+            .ci_observed_families(families)
+            .first_attempt_ci_passes(families / 2)
+            .revisions_before_merge(0)
+            .review_batches(0)
+            .review_findings(0)
+            .post_merge_followups(0)
+            .merged_cost(measurement(0, 0, 0))
+            .maybe_first_attempt_ci_pass_rate((families > 0).then_some(0.5))
+            .maybe_revisions_per_merged_pr((merged > 0).then_some(1.5))
+            .maybe_tokens_per_merged_family(tokens)
+            .merged_families_tokens_unmeasured(if tokens.is_none() { merged } else { 0 })
+            .build()
+    }
+
+    fn experiment_report(experiment: Option<&str>, master: bool) -> boss_protocol::ExperimentOutcomesReport {
+        let entry = |key: &str, state: &str| {
+            boss_protocol::ExperimentListEntry::builder()
+                .key(key)
+                .state(state)
+                .splits(true)
+        };
+        boss_protocol::ExperimentOutcomesReport {
+            master_switch_on: master,
+            experiments: vec![
+                entry("batched_search", "split").lane("worker_prompt").build(),
+                entry("delta_rereview", "waiting")
+                    .lane("pre_merge_review")
+                    .requires(vec!["review_batch_fanout".into()])
+                    .waiting_on(vec!["review_batch_fanout".into()])
+                    .build(),
+                entry("slim_worker_brief", "held")
+                    .lane("worker_prompt")
+                    .held_by("batched_search")
+                    .build(),
+                entry("min_review_changed_lines", "off").build(),
+            ],
+            outcomes: boss_protocol::ExperimentOutcomes {
+                experiment: experiment.map(str::to_owned),
+                arms: vec![boss_protocol::ArmOutcomes {
+                    arm: if experiment.is_some() { "treatment" } else { "all" }.to_owned(),
+                    outcomes: outcome_metrics(10, 4, Some(1_234_567.0)),
+                    by_driver: vec![
+                        boss_protocol::DriverOutcomes {
+                            driver: "claude".to_owned(),
+                            outcomes: outcome_metrics(6, 2, Some(100.0)),
+                        },
+                        boss_protocol::DriverOutcomes {
+                            driver: "codex".to_owned(),
+                            outcomes: outcome_metrics(4, 2, None),
+                        },
+                    ],
+                }],
+                mixed_families: 3,
+                stopped_families: 1,
+                notes: vec!["A note.".to_owned()],
+            },
+        }
+    }
+
+    #[test]
+    fn the_experiment_listing_names_each_state_and_what_it_waits_on() {
+        let lines = experiment_outcome_lines(&experiment_report(Some("batched_search"), true)).join("\n");
+        assert!(lines.contains("`token_experiments` is on"), "{lines}");
+        assert!(
+            lines.contains("batched_search") && lines.contains("split  (lane worker_prompt, splits)"),
+            "{lines}"
+        );
+        assert!(lines.contains("waiting on review_batch_fanout"), "{lines}");
+        assert!(lines.contains("held by batched_search"), "{lines}");
+        assert!(
+            lines.contains("min_review_changed_lines  off  (no lane, splits)"),
+            "{lines}"
+        );
+    }
+
+    #[test]
+    fn a_switched_off_master_is_said_before_anything_else_is() {
+        let lines = experiment_outcome_lines(&experiment_report(None, false));
+        assert!(lines[0].contains("is off: every experiment is off"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn an_experiment_prints_each_arm_by_driver_and_what_was_left_out() {
+        let lines = experiment_outcome_lines(&experiment_report(Some("batched_search"), true));
+        let text = lines.join("\n");
+        assert!(text.contains("Outcomes of batched_search:"), "{text}");
+        assert!(
+            text.contains("treatment: 10 families, 4 merged; first CI passes 5/10 (50.0%)"),
+            "{text}"
+        );
+        assert!(text.contains("tokens/merged family 1,234,567"), "{text}");
+        assert!(text.contains("first launch on claude: 6 families"), "{text}");
+        assert!(text.contains("Left out: 3 mixed families, 1 stopped family."), "{text}");
+        // A family count with nothing to divide by is unknown, never 0.00.
+        assert!(text.contains("review batches/PR unknown"), "{text}");
+        // Merged families with no measured cost say so beside the figure.
+        assert!(
+            text.contains("tokens/merged family unknown (2 merged unmeasured)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_all_families_figure_has_no_exclusion_line() {
+        let text = experiment_outcome_lines(&experiment_report(None, true)).join("\n");
+        assert!(text.contains("Outcomes of every PR family:"), "{text}");
+        assert!(text.contains("  all: 10 families"), "{text}");
+        assert!(!text.contains("Left out"), "{text}");
     }
 }
 
